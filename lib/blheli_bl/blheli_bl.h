@@ -1,77 +1,109 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// blheli_bl — BLHeli-S / SiLabs EFM8 1-wire bootloader client for RP2040.
+// blheli_bl — BLHeli-S / SiLabs EFM8BB 1-wire bootloader client for RP2040.
 //
 // Speaks the ESC signal-wire bootloader protocol DIRECTLY (no flight controller):
 // connect, read device signature, read/write flash + EEPROM, erase, run.
 // esc_flash (firmware programming) and esc_setup (config params) build on this.
 //
-// Protocol constants (baud, framing, command bytes, CRC) live in PROTOCOL.md,
-// derived from Betaflight's 4-way avr/silabs bootloader + esc-configurator.
-// >>> Values marked [TODO:proto] are filled from that research. <<<
+// Protocol authority: Betaflight serial_4way_avrootloader.c (SiLabs "BLB"), cross-
+// checked with esc-configurator + BLHeli_S source. Details in PROTOCOL.md.
+// Physical layer: 19200 8N1, non-inverted, half-duplex single wire (idle HIGH).
+//
+// STATUS: full read path + write primitives implemented, but UNTESTED ON HARDWARE
+// (no Pico/ESC available at authoring time). Verify on the bench before trusting.
 #pragma once
 #include <Arduino.h>
 #include <stdint.h>
 
 namespace blheli_bl {
 
+// ---- bootloader ACK / response codes (BF-AVR) ----
+static constexpr uint8_t br_SUCCESS      = 0x30;
+static constexpr uint8_t br_ERRORVERIFY  = 0xC0;
+static constexpr uint8_t br_ERRORCOMMAND = 0xC1;  // also = "alive" NAK to keep-alive
+static constexpr uint8_t br_ERRORCRC     = 0xC2;
+static constexpr uint8_t br_NONE         = 0xFF;
+
 enum class McuType : uint8_t { UNKNOWN, SILABS_EFM8, ATMEL_AVR, ARM_BB51 };
 
 struct DeviceInfo {
 	bool        valid = false;
-	uint8_t     signature[2] = {0, 0};  // device signature (e.g. EFM8BB21)
-	uint8_t     bootInfo[8]  = {0};     // raw BootInfo / BootMsg response
+	uint8_t     signature[2] = {0, 0};   // [0]=sigHi [1]=sigLo; EFM8BB21 => E8 B2
+	uint8_t     bootVersion  = 0;
+	uint8_t     bootPages    = 0;
+	uint8_t     bootInfo[8]  = {0};      // raw connect reply
 	McuType     mcu  = McuType::UNKNOWN;
-	const char* name = nullptr;         // resolved chip name, or nullptr
+	const char* name = nullptr;          // resolved chip name, or nullptr
+	uint16_t    signatureWord() const { return (uint16_t(signature[0]) << 8) | signature[1]; }
 };
 
 struct Config {
 	uint8_t  signalPin;        // shared ESC signal wire (same pin DShot uses)
-	uint32_t baud = 0;         // 0 => protocol default (see PROTOCOL.md) [TODO:proto]
+	uint32_t baud = 19200;     // SiLabs bootloader is 19200 (52 us bit time)
 };
 
 class Bootloader {
 public:
 	explicit Bootloader(const Config& cfg) : cfg_(cfg) {}
 
-	// Bring up the single-wire half-duplex transport on the signal pin.
+	// Bring up the single-wire transport; leaves the line idle (input, pulled high).
 	bool begin();
 
-	// Send BootInit/hello and confirm the ESC sits in its bootloader.
-	// The SiLabs bootloader only listens for a short window after power-up, so the
-	// ESC usually must be (re)powered while connect() retries. Returns true once the
-	// expected boot response is seen.
+	// Send BootInit and confirm the ESC is in its bootloader ("471" + signature).
+	// The bootloader only listens briefly at power-up, so retry while (re)powering
+	// the ESC. On success, DeviceInfo is captured (see lastDevice()).
 	bool connect();
 
-	// Read device signature / boot info (identify EFM8BB21 etc).
+	// Return the DeviceInfo captured during connect().
 	bool readDeviceInfo(DeviceInfo& out);
+	const DeviceInfo& lastDevice() const { return dev_; }
 
-	// Read `len` bytes from `addr` (flash or EEPROM space) into buf.
-	bool readMemory(uint16_t addr, uint8_t* buf, uint16_t len);
+	// Read `len` bytes (1..256) from flash (`readFlash`) or EEPROM (`readEeprom`).
+	bool readEeprom(uint16_t addr, uint8_t* buf, uint16_t len);
+	bool readFlash (uint16_t addr, uint8_t* buf, uint16_t len);
 
-	// --- write path (Phase A1) ---
-	bool setAddress(uint16_t addr);
-	bool erasePage(uint16_t addr);
-	bool writeMemory(uint16_t addr, const uint8_t* buf, uint16_t len);
+	// --- write path (Phase A1; frames correct per BF-AVR, untested) ---
+	bool erasePage (uint16_t addr);                                   // page erase (512B on BB2)
+	bool writeFlash (uint16_t addr, const uint8_t* buf, uint16_t len);
+	bool writeEeprom(uint16_t addr, const uint8_t* buf, uint16_t len);
+
+	bool keepAlive();          // true if bootloader NAKs 0xFD with br_ERRORCOMMAND
 	bool run();                // exit bootloader → start app
 
 	void end();
 	bool connected() const { return connected_; }
 
 private:
-	Config cfg_;
-	bool   connected_ = false;
+	Config     cfg_;
+	bool       connected_ = false;
+	DeviceInfo dev_;
+	uint32_t   bitTimeUs_    = 52;   // 1e6 / baud
+	uint32_t   bitTime34Us_  = 39;   // 3/4 bit — sample offset into start bit
 
-	// --- transport: single-wire UART on cfg_.signalPin (SerialPIO/bit-bang) ---
-	// Implementation chosen once baud/framing is confirmed (see PROTOCOL.md §A).
-	bool sendFrame(const uint8_t* data, uint16_t len);
-	bool recvFrame(uint8_t* buf, uint16_t maxLen, uint16_t& outLen, uint32_t timeoutMs);
+	// --- 1-wire transport (bit-banged, mirrors BF-AVR suart) ---
+	void setTx();                    // push-pull output, idle high
+	void setRx();                    // input, pull-up
+	void txByte(uint8_t b);
+	bool rxByte(uint8_t& out, uint32_t timeoutMs);
 
-	// Protocol CRC (poly/algorithm per PROTOCOL.md §C) [TODO:proto]
-	static uint16_t crc16(const uint8_t* data, uint16_t len);
+	// --- framing ---
+	// Send payload, appending the 2-byte CRC iff connected_ (stateful, per BF-AVR).
+	void sendCmd(const uint8_t* data, uint16_t len);
+	// Read a single ACK byte.
+	bool getAck(uint8_t& ack, uint32_t timeoutMs = 250);
+	// Read N data bytes (+CRC when connected) then the ACK; verify CRC; ack==0x30.
+	bool readBuf(uint8_t* buf, uint16_t n, uint32_t timeoutMs = 250);
+	// setAddress (big-endian) + a read/write command helper.
+	bool setAddress(uint16_t addr);
+	bool setBuffer(const uint8_t* data, uint16_t len);
+
+	static uint16_t crcAdd(uint16_t crc, uint8_t b);   // poly 0xA001, reflected
+	static uint16_t crcBuf(const uint8_t* data, uint16_t len);
 };
 
-// Resolve a device signature to a human name (table in blheli_bl.cpp) [TODO:proto].
-const char* signatureName(const uint8_t sig[2]);
+// Resolve a device signature word to a human name (EFM8BB10x/21x/51x), or nullptr.
+const char* signatureName(uint16_t sigWord);
+McuType     mcuTypeFor(uint16_t sigWord);
 
 } // namespace blheli_bl

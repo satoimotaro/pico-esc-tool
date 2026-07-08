@@ -1,45 +1,79 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // esc_setup — read/decode/encode the BLHeli-S EEPROM configuration block.
-// Uses blheli_bl for 1-wire access. Offsets & fields: see EEPROM.md [TODO:proto].
+// Uses blheli_bl for 1-wire access. Offsets & encodings: see EEPROM.md
+// (layout revision 33; base 0x1A00; 112 bytes). Verified vs esc-configurator +
+// BLHeli_S.asm. Decode is read-only for A0; encode/write is Phase A1.
 #pragma once
 #include <Arduino.h>
 #include "blheli_bl.h"
 
 namespace esc_setup {
 
-// Decoded BLHeli-S settings (subset; extend from EEPROM.md as fields are confirmed).
+// EEPROM parameter block on SiLabs BLHeli-S (EFM8BB1/BB2).
+constexpr uint16_t kEepromAddr = 0x1A00;
+constexpr uint16_t kEepromLen  = 0x70;   // 112 bytes
+
+// Byte offsets within the block (relative to kEepromAddr).
+enum Off : uint8_t {
+	OFF_MAIN_REVISION   = 0x00,
+	OFF_SUB_REVISION    = 0x01,
+	OFF_LAYOUT_REVISION = 0x02,
+	OFF_STARTUP_POWER   = 0x09,
+	OFF_DIRECTION       = 0x0B,
+	OFF_MODE_L          = 0x0D,
+	OFF_MODE_H          = 0x0E,
+	OFF_TX_PROGRAM      = 0x0F,
+	OFF_COMM_TIMING     = 0x15,
+	OFF_MIN_THROTTLE    = 0x19,
+	OFF_MAX_THROTTLE    = 0x1A,
+	OFF_BEEP_STRENGTH   = 0x1B,
+	OFF_BEACON_STRENGTH = 0x1C,
+	OFF_BEACON_DELAY    = 0x1D,
+	OFF_DEMAG_COMP      = 0x1F,
+	OFF_CENTER_THROTTLE = 0x21,
+	OFF_TEMP_PROTECT    = 0x23,
+	OFF_LOW_RPM_PROTECT = 0x24,
+	OFF_BRAKE_ON_STOP   = 0x27,
+	OFF_LED_CONTROL     = 0x28,
+	OFF_LAYOUT_TAG      = 0x40,  // 16 ASCII
+	OFF_MCU_TAG         = 0x50,  // 16 ASCII
+	OFF_NAME            = 0x60,  // 16 ASCII
+};
+
 struct Settings {
 	bool     valid = false;
-	uint8_t  layoutRevision = 0;      // EEPROM layout/version byte
-	char     layoutName[16] = {0};    // e.g. "#S_H_50#"
-	char     mcuName[16]    = {0};
-	// common params (encodings per EEPROM.md) [TODO:proto]
-	uint8_t  motorDirection        = 0;  // normal / reversed / bidirectional
-	uint8_t  ppmMinThrottle        = 0;
-	uint8_t  ppmMaxThrottle        = 0;
-	uint8_t  ppmCenterThrottle     = 0;
-	uint8_t  beepStrength          = 0;
-	uint8_t  beaconStrength        = 0;
-	uint8_t  beaconDelay           = 0;
-	uint8_t  motorTiming           = 0;
-	uint8_t  pwmFrequency          = 0;
-	uint8_t  demagCompensation     = 0;
-	uint8_t  temperatureProtection = 0;
-	uint8_t  lowVoltageProtection  = 0;
-	uint8_t  brakeOnStop           = 0;
-	uint8_t  startupPower          = 0;
-	// full raw block kept for safe read-modify-write round trips
-	uint8_t  raw[256] = {0};
+	uint8_t  mainRevision  = 0;
+	uint8_t  subRevision   = 0;
+	uint8_t  layoutRevision = 0;
+	uint8_t  motorDirection = 0;   // 1=Normal 2=Reversed 3=Bidir 4=Bidir-rev
+	uint8_t  startupPower   = 0;    // 1..13
+	uint8_t  commTiming     = 0;    // 1..5 (Low..High)
+	uint8_t  minThrottle    = 0;    // us = 1000 + 4*byte
+	uint8_t  maxThrottle    = 0;
+	uint8_t  centerThrottle = 0;
+	uint8_t  beepStrength   = 0;
+	uint8_t  beaconStrength = 0;
+	uint8_t  beaconDelay    = 0;    // 1..5
+	uint8_t  demagComp      = 0;    // 1=Off 2=Low 3=High
+	uint8_t  tempProtect    = 0;    // rev33: 0=Off,1..7 levels
+	uint8_t  lowRpmProtect  = 0;    // bool
+	uint8_t  brakeOnStop    = 0;    // bool
+	uint8_t  txProgram      = 0;    // bool
+	uint16_t modeSignature  = 0;    // 0x55AA=multi 0xA55A=main 0x5AA5=tail
+	char     layoutTag[17]  = {0};
+	char     mcuTag[17]     = {0};
+	char     name[17]       = {0};
+	uint8_t  raw[kEepromLen] = {0};
 	uint16_t rawLen = 0;
 };
 
-// EEPROM parameter block base address on SiLabs BLHeli-S [TODO:proto confirm].
-constexpr uint16_t kEepromAddr = 0x1A00;   // placeholder
-constexpr uint16_t kEepromLen  = 0x70;     // placeholder
+// us pulse width for a throttle byte (min/max/center). 1000 + 4*byte.
+static inline uint16_t throttleUs(uint8_t b) { return 1000 + 4 * (uint16_t)b; }
 
-bool  read (blheli_bl::Bootloader& bl, Settings& out);          // read + decode
-bool  write(blheli_bl::Bootloader& bl, const Settings& in);     // encode + write (A1)
-void  print(const Settings& s, Stream& out);                    // human-readable dump
+bool read (blheli_bl::Bootloader& bl, Settings& out);        // readEeprom + decode
+bool write(blheli_bl::Bootloader& bl, const Settings& in);   // encode + write (A1)
+void decode(const uint8_t* raw, uint16_t len, Settings& out);
+void print(const Settings& s, Stream& out);
 
 } // namespace esc_setup

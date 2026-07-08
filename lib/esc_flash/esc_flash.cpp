@@ -8,13 +8,14 @@ namespace esc_flash {
 
 bool programImage(blheli_bl::Bootloader& bl, const uint8_t*, size_t, ProgressCb) {
 	if (!bl.connected()) return false;
-	// [TODO:proto] A1: for each page → setAddress, erasePage, writeMemory, then verify.
+	// A1: parse Intel-HEX → for each 512B page: erasePage(addr), then writeFlash(addr,buf,len)
+	// in <=256B chunks (blheli_bl primitives now exist), then verifyImage().
 	return false;
 }
 
 bool verifyImage(blheli_bl::Bootloader& bl, const uint8_t*, size_t, ProgressCb) {
 	if (!bl.connected()) return false;
-	// [TODO:proto] A1: readMemory page-by-page and compare.
+	// A1: readFlash page-by-page and compare against the image.
 	return false;
 }
 
