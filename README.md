@@ -2,46 +2,60 @@
 
 Standalone **RP2040 (Pico)** controller for BLHeli-S ESCs — setup, firmware flashing,
 DShot control, and telemetry for underwater ROV thrusters. **No flight controller
-required.** Built with the **Pico SDK (C/C++) + PIO**.
+required.**
 
-Part of the UWR ESC project. Design docs are kept in the workspace `.ai/` (local).
+- **Build system:** PlatformIO, **earlephilhower Arduino-Pico core** (wraps the Pico
+  SDK + PIO). `Serial` = USB-C CDC — the Phase-1 host link.
+- **DShot/telemetry:** via **[pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot)**
+  (GPL-3.0) — DShot TX + bidirectional eRPM + Extended DShot Telemetry.
+
+Design docs live in the workspace `.ai/` (local, not pushed here). License: GPL-3.0-or-later.
 
 ## Why
 
 Drone ESCs can't self-configure (need an FC), are tuned for high RPM, are hard for a
-plain MCU to read telemetry from, and an FC can only drive ~4 of them — too few for an
-ROV. This board fixes that: configure/flash/drive/monitor many BLHeli-S ESCs directly
-from a PC/SBC.
+plain MCU to read telemetry from, and an FC can only drive ~4 — too few for an ROV.
+This controller configures/flashes/drives/monitors many BLHeli-S ESCs from a PC/SBC.
 
-## Layout
+## Layout (PlatformIO)
 
 ```
-firmware/
-  src/        app entry, command dispatch, board pins
-  include/    public headers
-  pio/        DShot TX + bidirectional DShot RX PIO programs
-  lib/
-    dshot/         DShot150/300/600 TX
-    telemetry/     eRPM (bidir DShot) + optional KISS telem UART
-    rpm_filter/    eRPM → mechanical RPM, dropout rejection
-    esc_setup/     BLHeli-S EEPROM parameter read/write   [core, hard]
-    flash/         BLHeli-S 1-wire bootloader flashing     [core, hard]
-    pc_iface/      host link (USB-C CDC first)
-host/         optional PC-side CLI
-construction/ wiring / pcb (KiCad) / cad (case)
-docs/         protocol notes, build & run guide
+platformio.ini    envs: [pico], [picow]; lib_deps = pico-bidir-dshot
+src/main.cpp      A0 baseline: 1 ESC over bidir DShot, USB-CDC command loop
+lib/              our modules (auto-discovered) — see lib/README.md
+  esc_dshot/  esc_telemetry/  rpm_filter/  esc_setup/*  esc_flash/*  pc_iface/
+construction/     wiring / pcb (KiCad) / cad (case)
+docs/             protocol notes
+                  (* = BLHeli-S 1-wire tools, the hard core — Phase A1)
 ```
+
+## Build & flash
+
+**Windows PlatformIO (recommended):** open this folder (works over
+`\\wsl$\Ubuntu-24.04\home\satoi\UWR_ESC_ws\ESC-controller`), pick env `pico` or
+`picow`, Build, then flash (UF2: hold BOOTSEL, drag `.uf2`, or PlatformIO Upload).
+
+**CLI:**
+```
+pio run -e pico                 # build
+pio run -e pico -t upload       # flash
+pio device monitor -b 115200    # serial
+```
+
+## A0 usage (Serial Monitor, newline mode)
+
+```
+E          enable Extended DShot Telemetry
+A          arm
+T1000      throttle 1000 (0-2000)
+D          disarm (throttle 0)
+C3         special command 3 (beacon), only when stopped
+?          reprint header
+```
+Prints `Thrott  RPM  Volt  Amp  Temp  Stress  Status`. Set `SIGNAL_PIN` and
+`MOTOR_POLES` in `src/main.cpp` for your wiring/motor. See `construction/wiring/`.
 
 ## Status
 
-Early scaffold — see the workspace phase plan (`.ai/architecture/phase-plan.md`),
-Phase A0. See `docs/protocol-notes.md` for the BLHeli-S/DShot references.
-
-## Target hardware
-
-Bring-up on a bare Pico + LittleBee Spring 30A (BLHeli-S). Generalizes to other
-BLHeli-S ESCs later.
-
-## Build (planned)
-
-Pico SDK + CMake. Toolchain and instructions land with Phase A0.
+**Phase A0** (see `.ai/architecture/phase-plan.md`). Baseline single-ESC DShot +
+telemetry app is in place; next: multi-channel + the 1-wire setup/flash spike.
