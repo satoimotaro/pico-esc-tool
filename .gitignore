@@ -1,0 +1,26 @@
+# Pico SDK / CMake
+build/
+cmake-build-*/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# host tooling
+__pycache__/
+*.pyc
+.venv/
+target/          # rust host CLI, if used
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
