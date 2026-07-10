@@ -27,9 +27,15 @@ per-thruster commands with a deadman. cmd_vel→thruster mixing is left to the h
   auto-applied after a flash.
 - **Bootloader session** — config commands keep the ESC connected (motor off) and reuse it, so a
   batch of commands doesn't reboot the ESC between each; it restarts only on `run`/`disconnect`.
-- **Multi-ESC** — one signal pin per ESC (`ESC_PINS[]`); target an index or `all`.
-- **DShot control + bidirectional eRPM telemetry** baseline app (via
-  [pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot)).
+- **Multi-ESC** — one signal pin per ESC (`PINS[]` in `src/apps/esc_session.h`); target an index or `all`.
+- **Firmware-aware thruster drive** — the spin path detects the ESC firmware and picks the DShot
+  variant: **normal DShot** for stock BLHeli-S (throttle only), **bidirectional DShot** for
+  Bluejay/JESC (with telemetry). Arms the ESC, then holds throttle with a deadman auto-stop.
+- **Reversible / 3D** — if the ESC is configured reversible, throttle becomes a **signed thrust**
+  (−full … 0 = stop … +full); one-way ESCs use a plain 0–100% throttle.
+- **Live telemetry** (bidir firmware) — eRPM always; temperature + stress via EDT; voltage/current
+  when the ESC has the sensors. DShot via
+  [pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot).
 
 ## Requirements
 
@@ -62,7 +68,7 @@ python host/esctool.py run 0                                  # end the session,
 
 | Command | What it does |
 |---|---|
-| `list` | Scan `ESC_PINS[]` and print each ESC (signature, layout, name, firmware). |
+| `list` | Scan all configured pins and print each ESC (signature, layout, name, firmware). |
 | `connect <i\|all>` | Enter the bootloader and hold the session (motor off). |
 | `read <i\|all> [-o file.yaml]` | Read config; print YAML or write it to a file. |
 | `set <i\|all> key=value ...` | Change settings (enum names OK, e.g. `motor_direction=Reversed`). |
@@ -74,6 +80,28 @@ Config commands hold the ESC in a bootloader session (motor off) and **do not re
 `-r` to restart after a single command, or `run`/`disconnect` when done. Get the firmware HEX for
 your ESC's layout from [github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli)
 (`BLHeli_S SiLabs/Hex files/`).
+
+## Driving thrusters
+
+`esc_tool` spins each ESC over DShot — from the Wi-Fi web UI (**Spin test**) or the USB-serial API:
+
+```
+arm <i> [normal|bidir]    # arm ESC i (AUTO picks bidir for Bluejay/JESC, else normal DShot)
+throttle <i> <0..2000>    # one-way throttle (armed)
+thrust <i> <-1000..1000>  # reversible/3D: signed thrust, 0 = stop (armed)
+tele <i>                  # rpm | volts | amps | tempC | stress   (bidir firmware only)
+disarm <i>                # stop + release the ESC
+```
+
+Arming streams zero throttle for ~3 s (BLHeli-S won't spin until it has been armed), so wait for the
+start-up beeps before applying throttle. A **deadman** re-zeros the throttle if no command arrives
+within 500 ms — resend regularly to keep it spinning (the web UI heartbeats automatically).
+
+**Firmware & telemetry.** Stock BLHeli-S understands only normal DShot (throttle, no telemetry).
+eRPM + temperature telemetry and reversible support work best on **Bluejay** (or JESC); its motor
+PWM frequency (24 / 48 / 96 kHz) is chosen by *which hex you flash*. Get Bluejay from
+[github.com/bird-sanctuary/bluejay](https://github.com/bird-sanctuary/bluejay). The Pico exposes a
+generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/Pi (RL/sim-friendly).
 
 ## Wi-Fi web tool (SETUP mode)
 
@@ -128,9 +156,12 @@ docs/                   notes; lib/blheli_bl/PROTOCOL.md is the bootloader refer
 
 ## Status & roadmap
 
-**BLHeli-S 1-wire tooling is proven on hardware** (EFM8BB21): connect, read, write, and flash all
-work via `esctool`, with the compat guard and auto-default-config. Next phases: telemetry + RPM
-filtering polish, and a Wi-Fi / BLE link to the Pico W for a wireless GUI.
+**Proven on hardware** (EFM8BB21, ReadyToSky 45A/30A): bootloader connect / read / write / flash
+with the compat guard and auto-default-config; DShot spin with eRPM + EDT telemetry on **Bluejay**
+and throttle-only spin on **stock BLHeli-S** (auto-selected); reversible / 3D signed thrust; and the
+Wi-Fi web configurator + spin test (Wi-Fi AP and DShot coexist on the Pico W's PIO). Next: multi-
+thruster simultaneous drive, firmware flashing from the browser, and RPM filtering / telemetry→
+thrust mapping on the host.
 
 ## License
 

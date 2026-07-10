@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 satoimotaro
 //
-// esc_session — shared, transport-agnostic BLHeli-S bootloader session for the RP2040 ESC tool.
-// core0 owns DShot (PIO) for bootloader entry; core1 owns the 1-wire bit-bang (blheli_bl). Both
-// the USB-serial firmware (esc_host) and the Wi-Fi web firmware (esc_web) drive this same API and
-// supply only their own transport (serial parser / HTTP handlers). Header-only: exactly one app
-// translation unit compiles it per PlatformIO env, so the file-local statics have a single copy.
+// esc_session — shared, transport-agnostic BLHeli-S bootloader session + DShot drive for the RP2040
+// ESC tool. core0 owns DShot (PIO) for bootloader entry and thruster drive; core1 owns the 1-wire
+// bit-bang (blheli_bl). The unified `esc_tool` firmware drives this same API from both its transports
+// (USB-serial parser and Wi-Fi HTTP handlers). Header-only: exactly one app translation unit compiles
+// it per PlatformIO env, so the file-local statics have a single copy.
 //
 // A persistent SESSION holds one ESC in its bootloader (motor off) and reuses it across calls so
 // config ops don't reboot the ESC each time; core1 keeps it alive. Call release() to restart it.
