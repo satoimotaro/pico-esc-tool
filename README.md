@@ -132,8 +132,8 @@ PIO — validate the combination on the bench.)
 
 | Env | Purpose |
 |---|---|
-| `esc_tool` | **The tool** — unified firmware (USB serial CLI + Wi-Fi web UI + DShot spin). |
-| `picow` / `pico` | Standalone DShot drive demo (`src/apps/dshot_demo.cpp`). |
+| `esc_tool` | **The tool** — unified firmware (USB serial CLI + Wi-Fi web UI + DShot spin). *The default build.* |
+| `dshot_demo` | Standalone DShot drive demo (`src/apps/dshot_demo.cpp`); Pico W by default, set `board = rpipico` for a plain Pico. |
 | `spike_*` | Standalone bring-up/diagnostic firmwares for the bootloader work. |
 
 `esc_tool` builds on the shared bootloader/session/drive logic in `src/apps/esc_session.h`.
@@ -156,7 +156,7 @@ construction/wiring/    how to wire an ESC signal line to the Pico
 docs/                   notes; lib/blheli_bl/PROTOCOL.md is the bootloader reference
 ```
 
-## DShot demo (`pico` / `picow` env)
+## DShot demo (`dshot_demo` env)
 
 `src/apps/dshot_demo.cpp` drives one ESC over bidirectional DShot from the serial monitor (115200,
 newline): `E` enable telemetry, `A` arm, a number = throttle (0–2000), `D` disarm, `C3` beacon (when
