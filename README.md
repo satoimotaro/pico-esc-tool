@@ -27,7 +27,7 @@ per-thruster commands with a deadman. cmd_vel→thruster mixing is left to the h
   auto-applied after a flash.
 - **Bootloader session** — config commands keep the ESC connected (motor off) and reuse it, so a
   batch of commands doesn't reboot the ESC between each; it restarts only on `run`/`disconnect`.
-- **Multi-ESC** — one signal pin per ESC (`PINS[]` in `src/apps/esc_session.h`); target an index or `all`.
+- **Multi-ESC** — one signal pin per ESC (`ESC_SIGNAL_PINS` in `src/apps/esc_config.h`); target an index or `all`.
 - **Firmware-aware thruster drive** — the spin path detects the ESC firmware and picks the DShot
   variant: **normal DShot** for stock BLHeli-S (throttle only), **bidirectional DShot** for
   Bluejay/JESC (with telemetry). Arms the ESC, then holds throttle with a deadman auto-stop.
@@ -39,8 +39,9 @@ per-thruster commands with a deadman. cmd_vel→thruster mixing is left to the h
 
 ## Requirements
 
-- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (default **GP10**) with a common
-  ground. See `construction/wiring/`.
+- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults **GP10**, plus **GP11** for
+  a 2nd ESC) with a common ground. All wiring — signal pins, mode pin, Wi-Fi, motor poles — is
+  configured in one place, `src/apps/esc_config.h`. See `construction/wiring/`.
 - **Firmware build:** [PlatformIO](https://platformio.org/) (earlephilhower Arduino-Pico core;
   fetched automatically).
 - **Host CLI:** Python 3.8+ and `pyserial` (`pip install pyserial`; `pyyaml` optional).
@@ -108,8 +109,8 @@ generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/
 In SETUP mode (the default), `esc_tool` brings up a Wi-Fi Access Point. Connect your phone/PC to
 the SSID `pico-esc-tool` and open `http://192.168.4.1` for a configurator-style browser UI: scan
 ESCs, read/edit settings, run a per-thruster spin test with live telemetry, and **flash firmware**
-(upload a `.hex`) — no cables. Change `AP_SSID` / `AP_PASS` (and `MODE_PIN`) at the top of
-`src/apps/esc_tool.cpp`.
+(upload a `.hex`) — no cables. The AP SSID/password and the mode pin are set in
+`src/apps/esc_config.h`.
 
 Browser flashing is the same app-only, layout/MCU-guarded flow as the CLI (bootloader preserved,
 firmware defaults applied); it runs page-by-page in the background with a progress readout. Pick the
@@ -132,7 +133,7 @@ PIO — validate the combination on the bench.)
 | Env | Purpose |
 |---|---|
 | `esc_tool` | **The tool** — unified firmware (USB serial CLI + Wi-Fi web UI + DShot spin). |
-| `picow` / `pico` | DShot control + telemetry baseline app (`src/main.cpp`). |
+| `picow` / `pico` | Standalone DShot drive demo (`src/apps/dshot_demo.cpp`). |
 | `spike_*` | Standalone bring-up/diagnostic firmwares for the bootloader work. |
 
 `esc_tool` builds on the shared bootloader/session/drive logic in `src/apps/esc_session.h`.
@@ -141,9 +142,11 @@ PIO — validate the combination on the bench.)
 
 ```
 platformio.ini          build environments
-src/main.cpp            DShot + telemetry baseline app (USB-CDC command loop)
-src/apps/esc_tool.cpp   unified firmware (USB serial + Wi-Fi web + DShot spin)
+src/apps/esc_config.h   hardware config — EDIT THIS for your wiring (pins, Wi-Fi, motor)
+src/apps/esc_tool.cpp   the tool: unified firmware (USB serial + Wi-Fi web + DShot spin)
 src/apps/esc_session.h  shared bootloader session + drive/spin (used by esc_tool)
+src/apps/dshot_demo.cpp standalone DShot drive demo (pico / picow envs)
+src/apps/spike_*.cpp    standalone bring-up / diagnostic firmwares
 host/esctool.py         the PC CLI
 host/profiles/          example YAML profiles
 lib/blheli_bl/          BLHeli-S 1-wire bootloader client  (PROTOCOL.md = reference)
@@ -153,11 +156,12 @@ construction/wiring/    how to wire an ESC signal line to the Pico
 docs/                   notes; lib/blheli_bl/PROTOCOL.md is the bootloader reference
 ```
 
-## DShot baseline app (`picow` env)
+## DShot demo (`pico` / `picow` env)
 
-`src/main.cpp` drives one ESC over bidirectional DShot from the serial monitor (115200, newline):
-`E` enable telemetry, `A` arm, a number = throttle (0–2000), `D` disarm, `C3` beacon (when stopped),
-`?` reprint header. Set the signal pin / motor pole count near the top of the file for your wiring.
+`src/apps/dshot_demo.cpp` drives one ESC over bidirectional DShot from the serial monitor (115200,
+newline): `E` enable telemetry, `A` arm, a number = throttle (0–2000), `D` disarm, `C3` beacon (when
+stopped), `?` reprint header. It's a minimal standalone reference (the full tool is `esc_tool`); pins
+and motor poles come from `src/apps/esc_config.h`.
 
 ## Status & roadmap
 

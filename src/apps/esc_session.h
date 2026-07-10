@@ -13,12 +13,13 @@
 #include <Arduino.h>
 #include <PIO_DShot.h>
 #include <string.h>
+#include "esc_config.h"
 #include "blheli_bl.h"
 #include "esc_setup.h"
 
 namespace escs {
 
-static const uint8_t PINS[]  = { 10, 11 };  // one signal pin per ESC (add more for multi-ESC)
+static const uint8_t PINS[]  = ESC_SIGNAL_PINS;   // signal pin(s) per ESC — edit in esc_config.h
 static const uint8_t COUNT   = sizeof(PINS) / sizeof(PINS[0]);
 
 struct Info {
@@ -42,7 +43,7 @@ static const uint16_t SPIN_MAX        = 2000;   // max throttle
 static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no command within this
 static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this long to ARM the ESC
                                                 // (covers the ESC's boot beep after leaving the BL)
-static const uint16_t MOTOR_POLES     = 14;     // magnet poles (for eRPM->RPM); motor-dependent
+static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc_config.h)
 
 // Per-ESC DShot mode. BLHeli-S understands only *normal* DShot; *bidir* DShot (inverted, with eRPM/
 // EDT telemetry back over the wire) needs firmware that supports it (Bluejay/JESC). AUTO picks bidir
@@ -50,7 +51,7 @@ static const uint16_t MOTOR_POLES     = 14;     // magnet poles (for eRPM->RPM);
 enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
 
 namespace detail {
-	static const uint32_t DSHOT_KBAUD = 600, PRIME_MS = 500, HIGH_HOLD_MS = 1000;
+	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500, HIGH_HOLD_MS = 1000;
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
 	static blheli_bl::Bootloader  bl({ .signalPin = PINS[0], .baud = 0 });    // core1 only
 

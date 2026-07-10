@@ -1,33 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 satoimotaro
 //
-// ESC-controller (thrust-controller) — A0 baseline
-// -------------------------------------------------
-// Minimal standalone driver for a single BLHeli-S ESC over bidirectional DShot,
-// controlled from a PC over USB-C CDC serial. Satisfies Phase A0 exit criteria:
-// spin the motor via DShot and read RPM (+ EDT: voltage/current/temp/stress) back.
+// dshot_demo — standalone bidirectional-DShot drive demo (the `pico` / `picow` envs).
+// -----------------------------------------------------------------------------------
+// Minimal single-ESC driver over bidirectional DShot, from a PC over USB-C CDC serial: spin the
+// motor and read RPM (+ EDT: voltage/current/temp/stress). A small reference/bring-up app on the
+// same level as the spikes — the full tool is `esc_tool` (config/flash + drive + Wi-Fi web UI).
+// Kept as the default entry for the plain `pico` (non-W) board, which can't build esc_tool's Wi-Fi.
 //
-// Built on pico-bidir-dshot (Bastian2001, GPL-3.0), which handles DShot TX,
-// bidirectional eRPM, and Extended DShot Telemetry decoding on the RP2040 PIO.
-// Adapted from that library's advanced EDT example as our A0 starting point.
+// Built on pico-bidir-dshot (Bastian2001, GPL-3.0): DShot TX, bidirectional eRPM, and Extended
+// DShot Telemetry decoding on the RP2040 PIO. Adapted from that library's advanced EDT example.
 //
-// Host protocol (Serial Monitor, newline mode). See .ai/architecture/interfaces.md:
+// Host protocol (Serial Monitor, newline mode):
 //   T<0-2000>  set throttle (0 = stop)
 //   C<0-47>    send special command (only when stopped); e.g. C3 = beacon 3
 //   E          enable Extended DShot Telemetry (== C13)
-//   A          arm    (ramp allowed; here: permit throttle)
+//   A          arm    (permit throttle)
 //   D          disarm (force throttle 0)
 //   ?          print status header again
 //
-// NOTE: MOTOR_POLES is motor-dependent (count magnets, not stator slots).
-//       SIGNAL_PIN is the ESC signal wire. Adjust for your wiring.
+// Pins / motor poles come from esc_config.h (shared with the tool); this demo drives ESC 0's pin.
 
 #include <Arduino.h>
 #include <PIO_DShot.h>
+#include "esc_config.h"
 
-#define SIGNAL_PIN   10   // ESC signal wire  (see construction/wiring/)
-#define MOTOR_POLES  14   // magnet poles of the target motor
-#define DSHOT_KBAUD  600  // DShot600
+static const uint8_t kDemoPins[] = ESC_SIGNAL_PINS;
+#define SIGNAL_PIN   kDemoPins[0]     // ESC 0's signal wire (see esc_config.h, construction/wiring/)
+#define MOTOR_POLES  ESC_MOTOR_POLES  // magnet poles of the target motor
+#define DSHOT_KBAUD  ESC_DSHOT_KBAUD  // DShot bitrate
 
 BidirDShotX1 *esc = nullptr;
 

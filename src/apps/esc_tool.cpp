@@ -9,8 +9,9 @@
 // MODES (the "setup vs drive" split):
 //   SETUP (default): Wi-Fi AP ON (browser configurator + individual spin test) + full serial API.
 //   DRIVE          : Wi-Fi OFF (save power / no RF) — accepts per-thruster commands; deadman armed.
-// Mode is chosen at boot by MODE_PIN (internal pull-up: unwired/HIGH => SETUP, tie LOW => DRIVE, so
-// leaving it unconnected is fine) and can be changed at runtime with the `mode` command.
+// Mode is chosen at boot by the mode pin (ESC_MODE_PIN in esc_config.h; internal pull-up:
+// unwired/HIGH => SETUP, tie LOW => DRIVE, so leaving it unconnected is fine — or set it to -1 to
+// disable the pin) and can be changed at runtime with the `mode` command.
 //
 // The Pico is a generic per-thruster driver: cmd_vel->thruster mixing lives on the host/Pi (keeps
 // it RL/sim-friendly). Wi-Fi is a surface/bench affordance (2.4 GHz does not travel underwater).
@@ -20,9 +21,9 @@
 #include "esc_session.h"
 #include "esc_flash.h"
 
-#define MODE_PIN 22                    // tie LOW at boot for DRIVE; unconnected (pull-up) => SETUP
-static const char* AP_SSID = "pico-esc-tool";
-static const char* AP_PASS = "esctool1234";   // >= 8 chars (WPA2). Change before real use.
+// Hardware config (pins, AP creds, DShot) lives in esc_config.h — the one place to edit.
+static const char* AP_SSID = ESC_AP_SSID;
+static const char* AP_PASS = ESC_AP_PASS;
 
 enum Mode { SETUP, DRIVE };
 static Mode mode   = SETUP;
@@ -334,7 +335,9 @@ static void handleSerial() {
 
 void setup() {
 	Serial.begin(115200);
-	pinMode(MODE_PIN, INPUT_PULLUP);
+#if ESC_MODE_PIN >= 0
+	pinMode(ESC_MODE_PIN, INPUT_PULLUP);
+#endif
 	delay(50);
 	server.on("/", hIndex);
 	server.on("/api/scan", hScan);
@@ -348,7 +351,11 @@ void setup() {
 	server.on("/api/tele", hTele);
 	server.on("/api/flash", HTTP_POST, hFlashStart, hFlashUpload);   // upload .hex then flash
 	server.on("/api/flashstatus", hFlashStatus);
-	setMode(digitalRead(MODE_PIN) == LOW ? DRIVE : SETUP);   // LOW=drive; unconnected(HIGH)=setup
+#if ESC_MODE_PIN >= 0
+	setMode(digitalRead(ESC_MODE_PIN) == LOW ? DRIVE : SETUP);  // LOW=drive; unconnected(HIGH)=setup
+#else
+	setMode(SETUP);                                             // mode pin disabled: boot into SETUP
+#endif
 }
 void loop() {
 	handleSerial();

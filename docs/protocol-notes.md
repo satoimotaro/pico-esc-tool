@@ -1,4 +1,4 @@
-# Protocol notes — ESC-controller
+# Protocol notes — pico-esc-tool
 
 References for the interfaces this firmware implements. Fuller design in the
 workspace `.ai/architecture/interfaces.md` (local).
