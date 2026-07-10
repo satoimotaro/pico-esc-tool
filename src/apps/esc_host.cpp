@@ -32,7 +32,7 @@ static BidirDShotX1*         dsh = nullptr;                            // core0 
 static blheli_bl::Bootloader bl({ .signalPin = ESC_PINS[0], .baud = 0 });  // core1 only
 
 // --- core0 <-> core1 op handshake ---
-enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, RUN };
+enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, ERASE, WRITEFLASH, READFLASH, RUN };
 volatile Op       g_op     = Op::NONE;
 volatile bool     g_opDone = false;
 volatile bool     g_opOk   = false;
@@ -41,6 +41,9 @@ volatile uint8_t  g_sig[2] = {0, 0};
 volatile uint8_t  g_bootVer = 0, g_bootPages = 0;
 static   uint8_t  g_cfg[esc_setup::kEepromLen];   // last READCFG result (core1 -> core0)
 static   uint8_t  g_page[esc_setup::kPageLen];    // 512B page shared for READPAGE/WRITEPAGE
+static   uint8_t  g_flBuf[256];                   // flash write/read chunk (ERASE/WRITEFLASH/READFLASH)
+volatile uint16_t g_flAddr = 0;
+volatile uint16_t g_flLen  = 0;
 volatile bool     g_cfgOk  = false;
 // Persistent session: which ESC is currently held in the bootloader (-1 = none). Config commands
 // reuse it instead of re-entering (which would reboot the ESC each time); core1 keeps it alive.
@@ -97,24 +100,40 @@ static void printHex(const uint8_t* p, uint16_t n) {
 		Serial.print("0123456789ABCDEF"[b & 0xF]);
 	}
 }
+static int hexVal(char c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	return -1;
+}
+// Parse a hex string into buf (max cap bytes). Returns the byte count, or -1 on a bad digit/overflow.
+static int parseHex(const char* s, uint8_t* buf, int cap) {
+	int n = 0;
+	for (; s[0] && s[1]; s += 2) {
+		if (n >= cap) return -1;
+		int hi = hexVal(s[0]), lo = hexVal(s[1]);
+		if (hi < 0 || lo < 0) return -1;
+		buf[n++] = (uint8_t)((hi << 4) | lo);
+	}
+	return n;
+}
 
-// Emit one "esc|..." line for a scan: enter BL, read identity, run app again (non-destructive).
+// Emit one "esc|..." line for a scan: connect (via the session, no reboot) and read identity.
+// The ESC is LEFT in the bootloader session — `run`/`disconnect` restarts it when you're done.
 static void scanOne(uint8_t idx) {
-	uint8_t pin = ESC_PINS[idx];
-	if (!enterBootloader(pin)) { Serial.printf("esc|%u|%u|0\n", idx, pin); return; }
+	if (!ensureConnected(idx)) { Serial.printf("esc|%u|%u|0\n", idx, ESC_PINS[idx]); return; }
 	esc_setup::Settings s;
-	bool cfg = runOp(Op::READCFG, pin);
+	bool cfg = runOp(Op::READCFG, ESC_PINS[idx]);
 	if (cfg) esc_setup::decode(g_cfg, esc_setup::kEepromLen, s);
-	Serial.printf("esc|%u|%u|1|%02X%02X|%u|%s|%s|%u.%02u\n",
-		idx, pin, g_sig[0], g_sig[1], g_bootVer,
+	Serial.printf("esc|%u|%u|1|%02X%02X|%u|%s|%s|%u.%u\n",
+		idx, ESC_PINS[idx], g_sig[0], g_sig[1], g_bootVer,
 		cfg ? s.layoutTag : "?", cfg ? s.name : "?", s.mainRevision, s.subRevision);
-	runOp(Op::RUN, pin);   // leave the ESC running normally
 }
 
 void setup() { Serial.begin(115200); }
 
 void loop() {
-	static char line[256];             // room for an editpage override list (off:val,...)
+	static char line[600];             // room for a writeflash chunk (256 B = 512 hex) or override list
 	static uint16_t len = 0;
 	while (Serial.available()) {
 		int c = Serial.read();
@@ -131,7 +150,6 @@ void loop() {
 				for (uint8_t i = 0; i < NUM_ESC; i++) Serial.printf(" %u", ESC_PINS[i]);
 				Serial.println(); Serial.println("ok");
 			} else if (!strcmp(cmd, "scan")) {
-				releaseSession();                       // survey restores each ESC to its app
 				for (uint8_t i = 0; i < NUM_ESC; i++) scanOne(i);
 				Serial.println("ok");
 			} else if (!strcmp(cmd, "read")) {
@@ -178,6 +196,34 @@ void loop() {
 						Serial.println(wok ? "ok" : "err write-verify-failed");
 					}
 				}
+			} else if (!strcmp(cmd, "erase")) {           // erase <i> <pageAddrHex>
+				char* a = strtok(nullptr, " "); char* ad = strtok(nullptr, " ");
+				int i = a ? atoi(a) : -1;
+				if (i < 0 || i >= NUM_ESC || !ad) Serial.println("err bad-args");
+				else if (!ensureConnected(i)) Serial.println("err no-connect");
+				else { g_flAddr = (uint16_t)strtol(ad, nullptr, 16);
+					Serial.println(runOp(Op::ERASE, ESC_PINS[i]) ? "ok" : "err erase-failed"); }
+			} else if (!strcmp(cmd, "writeflash")) {      // writeflash <i> <addrHex> <dataHex>
+				char* a = strtok(nullptr, " "); char* ad = strtok(nullptr, " "); char* hx = strtok(nullptr, " ");
+				int i = a ? atoi(a) : -1;
+				if (i < 0 || i >= NUM_ESC || !ad || !hx) Serial.println("err bad-args");
+				else if (!ensureConnected(i)) Serial.println("err no-connect");
+				else {
+					int n = parseHex(hx, g_flBuf, sizeof(g_flBuf));
+					if (n <= 0) Serial.println("err bad-hex");
+					else { g_flAddr = (uint16_t)strtol(ad, nullptr, 16); g_flLen = (uint16_t)n;
+						Serial.println(runOp(Op::WRITEFLASH, ESC_PINS[i]) ? "ok" : "err write-failed"); }
+				}
+			} else if (!strcmp(cmd, "readflash")) {       // readflash <i> <addrHex> <len>
+				char* a = strtok(nullptr, " "); char* ad = strtok(nullptr, " "); char* ln = strtok(nullptr, " ");
+				int i = a ? atoi(a) : -1;
+				int len = ln ? atoi(ln) : -1;
+				if (i < 0 || i >= NUM_ESC || !ad || len < 1 || len > (int)sizeof(g_flBuf)) Serial.println("err bad-args");
+				else if (!ensureConnected(i)) Serial.println("err no-connect");
+				else { g_flAddr = (uint16_t)strtol(ad, nullptr, 16); g_flLen = (uint16_t)len;
+					bool k = runOp(Op::READFLASH, ESC_PINS[i]);
+					if (k) { Serial.print("data|"); printHex(g_flBuf, len); Serial.println(); }
+					Serial.println(k ? "ok" : "err read-failed"); }
 			} else {
 				Serial.println("err unknown-cmd");
 			}
@@ -229,6 +275,12 @@ void loop1() {
 		ok = esc_setup::readPage(bl, g_page);
 	} else if (op == Op::WRITEPAGE) {
 		ok = esc_setup::writePage(bl, g_page);   // erase + write + read-back verify
+	} else if (op == Op::ERASE) {
+		ok = bl.erasePage(g_flAddr);
+	} else if (op == Op::WRITEFLASH) {
+		ok = bl.writeFlash(g_flAddr, g_flBuf, g_flLen);
+	} else if (op == Op::READFLASH) {
+		ok = bl.readFlash(g_flAddr, g_flBuf, g_flLen);
 	} else if (op == Op::RUN) {
 		ok = bl.run();
 	}

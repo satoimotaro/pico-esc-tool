@@ -1,89 +1,118 @@
-# ESC-controller (thrust-controller)
+# ESC-controller
 
-Standalone **RP2040 (Pico)** controller for BLHeli-S ESCs — setup, firmware flashing,
-DShot control, and telemetry for underwater ROV thrusters. **No flight controller
-required.**
+An **RP2040 (Pico / Pico W)** tool for **BLHeli-S ESCs**: configure, flash firmware, and drive
+them over DShot with telemetry — **no flight controller required.** Built for underwater ROV
+thrusters (many ESCs from one PC/SBC), but works with any BLHeli-S SiLabs ESC.
 
-- **Build system:** PlatformIO, **earlephilhower Arduino-Pico core** (wraps the Pico
-  SDK + PIO). `Serial` = USB-C CDC — the Phase-1 host link.
-- **DShot/telemetry:** via **[pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot)**
-  (GPL-3.0) — DShot TX + bidirectional eRPM + Extended DShot Telemetry.
+It has two halves:
 
-Design docs live in the workspace `.ai/` (local, not pushed here). License: GPL-3.0-or-later.
+- **`esc_host`** — firmware for the Pico that speaks the BLHeli-S 1-wire bootloader on the ESC
+  signal line and exposes a small serial protocol.
+- **`esctool`** — a BLHeli-Configurator-like **CLI** on the PC that drives it: list ESCs, read /
+  write settings (YAML profiles), and flash firmware — with a layout/MCU **compatibility guard**.
 
-## Why
+## Features
 
-Drone ESCs can't self-configure (need an FC), are tuned for high RPM, are hard for a
-plain MCU to read telemetry from, and an FC can only drive ~4 — too few for an ROV.
-This controller configures/flashes/drives/monitors many BLHeli-S ESCs from a PC/SBC.
+- **Discover / read / write** BLHeli-S config over the signal wire (CRC-verified, read-back checked).
+- **YAML profiles** — export a config, edit, and `apply` it (single ESC or `all`).
+- **Firmware flashing** from the CLI, app-only (bootloader + your settings-page are never touched),
+  refused unless the HEX's layout + MCU match the ESC. The firmware's own default config is
+  auto-applied after a flash.
+- **Bootloader session** — config commands keep the ESC connected (motor off) and reuse it, so a
+  batch of commands doesn't reboot the ESC between each; it restarts only on `run`/`disconnect`.
+- **Multi-ESC** — one signal pin per ESC (`ESC_PINS[]`); target an index or `all`.
+- **DShot control + bidirectional eRPM telemetry** baseline app (via
+  [pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot)).
 
-## Layout (PlatformIO)
+## Requirements
 
-```
-platformio.ini        envs: [picow] app, [esc_host] unified tool, [spike_*] diagnostics
-src/main.cpp          A0 baseline: 1 ESC over bidir DShot, USB-CDC command loop
-src/apps/esc_host.cpp unified host-driven firmware (serial command protocol) for the CLI
-host/esctool.py       PC-side CLI: list / read ESCs (set/apply/flash coming)
-lib/                  our modules (auto-discovered) — see lib/README.md
-  blheli_bl/*  esc_setup/*  esc_flash/*   BLHeli-S 1-wire bootloader: connect/read/write/flash
-  esc_dshot/  esc_telemetry/  rpm_filter/  pc_iface/
-construction/         wiring / pcb (KiCad) / cad (case)
-docs/                 protocol notes; lib/blheli_bl/PROTOCOL.md = the bootloader reference
-                      (* = BLHeli-S 1-wire tools, the hard core — Phase A1)
-```
+- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (default **GP10**) with a common
+  ground. See `construction/wiring/`.
+- **Firmware build:** [PlatformIO](https://platformio.org/) (earlephilhower Arduino-Pico core;
+  fetched automatically).
+- **Host CLI:** Python 3.8+ and `pyserial` (`pip install pyserial`; `pyyaml` optional).
 
-## Build & flash
+## Quick start
 
-**Windows PlatformIO (recommended):** open this folder (works over
-`\\wsl$\Ubuntu-24.04\home\satoi\UWR_ESC_ws\ESC-controller`), pick env `pico` or
-`picow`, Build, then flash (UF2: hold BOOTSEL, drag `.uf2`, or PlatformIO Upload).
-
-**CLI:**
-```
-pio run -e pico                 # build
-pio run -e pico -t upload       # flash
-pio device monitor -b 115200    # serial
-```
-
-## Host CLI (esctool)
-
-Flash the unified **`esc_host`** firmware, then drive ESCs from a PC over USB serial:
+Build and flash the unified firmware to the Pico:
 
 ```
 pio run -e esc_host -t upload
-python host/esctool.py list                       # scan & list connected ESCs
-python host/esctool.py read 0 -o config.yaml      # export one ESC's config to YAML
+```
+
+Then drive ESCs from the PC (the Pico is auto-detected by its USB VID 2E8A):
+
+```
+python host/esctool.py list                                   # scan & list connected ESCs
+python host/esctool.py read 0 -o config.yaml                  # export ESC 0's config to YAML
 python host/esctool.py set 0 motor_direction=Reversed beep_strength=60
-python host/esctool.py apply all host/profiles/blheli-s-default.yaml   # a profile -> every ESC
-python host/esctool.py run 0                       # end the session (restart the ESC)
+python host/esctool.py apply all host/profiles/blheli-s-default.yaml
+python host/esctool.py flash 0 J_H_25_REV16_7.HEX --yes       # flash matching BLHeli-S firmware
+python host/esctool.py run 0                                  # end the session, restart the ESC
 ```
 
-Config commands hold the ESC in a **bootloader session** (motor off, no repeated reboots) and
-reuse it across commands; the ESC only restarts on `run`/`disconnect` (or with `-r`). Use an
-ESC index or `all`. Multi-ESC is driven by the firmware's `ESC_PINS[]` list. Needs `pyserial`
-(`pip install pyserial`); auto-detects the Pico by USB VID 2E8A. Flashing firmware from the CLI
-is the next phase (today, flashing is via the `spike_program` env).
+## CLI reference
 
-## A0 usage (Serial Monitor, newline mode)
+| Command | What it does |
+|---|---|
+| `list` | Scan `ESC_PINS[]` and print each ESC (signature, layout, name, firmware). |
+| `connect <i\|all>` | Enter the bootloader and hold the session (motor off). |
+| `read <i\|all> [-o file.yaml]` | Read config; print YAML or write it to a file. |
+| `set <i\|all> key=value ...` | Change settings (enum names OK, e.g. `motor_direction=Reversed`). |
+| `apply <i\|all> profile.yaml` | Apply a profile's `settings:` block (`--name`, `--with-name`). |
+| `flash <i> file.hex --yes` | Compat-check then erase/program/verify the app + apply defaults (`--force` to override). |
+| `run` / `disconnect` `[i]` | End the session and restart the held ESC(s). |
+
+Config commands hold the ESC in a bootloader session (motor off) and **do not restart it** — add
+`-r` to restart after a single command, or `run`/`disconnect` when done. Get the firmware HEX for
+your ESC's layout from [github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli)
+(`BLHeli_S SiLabs/Hex files/`).
+
+## Safety
+
+- **Flash is app-only.** The 1-wire bootloader (top of flash) is never overwritten — it's how the
+  tool talks to the ESC — so a failed flash is recoverable by re-flashing.
+- **Compatibility guard.** `flash` refuses a HEX whose layout tag or MCU signature doesn't match
+  the connected ESC (wrong FET map / wrong chip), unless `--force`.
+- Every write is **read-back verified** on the device.
+
+## PlatformIO environments
+
+| Env | Purpose |
+|---|---|
+| `esc_host` | **The tool** — unified host-driven firmware for `esctool`. |
+| `picow` / `pico` | DShot control + telemetry baseline app (`src/main.cpp`). |
+| `spike_*` | Standalone bring-up/diagnostic firmwares for the bootloader work. |
+
+## Layout
 
 ```
-E          enable Extended DShot Telemetry
-A          arm
-
-0      throttle 1000 (0-2000)
-D          disarm (throttle 0)
-C3         special command 3 (beacon), only when stopped
-?          reprint header
+platformio.ini          build environments
+src/main.cpp            DShot + telemetry baseline app (USB-CDC command loop)
+src/apps/esc_host.cpp   unified host-driven firmware (serial protocol for esctool)
+host/esctool.py         the PC CLI
+host/profiles/          example YAML profiles
+lib/blheli_bl/          BLHeli-S 1-wire bootloader client  (PROTOCOL.md = reference)
+lib/esc_setup/          config read / write (read-modify-write a flash page)
+lib/esc_flash/          Intel-HEX parse, program/verify, compatibility check
+lib/esc_dshot/ esc_telemetry/ rpm_filter/ pc_iface/   DShot + telemetry building blocks
+construction/           wiring / PCB (KiCad) / case (CAD)
+docs/                   notes; lib/blheli_bl/PROTOCOL.md is the bootloader reference
 ```
-Prints `Thrott  RPM  Volt  Amp  Temp  Stress  Status`. Set `SIGNAL_PIN` and
-`MOTOR_POLES` in `src/main.cpp` for your wiring/motor. See `construction/wiring/`.
 
-## Status
+## DShot baseline app (`picow` env)
 
-**Phase A1 — BLHeli-S 1-wire bootloader tools proven on hardware** (EFM8BB21). Working
-end-to-end: bootloader connect, config **read** (CRC-verified), config **write**
-(read-modify-write + verify), and **firmware flash** with a layout/MCU compatibility
-guard — app-only (bootloader + EEPROM preserved), and the firmware's own default config
-is auto-applied from the HEX after flashing. Unified host firmware `esc_host` + `esctool`
-CLI (list / read) are in place; next: `set`/`apply`(YAML profiles)/`flash` from the CLI,
-BLHeli-S default profiles, and multi-ESC. (Phase-plan detail in the workspace `.ai/`.)
+`src/main.cpp` drives one ESC over bidirectional DShot from the serial monitor (115200, newline):
+`E` enable telemetry, `A` arm, a number = throttle (0–2000), `D` disarm, `C3` beacon (when stopped),
+`?` reprint header. Set the signal pin / motor pole count near the top of the file for your wiring.
+
+## Status & roadmap
+
+**BLHeli-S 1-wire tooling is proven on hardware** (EFM8BB21): connect, read, write, and flash all
+work via `esctool`, with the compat guard and auto-default-config. Next phases: telemetry + RPM
+filtering polish, and a Wi-Fi / BLE link to the Pico W for a wireless GUI.
+
+## License
+
+GPL-3.0-or-later. DShot/telemetry via pico-bidir-dshot (GPL-3.0). BLHeli-S firmware images are the
+property of their authors (github.com/bitdump/BLHeli) and are not distributed here.

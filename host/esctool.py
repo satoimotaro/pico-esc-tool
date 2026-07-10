@@ -263,9 +263,118 @@ def cmd_apply(dev: EscHost, args):
         _finish(dev, i, args.run)
 
 
+def cmd_connect(dev: EscHost, args):
+    for i in resolve_indices(dev, args.index):
+        line = next((l for l in dev.cmd(f"enter {i}") if l.startswith("dev|")), None)
+        if not line:
+            print(f"ESC {i}: could not connect")
+            continue
+        _, sig, boot, pages = line.split("|")
+        print(f"ESC {i} connected (held): sig={sig} bootVer={boot} bootPages={pages}")
+
+
 def cmd_run(dev: EscHost, args):
     dev.cmd("disconnect")
     print("released bootloader session; ESC(s) restarted.")
+
+
+APP_END, EEPROM_BASE, BOOT_BASE = 0x1A00, 0x1A00, 0x1C00
+SIG_FOR_MCU = {"B21": "E8B2", "B51": "E8B5", "B10": "E8B1"}
+
+
+def parse_hex(path: str):
+    """Intel-HEX -> (app{addr:byte} <0x1A00, ident{addr:byte} 0x1A00..0x1BFF, boot_byte_count)."""
+    app, ident, boot, upper = {}, {}, 0, 0
+    for ln in open(path, encoding="utf-8"):
+        ln = ln.strip()
+        if not ln.startswith(":"):
+            continue
+        rec = bytes.fromhex(ln[1:])
+        if sum(rec) & 0xFF:
+            raise ValueError(f"bad checksum: {ln}")
+        bc, addr, tt, data = rec[0], (rec[1] << 8) | rec[2], rec[3], rec[4:4 + rec[0]]
+        if tt == 4:
+            upper = (data[0] << 8) | data[1]
+        elif tt == 0:
+            for k, b in enumerate(data):
+                a = (upper << 16) | (addr + k)
+                if a < APP_END:
+                    app[a] = b
+                elif a < BOOT_BASE:
+                    ident[a] = b
+                else:
+                    boot += 1
+    return app, ident, boot
+
+
+def hex_tag(ident: dict, off: int) -> str:
+    s = bytearray()
+    for j in range(16):
+        b = ident.get(EEPROM_BASE + off + j, 0xFF)
+        if b in (0, 0xFF):
+            break
+        s.append(b)
+    return s.decode("ascii", "replace").rstrip()
+
+
+def _pages_from(app: dict, ident: dict) -> dict:
+    """Assemble {page_addr: bytearray(512)} for the app pages plus the config page (firmware
+    defaults from the HEX's eeprom section -> auto-applied config)."""
+    pages: dict[int, bytearray] = {}
+    for a, b in app.items():
+        pages.setdefault(a & ~0x1FF, bytearray(b"\xff" * 512))[a & 0x1FF] = b
+    if ident:
+        buf = bytearray(b"\xff" * 512)
+        for a, b in ident.items():
+            buf[a - EEPROM_BASE] = b
+        pages[EEPROM_BASE] = buf
+    return pages
+
+
+def cmd_flash(dev: EscHost, args):
+    app, ident, boot = parse_hex(args.hexfile)
+    if not app:
+        sys.exit("HEX has no application data")
+    fw_layout, fw_mcu = hex_tag(ident, 0x40), hex_tag(ident, 0x50)
+    i = int(args.index)
+
+    dev_line = next((l for l in dev.cmd(f"enter {i}") if l.startswith("dev|")), None)
+    if not dev_line:
+        sys.exit(f"ESC {i}: could not connect")
+    esc_sig = dev_line.split("|")[1]
+    cfg = next((l for l in dev.cmd(f"read {i}") if l.startswith("cfg|")), None)
+    esc_layout = _tag(bytes.fromhex(cfg.split("|", 1)[1]), 0x40) if cfg else ""
+
+    exp_sig = next((v for k, v in SIG_FOR_MCU.items() if k in fw_mcu), None)
+    mcu_ok = exp_sig is not None and exp_sig == esc_sig
+    layout_ok = bool(fw_layout) and fw_layout == esc_layout
+    print(f"ESC {i}: sig={esc_sig} layout='{esc_layout}'   HEX: mcu='{fw_mcu}' layout='{fw_layout}'")
+    print(f"compat: MCU {'OK' if mcu_ok else 'MISMATCH'}, layout {'OK' if layout_ok else 'MISMATCH'}")
+    if not (mcu_ok and layout_ok) and not args.force:
+        dev.cmd(f"run {i}")
+        sys.exit("INCOMPATIBLE firmware - refusing (use --force to override).")
+    if not args.yes:
+        dev.cmd(f"run {i}")
+        sys.exit("this ERASES + writes the ESC app. Re-run with --yes to proceed.")
+    if boot:
+        print(f"note: {boot} bootloader byte(s) in HEX are skipped (BL preserved)")
+
+    pages = _pages_from(app, ident)
+    for n, p in enumerate(sorted(pages), 1):
+        buf = pages[p]
+        dev.cmd(f"erase {i} {p:04X}")
+        for off in (0, 256):
+            dev.cmd(f"writeflash {i} {p + off:04X} {buf[off:off + 256].hex()}")
+        rb = bytearray()
+        for off in (0, 256):
+            r = next((l for l in dev.cmd(f"readflash {i} {p + off:04X} 256") if l.startswith("data|")), "data|")
+            rb += bytes.fromhex(r.split("|", 1)[1])
+        if rb != buf:
+            dev.cmd(f"run {i}")
+            sys.exit(f"verify FAILED at page 0x{p:04X}")
+        print(f"  [{n}/{len(pages)}] page 0x{p:04X} written + verified")
+    dev.cmd(f"run {i}")
+    print("FLASH OK: app programmed + verified, firmware default config applied. ESC restarted.")
 
 
 def cmd_list(dev: EscHost, args):
@@ -322,14 +431,22 @@ def main():
     ap_.add_argument("--name", help="also set the ESC name")
     ap_.add_argument("--with-name", action="store_true", help="also apply identity.name from the profile")
     ap_.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
+    cn = sub.add_parser("connect", help="enter the bootloader and hold the session (index or 'all')")
+    cn.add_argument("index", help="ESC index or 'all'")
     rn = sub.add_parser("run", aliases=["disconnect"], help="restart held ESC(s) (end the session)")
     rn.add_argument("index", type=int, nargs="?", default=0)
+    fl = sub.add_parser("flash", help="flash BLHeli-S firmware (Intel-HEX) to an ESC")
+    fl.add_argument("index", type=int)
+    fl.add_argument("hexfile", help="BLHeli-S .HEX matching the ESC's layout + MCU")
+    fl.add_argument("--yes", action="store_true", help="confirm the erase+write (required)")
+    fl.add_argument("--force", action="store_true", help="flash even if the compat check fails (danger)")
     args = ap.parse_args()
 
     dev = EscHost(args.port)
     try:
         {"list": cmd_list, "read": cmd_read, "set": cmd_set, "apply": cmd_apply,
-         "run": cmd_run, "disconnect": cmd_run}[args.cmd](dev, args)
+         "connect": cmd_connect, "run": cmd_run, "disconnect": cmd_run,
+         "flash": cmd_flash}[args.cmd](dev, args)
     finally:
         dev.close()
 
