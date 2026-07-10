@@ -39,7 +39,9 @@ struct Telem {
 };
 
 static const uint16_t SPIN_MAX        = 2000;   // max throttle
-static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no spinSet within this
+static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no command within this
+static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this long to ARM the ESC
+                                                // (covers the ESC's boot beep after leaving the BL)
 static const uint16_t MOTOR_POLES     = 14;     // magnet poles (for eRPM->RPM); motor-dependent
 
 namespace detail {
@@ -62,6 +64,8 @@ namespace detail {
 	static BidirDShotX1*     drv[COUNT] = { nullptr };
 	static volatile uint16_t drvTarget[COUNT] = { 0 };
 	static uint32_t          drvLast[COUNT] = { 0 };
+	static bool              drvArmed[COUNT] = { false };
+	static uint32_t          drvArmStart[COUNT] = { 0 };
 	static Telem             drvTele[COUNT];
 
 	static bool runOp(Op o, uint8_t pin) {          // core0: hand an op to core1, block till done
@@ -153,36 +157,45 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
 
-// ---- drive / spin (core0): send DShot to a running ESC, with a deadman auto-stop -------------
-// spinSet arms (leaves any bootloader session) and sets the target throttle (0..SPIN_MAX). Call
-// spinPoll() every core0 loop to keep DShot frames flowing, enforce the deadman, and read telemetry.
-inline void spinSet(uint8_t idx, uint16_t throttle) {
+// ---- drive / spin (core0): arm an ESC, then send DShot throttle, with a deadman auto-stop -----
+// Flow: spinArm() (leaves any bootloader session, streams zero throttle for SPIN_ARM_MS so the ESC
+// arms) -> spinThrottle(0..SPIN_MAX) (only takes effect once armed) -> spinStop()/spinDisarm().
+// Call spinPoll() every core0 loop to keep frames flowing, run arming + deadman, and read telemetry.
+inline void spinArm(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
 	release();                                            // ESC must run its app (not the bootloader)
 	if (!drv[idx]) drv[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD);
+	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
+}
+inline void spinThrottle(uint8_t idx, uint16_t throttle) {
+	using namespace detail;
+	if (idx >= COUNT || !drv[idx] || !drvArmed[idx]) return;   // must be armed first
 	drvTarget[idx] = throttle > SPIN_MAX ? SPIN_MAX : throttle;
 	drvLast[idx] = millis();
 }
+inline bool spinArmed(uint8_t idx) { return idx < COUNT && detail::drv[idx] && detail::drvArmed[idx]; }
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
-	drvTarget[idx] = 0;
+	drvTarget[idx] = 0; drvArmed[idx] = false;
 	if (drv[idx]) { drv[idx]->sendThrottle(0); delete drv[idx]; drv[idx] = nullptr; }
 }
+inline void spinDisarm(uint8_t idx) { spinStop(idx); }
 inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
 inline bool spinning()    { for (uint8_t i = 0; i < COUNT; i++) if (detail::drv[i]) return true; return false; }
 inline bool spinTele(uint8_t idx, Telem& out) {
 	if (idx >= COUNT || !detail::drv[idx]) return false;
 	out = detail::drvTele[idx]; return true;
 }
-inline void spinPoll() {   // call every core0 loop while spinning: frames + deadman + telemetry
+inline void spinPoll() {   // call every core0 loop while spinning: arm + frames + deadman + telemetry
 	using namespace detail;
 	bool any = false;
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!drv[i]) continue;
 		any = true;
-		if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman safety
+		if (!drvArmed[i]) { drvTarget[i] = 0; if (millis() - drvArmStart[i] > SPIN_ARM_MS) drvArmed[i] = true; }
+		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		uint32_t v = 0;
 		switch (drv[i]->getTelemetryPacket(&v)) {
 			case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; break;

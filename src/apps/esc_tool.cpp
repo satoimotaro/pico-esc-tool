@@ -79,13 +79,17 @@ async function read(i){stopTick();let d=await(await fetch('/api/read?i='+i)).jso
 async function save(i){let p=[...document.querySelectorAll('[id^=f_]')].map(el=>el.id.slice(2)+'='+el.value).join('&');
  let d=await(await fetch('/api/set?i='+i+'&'+p,{method:'POST'})).json();msg(d.error?d.error:('saved: '+d.result));}
 function spinUI(i){stopTick();g('cfg').innerHTML=`<div class=esc><h3>ESC ${i} spin test</h3>
-  <input id=thr type=range min=0 max=2000 value=0 oninput="spinSet(${i},this.value);g('tv').textContent=this.value">
-  <span id=tv>0</span><button class=stop onclick="spinSet(${i},0);g('thr').value=0;g('tv').textContent=0">Stop</button>
-  <p id=tele>telemetry...</p></div>`;
-  tick=setInterval(async()=>{await spinSet(i,g('thr').value);
+  <p><b>Props off / motor secured.</b> Arm, wait ~3s, then move the slider.</p>
+  <button onclick="armEsc(${i})">Arm</button>
+  <input id=thr type=range min=0 max=2000 value=0 oninput="g('tv').textContent=this.value">
+  <span id=tv>0</span>
+  <button class=stop onclick="disarmEsc(${i})">Disarm / Stop</button>
+  <p id=tele>not armed</p></div>`;}
+async function armEsc(i){await fetch('/api/arm?i='+i,{method:'POST'});msg('arming ~3s...');stopTick();
+  tick=setInterval(async()=>{await fetch('/api/spin?i='+i+'&v='+g('thr').value,{method:'POST'});
    let t=await(await fetch('/api/tele?i='+i)).json();
-   g('tele').textContent=t.ok?`rpm ${t.rpm}  ${t.volt}V  ${t.amp}A  ${t.temp}C  stress ${t.stress}`:'no telemetry';},200);}
-async function spinSet(i,v){await fetch('/api/spin?i='+i+'&v='+v,{method:'POST'});}
+   g('tele').textContent=t.ok?`${t.armed?'ARMED':'arming...'}  rpm ${t.rpm}  ${t.volt}V  ${t.amp}A  ${t.temp}C  stress ${t.stress}`:'no telemetry';},200);}
+async function disarmEsc(i){stopTick();g('thr').value=0;g('tv').textContent=0;await fetch('/api/disarm?i='+i,{method:'POST'});msg('disarmed');}
 function stopTick(){if(tick){clearInterval(tick);tick=null;}}
 async function stopAll(){stopTick();await fetch('/api/spinstop',{method:'POST'});msg('stopped');}
 async function disc(){stopTick();await fetch('/api/run',{method:'POST'});g('cfg').innerHTML='';msg('ESC restarted');}
@@ -123,13 +127,16 @@ static void hSet() {
 	server.send(200, "application/json", r<0 ? "{\"error\":\"write-failed\"}" : (ch?"{\"result\":\"written\"}":"{\"result\":\"unchanged\"}"));
 }
 static void hRun()      { escs::release(); server.send(200,"application/json","{\"result\":\"restarted\"}"); }
-static void hSpin()     { int i=server.arg("i").toInt(); int v=server.arg("v").toInt();
-	if (i>=0&&i<escs::COUNT) escs::spinSet((uint8_t)i,(uint16_t)v); server.send(200,"application/json","{\"ok\":true}"); }
+static void hArm()      { int i=server.arg("i").toInt(); if(i>=0&&i<escs::COUNT) escs::spinArm((uint8_t)i); server.send(200,"application/json","{\"ok\":true}"); }
+static void hSpin()     { int i=server.arg("i").toInt(); int v=server.arg("v").toInt();   // throttle (armed only)
+	if (i>=0&&i<escs::COUNT) escs::spinThrottle((uint8_t)i,(uint16_t)v); server.send(200,"application/json","{\"ok\":true}"); }
+static void hDisarm()   { int i=server.arg("i").toInt(); if(i>=0&&i<escs::COUNT) escs::spinStop((uint8_t)i); server.send(200,"application/json","{\"ok\":true}"); }
 static void hSpinStop() { escs::spinStopAll(); server.send(200,"application/json","{\"ok\":true}"); }
 static void hTele() {
 	int i=server.arg("i").toInt(); escs::Telem t;
 	if (i<0||i>=escs::COUNT||!escs::spinTele((uint8_t)i,t)) { server.send(200,"application/json","{\"ok\":false}"); return; }
-	String j = "{\"ok\":true,\"rpm\":"; j+=t.rpm; j+=",\"volt\":"; j+=t.voltage; j+=",\"amp\":"; j+=t.current;
+	String j = "{\"ok\":true,\"armed\":"; j += escs::spinArmed((uint8_t)i)?"true":"false";
+	j += ",\"rpm\":"; j+=t.rpm; j+=",\"volt\":"; j+=t.voltage; j+=",\"amp\":"; j+=t.current;
 	j += ",\"temp\":"; j+=t.tempC; j+=",\"stress\":"; j+=t.stress; j+="}"; server.send(200,"application/json",j);
 }
 
@@ -186,10 +193,14 @@ static void handleSerial() {
 			if(i<0||i>=escs::COUNT||!ad||rl<1||rl>(int)sizeof(flbuf)) Serial.println("err bad-args");
 			else if(!escs::readFlash((uint8_t)i,(uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) Serial.println("err read-failed");
 			else { Serial.print("data|"); printHex(flbuf,rl); Serial.println(); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"spin")||!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");
+		else if (!strcmp(cmd,"arm")) { int i=argi();
+			if(i<0||i>=escs::COUNT) Serial.println("err bad-index");
+			else { escs::spinArm((uint8_t)i); Serial.println("arming ~3s"); Serial.println("ok"); } }
+		else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"thrust")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");
 			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
-			else { escs::spinSet((uint8_t)i,(uint16_t)atoi(v)); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<escs::COUNT) escs::spinStop((uint8_t)i); Serial.println("ok"); }
+			else if(!escs::spinArmed((uint8_t)i)) Serial.println("err not-armed");
+			else { escs::spinThrottle((uint8_t)i,(uint16_t)atoi(v)); Serial.println("ok"); } }
+		else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<escs::COUNT) escs::spinStop((uint8_t)i); Serial.println("ok"); }
 		else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
 			if(i<0||i>=escs::COUNT||!escs::spinTele((uint8_t)i,t)) Serial.println("err no-telem");
 			else { Serial.printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); Serial.println("ok"); } }
@@ -206,7 +217,9 @@ void setup() {
 	server.on("/api/read", hRead);
 	server.on("/api/set", HTTP_POST, hSet);
 	server.on("/api/run", HTTP_POST, hRun);
+	server.on("/api/arm", HTTP_POST, hArm);
 	server.on("/api/spin", HTTP_POST, hSpin);
+	server.on("/api/disarm", HTTP_POST, hDisarm);
 	server.on("/api/spinstop", HTTP_POST, hSpinStop);
 	server.on("/api/tele", hTele);
 	setMode(digitalRead(MODE_PIN) == LOW ? DRIVE : SETUP);   // LOW=drive; unconnected(HIGH)=setup
