@@ -181,17 +181,22 @@ void loop() {
 				else if (!ensureConnected(i)) { Serial.println("err no-connect"); }
 				else if (!runOp(Op::READPAGE, ESC_PINS[i])) { Serial.println("err read-failed"); }
 				else {
-					bool bad = false; int applied = 0;
+					bool bad = false, changed = false; int applied = 0;
 					for (char* tok = strtok(ovr, ","); tok; tok = strtok(nullptr, ",")) {
 						char* colon = strchr(tok, ':');
 						if (!colon) { bad = true; break; }
 						*colon = '\0';
 						long off = strtol(tok, nullptr, 16), val = strtol(colon + 1, nullptr, 16);
 						if (off < 0 || off >= (long)esc_setup::kPageLen || val < 0 || val > 255) { bad = true; break; }
-						g_page[off] = (uint8_t)val; applied++;
+						if (g_page[off] != (uint8_t)val) { g_page[off] = (uint8_t)val; changed = true; }
+						applied++;
 					}
 					if (bad) { Serial.println("err bad-override"); }   // stays in session
-					else {
+					else if (!changed) {
+						// values already match -> DON'T erase/write (avoids needless flash wear)
+						Serial.println("unchanged (flash write skipped)");
+						Serial.println("ok");
+					} else {
 						bool wok = runOp(Op::WRITEPAGE, ESC_PINS[i]);
 						Serial.printf("edited %d byte(s)\n", applied);
 						Serial.println(wok ? "ok" : "err write-verify-failed");

@@ -223,8 +223,11 @@ def _finish(dev: EscHost, index: int, run: bool):
 def _apply_overrides(dev: EscHost, index: int, ovs: list[tuple[int, int]]):
     if not ovs:
         sys.exit("no writable settings to apply")
-    dev.cmd(f"editpage {index} {overrides_str(ovs)}", timeout=30)
-    print(f"applied {len(ovs)} byte(s) to ESC {index}; verified on device")
+    lines = dev.cmd(f"editpage {index} {overrides_str(ovs)}", timeout=30)
+    if any("unchanged" in l for l in lines):
+        print(f"ESC {index}: already matches (no flash write)")
+    else:
+        print(f"applied {len(ovs)} byte(s) to ESC {index}; verified on device")
 
 
 def resolve_indices(dev: EscHost, index_arg) -> list[int]:
