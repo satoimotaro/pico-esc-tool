@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // esc_setup — read/decode/encode the BLHeli-S EEPROM configuration block.
 // Uses blheli_bl for 1-wire access. Offsets & encodings: see EEPROM.md

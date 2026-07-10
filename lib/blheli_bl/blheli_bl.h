@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // blheli_bl — BLHeli-S / SiLabs EFM8BB 1-wire bootloader client for RP2040.
 //
@@ -6,12 +7,11 @@
 // connect, read device signature, read/write flash + EEPROM, erase, run.
 // esc_flash (firmware programming) and esc_setup (config params) build on this.
 //
-// Protocol authority: Betaflight serial_4way_avrootloader.c (SiLabs "BLB"), cross-
+// Protocol reference: Betaflight serial_4way_avrootloader.c (SiLabs "BLB"), cross-
 // checked with esc-configurator + BLHeli_S source. Details in PROTOCOL.md.
 // Physical layer: 19200 8N1, non-inverted, half-duplex single wire (idle HIGH).
 //
-// STATUS: full read path + write primitives implemented, but UNTESTED ON HARDWARE
-// (no Pico/ESC available at authoring time). Verify on the bench before trusting.
+// STATUS: proven on hardware (EFM8BB21) — connect, read/write config, erase, program flash.
 #pragma once
 #include <Arduino.h>
 #include <stdint.h>

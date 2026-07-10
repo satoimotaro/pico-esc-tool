@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // Minimal bootloader-entry TEST (no DShot): hammer BootInit continuously; the USER
 // power-cycles the ESC while this runs. Tests the "SiLabs BL listens only briefly at

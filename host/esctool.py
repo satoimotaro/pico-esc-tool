@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 satoimotaro
 """esctool — BLHeli-Configurator-like CLI for the RP2040 ESC tool (firmware: esc_host).
 
 Talks to the Pico over USB-CDC serial (auto-detected by VID 2E8A) with a small text protocol.

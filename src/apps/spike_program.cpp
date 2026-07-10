@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // A1 spike (FLASH WRITE): connect to the BLHeli-S bootloader, then — only after an explicit
 // 'Y' typed on the serial link — ERASE + PROGRAM + VERIFY the firmware image embedded in

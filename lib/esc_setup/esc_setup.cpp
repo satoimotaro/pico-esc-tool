@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // esc_setup implementation. Decode is verified against esc-configurator
 // BlheliS/settings.js + BLHeli_S.asm Eep_* offsets (layout rev 32/33).

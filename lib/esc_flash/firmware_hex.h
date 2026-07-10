@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // firmware_hex.h - the BLHeli-S firmware image to flash, as Intel-HEX text.
 //

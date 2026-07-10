@@ -26,3 +26,6 @@ __pycache__/
 # local artifacts (test dumps / captures)
 config.yaml
 *.HEX
+
+# debug artifacts (local)
+debug/

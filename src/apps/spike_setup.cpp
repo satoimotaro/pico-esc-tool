@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // A0 spike (DShot-primed bootloader entry): read the ESC EEPROM over the bootloader,
 // replicating exactly how a flight-controller 4-way interface enters it.

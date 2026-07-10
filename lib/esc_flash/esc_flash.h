@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // esc_flash — program/verify BLHeli-S ESC firmware (Intel-HEX) via the 1-wire bootloader.
-// Builds on blheli_bl. Phase A1. Target: EFM8BB21 (LittleBee Spring 30A) unless overridden.
+// Builds on blheli_bl. Target: EFM8BB21 (BB2), e.g. ReadyToSky 45A/30A.
 //
 // SAFETY: the SiLabs bootloader lives at the TOP of flash (0x1C00-0x1FFF on BB2) and MUST
 // NOT be erased/overwritten — doing so bricks the ESC unrecoverably (no way back in without
-// a C2 debugger). The EEPROM parameter page (0x1A00) is also excluded. This module refuses
-// any HEX byte at/above kAppEnd, so a wrong/oversized image errors out instead of bricking.
+// a C2 debugger). The parser flashes the app region [0x0000,0x1A00) only, captures the HEX's
+// eeprom-identity section (0x1A00-0x1BFF) for the compat check, and skips the bootloader region.
 #pragma once
 #include <Arduino.h>
 #include "blheli_bl.h"

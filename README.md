@@ -4,6 +4,8 @@ An **RP2040 (Pico / Pico W)** tool for **BLHeli-S ESCs**: configure, flash firmw
 them over DShot with telemetry — **no flight controller required.** Built for underwater ROV
 thrusters (many ESCs from one PC/SBC), but works with any BLHeli-S SiLabs ESC.
 
+Developed and tested on **ReadyToSky 45A and 30A** ESCs (SiLabs **EFM8BB21**).
+
 It has two halves:
 
 - **`esc_host`** — firmware for the Pico that speaks the BLHeli-S 1-wire bootloader on the ESC
@@ -95,8 +97,7 @@ host/profiles/          example YAML profiles
 lib/blheli_bl/          BLHeli-S 1-wire bootloader client  (PROTOCOL.md = reference)
 lib/esc_setup/          config read / write (read-modify-write a flash page)
 lib/esc_flash/          Intel-HEX parse, program/verify, compatibility check
-lib/esc_dshot/ esc_telemetry/ rpm_filter/ pc_iface/   DShot + telemetry building blocks
-construction/           wiring / PCB (KiCad) / case (CAD)
+construction/wiring/    how to wire an ESC signal line to the Pico
 docs/                   notes; lib/blheli_bl/PROTOCOL.md is the bootloader reference
 ```
 
@@ -114,5 +115,10 @@ filtering polish, and a Wi-Fi / BLE link to the Pico W for a wireless GUI.
 
 ## License
 
-GPL-3.0-or-later. DShot/telemetry via pico-bidir-dshot (GPL-3.0). BLHeli-S firmware images are the
-property of their authors (github.com/bitdump/BLHeli) and are not distributed here.
+Copyright (C) 2026 satoimotaro. **GPL-3.0-or-later** — see [`LICENSE`](LICENSE).
+
+Third-party: DShot / telemetry via
+[pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot) (GPL-3.0). The BLHeli-S 1-wire
+protocol was implemented with reference to Betaflight and BLHeli_S (both GPL). BLHeli-S firmware
+images belong to their authors ([github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli))
+and are **not** distributed here.

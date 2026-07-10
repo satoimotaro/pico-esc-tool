@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO + pyserial
+        run: pip install platformio pyserial
+
+      - name: Build all firmware environments
+        run: >
+          pio run
+          -e picow -e pico -e esc_host
+          -e spike_setup -e spike_program -e spike_write -e spike_boot -e spike_flash
+
+      - name: Syntax-check the host CLI
+        run: python -m py_compile host/esctool.py

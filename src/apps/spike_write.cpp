@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // A1 spike: CONFIG WRITE (change one setting) via the BLHeli-S bootloader, with a hard safety
 // gate. Same DShot-primed bootloader entry as spike_setup, then:

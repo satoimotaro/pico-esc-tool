@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // A0 spike (link test): connect to the BLHeli-S bootloader, read the device signature,
 // and hold the link with keep-alive. Uses the SAME DShot-primed signal-loss entry as

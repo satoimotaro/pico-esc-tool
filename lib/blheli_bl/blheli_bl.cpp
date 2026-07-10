@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // blheli_bl implementation — SiLabs EFM8BB 1-wire bootloader ("BLB").
-// Ported from Betaflight serial_4way_avrootloader.c (author 4712 / H. Reddmann),
-// cross-checked with esc-configurator + BLHeli_S. See PROTOCOL.md for every value.
+// Wire format implemented with reference to Betaflight serial_4way_avrootloader.c
+// (author 4712 / H. Reddmann) and esc-configurator + BLHeli_S. See PROTOCOL.md for every value.
 //
-// UNTESTED ON HARDWARE — timing and turnaround must be validated on the bench.
+// Proven on hardware (EFM8BB21): connect, read, write, and firmware flash.
 #include "blheli_bl.h"
 #include <string.h>
 #include <hardware/timer.h>          // timer_hw: 1 MHz free-running counter

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // esc_host — unified host-driven firmware for the RP2040 ESC tool. Replaces the one-off spikes
 // with a single build that a PC-side CLI (host/esctool.py) drives over USB-CDC serial with a

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 satoimotaro
 //
 // esc_flash implementation (Phase A1) — Intel-HEX parse + page erase/program/verify over
 // the BLHeli-S 1-wire bootloader. Strictly refuses the EEPROM/bootloader region (>=kAppEnd).
