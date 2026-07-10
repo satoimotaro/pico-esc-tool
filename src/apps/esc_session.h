@@ -44,6 +44,11 @@ static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this lon
                                                 // (covers the ESC's boot beep after leaving the BL)
 static const uint16_t MOTOR_POLES     = 14;     // magnet poles (for eRPM->RPM); motor-dependent
 
+// Per-ESC DShot mode. BLHeli-S understands only *normal* DShot; *bidir* DShot (inverted, with eRPM/
+// EDT telemetry back over the wire) needs firmware that supports it (Bluejay/JESC). AUTO picks bidir
+// if the firmware name says so, else normal — so any stock BLHeli-S ESC still spins.
+enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
+
 namespace detail {
 	static const uint32_t DSHOT_KBAUD = 600, PRIME_MS = 500, HIGH_HOLD_MS = 1000;
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
@@ -60,13 +65,30 @@ namespace detail {
 	static uint8_t  flBuf[256];
 	static volatile uint16_t flAddr = 0, flLen = 0;
 	static volatile int8_t   session = -1;
-	// drive/spin: a persistent DShot per pin (core0). null = not spinning that pin.
-	static BidirDShotX1*     drv[COUNT] = { nullptr };
+	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
+	static BidirDShotX1*     drvB[COUNT] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
+	static DShotX4*          drvN[COUNT] = { nullptr };   // normal DShot: idle LOW, throttle only
 	static volatile uint16_t drvTarget[COUNT] = { 0 };
 	static uint32_t          drvLast[COUNT] = { 0 };
 	static bool              drvArmed[COUNT] = { false };
 	static uint32_t          drvArmStart[COUNT] = { 0 };
+	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
+	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
 	static Telem             drvTele[COUNT];
+	// last-known firmware/direction, cached by connect()/scan() so spinArm() needn't re-enter the BL
+	static bool              infoBidir[COUNT] = { false };  // firmware supports bidir DShot (Bluejay/JESC)
+	static bool              infoRev[COUNT]   = { false };  // configured reversible (3D)
+	static bool              infoKnown[COUNT] = { false };
+
+	static inline bool drvActive(uint8_t i) { return drvB[i] || drvN[i]; }
+	static inline void drvSend(uint8_t i, uint16_t t) {
+		if (drvB[i]) drvB[i]->sendThrottle(t);
+		else if (drvN[i]) { uint16_t a[4] = { t, 0, 0, 0 }; drvN[i]->sendThrottles(a); }
+	}
+	static inline void drvFree(uint8_t i) {
+		if (drvB[i]) { drvB[i]->sendThrottle(0); delete drvB[i]; drvB[i] = nullptr; }
+		if (drvN[i]) { uint16_t a[4] = { 0, 0, 0, 0 }; drvN[i]->sendThrottles(a); delete drvN[i]; drvN[i] = nullptr; }
+	}
 
 	static bool runOp(Op o, uint8_t pin) {          // core0: hand an op to core1, block till done
 		opPin = pin; opOk = false; opDone = false; op = o;
@@ -86,7 +108,7 @@ namespace detail {
 	}
 	static bool ensureConnected(uint8_t i) {        // reuse the session; enter only if needed
 		if (session == (int8_t)i) return true;
-		if (drv[i]) { drv[i]->sendThrottle(0); delete drv[i]; drv[i] = nullptr; }  // free pin from drive
+		if (drvActive(i)) drvFree(i);                                             // free pin from drive
 		if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; }
 		if (enterBootloader(PINS[i])) { session = (int8_t)i; return true; }
 		return false;
@@ -102,7 +124,12 @@ inline bool connect(uint8_t idx, Info& out) {
 	if (!ensureConnected(idx)) return false;
 	esc_setup::Settings s;
 	bool cfgok = runOp(Op::READCFG, PINS[idx]);
-	if (cfgok) esc_setup::decode(cfg, esc_setup::kEepromLen, s);
+	if (cfgok) {
+		esc_setup::decode(cfg, esc_setup::kEepromLen, s);
+		infoBidir[idx] = strstr(s.name, "Bluejay") || strstr(s.name, "JESC");   // cache for spinArm
+		infoRev[idx]   = (cfg[0x0B] == 3 || cfg[0x0B] == 4);
+		infoKnown[idx] = true;
+	}
 	out.present = true; out.sig = (uint16_t)((sig[0] << 8) | sig[1]);
 	out.bootVer = bootVer; out.bootPages = bootPages;
 	strncpy(out.layout, cfgok ? s.layoutTag : "", 16);
@@ -157,56 +184,93 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
 
-// ---- drive / spin (core0): arm an ESC, then send DShot throttle, with a deadman auto-stop -----
-// Flow: spinArm() (leaves any bootloader session, streams zero throttle for SPIN_ARM_MS so the ESC
-// arms) -> spinThrottle(0..SPIN_MAX) (only takes effect once armed) -> spinStop()/spinDisarm().
+// ---- drive / spin (core0) ----------------------------------------------------------------------
+// spinArm() leaves any bootloader session (the ESC must run its app), picks the DShot mode, and
+// starts the arming stream for SPIN_ARM_MS. Then spinThrottle()/spinThrust() set the target;
+// spinStop()/spinDisarm() release it. Mode AUTO reads the ESC's firmware name: Bluejay/JESC -> bidir
+// DShot (idle HIGH, eRPM + EDT telemetry); otherwise normal DShot (idle LOW), which any BLHeli-S
+// spins. Reversible (3D) rotation is read from the config so throttle can be a signed thrust.
 // Call spinPoll() every core0 loop to keep frames flowing, run arming + deadman, and read telemetry.
-inline void spinArm(uint8_t idx) {
+inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
 	using namespace detail;
 	if (idx >= COUNT) return;
-	release();                                            // ESC must run its app (not the bootloader)
-	if (!drv[idx]) drv[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD);
+	// Resolve firmware/direction from the cache (populated by scan/connect). Only re-read config when
+	// unknown, or when already connected to this ESC (cheap — no bootloader re-entry). This keeps a
+	// post-scan arm fast; a cold arm (never scanned) pays one bootloader entry to detect.
+	if (!infoKnown[idx] || session == (int8_t)idx) {
+		if (ensureConnected(idx) && runOp(Op::READCFG, PINS[idx])) {
+			esc_setup::Settings s; esc_setup::decode(cfg, esc_setup::kEepromLen, s);
+			infoBidir[idx] = strstr(s.name, "Bluejay") || strstr(s.name, "JESC");
+			infoRev[idx]   = (cfg[0x0B] == 3 || cfg[0x0B] == 4);   // 1=Norm 2=Rev 3=3D 4=3D-Rev
+			infoKnown[idx] = true;
+		}
+	}
+	if (mode == Drive::AUTO) mode = infoBidir[idx] ? Drive::BIDIR : Drive::NORMAL;
+	drvRev[idx] = infoRev[idx];
+	release();                                             // ESC must run its app (not the bootloader)
+	drvFree(idx);
+	if (mode == Drive::BIDIR) { drvB[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD); drvEdt[idx] = 20; }
+	else                      { drvN[idx] = new DShotX4(PINS[idx], 1, DSHOT_KBAUD);   drvEdt[idx] = 0;  }
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
 }
-inline void spinThrottle(uint8_t idx, uint16_t throttle) {
+inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
 	using namespace detail;
-	if (idx >= COUNT || !drv[idx] || !drvArmed[idx]) return;   // must be armed first
+	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;   // must be armed first
 	drvTarget[idx] = throttle > SPIN_MAX ? SPIN_MAX : throttle;
 	drvLast[idx] = millis();
 }
-inline bool spinArmed(uint8_t idx) { return idx < COUNT && detail::drv[idx] && detail::drvArmed[idx]; }
+inline void spinThrust(uint8_t idx, int16_t s) {   // reversible (3D): -1000..+1000, 0 = stop
+	using namespace detail;
+	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;
+	if (s >  1000) s =  1000;
+	if (s < -1000) s = -1000;
+	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1000 + s)      // forward -> DShot 1048..2047
+	                                   : (uint16_t)(1001 + s));    // reverse -> DShot   48..1047
+	drvTarget[idx] = t; drvLast[idx] = millis();
+}
+inline bool spinArmed(uint8_t idx)      { return idx < COUNT && detail::drvActive(idx) && detail::drvArmed[idx]; }
+inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::drvRev[idx]; }
+inline const char* spinMode(uint8_t idx) {
+	using namespace detail;
+	if (idx >= COUNT) return "none";
+	return drvB[idx] ? "bidir" : (drvN[idx] ? "normal" : "none");
+}
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
-	drvTarget[idx] = 0; drvArmed[idx] = false;
-	if (drv[idx]) { drv[idx]->sendThrottle(0); delete drv[idx]; drv[idx] = nullptr; }
+	drvTarget[idx] = 0; drvArmed[idx] = false; drvFree(idx);
 }
 inline void spinDisarm(uint8_t idx) { spinStop(idx); }
 inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
-inline bool spinning()    { for (uint8_t i = 0; i < COUNT; i++) if (detail::drv[i]) return true; return false; }
+inline bool spinning()    { for (uint8_t i = 0; i < COUNT; i++) if (detail::drvActive(i)) return true; return false; }
 inline bool spinTele(uint8_t idx, Telem& out) {
-	if (idx >= COUNT || !detail::drv[idx]) return false;
+	if (idx >= COUNT || !detail::drvB[idx]) return false;   // telemetry only on bidir DShot
 	out = detail::drvTele[idx]; return true;
 }
 inline void spinPoll() {   // call every core0 loop while spinning: arm + frames + deadman + telemetry
 	using namespace detail;
 	bool any = false;
 	for (uint8_t i = 0; i < COUNT; i++) {
-		if (!drv[i]) continue;
+		if (!drvActive(i)) continue;
 		any = true;
 		if (!drvArmed[i]) { drvTarget[i] = 0; if (millis() - drvArmStart[i] > SPIN_ARM_MS) drvArmed[i] = true; }
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
-		uint32_t v = 0;
-		switch (drv[i]->getTelemetryPacket(&v)) {
-			case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; break;
-			case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
-			case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
-			case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;
-			case BidirDshotTelemetryType::STRESS:      drvTele[i].stress = v & ESC_STATUS_MAX_STRESS_MASK; break;
-			case BidirDshotTelemetryType::STATUS:      drvTele[i].status = v; break;
-			default: break;
+		if (drvB[i]) {
+			uint32_t v = 0;
+			switch (drvB[i]->getTelemetryPacket(&v)) {
+				case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; break;
+				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
+				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
+				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;
+				case BidirDshotTelemetryType::STRESS:      drvTele[i].stress = v & ESC_STATUS_MAX_STRESS_MASK; break;
+				case BidirDshotTelemetryType::STATUS:      drvTele[i].status = v; break;
+				default: break;
+			}
+			// Enable EDT (extended telemetry: V/A/temp) once armed and still stopped — the ESC ignores
+			// commands during its post-bootloader boot beep, so this must come after the arm window.
+			if (drvArmed[i] && drvTarget[i] == 0 && drvEdt[i] > 0) { drvB[i]->sendRaw11Bit(13); drvEdt[i]--; continue; }
 		}
-		drv[i]->sendThrottle(drvTarget[i]);
+		drvSend(i, drvTarget[i]);
 	}
 	if (any) delayMicroseconds(200);
 }

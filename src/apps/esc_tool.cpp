@@ -80,15 +80,19 @@ async function save(i){let p=[...document.querySelectorAll('[id^=f_]')].map(el=>
  let d=await(await fetch('/api/set?i='+i+'&'+p,{method:'POST'})).json();msg(d.error?d.error:('saved: '+d.result));}
 function spinUI(i){stopTick();g('cfg').innerHTML=`<div class=esc><h3>ESC ${i} spin test</h3>
   <p><b>Props off / motor secured.</b> Arm, wait ~3s, then move the slider.</p>
-  <button onclick="armEsc(${i})">Arm</button>
+  <button onclick="armEsc(${i})">Arm</button> <span id=smode></span><br>
   <input id=thr type=range min=0 max=2000 value=0 oninput="g('tv').textContent=this.value">
-  <span id=tv>0</span>
+  <span id=tv>0</span> <button onclick="g('thr').value=0;g('tv').textContent=0">Center/Stop</button>
   <button class=stop onclick="disarmEsc(${i})">Disarm / Stop</button>
   <p id=tele>not armed</p></div>`;}
-async function armEsc(i){await fetch('/api/arm?i='+i,{method:'POST'});msg('arming ~3s...');stopTick();
+async function armEsc(i){let a=await(await fetch('/api/arm?i='+i,{method:'POST'})).json();msg('arming ~3s...');
+  let s=g('thr');
+  if(a.rev){s.min=-1000;s.max=1000;}else{s.min=0;s.max=2000;}s.value=0;g('tv').textContent=0;
+  g('smode').textContent='DShot: '+a.mode+(a.rev?' — reversible (−1000..+1000, 0=stop)':' — one-way (0..2000)');
+  stopTick();
   tick=setInterval(async()=>{await fetch('/api/spin?i='+i+'&v='+g('thr').value,{method:'POST'});
    let t=await(await fetch('/api/tele?i='+i)).json();
-   g('tele').textContent=t.ok?`${t.armed?'ARMED':'arming...'}  rpm ${t.rpm}  ${t.volt}V  ${t.amp}A  ${t.temp}C  stress ${t.stress}`:'no telemetry';},200);}
+   g('tele').textContent=t.ok?(`${t.armed?'ARMED':'arming...'}  `+(t.tele?`rpm ${t.rpm}  ${t.volt}V  ${t.amp}A  ${t.temp}C  stress ${t.stress}`:'(no telemetry — normal DShot)')):'no telemetry';},200);}
 async function disarmEsc(i){stopTick();g('thr').value=0;g('tv').textContent=0;await fetch('/api/disarm?i='+i,{method:'POST'});msg('disarmed');}
 function stopTick(){if(tick){clearInterval(tick);tick=null;}}
 async function stopAll(){stopTick();await fetch('/api/spinstop',{method:'POST'});msg('stopped');}
@@ -127,17 +131,33 @@ static void hSet() {
 	server.send(200, "application/json", r<0 ? "{\"error\":\"write-failed\"}" : (ch?"{\"result\":\"written\"}":"{\"result\":\"unchanged\"}"));
 }
 static void hRun()      { escs::release(); server.send(200,"application/json","{\"result\":\"restarted\"}"); }
-static void hArm()      { int i=server.arg("i").toInt(); if(i>=0&&i<escs::COUNT) escs::spinArm((uint8_t)i); server.send(200,"application/json","{\"ok\":true}"); }
-static void hSpin()     { int i=server.arg("i").toInt(); int v=server.arg("v").toInt();   // throttle (armed only)
-	if (i>=0&&i<escs::COUNT) escs::spinThrottle((uint8_t)i,(uint16_t)v); server.send(200,"application/json","{\"ok\":true}"); }
+static void hArm()      { int i=server.arg("i").toInt();
+	if (i<0||i>=escs::COUNT) { server.send(200,"application/json","{\"ok\":false}"); return; }
+	escs::Drive m = escs::Drive::AUTO; String md = server.arg("mode");
+	if (md=="normal") m=escs::Drive::NORMAL; else if (md=="bidir") m=escs::Drive::BIDIR;
+	escs::spinArm((uint8_t)i, m);
+	String j="{\"ok\":true,\"mode\":\""; j+=escs::spinMode((uint8_t)i);
+	j+="\",\"rev\":"; j+=escs::spinReversible((uint8_t)i)?"true":"false"; j+="}";
+	server.send(200,"application/json",j); }
+static void hSpin()     { int i=server.arg("i").toInt(); int v=server.arg("v").toInt();   // armed only
+	if (i>=0&&i<escs::COUNT) {                                       // reversible ESC => v is signed thrust
+		if (escs::spinReversible((uint8_t)i)) escs::spinThrust((uint8_t)i,(int16_t)v);
+		else                                  escs::spinThrottle((uint8_t)i,(uint16_t)v);
+	}
+	server.send(200,"application/json","{\"ok\":true}"); }
 static void hDisarm()   { int i=server.arg("i").toInt(); if(i>=0&&i<escs::COUNT) escs::spinStop((uint8_t)i); server.send(200,"application/json","{\"ok\":true}"); }
 static void hSpinStop() { escs::spinStopAll(); server.send(200,"application/json","{\"ok\":true}"); }
 static void hTele() {
-	int i=server.arg("i").toInt(); escs::Telem t;
-	if (i<0||i>=escs::COUNT||!escs::spinTele((uint8_t)i,t)) { server.send(200,"application/json","{\"ok\":false}"); return; }
+	int i=server.arg("i").toInt();
+	if (i<0||i>=escs::COUNT) { server.send(200,"application/json","{\"ok\":false}"); return; }
 	String j = "{\"ok\":true,\"armed\":"; j += escs::spinArmed((uint8_t)i)?"true":"false";
-	j += ",\"rpm\":"; j+=t.rpm; j+=",\"volt\":"; j+=t.voltage; j+=",\"amp\":"; j+=t.current;
-	j += ",\"temp\":"; j+=t.tempC; j+=",\"stress\":"; j+=t.stress; j+="}"; server.send(200,"application/json",j);
+	j += ",\"mode\":\""; j += escs::spinMode((uint8_t)i); j += "\",\"rev\":"; j += escs::spinReversible((uint8_t)i)?"true":"false";
+	escs::Telem t;
+	if (escs::spinTele((uint8_t)i,t)) {                              // telemetry only on bidir DShot
+		j += ",\"tele\":true,\"rpm\":"; j+=t.rpm; j+=",\"volt\":"; j+=t.voltage; j+=",\"amp\":"; j+=t.current;
+		j += ",\"temp\":"; j+=t.tempC; j+=",\"stress\":"; j+=t.stress;
+	} else j += ",\"tele\":false";
+	j += "}"; server.send(200,"application/json",j);
 }
 
 // ================= USB-serial API (always) =================
@@ -193,13 +213,21 @@ static void handleSerial() {
 			if(i<0||i>=escs::COUNT||!ad||rl<1||rl>(int)sizeof(flbuf)) Serial.println("err bad-args");
 			else if(!escs::readFlash((uint8_t)i,(uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) Serial.println("err read-failed");
 			else { Serial.print("data|"); printHex(flbuf,rl); Serial.println(); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"arm")) { int i=argi();
+		else if (!strcmp(cmd,"arm")) { int i=argi(); char* m=strtok(nullptr," ");   // arm <i> [normal|bidir]
 			if(i<0||i>=escs::COUNT) Serial.println("err bad-index");
-			else { escs::spinArm((uint8_t)i); Serial.println("arming ~3s"); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"thrust")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");
+			else { escs::Drive md=escs::Drive::AUTO;
+				if(m&&!strcmp(m,"normal"))md=escs::Drive::NORMAL; else if(m&&!strcmp(m,"bidir"))md=escs::Drive::BIDIR;
+				escs::spinArm((uint8_t)i,md);
+				Serial.printf("arming ~3s (mode %s, %s)\n",escs::spinMode((uint8_t)i),escs::spinReversible((uint8_t)i)?"reversible":"one-way");
+				Serial.println("ok"); } }
+		else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");  // 0..2000
 			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
 			else if(!escs::spinArmed((uint8_t)i)) Serial.println("err not-armed");
 			else { escs::spinThrottle((uint8_t)i,(uint16_t)atoi(v)); Serial.println("ok"); } }
+		else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D)
+			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
+			else if(!escs::spinArmed((uint8_t)i)) Serial.println("err not-armed");
+			else { escs::spinThrust((uint8_t)i,(int16_t)atoi(v)); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<escs::COUNT) escs::spinStop((uint8_t)i); Serial.println("ok"); }
 		else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
 			if(i<0||i>=escs::COUNT||!escs::spinTele((uint8_t)i,t)) Serial.println("err no-telem");
