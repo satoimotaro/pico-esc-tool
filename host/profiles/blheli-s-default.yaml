@@ -1,0 +1,14 @@
+# BLHeli-S sensible defaults — a starting profile for a freshly flashed ESC.
+# Apply with:  python esctool.py apply <index> profiles/blheli-s-default.yaml
+# (Only the `settings:` block is applied; identity/mode/raw_hex are ignored. After a firmware
+#  flash the firmware's own defaults are auto-written, so this is for later re-tuning.)
+settings:
+  motor_direction: Normal          # Normal | Reversed | Bidirectional | Bidirectional-Reversed
+  comm_timing: Medium              # Low | MediumLow | Medium | MediumHigh | High
+  demag_compensation: Low          # Off | Low | High
+  beep_strength: 40                # 1..255
+  beacon_strength: 80              # 1..255
+  beacon_delay: 4                  # 1..5 (index)
+  temperature_protection: 7        # 0=off, 1..7
+  low_rpm_power_protection: 1      # 0/1
+  brake_on_stop: 0                 # 0/1

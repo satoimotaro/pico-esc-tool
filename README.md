@@ -51,12 +51,18 @@ Flash the unified **`esc_host`** firmware, then drive ESCs from a PC over USB se
 
 ```
 pio run -e esc_host -t upload
-python host/esctool.py list                 # scan & list connected ESCs
-python host/esctool.py read 0 -o config.yaml  # dump one ESC's config to YAML
+python host/esctool.py list                       # scan & list connected ESCs
+python host/esctool.py read 0 -o config.yaml      # export one ESC's config to YAML
+python host/esctool.py set 0 motor_direction=Reversed beep_strength=60
+python host/esctool.py apply all host/profiles/blheli-s-default.yaml   # a profile -> every ESC
+python host/esctool.py run 0                       # end the session (restart the ESC)
 ```
 
-Needs `pyserial` (`pip install pyserial`); auto-detects the Pico by USB VID 2E8A.
-`set` / `apply <profile.yaml>` / `flash` / multi-ESC are the next phases.
+Config commands hold the ESC in a **bootloader session** (motor off, no repeated reboots) and
+reuse it across commands; the ESC only restarts on `run`/`disconnect` (or with `-r`). Use an
+ESC index or `all`. Multi-ESC is driven by the firmware's `ESC_PINS[]` list. Needs `pyserial`
+(`pip install pyserial`); auto-detects the Pico by USB VID 2E8A. Flashing firmware from the CLI
+is the next phase (today, flashing is via the `spike_program` env).
 
 ## A0 usage (Serial Monitor, newline mode)
 
