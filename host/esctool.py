@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 satoimotaro
-"""esctool — BLHeli-Configurator-like CLI for the RP2040 ESC tool (firmware: esc_host).
+"""esctool — BLHeli-Configurator-like CLI for the RP2040 ESC tool (firmware: esc_tool).
 
 Talks to the Pico over USB-CDC serial (auto-detected by VID 2E8A) with a small text protocol.
-Phase 1 commands: list, read. (set/apply/flash/profiles come next.)
+Commands: list, connect, read, set, apply <profile.yaml>, flash <hex>, run/disconnect.
 
   python esctool.py list
   python esctool.py read 0 -o config.yaml
+  python esctool.py apply all host/profiles/blheli-s-default.yaml
 """
 from __future__ import annotations
 
@@ -86,7 +87,7 @@ def find_pico(port: str | None) -> str:
             if p.vid == RPI_VID:
                 return p.device
         time.sleep(0.1)
-    sys.exit("no RP2040 (VID 2E8A) found - is esc_host flashed and the monitor closed?")
+    sys.exit("no RP2040 (VID 2E8A) found - is esc_tool flashed and the monitor closed?")
 
 
 class EscHost:
@@ -429,7 +430,7 @@ def cmd_read(dev: EscHost, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="BLHeli-S ESC CLI (esc_host firmware)")
+    ap = argparse.ArgumentParser(description="BLHeli-S ESC CLI (esc_tool firmware)")
     ap.add_argument("--port", help="serial port (default: auto-detect VID 2E8A)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="scan and list connected ESCs")

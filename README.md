@@ -6,12 +6,17 @@ thrusters (many ESCs from one PC/SBC), but works with any BLHeli-S SiLabs ESC.
 
 Developed and tested on **ReadyToSky 45A and 30A** ESCs (SiLabs **EFM8BB21**).
 
-It has two halves:
+It has two parts:
 
-- **`esc_host`** — firmware for the Pico that speaks the BLHeli-S 1-wire bootloader on the ESC
-  signal line and exposes a small serial protocol.
-- **`esctool`** — a BLHeli-Configurator-like **CLI** on the PC that drives it: list ESCs, read /
-  write settings (YAML profiles), and flash firmware — with a layout/MCU **compatibility guard**.
+- **`esc_tool`** — one Pico W firmware that configures/flashes BLHeli-S ESCs over the 1-wire
+  bootloader **and** spins thrusters over DShot, exposed over USB serial and (in SETUP mode) a
+  Wi-Fi web UI. No reflashing to switch jobs.
+- **`esctool`** — a BLHeli-Configurator-like **CLI** on the PC that drives it over USB: list ESCs,
+  read / write settings (YAML profiles), and flash firmware — with a layout/MCU **compatibility guard**.
+
+**Modes** (chosen at boot by an optional GPIO, or the `mode` command): **SETUP** brings up the
+Wi-Fi AP + web configurator and per-thruster test; **DRIVE** turns Wi-Fi off and accepts
+per-thruster commands with a deadman. cmd_vel→thruster mixing is left to the host/Pi (RL-friendly).
 
 ## Features
 
@@ -39,7 +44,7 @@ It has two halves:
 Build and flash the unified firmware to the Pico:
 
 ```
-pio run -e esc_host -t upload
+pio run -e esc_tool -t upload
 ```
 
 Then drive ESCs from the PC (the Pico is auto-detected by its USB VID 2E8A):
@@ -70,18 +75,16 @@ Config commands hold the ESC in a bootloader session (motor off) and **do not re
 your ESC's layout from [github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli)
 (`BLHeli_S SiLabs/Hex files/`).
 
-## Wi-Fi web tool (`esc_web`, Pico W)
+## Wi-Fi web tool (SETUP mode)
 
-Flash `esc_web`, connect your phone/PC to the Pico W's Wi-Fi Access Point (SSID `pico-esc-tool`),
-and open `http://192.168.4.1` for a configurator-style browser UI — scan ESCs, read, and edit
-settings with no cables. Change `AP_SSID` / `AP_PASS` at the top of `src/apps/esc_web.cpp`.
+In SETUP mode (the default), `esc_tool` brings up a Wi-Fi Access Point. Connect your phone/PC to
+the SSID `pico-esc-tool` and open `http://192.168.4.1` for a configurator-style browser UI: scan
+ESCs, read/edit settings, and run a per-thruster spin test with live telemetry — no cables. Change
+`AP_SSID` / `AP_PASS` (and `MODE_PIN`) at the top of `src/apps/esc_tool.cpp`.
 
-```
-pio run -e esc_web -t upload
-```
-
-First slice: scan / read / set / disconnect; firmware flashing from the browser is next. (Pico W
-only; both radio and DShot use PIO — validate on the bench.)
+Wi-Fi is a **surface/bench** affordance — 2.4 GHz does not travel through water, so a deployed
+underwater craft is driven over the tether/host, not Wi-Fi. (Pico W only; radio and DShot both use
+PIO — validate the combination on the bench.)
 
 ## Safety
 
@@ -95,19 +98,19 @@ only; both radio and DShot use PIO — validate on the bench.)
 
 | Env | Purpose |
 |---|---|
-| `esc_host` | **USB tool** — host-driven firmware for the `esctool` CLI (over USB serial). |
-| `esc_web` | **Wi-Fi web tool** (Pico W) — AP + browser configurator (see below). |
+| `esc_tool` | **The tool** — unified firmware (USB serial CLI + Wi-Fi web UI + DShot spin). |
 | `picow` / `pico` | DShot control + telemetry baseline app (`src/main.cpp`). |
 | `spike_*` | Standalone bring-up/diagnostic firmwares for the bootloader work. |
 
-Both `esc_host` and `esc_web` share the bootloader logic in `src/apps/esc_session.h`.
+`esc_tool` builds on the shared bootloader/session/drive logic in `src/apps/esc_session.h`.
 
 ## Layout
 
 ```
 platformio.ini          build environments
 src/main.cpp            DShot + telemetry baseline app (USB-CDC command loop)
-src/apps/esc_host.cpp   unified host-driven firmware (serial protocol for esctool)
+src/apps/esc_tool.cpp   unified firmware (USB serial + Wi-Fi web + DShot spin)
+src/apps/esc_session.h  shared bootloader session + drive/spin (used by esc_tool)
 host/esctool.py         the PC CLI
 host/profiles/          example YAML profiles
 lib/blheli_bl/          BLHeli-S 1-wire bootloader client  (PROTOCOL.md = reference)

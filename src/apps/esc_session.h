@@ -31,6 +31,17 @@ struct Info {
 	uint8_t  fwMain = 0, fwSub = 0;
 };
 
+// Live DShot telemetry (Extended DShot Telemetry) for a spinning thruster.
+struct Telem {
+	bool     valid = false;
+	uint32_t rpm = 0, current = 0, tempC = 0, stress = 0, status = 0;
+	float    voltage = 0.0f;
+};
+
+static const uint16_t SPIN_MAX        = 2000;   // max throttle
+static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no spinSet within this
+static const uint16_t MOTOR_POLES     = 14;     // magnet poles (for eRPM->RPM); motor-dependent
+
 namespace detail {
 	static const uint32_t DSHOT_KBAUD = 600, PRIME_MS = 500, HIGH_HOLD_MS = 1000;
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
@@ -47,6 +58,11 @@ namespace detail {
 	static uint8_t  flBuf[256];
 	static volatile uint16_t flAddr = 0, flLen = 0;
 	static volatile int8_t   session = -1;
+	// drive/spin: a persistent DShot per pin (core0). null = not spinning that pin.
+	static BidirDShotX1*     drv[COUNT] = { nullptr };
+	static volatile uint16_t drvTarget[COUNT] = { 0 };
+	static uint32_t          drvLast[COUNT] = { 0 };
+	static Telem             drvTele[COUNT];
 
 	static bool runOp(Op o, uint8_t pin) {          // core0: hand an op to core1, block till done
 		opPin = pin; opOk = false; opDone = false; op = o;
@@ -66,6 +82,7 @@ namespace detail {
 	}
 	static bool ensureConnected(uint8_t i) {        // reuse the session; enter only if needed
 		if (session == (int8_t)i) return true;
+		if (drv[i]) { drv[i]->sendThrottle(0); delete drv[i]; drv[i] = nullptr; }  // free pin from drive
 		if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; }
 		if (enterBootloader(PINS[i])) { session = (int8_t)i; return true; }
 		return false;
@@ -135,6 +152,51 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
+
+// ---- drive / spin (core0): send DShot to a running ESC, with a deadman auto-stop -------------
+// spinSet arms (leaves any bootloader session) and sets the target throttle (0..SPIN_MAX). Call
+// spinPoll() every core0 loop to keep DShot frames flowing, enforce the deadman, and read telemetry.
+inline void spinSet(uint8_t idx, uint16_t throttle) {
+	using namespace detail;
+	if (idx >= COUNT) return;
+	release();                                            // ESC must run its app (not the bootloader)
+	if (!drv[idx]) drv[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD);
+	drvTarget[idx] = throttle > SPIN_MAX ? SPIN_MAX : throttle;
+	drvLast[idx] = millis();
+}
+inline void spinStop(uint8_t idx) {
+	using namespace detail;
+	if (idx >= COUNT) return;
+	drvTarget[idx] = 0;
+	if (drv[idx]) { drv[idx]->sendThrottle(0); delete drv[idx]; drv[idx] = nullptr; }
+}
+inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
+inline bool spinning()    { for (uint8_t i = 0; i < COUNT; i++) if (detail::drv[i]) return true; return false; }
+inline bool spinTele(uint8_t idx, Telem& out) {
+	if (idx >= COUNT || !detail::drv[idx]) return false;
+	out = detail::drvTele[idx]; return true;
+}
+inline void spinPoll() {   // call every core0 loop while spinning: frames + deadman + telemetry
+	using namespace detail;
+	bool any = false;
+	for (uint8_t i = 0; i < COUNT; i++) {
+		if (!drv[i]) continue;
+		any = true;
+		if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman safety
+		uint32_t v = 0;
+		switch (drv[i]->getTelemetryPacket(&v)) {
+			case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; break;
+			case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
+			case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
+			case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;
+			case BidirDshotTelemetryType::STRESS:      drvTele[i].stress = v & ESC_STATUS_MAX_STRESS_MASK; break;
+			case BidirDshotTelemetryType::STATUS:      drvTele[i].status = v; break;
+			default: break;
+		}
+		drv[i]->sendThrottle(drvTarget[i]);
+	}
+	if (any) delayMicroseconds(200);
+}
 
 // ---- core1 worker: call once from loop1() ------------------------------------------------------
 inline void core1Poll() {
