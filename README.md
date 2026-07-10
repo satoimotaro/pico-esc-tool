@@ -107,8 +107,13 @@ generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/
 
 In SETUP mode (the default), `esc_tool` brings up a Wi-Fi Access Point. Connect your phone/PC to
 the SSID `pico-esc-tool` and open `http://192.168.4.1` for a configurator-style browser UI: scan
-ESCs, read/edit settings, and run a per-thruster spin test with live telemetry — no cables. Change
-`AP_SSID` / `AP_PASS` (and `MODE_PIN`) at the top of `src/apps/esc_tool.cpp`.
+ESCs, read/edit settings, run a per-thruster spin test with live telemetry, and **flash firmware**
+(upload a `.hex`) — no cables. Change `AP_SSID` / `AP_PASS` (and `MODE_PIN`) at the top of
+`src/apps/esc_tool.cpp`.
+
+Browser flashing is the same app-only, layout/MCU-guarded flow as the CLI (bootloader preserved,
+firmware defaults applied); it runs page-by-page in the background with a progress readout. Pick the
+`.hex`, choose the ESC, and Flash (tick *force* to override the compat guard).
 
 Wi-Fi is a **surface/bench** affordance — 2.4 GHz does not travel through water, so a deployed
 underwater craft is driven over the tether/host, not Wi-Fi. (Pico W only; radio and DShot both use
