@@ -82,7 +82,8 @@ function spinUI(i){stopTick();g('cfg').innerHTML=`<div class=esc><h3>ESC ${i} sp
   <input id=thr type=range min=0 max=2000 value=0 oninput="spinSet(${i},this.value);g('tv').textContent=this.value">
   <span id=tv>0</span><button class=stop onclick="spinSet(${i},0);g('thr').value=0;g('tv').textContent=0">Stop</button>
   <p id=tele>telemetry...</p></div>`;
-  tick=setInterval(async()=>{let t=await(await fetch('/api/tele?i='+i)).json();
+  tick=setInterval(async()=>{await spinSet(i,g('thr').value);
+   let t=await(await fetch('/api/tele?i='+i)).json();
    g('tele').textContent=t.ok?`rpm ${t.rpm}  ${t.volt}V  ${t.amp}A  ${t.temp}C  stress ${t.stress}`:'no telemetry';},200);}
 async function spinSet(i,v){await fetch('/api/spin?i='+i+'&v='+v,{method:'POST'});}
 function stopTick(){if(tick){clearInterval(tick);tick=null;}}
