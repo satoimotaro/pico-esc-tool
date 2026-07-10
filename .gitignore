@@ -18,3 +18,11 @@
 .idea/
 *.swp
 .DS_Store
+
+# host CLI
+__pycache__/
+*.pyc
+
+# local artifacts (test dumps / captures)
+config.yaml
+*.HEX

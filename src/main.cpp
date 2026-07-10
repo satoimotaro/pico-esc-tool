@@ -75,19 +75,32 @@ static void pollTelemetry() {
 static void handleHostCommand() {
 	if (!Serial.available()) return;
 	delay(3);                       // let the rest of the line arrive
-	char cmd = Serial.read();
+	int c = Serial.read();
+	if (c < 0) return;
+	char cmd = toupper((char)c);    // accept lower-case commands too
 	String s;
 	while (Serial.available()) s += (char)Serial.read();
+	s.trim();                       // strip CR/LF/space so toInt() is clean
 	uint32_t value = s.toInt();
 
 	switch (cmd) {
-	case 'T': throttle = armed ? (uint16_t)value : 0; break;
-	case 'C': if (throttle == 0) sendSpecialCommand(value); break;
-	case 'E': if (throttle == 0) sendSpecialCommand(DSHOT_CMD_EXTENDED_TELEMETRY_ENABLE); break;
-	case 'A': armed = true;  break;
-	case 'D': armed = false; throttle = 0; break;
-	case '?': printHeader();  break;
-	default:  throttle = 0;   break;
+	case 'T':
+		throttle = armed ? (uint16_t)value : 0;
+		Serial.printf("> T%u -> throttle=%u (armed=%d)\n", value, throttle, armed);
+		break;
+	case 'C':
+		if (throttle == 0) { sendSpecialCommand(value); Serial.printf("> C%u sent\n", value); }
+		else               Serial.println("> C ignored: stop first (T0)");
+		break;
+	case 'E':
+		if (throttle == 0) { sendSpecialCommand(DSHOT_CMD_EXTENDED_TELEMETRY_ENABLE); Serial.println("> EDT enabled"); }
+		else               Serial.println("> E ignored: stop first (T0)");
+		break;
+	case 'A': armed = true;              Serial.println("> ARMED");    break;
+	case 'D': armed = false; throttle = 0; Serial.println("> DISARMED"); break;
+	case '?': printHeader();             break;
+	case '\r': case '\n': case ' ': case '\t': break;   // ignore stray whitespace
+	default:  Serial.printf("> unknown cmd '%c' (0x%02X)\n", cmd, cmd); break; // do NOT zero throttle
 	}
 }
 

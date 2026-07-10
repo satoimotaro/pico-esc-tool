@@ -20,13 +20,16 @@ This controller configures/flashes/drives/monitors many BLHeli-S ESCs from a PC/
 ## Layout (PlatformIO)
 
 ```
-platformio.ini    envs: [pico], [picow]; lib_deps = pico-bidir-dshot
-src/main.cpp      A0 baseline: 1 ESC over bidir DShot, USB-CDC command loop
-lib/              our modules (auto-discovered) — see lib/README.md
-  esc_dshot/  esc_telemetry/  rpm_filter/  esc_setup/*  esc_flash/*  pc_iface/
-construction/     wiring / pcb (KiCad) / cad (case)
-docs/             protocol notes
-                  (* = BLHeli-S 1-wire tools, the hard core — Phase A1)
+platformio.ini        envs: [picow] app, [esc_host] unified tool, [spike_*] diagnostics
+src/main.cpp          A0 baseline: 1 ESC over bidir DShot, USB-CDC command loop
+src/apps/esc_host.cpp unified host-driven firmware (serial command protocol) for the CLI
+host/esctool.py       PC-side CLI: list / read ESCs (set/apply/flash coming)
+lib/                  our modules (auto-discovered) — see lib/README.md
+  blheli_bl/*  esc_setup/*  esc_flash/*   BLHeli-S 1-wire bootloader: connect/read/write/flash
+  esc_dshot/  esc_telemetry/  rpm_filter/  pc_iface/
+construction/         wiring / pcb (KiCad) / cad (case)
+docs/                 protocol notes; lib/blheli_bl/PROTOCOL.md = the bootloader reference
+                      (* = BLHeli-S 1-wire tools, the hard core — Phase A1)
 ```
 
 ## Build & flash
@@ -42,12 +45,26 @@ pio run -e pico -t upload       # flash
 pio device monitor -b 115200    # serial
 ```
 
+## Host CLI (esctool)
+
+Flash the unified **`esc_host`** firmware, then drive ESCs from a PC over USB serial:
+
+```
+pio run -e esc_host -t upload
+python host/esctool.py list                 # scan & list connected ESCs
+python host/esctool.py read 0 -o config.yaml  # dump one ESC's config to YAML
+```
+
+Needs `pyserial` (`pip install pyserial`); auto-detects the Pico by USB VID 2E8A.
+`set` / `apply <profile.yaml>` / `flash` / multi-ESC are the next phases.
+
 ## A0 usage (Serial Monitor, newline mode)
 
 ```
 E          enable Extended DShot Telemetry
 A          arm
-T1000      throttle 1000 (0-2000)
+
+0      throttle 1000 (0-2000)
 D          disarm (throttle 0)
 C3         special command 3 (beacon), only when stopped
 ?          reprint header
@@ -57,5 +74,10 @@ Prints `Thrott  RPM  Volt  Amp  Temp  Stress  Status`. Set `SIGNAL_PIN` and
 
 ## Status
 
-**Phase A0** (see `.ai/architecture/phase-plan.md`). Baseline single-ESC DShot +
-telemetry app is in place; next: multi-channel + the 1-wire setup/flash spike.
+**Phase A1 — BLHeli-S 1-wire bootloader tools proven on hardware** (EFM8BB21). Working
+end-to-end: bootloader connect, config **read** (CRC-verified), config **write**
+(read-modify-write + verify), and **firmware flash** with a layout/MCU compatibility
+guard — app-only (bootloader + EEPROM preserved), and the firmware's own default config
+is auto-applied from the HEX after flashing. Unified host firmware `esc_host` + `esctool`
+CLI (list / read) are in place; next: `set`/`apply`(YAML profiles)/`flash` from the CLI,
+BLHeli-S default profiles, and multi-ESC. (Phase-plan detail in the workspace `.ai/`.)

@@ -28,8 +28,20 @@ Authoritative values for `blheli_bl`, read line-by-line from the reference sourc
   BootVersion + BootPages. Valid iff first 3 bytes == `34 37 31` ("471") and signature≠0.
 - **Keep-alive:** send `FD 00` (+CRC); **alive iff reply ACK == 0xC1** (`brERRORCOMMAND`)
   — 0xFD is an invalid command, so the NAK proves the BL is running. (Not a failure!)
-- Entry: a powered idle BLHeli-S jumps to its BL when it sees BootInit; if unresponsive,
-  power-cycle the ESC while streaming BootInit (BL listens only briefly at boot).
+- **Entry (no power-cycle, source-confirmed via BLHeli_S.asm `init_no_signal`):** the
+  RUNNING app jumps to the BL itself. Sequence: (1) feed a valid signal, then STOP it
+  (signal loss); (2) hold the line **continuously HIGH, glitch-free, for ≥~60ms** — the
+  app times out (RC-timeout counter #10 polled ~10ms ⇒ up to ~100ms), reaches
+  `init_no_signal`, verifies the line is high for **15ms with zero intervening lows**, then
+  `ljmp 1C00h` into the BL; (3) ONLY THEN stream BootInit. Sending BootInit's LOW start
+  bits during the 15ms check aborts the jump (`jnb RTX_PORT.RTX_PIN,bootloader_done`) →
+  the app keeps running/beeping. We use HIGH_HOLD_MS=200 for margin. Betaflight's
+  `esc4wayInit` does exactly this (motorDisable + input-pullup + setEscHi), then waits an
+  MSP round-trip (100ms+) before `BL_ConnectEx`. Once in the BL it waits ~250ms×250 for
+  the first start bit, so overshooting the hold is harmless. Bidir (inverted) DShot idles
+  HIGH, so priming with it is *consistent* with the required hold-high. Fallback if the
+  running-app path ever fails: power-cycle the ESC while streaming BootInit (BL also
+  listens briefly at reset) — see `spike_boot`.
 
 ## §C. Command set, framing & CRC
 Command bytes: `RUN 0x00 · PROG_FLASH 0x01 · ERASE_FLASH 0x02 · READ_FLASH_SIL 0x03 ·
@@ -95,3 +107,31 @@ See `../esc_setup/EEPROM.md` for the full offset→field map (implemented in `es
   0x40/0x50 tag positions are ESC-JS-sourced (asm defines up to 0x29 + Name@0x60);
   BootVersion/Pages reply bytes informational; LittleBee logic-rail voltage — confirm
   on hardware before wiring the pull-up. **All transport timing untested on hardware.**
+
+## §G. Bench-confirmed on hardware (2026-07-10, EFM8BB21 sig E8 B2)
+
+Full pipeline proven: connect → read → write → firmware flash. Corrections vs earlier notes:
+
+- **Read the SiLabs config with FLASH-read `0x03`, not EEPROM-read `0x04`.** EFM8 has no EEPROM;
+  BLHeli-S/BlueJay config lives in FLASH at 0x1A00. `0x04` returns 0 bytes and wedges the parser.
+  `readEeprom`→ use `readFlash(0x1A00,…)`.
+- **TX→RX turnaround gap is REQUIRED.** After the ESC transmits a reply it needs time to switch
+  back to RX; a command sent immediately after an ACK is missed entirely (ESC 100% silent,
+  raw `edges=0`). Fix: `sendCmd` does `if (connected_) delay(5ms)` before every post-connect
+  command. This was the true cause of the long-standing "read failed" (the READ cmd right after
+  the SET_ADDRESS ack was never heard). Fast OE-register turnaround was *too* fast for the ESC.
+- **Read response = `[data][CRC-lo][CRC-hi][ACK]`** — there IS a trailing ACK byte (0x30) after
+  the CRC (BF `BL_ReadBuf`: "with CRC read 3 more"). `readBuf` must read it.
+- **SET_BUFFER header gets NO ack** — the device waits for the buffer bytes (BF asserts brNONE);
+  the SUCCESS ack comes only after the data. Waiting for an ack after the header hangs writes.
+- **Frames confirmed:** SET_ADDRESS `{FF,0,hi,lo}`+CRC→0x30; keepAlive `{FD,0}`+CRC→C1;
+  read `{cmd,len}`+CRC; SET_BUFFER `{FE,0,hi,lo}` (len 256→`{FE,0,1,0}`). Latencies ~28µs.
+- **Flash write = app-only.** A stock BLHeli-S HEX contains app (0x0000-0x19FF) + eeprom identity
+  (~0x1A40 tags) + bootloader (0x1C00+). Over the 1-wire BL you MUST NOT reflash the BL you speak
+  through: flash 0x0000-0x19FF, capture the eeprom identity for the compat check, SKIP everything
+  ≥0x1A00. Page erase = 512 B (EFM8BB21); writeFlash ≤256 B/call.
+- **Compatibility guard** (`esc_flash::checkCompatibility`): the ESC's bootloader signature +
+  its config LAYOUT tag (0x1A40) must match the HEX's MCU tag (0x1A50) + LAYOUT tag. Demonstrated:
+  wrong layout → BLOCK, matching → allow. Prevents flashing a wrong-FET-map image.
+- **Note:** flashing app-only leaves the EEPROM (0x1A00) untouched, so config `name`/version keep
+  their pre-flash values; identify the RUNNING firmware by reading APP flash (0x0000), not EEPROM.

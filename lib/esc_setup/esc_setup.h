@@ -12,7 +12,11 @@ namespace esc_setup {
 
 // EEPROM parameter block on SiLabs BLHeli-S (EFM8BB1/BB2).
 constexpr uint16_t kEepromAddr = 0x1A00;
-constexpr uint16_t kEepromLen  = 0x70;   // 112 bytes
+// BlueJay's config block is 255 bytes (esc-configurator Bluejay/eeprom.js LAYOUT_SIZE=0xFF) —
+// it includes the 128-byte STARTUP_MELODY at 0x70. (Plain BLHeli-S only uses 0x70=112.)
+constexpr uint16_t kEepromLen  = 0xFF;   // 255 bytes (covers name 0x60 + melody 0x70..0xEF + wait 0xF0)
+constexpr uint16_t kMelodyOff  = 0x70;   // STARTUP_MELODY offset within the block
+constexpr uint16_t kMelodyLen  = 128;    // 0x70..0xEF
 
 // Byte offsets within the block (relative to kEepromAddr).
 enum Off : uint8_t {
@@ -71,9 +75,20 @@ struct Settings {
 // us pulse width for a throttle byte (min/max/center). 1000 + 4*byte.
 static inline uint16_t throttleUs(uint8_t b) { return 1000 + 4 * (uint16_t)b; }
 
-bool read (blheli_bl::Bootloader& bl, Settings& out);        // readEeprom + decode
+bool read (blheli_bl::Bootloader& bl, Settings& out);        // readFlash + decode
 bool write(blheli_bl::Bootloader& bl, const Settings& in);   // encode + write (A1)
 void decode(const uint8_t* raw, uint16_t len, Settings& out);
 void print(const Settings& s, Stream& out);
+
+// --- config flash page (read-modify-write) -------------------------------------------------
+// EFM8BB21 flash page = 512 B; the BlueJay/BLHeli-S config occupies the first 255 B of the page
+// at kEepromAddr (0x1A00). A safe write must preserve the whole page.
+constexpr uint16_t kPageLen = 512;
+
+// Read the current 512-B config page into out (two 256-B reads). CRC-verified per read.
+bool readPage (blheli_bl::Bootloader& bl, uint8_t* out512);
+// Erase the page and write page512 back (two 256-B writes), then read back and verify byte-exact.
+// Returns true ONLY if the read-back matches. ⚠ ERASES + WRITES FLASH — gate the call site.
+bool writePage(blheli_bl::Bootloader& bl, const uint8_t* page512);
 
 } // namespace esc_setup

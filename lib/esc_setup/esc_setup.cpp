@@ -13,6 +13,7 @@ static void copyTag(char* dst, const uint8_t* src, uint8_t n) {
 		if (c == 0x00 || c == 0xFF) break;   // padding / erased
 		dst[j++] = (c >= 32 && c < 127) ? (char)c : '.';
 	}
+	while (j > 0 && dst[j - 1] == ' ') j--;  // trim trailing pad spaces (so tags compare cleanly)
 	dst[j] = '\0';
 }
 
@@ -23,7 +24,9 @@ void decode(const uint8_t* r, uint16_t len, Settings& s) {
 	s.layoutRevision = r[OFF_LAYOUT_REVISION];
 	s.startupPower   = r[OFF_STARTUP_POWER];
 	s.motorDirection = r[OFF_DIRECTION];
-	s.modeSignature  = (uint16_t(r[OFF_MODE_H]) << 8) | r[OFF_MODE_L];
+	// MODE is big-endian on the wire: raw[0x0D] is the HIGH byte. (MULTI=0x55AA, MAIN=0xA55A,
+	// TAIL=0x5AA5 per esc-configurator Bluejay/eeprom.js MODES.)
+	s.modeSignature  = (uint16_t(r[OFF_MODE_L]) << 8) | r[OFF_MODE_H];
 	s.txProgram      = r[OFF_TX_PROGRAM];
 	s.commTiming     = r[OFF_COMM_TIMING];
 	s.minThrottle    = r[OFF_MIN_THROTTLE];
@@ -47,7 +50,10 @@ void decode(const uint8_t* r, uint16_t len, Settings& s) {
 bool read(blheli_bl::Bootloader& bl, Settings& out) {
 	out = Settings{};
 	if (!bl.connected()) return false;
-	if (!bl.readEeprom(kEepromAddr, out.raw, kEepromLen)) return false;
+	// SiLabs EFM8 has NO EEPROM — BLHeli-S stores its config block in FLASH at 0x1A00, so it's
+	// read with the flash-read command (0x03), not the Atmel EEPROM-read (0x04). readEeprom(0x04)
+	// returned zero bytes on this MCU; readFlash(0x03) is what esc-configurator/BLHeliSuite use.
+	if (!bl.readFlash(kEepromAddr, out.raw, kEepromLen)) return false;
 	out.rawLen = kEepromLen;
 	decode(out.raw, out.rawLen, out);
 	return true;
@@ -55,6 +61,23 @@ bool read(blheli_bl::Bootloader& bl, Settings& out) {
 
 bool write(blheli_bl::Bootloader& /*bl*/, const Settings& /*in*/) {
 	return false;  // Phase A1: encode fields into raw (read-modify-write) + writeEeprom + verify
+}
+
+bool readPage(blheli_bl::Bootloader& bl, uint8_t* out512) {
+	if (!bl.connected()) return false;
+	return bl.readFlash(kEepromAddr,       out512,       256)
+	    && bl.readFlash(kEepromAddr + 256, out512 + 256, 256);
+}
+
+bool writePage(blheli_bl::Bootloader& bl, const uint8_t* page512) {
+	if (!bl.connected()) return false;
+	if (!bl.erasePage(kEepromAddr)) return false;               // erase 0x1A00..0x1BFF
+	if (!bl.writeFlash(kEepromAddr,       page512,       256)) return false;
+	if (!bl.writeFlash(kEepromAddr + 256, page512 + 256, 256)) return false;
+	uint8_t rb[kPageLen];                                        // read back and verify byte-exact
+	if (!readPage(bl, rb)) return false;
+	for (uint16_t i = 0; i < kPageLen; i++) if (rb[i] != page512[i]) return false;
+	return true;
 }
 
 static const char* dirName(uint8_t d) {
@@ -75,7 +98,7 @@ void print(const Settings& s, Stream& out) {
 	out.printf("firmware      : %u.%u  (layout rev %u)\n", s.mainRevision, s.subRevision, s.layoutRevision);
 	out.printf("name / layout : \"%s\" / \"%s\"\n", s.name, s.layoutTag);
 	out.printf("mcu tag       : \"%s\"\n", s.mcuTag);
-	if (!s.valid) out.println(F("WARNING: mode signature not recognized — block may be unprogrammed/misread"));
+	if (!s.valid) out.println(F("WARNING: mode signature not recognized - block may be unprogrammed/misread"));
 	out.printf("direction     : %u (%s)\n", s.motorDirection, dirName(s.motorDirection));
 	out.printf("comm timing   : %u (%s)\n", s.commTiming, timingName(s.commTiming));
 	out.printf("demag comp    : %u (%s)\n", s.demagComp, demagName(s.demagComp));
