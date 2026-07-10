@@ -18,7 +18,7 @@
 
 namespace escs {
 
-static const uint8_t PINS[]  = { 10 };     // one signal pin per ESC (add more for multi-ESC)
+static const uint8_t PINS[]  = { 10, 11 };  // one signal pin per ESC (add more for multi-ESC)
 static const uint8_t COUNT   = sizeof(PINS) / sizeof(PINS[0]);
 
 struct Info {
