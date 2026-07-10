@@ -93,7 +93,17 @@ class EscHost:
     """Line-based transport: send a command, collect reply lines until 'ok'/'err'."""
 
     def __init__(self, port: str | None = None):
-        self.ser = serial.Serial(find_pico(port), 115200, timeout=10)
+        self.ser = None
+        p = find_pico(port)
+        for _ in range(30):                         # port can be briefly un-openable after an upload
+            try:
+                self.ser = serial.Serial(p, 115200, timeout=10)
+                break
+            except serial.SerialException:
+                time.sleep(0.15)
+                p = find_pico(port)
+        if self.ser is None:
+            sys.exit(f"could not open {p}")
         time.sleep(0.3)
         self.ser.reset_input_buffer()
 

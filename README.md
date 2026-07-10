@@ -70,6 +70,19 @@ Config commands hold the ESC in a bootloader session (motor off) and **do not re
 your ESC's layout from [github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli)
 (`BLHeli_S SiLabs/Hex files/`).
 
+## Wi-Fi web tool (`esc_web`, Pico W)
+
+Flash `esc_web`, connect your phone/PC to the Pico W's Wi-Fi Access Point (SSID `pico-esc-tool`),
+and open `http://192.168.4.1` for a configurator-style browser UI — scan ESCs, read, and edit
+settings with no cables. Change `AP_SSID` / `AP_PASS` at the top of `src/apps/esc_web.cpp`.
+
+```
+pio run -e esc_web -t upload
+```
+
+First slice: scan / read / set / disconnect; firmware flashing from the browser is next. (Pico W
+only; both radio and DShot use PIO — validate on the bench.)
+
 ## Safety
 
 - **Flash is app-only.** The 1-wire bootloader (top of flash) is never overwritten — it's how the
@@ -82,9 +95,12 @@ your ESC's layout from [github.com/bitdump/BLHeli](https://github.com/bitdump/BL
 
 | Env | Purpose |
 |---|---|
-| `esc_host` | **The tool** — unified host-driven firmware for `esctool`. |
+| `esc_host` | **USB tool** — host-driven firmware for the `esctool` CLI (over USB serial). |
+| `esc_web` | **Wi-Fi web tool** (Pico W) — AP + browser configurator (see below). |
 | `picow` / `pico` | DShot control + telemetry baseline app (`src/main.cpp`). |
 | `spike_*` | Standalone bring-up/diagnostic firmwares for the bootloader work. |
+
+Both `esc_host` and `esc_web` share the bootloader logic in `src/apps/esc_session.h`.
 
 ## Layout
 
