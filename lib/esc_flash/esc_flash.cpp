@@ -109,15 +109,6 @@ bool parseIntelHex(const char* hex, size_t len, HexImage& img, const char** err)
 	return true;
 }
 
-// Map a firmware MCU tag (e.g. "#BLHELI$EFM8B21#") to the expected bootloader signature word.
-// EFM8BB10=0xE8B1, EFM8BB21=0xE8B2, EFM8BB51=0xE8B5. Returns 0 if unrecognized.
-static uint16_t sigForMcuTag(const char* tag) {
-	if (strstr(tag, "B21")) return 0xE8B2;
-	if (strstr(tag, "B51")) return 0xE8B5;
-	if (strstr(tag, "B10")) return 0xE8B1;
-	return 0;
-}
-
 Compat checkCompatibility(uint16_t escSig, const char* escLayoutTag, const HexImage& img) {
 	Compat c;
 	c.sizeOk = img.valid && img.maxAddr > img.minAddr && img.maxAddr <= kAppEnd;
@@ -132,7 +123,7 @@ Compat checkCompatibility(uint16_t escSig, const char* escLayoutTag, const HexIm
 			"HEX has no identity section: cannot verify MCU/layout (ESC layout '%s') - override required", el);
 		return c;   // ok stays false: block by default
 	}
-	uint16_t fwSig = sigForMcuTag(img.fwMcuTag);
+	uint16_t fwSig = blheli_bl::signatureForMcuTag(img.fwMcuTag);   // shared MCU table (blheli_bl)
 	c.mcuOk    = (fwSig != 0) && (fwSig == escSig);
 	c.layoutOk = (el[0] != '\0') && (strcmp(el, img.fwLayoutTag) == 0);
 	c.ok = c.sizeOk && c.mcuOk && c.layoutOk;

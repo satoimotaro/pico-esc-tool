@@ -1,4 +1,4 @@
-# ESC-controller
+# pico-esc-tool
 
 An **RP2040 (Pico / Pico W)** tool for **BLHeli-S ESCs**: configure, flash firmware, and drive
 them over DShot with telemetry — **no flight controller required.** Built for underwater ROV

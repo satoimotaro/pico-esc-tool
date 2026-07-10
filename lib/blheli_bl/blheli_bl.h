@@ -159,8 +159,11 @@ private:
 	static uint16_t crcBuf(const uint8_t* data, uint16_t len);
 };
 
+// Known-MCU table is the single source of truth for signature <-> name <-> config MCU-tag.
 // Resolve a device signature word to a human name (EFM8BB10x/21x/51x), or nullptr.
 const char* signatureName(uint16_t sigWord);
 McuType     mcuTypeFor(uint16_t sigWord);
+// Signature word expected for a BLHeli config MCU tag (e.g. "#BLHELI$EFM8B21#"), or 0 if unknown.
+uint16_t    signatureForMcuTag(const char* mcuTag);
 
 } // namespace blheli_bl

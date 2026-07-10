@@ -471,17 +471,26 @@ bool Bootloader::run() {
 void Bootloader::end() { connected_ = false; setRx(); }
 
 // ---- signature table (esc-configurator Silabs.js) ----
+// Single source of truth: BLHeli-S SiLabs MCUs. `tagFrag` is the token found in the config
+// MCU tag (e.g. "#BLHELI$EFM8B21#"). Add a row here to support a new MCU everywhere at once.
+struct McuSig { uint16_t sig; const char* name; const char* tagFrag; };
+static const McuSig kMcuTable[] = {
+	{ 0xE8B1, "EFM8BB10x", "B10" },
+	{ 0xE8B2, "EFM8BB21x", "B21" },
+	{ 0xE8B5, "EFM8BB51x", "B51" },
+};
+
 McuType mcuTypeFor(uint16_t w) {
-	if (w > 0xE800 && w < 0xF900) return McuType::SILABS_EFM8;
+	for (const auto& m : kMcuTable) if (m.sig == w) return McuType::SILABS_EFM8;
 	return McuType::UNKNOWN;
 }
 const char* signatureName(uint16_t w) {
-	switch (w) {
-		case 0xE8B1: return "EFM8BB10x";
-		case 0xE8B2: return "EFM8BB21x";   // LittleBee Spring 30A
-		case 0xE8B5: return "EFM8BB51x";
-		default:     return nullptr;
-	}
+	for (const auto& m : kMcuTable) if (m.sig == w) return m.name;
+	return nullptr;
+}
+uint16_t signatureForMcuTag(const char* mcuTag) {
+	if (mcuTag) for (const auto& m : kMcuTable) if (strstr(mcuTag, m.tagFrag)) return m.sig;
+	return 0;
 }
 
 } // namespace blheli_bl

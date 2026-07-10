@@ -281,7 +281,8 @@ def cmd_run(dev: EscHost, args):
 
 
 APP_END, EEPROM_BASE, BOOT_BASE = 0x1A00, 0x1A00, 0x1C00
-SIG_FOR_MCU = {"B21": "E8B2", "B51": "E8B5", "B10": "E8B1"}
+# MCU-tag fragment -> signature. Mirror of lib/blheli_bl kMcuTable (keep in sync when adding MCUs).
+SIG_FOR_MCU = {"B10": "E8B1", "B21": "E8B2", "B51": "E8B5"}
 
 
 def parse_hex(path: str):
