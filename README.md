@@ -36,6 +36,9 @@ per-thruster commands with a deadman. cmd_vel→thruster mixing is left to the h
 - **Live telemetry** (bidir firmware) — eRPM always; temperature + stress via EDT; voltage/current
   when the ESC has the sensors. DShot via
   [pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot).
+- **Closed-loop position control** (`host/posctl.py`) — an AS5600 encoder on the Pico + a host
+  cascade controller (position → velocity → thrust), with direction auto-cal and full safety
+  aborts. See [Position control](#position-control-hostposctlpy--as5600-encoder).
 
 ## Requirements
 
@@ -91,6 +94,7 @@ arm <i> [normal|bidir]    # arm ESC i (AUTO picks bidir for Bluejay/JESC, else n
 throttle <i> <0..2000>    # one-way throttle (armed)
 thrust <i> <-1000..1000>  # reversible/3D: signed thrust, 0 = stop (armed)
 tele <i>                  # rpm | volts | amps | tempC | stress   (bidir firmware only)
+enc                       # read the AS5600 encoder: raw|ang|deg|md|ml|mh|agc|mag
 disarm <i>                # stop + release the ESC
 ```
 
@@ -103,6 +107,48 @@ eRPM + temperature telemetry and reversible support work best on **Bluejay** (or
 PWM frequency (24 / 48 / 96 kHz) is chosen by *which hex you flash*. Get Bluejay from
 [github.com/bird-sanctuary/bluejay](https://github.com/bird-sanctuary/bluejay). The Pico exposes a
 generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/Pi (RL/sim-friendly).
+
+## Position control (`host/posctl.py` + AS5600 encoder)
+
+Closed-loop **shaft-position** control: an **AS5600** magnetic encoder on the Pico's I2C0 feeds a
+host-side cascade controller (outer position → inner velocity → signed `thrust`). The Pico reads
+the encoder (`enc` command); the control loop runs on the PC.
+
+**Wiring** (AS5600 → Pico): `SDA→GP16`, `SCL→GP17`, `VCC→3V3`, `GND→GND`, `DIR→GND` (I2C addr
+`0x36`). Check it first with `enc` — you want `md=1` (magnet detected), `ml=mh=0`, and `agc` mid-range.
+
+**ESC setup:** position control needs **reversible** drive, so set the ESC to 3D mode and use bidir
+(Bluejay) firmware:
+
+```
+python host/esctool.py set 1 motor_direction=Bidirectional      # reversible thrust
+# (re-apply your tuned profile after any firmware flash — flashing resets the config page)
+```
+
+**Usage:**
+
+```
+python host/posctl.py move --deg 720                 # rotate to +720° from the current pose
+python host/posctl.py step --seq 360,-360,720        # relative moves, one after another
+python host/posctl.py hold --deg 0                   # actively hold a position
+python host/posctl.py move --deg 360 --dry-run       # simulated motor, no hardware (safe smoke test)
+```
+
+Key flags: `--esc-index 1`, `--tol 12` (deg deadband), `--tmax 300` / `--tmin 40` (thrust limits),
+`--vmax 400` (deg/s cap), `--kp/--kd/--kpv/--ki` (gains), `--max-secs` / `--max-revs` / `--vel-abort`
+(runaway aborts), `--csv` (log to `host/reports/`). On start it **auto-calibrates direction** (a
+brief probe spin to learn whether `+thrust` increases or decreases the encoder count — no need to
+match wiring/DIR polarity); override with `--invert-encoder` / `--no-autocal`.
+
+**Safety:** the loop keep-alives the ESC under the 500 ms deadman, guards the encoder unwrap, and
+**always disarms** on completion, abort, or Ctrl-C. It aborts + disarms on lost magnet, stuck/
+implausible encoder reads, over-velocity, wrong-way runaway, or the time/rev limits.
+
+> **6-step limitation (important).** On stock 6-step/BEMF firmware the motor can't rotate below
+> ~185 RPM, so it can't creep to a target: `hold` is excellent (friction holds the rotor, ~0.1°),
+> but a **`move` overshoots by ~2 revolutions** before settling within `--tol`. Precise low-speed
+> positioning needs an open-loop **sine drive mode** in the ESC firmware (the BlueGill #3 roadmap);
+> `posctl.py` is the instrument that quantifies this and will command that mode once it lands.
 
 ## Wi-Fi web tool (SETUP mode)
 
@@ -154,6 +200,8 @@ src/apps/esc_session.h  shared bootloader session + drive/spin (used by esc_tool
 src/apps/dshot_demo.cpp standalone DShot drive demo (pico / picow envs)
 src/apps/spike_*.cpp    standalone bring-up / diagnostic firmwares
 host/esctool.py         the PC CLI
+host/posctl.py          closed-loop shaft-position controller (AS5600 encoder)
+host/autocal.py         per-thruster low-speed auto-calibration
 host/profiles/          example YAML profiles
 lib/blheli_bl/          BLHeli-S 1-wire bootloader client  (PROTOCOL.md = reference)
 lib/esc_setup/          config read / write (read-modify-write a flash page)
