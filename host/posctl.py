@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 satoimotaro
-"""posctl — host-side cascade position controller for the RP2040 esc_tool protocol.
+"""posctl — host-side position controller for the RP2040 esc_tool protocol.
 
-Closes a position loop around the integrated AS5600 encoder by driving the ESC
-over the existing signed `thrust` command — NO firmware changes. Cascade:
+Closes a position loop around the integrated AS5600 encoder by driving the ESC over the
+existing signed `thrust` command — NO firmware changes.
 
-    outer  position  P(+D)  -> velocity setpoint   (clamped to --vmax deg/s)
-    inner  velocity  PI     -> signed thrust        (clamped to --tmax)
+PULSE-AND-SETTLE (not a velocity servo): a 6-step/BEMF ESC cannot creep — every start
+runs a BLHeli startup ramp that flings the rotor up to ~1-2 revs before it is controllable,
+and it can't hold a sub-floor speed. So servoing a velocity just yields slam-overshoot-
+reverse-hunt. Instead this fires a FIXED SHORT pulse of thrust toward the target, lets
+`brake_on_stop` + coast bring the rotor to rest, MEASURES, and repeats — capped at
+--max-pulses so it parks (accepts the residual) instead of oscillating. The command is
+always a pulse toward the target or zero — never a reverse brake of a spinning rotor.
 
-Because the 6-step/BEMF drive cannot sustain rotation below ~185 RPM, below the
-minimum effective thrust the inner loop falls back to a bang-bang crawl toward the
-target; inside --tol it commands thrust 0 and coasts (a hold limit-cycle is
-expected here — the controller measures it rather than pretending to remove it).
+HARD 6-STEP LIMIT (bench-measured): the move quantum is ~one startup ramp (tens to a few
+hundred degrees, and variable), so this does clean, fast, non-oscillating LARGE moves
+(≥ ~1 rev: ~±35-50°) but CANNOT position finely (sub-~90°). True fine/slow positioning
+needs the ESC-side open-loop sine mode (#3). Requires ESC in Bidirectional (3D) mode with
+brake_on_stop=1; a gentle startup_power shrinks the quantum.
 
-Keep-alive: one `enc` + one `thrust` per ~20 ms tick (50 Hz) — well under the
-firmware's 500 ms spin deadman (reset only by throttle/thrust, not enc/tele).  If a
-tick ever runs long the deadman just zeroes the motor, which is the safe outcome.
-
-Safety: --max-secs / --max-revs runaway aborts, abort on N consecutive encoder read
-failures or on |velocity| over a hard limit, and on EVERY exit path (normal, error,
-SIGINT/SIGTERM) it triple-sends `thrust 0` then `disarm`.
+Keep-alive: one `enc` + one `thrust` per ~20 ms tick (50 Hz), well under the firmware's
+500 ms spin deadman. Safety: --max-secs / --max-revs / --vel-abort aborts, encoder magnet-
+health + unwrap-fault + stuck-encoder + wrong-way guards, and on EVERY exit path (normal,
+error, SIGINT/SIGTERM) it triple-sends `thrust 0` then `disarm`.
 
   python posctl.py move --deg 720 --dry-run
   python posctl.py step --seq 360,-360,720 --dry-run
@@ -263,37 +266,60 @@ class PosDrive:
 # Cascade controller.
 # ---------------------------------------------------------------------------
 class Cascade:
+    """Pulse-and-settle position controller for a drive with a hard MINIMUM speed.
+
+    On 6-step firmware the rotor can't creep — it either sits still or spins at >= the
+    ~185 RPM floor — so servoing a (sub-floor) velocity is impossible and just yields the
+    slam-overshoot-reverse-hunt seen on the bench. Instead this pushes a bounded PULSE
+    toward the target, cuts early (predictive, from a learned coast estimate) and COASTS
+    to rest, then measures and repeats. It NEVER brakes a spinning rotor (only ever
+    thrusts toward the target or coasts) and never asks for a speed the motor can't do.
+
+    The pulse length is planned from the remaining error and a learned deg/tick, starting
+    with the smallest move that reliably turns the motor and re-checking the encoder after
+    every pulse (auto-ramping the pulse if the motor didn't start). Achievable precision is
+    ~one min-pulse quantum — the honest 6-step limit; the #3 sine mode removes it.
+    (The class name is kept for drop-in compatibility with the run loop.)
+    """
+
     def __init__(self, opts):
-        self.kp = opts.kp          # outer position P  (deg/s per deg)
-        self.kd = opts.kd          # outer position D
-        self.kpv = opts.kpv        # inner velocity P  (thrust per deg/s)
-        self.ki = opts.ki          # inner velocity I
-        self.vmax = opts.vmax
         self.tmax = opts.tmax
-        self.tmin = opts.tmin      # min effective thrust (below -> bang-bang crawl)
+        self.tmin = opts.tmin
         self.tol = opts.tol
-        self.vfloor = opts.vfloor  # min sustainable speed, deg/s (~185 RPM 6-step floor)
-        self.crawl_hyst = opts.crawl_hyst    # coast-band exits at tol + this (deg)
-        self.crawl_period = max(1, opts.crawl_period)  # fire 1 crawl pulse per N ticks
-        self.target = 0.0
-        self.integ = 0.0
-        self.prev_err = 0.0
-        self._integ_max = self.tmax / max(self.ki, 1e-6)
-        self._coasting = False     # hysteretic coast latch (near target)
-        self._crawl_ctr = 0        # duty-cycle counter for crawl pulses
-        # unwrap / velocity state
+        self.pulse_thrust = min(opts.tmax, max(1, getattr(opts, "pulse_thrust", 35)))
+        self.vrest = getattr(opts, "vrest", 150.0)          # deg/s below this == "at rest"
+        # FIXED short pulses: this motor has a ~140ms startup dead-time then fast accel, so any
+        # long/planned pulse over-drives. We fire a fixed short pulse, brake+coast to rest, measure,
+        # and repeat toward the target — bounded ~1-quantum overshoot instead of blind over-drive.
+        self.pulse_ticks = max(1, getattr(opts, "pulse_ticks", 8))
+        self.min_move = getattr(opts, "min_move", 4.0)       # deg; below this a pulse "didn't move"
+        self.boost_step = max(1, getattr(opts, "boost_step", 3))
+        self.max_boost = max(0, getattr(opts, "max_boost", 20))
+        self.max_pulses = max(1, getattr(opts, "max_pulses", 5))
+        self.last_quantum = 90.0    # deg moved by the last pulse (park within half of it)
+        # encoder / velocity state (interface the run loop + guards depend on)
         self.enc_sign = 1          # +1/-1: maps raw counts so +thrust => +measured motion
         self.prev_raw = None
         self.pos_deg = 0.0         # continuous position, zeroed at start
         self.vel = 0.0             # low-passed velocity (deg/s)
-        self.last_delta_counts = 0  # raw-count movement of the last accepted sample
+        self.last_delta_counts = 0
+        self.target = 0.0
+        self.holding = False       # True once the segment is parked within reach (run loop reads this)
+        self._reset_seg()
+
+    def _reset_seg(self):
+        self.phase = "settle"      # "settle" (brake/coast to rest, then decide) or "pulse" (driving)
+        self.pulse_dir = 0
+        self.ticks_left = 0
+        self.pos_pulse_start = 0.0
+        self.pending_learn = False
+        self.boost = 0             # extra pulse ticks added when a pulse didn't start the motor
+        self.pulses = 0            # pulses fired this segment (capped to avoid oscillation)
+        self.holding = False
 
     def set_target(self, deg):
         self.target = deg
-        self.integ = 0.0
-        self.prev_err = deg - self.pos_deg
-        self._coasting = False
-        self._crawl_ctr = 0
+        self._reset_seg()
 
     def update_encoder(self, raw, dt, suspect=False):
         """Unwrap 0-4095 -> continuous position + low-passed velocity.
@@ -323,82 +349,54 @@ class Cascade:
             self.vel += VEL_LP_ALPHA * (inst - self.vel)
         return "ok"
 
-    def _crawl(self, err):
-        """Duty-cycled floor pulse toward the target: one tmin pulse per crawl_period
-        ticks, coasting the rest, so net travel per cycle stays small and the rotor
-        can stop between pulses (M4)."""
-        self._crawl_ctr += 1
-        if self._crawl_ctr >= self.crawl_period:
-            self._crawl_ctr = 0
-            return math.copysign(self.tmin, err)
-        return 0.0
-
     def step(self, dt):
-        """Return (signed thrust command, velocity setpoint). Pre-choke; PosDrive
-        re-clamps to tmax.
+        """Fixed-pulse approach. Returns (signed thrust, diagnostic). PosDrive re-clamps to
+        tmax. The command is ALWAYS a short pulse toward the target or zero — never a reverse
+        brake of a spinning rotor.
 
-        Governing safety rule (M4): the ESC command is ONLY ever thrust toward the
-        target or zero — never a large reverse thrust used to brake a fast-spinning
-        rotor (that is the heat / loss-of-sync hazard).  Overshoot is bled off by
-        coasting, then nudged back with a gentle crawl once the rotor has slowed.
+        SETTLE: command 0 (brake_on_stop kills the coast) until at rest; measure the move,
+                park if within reach, else fire the next fixed short pulse toward the target.
+        PULSE:  drive pulse_ticks (+boost) toward the target, cutting the moment the rotor
+                reaches/passes it.  A short pulse => small bounded move (~one quantum), so a
+                large error is closed in a few clean steps with no blind over-drive.
         """
         err = self.target - self.pos_deg
-        derr = (err - self.prev_err) / dt if dt > 0 else 0.0
-        self.prev_err = err
+        av = abs(self.vel)
 
-        # outer: position -> velocity setpoint (magnitude usually < vfloor, i.e. below
-        # what the 6-step drive can sustain -> the loop lives in bang-bang crawl)
-        vel_sp = self.kp * err + self.kd * derr
-        vel_sp = max(-self.vmax, min(self.vmax, vel_sp))
+        if self.phase == "settle":
+            if av > self.vrest:
+                return 0.0, 0.0                      # still braking/coasting — wait for rest
+            # rotor at rest: assess the pulse that just finished
+            if self.pending_learn:
+                moved = abs(self.pos_deg - self.pos_pulse_start)
+                if moved >= self.min_move:
+                    self.last_quantum = 0.5 * self.last_quantum + 0.5 * moved
+                    self.boost = 0                   # it moved — reset the startup ramp
+                elif self.boost < self.max_boost:
+                    self.boost += self.boost_step    # motor didn't start — longer next pulse
+                self.pending_learn = False
+            # park if within reach, OR after max_pulses (accept the residual rather than
+            # hunt back-and-forth forever — the startup quantum is the hard 6-step floor).
+            reach = max(self.tol, 0.5 * self.last_quantum)
+            if abs(err) <= reach or self.pulses >= self.max_pulses:
+                self.holding = True
+                return 0.0, 0.0
+            self.holding = False
+            self.phase = "pulse"                     # fire one fixed short pulse toward target
+            self.pulse_dir = 1 if err > 0 else -1
+            self.ticks_left = self.pulse_ticks + self.boost
+            self.pos_pulse_start = self.pos_deg
+            self.pending_learn = True
+            self.pulses += 1
+            self.ticks_left -= 1
+            return self.pulse_thrust * self.pulse_dir, float(self.pulse_dir)
 
-        # --- hysteretic coast band: latch coasting inside tol, release only past
-        #     tol + crawl_hyst (wider than one crawl pulse) so we don't chatter ---
-        if self._coasting:
-            if abs(err) <= self.tol + self.crawl_hyst:
-                self.integ *= 0.5
-                self._crawl_ctr = 0
-                return 0.0, vel_sp
-            self._coasting = False
-        elif abs(err) <= self.tol:
-            self._coasting = True
-            self.integ *= 0.5
-            self._crawl_ctr = 0
-            return 0.0, vel_sp
-
-        toward = (self.vel * err) > 0                 # rotor heading toward target
-        slow = abs(self.vel) < 0.5 * self.vfloor      # slow enough to safely push
-
-        # Governing safety rule (M4): the ESC is ONLY ever commanded toward the target
-        # or zero — never a large reverse thrust to brake a fast rotor. Overshoot is
-        # bled off by coasting. Two coast cases keep the approach speed-capped so it
-        # decelerates into the band instead of blasting a fast move through the target:
-        #   - moving AWAY but still fast: coast down, never slam reverse;
-        #   - heading toward at/above the (outer-clamped) setpoint: stop adding energy
-        #     and let it free-wheel the last bit in.
-        if not toward and not slow:
-            self.integ *= 0.8
-            self._crawl_ctr = 0
-            return 0.0, vel_sp
-        if toward and self.vel != 0.0 and abs(self.vel) >= abs(vel_sp):
-            self.integ *= 0.8
-            self._crawl_ctr = 0
-            return 0.0, vel_sp
-
-        # need to add thrust TOWARD the target (rotor slow, or too slow toward it)
-        vel_err = vel_sp - self.vel
-        u = self.kpv * vel_err + self.ki * self.integ
-        if abs(u) < self.tmax or (vel_err > 0) != (u > 0):
-            self.integ += vel_err * dt
-            self.integ = max(-self._integ_max, min(self._integ_max, self.integ))
-            u = self.kpv * vel_err + self.ki * self.integ
-
-        if abs(u) < self.tmin:
-            u = self._crawl(err)                      # below floor -> duty-cycled crawl
-            self.integ *= 0.8
-        else:
-            self._crawl_ctr = 0
-            u = math.copysign(min(abs(u), self.tmax), err)  # force sign toward target
-        return u, vel_sp
+        # phase == "pulse": drive toward the target; stop the instant it reaches/passes it
+        if (err > 0) != (self.pulse_dir > 0) or self.ticks_left <= 0:
+            self.phase = "settle"
+            return 0.0, 0.0
+        self.ticks_left -= 1
+        return self.pulse_thrust * self.pulse_dir, float(self.pulse_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -671,10 +669,13 @@ def run_segments(drive: PosDrive, ctrl: Cascade, clock, writer, opts,
                          f"{ctrl.target:.3f}", f"{vel_sp:.2f}", sent])
 
         settled = seg.update(t, ctrl.pos_deg, ctrl.target, opts.tol, opts.settle_dwell)
-        if settled and not hold:
-            print(f"#   settled: settle_t={seg.settle_t:.2f}s "
-                  f"overshoot={seg.peak_overshoot:.1f}deg "
-                  f"limit-cycle_pk-pk~{seg.limit_cycle_amp():.1f}deg")
+        # a move segment ends when the mean is within tol (settled) OR the pulse-and-settle
+        # controller has parked as close as the 6-step floor allows (ctrl.holding).
+        if (settled or ctrl.holding) and not hold:
+            fin = ctrl.target - ctrl.pos_deg
+            tag = "settled" if settled else "parked (6-step floor limit — #3 sine needed for finer)"
+            print(f"#   {tag}: t={t:.2f}s final_err={fin:+.1f}deg "
+                  f"peak_overshoot={seg.peak_overshoot:.1f}deg")
             seg_i += 1
             if seg_i >= len(targets):
                 reason = "converged"
@@ -741,20 +742,26 @@ def add_common(p):
     p.add_argument("--esc-index", type=int, default=1, help="ESC index (default 1)")
     p.add_argument("--tol", type=float, default=12.0,
                    help="settle tolerance, deg (default 12 ~ achievable 6-step hold resolution)")
-    p.add_argument("--vmax", type=float, default=400.0, help="max velocity setpoint, deg/s (default 400)")
     p.add_argument("--tmax", type=int, default=300, help="thrust magnitude ceiling, 0..1000 (default 300)")
-    p.add_argument("--tmin", type=int, default=40, help="min effective thrust / crawl level (default 40)")
-    p.add_argument("--vfloor", type=float, default=1100.0,
-                   help="min sustainable speed, deg/s (~185 RPM 6-step floor); below it "
-                        "the loop bang-bang crawls and never reverse-brakes (default 1100)")
-    p.add_argument("--crawl-hyst", type=float, default=15.0,
-                   help="coast-band hysteresis beyond tol, deg (default 15; wider than one crawl pulse)")
-    p.add_argument("--crawl-period", type=int, default=4,
-                   help="ticks per crawl cycle: 1 pulse then coast the rest (default 4)")
-    p.add_argument("--kp", type=float, default=4.0, help="outer position P (deg/s per deg)")
-    p.add_argument("--kd", type=float, default=0.0, help="outer position D")
-    p.add_argument("--kpv", type=float, default=1.0, help="inner velocity P (thrust per deg/s)")
-    p.add_argument("--ki", type=float, default=1.2, help="inner velocity I")
+    p.add_argument("--tmin", type=int, default=40, help="min thrust the guards treat as 'driving' (default 40)")
+    # --- pulse-and-settle drive (built for the 6-step minimum-speed floor) ---
+    p.add_argument("--pulse-thrust", type=int, default=35,
+                   help="thrust magnitude of one pulse — keep low so the rotor spins up briefly "
+                        "then coasts (default 55; raise if the motor won't start)")
+    p.add_argument("--vrest", type=float, default=150.0,
+                   help="deg/s below which the rotor counts as 'at rest' between pulses (default 150)")
+    p.add_argument("--pulse-ticks", type=int, default=8,
+                   help="fixed pulse length, in 20ms ticks — the smaller, the finer the step (and the "
+                        "closer it can park), but too short won't clear the ~140ms startup dead-time (default 8)")
+    p.add_argument("--boost-step", type=int, default=3,
+                   help="extra ticks added to the next pulse when a pulse failed to start the motor (default 3)")
+    p.add_argument("--max-boost", type=int, default=20,
+                   help="cap on the startup-ramp boost, ticks (default 20)")
+    p.add_argument("--max-pulses", type=int, default=5,
+                   help="park after this many pulses in a segment even if outside tol — accept the "
+                        "residual instead of oscillating (the ~startup-quantum is the hard 6-step floor; default 5)")
+    p.add_argument("--min-move", type=float, default=4.0,
+                   help="deg; a pulse that moves less is treated as 'motor didn't start' -> longer next pulse")
     p.add_argument("--max-secs", type=float, default=30.0, help="runaway/time abort (default 30)")
     p.add_argument("--max-revs", type=float, default=20.0, help="runaway travel abort, revs (default 20)")
     p.add_argument("--vel-abort", type=float, default=12000.0, help="hard |vel| abort, deg/s (default 12000)")
@@ -796,14 +803,13 @@ def _validate(opts):
     # symmetric clamp max(-tmax, min(tmax, u)) and pin thrust to +tmax (m5).
     opts.tmax = abs(int(opts.tmax))
     opts.tmin = abs(int(opts.tmin))
-    for name in ("tmax", "tmin", "vmax", "vfloor", "vel_abort", "tol", "max_secs",
-                 "max_revs", "probe_secs", "probe_min_deg"):
+    opts.pulse_thrust = abs(int(opts.pulse_thrust))
+    for name in ("tmax", "tmin", "pulse_thrust", "vrest", "vel_abort", "tol",
+                 "max_secs", "max_revs", "probe_secs", "probe_min_deg"):
         if getattr(opts, name) <= 0:
             sys.exit(f"--{name.replace('_', '-')} must be > 0")
-    if opts.crawl_hyst < 0:
-        sys.exit("--crawl-hyst must be >= 0")
-    if opts.crawl_period < 1:
-        sys.exit("--crawl-period must be >= 1")
+    if opts.pulse_ticks < 1:
+        sys.exit("--pulse-ticks must be >= 1")
     if opts.tmin >= opts.tmax:
         sys.exit("--tmin must be < --tmax")
 

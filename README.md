@@ -111,44 +111,51 @@ generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/
 ## Position control (`host/posctl.py` + AS5600 encoder)
 
 Closed-loop **shaft-position** control: an **AS5600** magnetic encoder on the Pico's I2C0 feeds a
-host-side cascade controller (outer position → inner velocity → signed `thrust`). The Pico reads
-the encoder (`enc` command); the control loop runs on the PC.
+host-side **pulse-and-settle** controller. Because a 6-step/BEMF ESC can't creep (every start runs a
+BLHeli startup ramp that flings the rotor up to ~1-2 revs before it's controllable), servoing a
+velocity just slams and hunts. Instead posctl fires a **fixed short pulse of `thrust` toward the
+target**, lets `brake_on_stop` + coast bring the rotor to rest, measures, and repeats — capped so it
+parks rather than oscillating. The Pico reads the encoder (`enc`); the loop runs on the PC.
 
 **Wiring** (AS5600 → Pico): `SDA→GP16`, `SCL→GP17`, `VCC→3V3`, `GND→GND`, `DIR→GND` (I2C addr
 `0x36`). Check it first with `enc` — you want `md=1` (magnet detected), `ml=mh=0`, and `agc` mid-range.
 
-**ESC setup:** position control needs **reversible** drive, so set the ESC to 3D mode and use bidir
-(Bluejay) firmware:
+**ESC setup** — reversible + braking + a *gentle* startup (smaller startup ramp = smaller move
+quantum). A ready profile is in `host/profiles/posctl_930kv.yaml`:
 
 ```
-python host/esctool.py set 1 motor_direction=Bidirectional      # reversible thrust
-# (re-apply your tuned profile after any firmware flash — flashing resets the config page)
+python host/esctool.py apply 1 host/profiles/posctl_930kv.yaml    # 3D + brake_on_stop + gentle startup
+# or by hand:
+python host/esctool.py set 1 motor_direction=Bidirectional brake_on_stop=1 startup_power_max=18
+# (re-apply after any firmware flash — flashing resets the config page)
 ```
 
 **Usage:**
 
 ```
-python host/posctl.py move --deg 720                 # rotate to +720° from the current pose
+python host/posctl.py move --deg 720                 # rotate +720° from the current pose
 python host/posctl.py step --seq 360,-360,720        # relative moves, one after another
-python host/posctl.py hold --deg 0                   # actively hold a position
+python host/posctl.py hold --deg 0                   # hold a position
 python host/posctl.py move --deg 360 --dry-run       # simulated motor, no hardware (safe smoke test)
 ```
 
-Key flags: `--esc-index 1`, `--tol 12` (deg deadband), `--tmax 300` / `--tmin 40` (thrust limits),
-`--vmax 400` (deg/s cap), `--kp/--kd/--kpv/--ki` (gains), `--max-secs` / `--max-revs` / `--vel-abort`
-(runaway aborts), `--csv` (log to `host/reports/`). On start it **auto-calibrates direction** (a
-brief probe spin to learn whether `+thrust` increases or decreases the encoder count — no need to
-match wiring/DIR polarity); override with `--invert-encoder` / `--no-autocal`.
+Key flags: `--esc-index 1`, `--tol 15` (deg deadband), `--pulse-thrust 35` (per-motor: raise until it
+starts, lower to shrink the step / overshoot), `--pulse-ticks 8` (pulse length, 20 ms ticks),
+`--max-pulses 5` (park after this many pulses — accept the residual vs oscillate), `--tmax`,
+`--max-secs`/`--max-revs`/`--vel-abort` (runaway aborts), `--csv` (log to `host/reports/`). On start
+it **auto-calibrates direction** (a brief probe spin to learn whether `+thrust` increases or decreases
+the encoder count); override with `--invert-encoder` / `--no-autocal`.
 
 **Safety:** the loop keep-alives the ESC under the 500 ms deadman, guards the encoder unwrap, and
 **always disarms** on completion, abort, or Ctrl-C. It aborts + disarms on lost magnet, stuck/
 implausible encoder reads, over-velocity, wrong-way runaway, or the time/rev limits.
 
-> **6-step limitation (important).** On stock 6-step/BEMF firmware the motor can't rotate below
-> ~185 RPM, so it can't creep to a target: `hold` is excellent (friction holds the rotor, ~0.1°),
-> but a **`move` overshoots by ~2 revolutions** before settling within `--tol`. Precise low-speed
-> positioning needs an open-loop **sine drive mode** in the ESC firmware (the BlueGill #3 roadmap);
-> `posctl.py` is the instrument that quantifies this and will command that mode once it lands.
+> **6-step limitation (important).** The move quantum is ~one BLHeli startup ramp (tens to a few
+> hundred degrees, and variable), so posctl does clean, fast, **non-oscillating** LARGE moves
+> (≥ ~1 rev → within ~±35-50°) but **cannot position finely** (sub-~90°) and can't creep slowly.
+> True fine/slow positioning + active zero-speed holding need the ESC-side open-loop **sine drive
+> mode** (the BlueGill #3 roadmap); posctl will command that mode once it lands. For now it's the
+> best 6-step can do, and the instrument that quantified the limit.
 
 ## Wi-Fi web tool (SETUP mode)
 
