@@ -29,3 +29,7 @@ config.yaml
 
 # debug artifacts (local)
 debug/
+
+# generated autocal outputs
+host/reports/
+host/profiles/*_autocal.yaml

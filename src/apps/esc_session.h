@@ -161,19 +161,26 @@ inline int editConfig(uint8_t idx, const uint16_t* offs, const uint8_t* vals, in
 		if (page[offs[k]] != vals[k]) { page[offs[k]] = vals[k]; changed = true; }
 	}
 	if (!changed) return 0;
-	return runOp(Op::WRITEPAGE, PINS[idx]) ? 1 : -4;
+	int r = runOp(Op::WRITEPAGE, PINS[idx]) ? 1 : -4;
+	if (r == 1) infoKnown[idx] = false;   // config changed -> re-detect (direction) on next spinArm
+	return r;
 }
 
 // Raw flash primitives (for firmware flashing). Each requires idx connectable.
 inline bool erasePage (uint8_t idx, uint16_t addr) {
 	using namespace detail;
 	if (idx >= COUNT || !ensureConnected(idx)) return false;
-	flAddr = addr; return runOp(Op::ERASE, PINS[idx]);
+	flAddr = addr; bool ok = runOp(Op::ERASE, PINS[idx]);
+	if (ok) infoKnown[idx] = false;       // flashing -> firmware (bidir/normal) may change
+	return ok;
 }
 inline bool writeFlash(uint8_t idx, uint16_t addr, const uint8_t* data, uint16_t len) {
 	using namespace detail;
 	if (idx >= COUNT || len > sizeof(flBuf) || !ensureConnected(idx)) return false;
-	memcpy(flBuf, data, len); flAddr = addr; flLen = len; return runOp(Op::WRITEFLASH, PINS[idx]);
+	memcpy(flBuf, data, len); flAddr = addr; flLen = len;
+	bool ok = runOp(Op::WRITEFLASH, PINS[idx]);
+	if (ok) infoKnown[idx] = false;       // flashing -> firmware (bidir/normal) may change
+	return ok;
 }
 inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 	using namespace detail;

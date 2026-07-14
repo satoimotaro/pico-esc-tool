@@ -20,6 +20,23 @@
 #include <WebServer.h>
 #include "esc_session.h"
 #include "esc_flash.h"
+#include <LittleFS.h>
+#include <Wire.h>
+
+// ---- AS5600 magnetic encoder (I2C0, SDA=GP16 SCL=GP17, addr 0x36) — #4B position feedback ----
+// Read-only; independent of the ESC signal pins (GP10/GP11) and DShot PIO. Runs on core0.
+namespace enc {
+	static const uint8_t ADDR = 0x36;
+	static void begin() { Wire.setSDA(16); Wire.setSCL(17); Wire.begin(); Wire.setClock(400000); }
+	static bool rd(uint8_t reg, uint8_t* b, uint8_t n) {
+		Wire.beginTransmission(ADDR); Wire.write(reg);
+		if (Wire.endTransmission(false) != 0) return false;      // repeated-start
+		if ((uint8_t)Wire.requestFrom((int)ADDR, (int)n) != n) return false;
+		for (uint8_t i = 0; i < n; i++) b[i] = Wire.read();
+		return true;
+	}
+	static int u12(uint8_t reg) { uint8_t b[2]; if (!rd(reg, b, 2)) return -1; return ((b[0] & 0x0F) << 8) | b[1]; }
+}
 
 // Hardware config (pins, AP creds, DShot) lives in esc_config.h — the one place to edit.
 static const char* AP_SSID = ESC_AP_SSID;
@@ -68,29 +85,49 @@ label{display:block;margin:.3em 0}input[type=number]{width:6em}.esc{border:1px s
 <button onclick=scan()>Scan</button><button onclick=disc()>Disconnect</button>
 <button class=stop onclick=stopAll()>STOP ALL</button><span id=msg></span>
 <div id=list></div><div id=cfg></div>
-<div id=fw class=esc><h3>Flash firmware (.hex)</h3>
- <input type=file id=fwfile accept=.hex> ESC <select id=fwesc></select>
- <label style="display:inline"><input type=checkbox id=fwforce> force (skip compat guard)</label>
- <button onclick=flashFw()>Flash</button> <span id=fwmsg></span>
- <p style="color:#888;font-size:.85em">App-only + your firmware's default config; bootloader preserved. Get HEX: BLHeli-S (bitdump/BLHeli) or Bluejay (bird-sanctuary/bluejay), layout must match the ESC.</p></div>
+<div id=fw class=esc><h3>Firmware</h3>
+ <b>Library</b> (stored on the Pico) <button onclick=loadFwList()>refresh</button>
+ <div id=fwlib><i>scan first</i></div>
+ <div style="margin-top:.4em"><b>Add / one-off:</b>
+  <input type=file id=fwfile accept=.hex> name <input id=fwname size=8 placeholder=label>
+  ESC <select id=fwesc onchange=loadFwList()></select>
+  <label style="display:inline"><input type=checkbox id=fwforce> force</label>
+  <button onclick=saveFw()>Save to library</button>
+  <button onclick=flashFw()>Flash uploaded now</button> <span id=fwmsg></span></div>
+ <p style="color:#888;font-size:.85em">App-only + firmware defaults; bootloader preserved. Get HEX: BLHeli-S (bitdump/BLHeli) or Bluejay (bird-sanctuary/bluejay); layout must match the ESC. Uploaded files persist in the library.</p></div>
 <script>
 const g=id=>document.getElementById(id),msg=t=>g('msg').textContent=t;let tick=null;
 async function scan(){msg('scanning...');let d=await(await fetch('/api/scan')).json();
  g('list').innerHTML=d.map((e,i)=>e.present?`<div class=esc><b>ESC ${i}</b> pin ${e.pin} sig ${e.sig} layout ${e.layout} "${e.name}" fw ${e.fw}
    <button onclick=read(${i})>Edit</button><button onclick=spinUI(${i})>Spin test</button></div>`
    :`<div class=esc>ESC ${i}: none</div>`).join('');
- g('fwesc').innerHTML=d.map((e,i)=>e.present?`<option value=${i}>ESC ${i} (${e.layout})</option>`:'').join('');msg('');}
-async function flashFw(){let fm=t=>g('fwmsg').textContent=t;
- let f=g('fwfile').files[0]; if(!f){fm('pick a .hex first');return;}
- let i=g('fwesc').value; if(i==='')  {fm('scan for an ESC first');return;}
- let force=g('fwforce').checked?1:0, fd=new FormData(); fd.append('hex',f);
- fm('uploading...');
- let r=await(await fetch('/api/flash?i='+i+'&force='+force,{method:'POST',body:fd})).json();
- if(!r.ok){fm('error: '+(r.err||'?'));return;}
- let t=setInterval(async()=>{let s=await(await fetch('/api/flashstatus')).json();
+ g('fwesc').innerHTML=d.map((e,i)=>e.present?`<option value=${i} data-layout="${e.layout}">ESC ${i} (${e.layout})</option>`:'').join('');
+ loadFwList();msg('');}
+const fm=t=>g('fwmsg').textContent=t;
+function pollFlash(){let t=setInterval(async()=>{let s=await(await fetch('/api/flashstatus')).json();
   if(s.state=='run'||s.state=='start')fm(`flashing ${s.done}/${s.total}...`);
   else if(s.state=='ok'){clearInterval(t);fm('OK: '+s.msg);scan();}
   else if(s.state=='err'){clearInterval(t);fm('FAILED: '+s.msg);}},400);}
+function escLayout(){let o=g('fwesc').selectedOptions[0];return o?o.dataset.layout:'';}
+async function loadFwList(){let d=await(await fetch('/api/fwlist')).json();let cl=escLayout();
+ g('fwlib').innerHTML=d.length?d.map(f=>`<div>${f.name} <small>[${f.layout||'?'}]</small>
+   <button onclick="flashStored('${f.name}')">Flash to ESC ${g('fwesc').value}</button>
+   <button onclick="delFw('${f.name}')">del</button>${(f.layout&&f.layout!=cl)?' <small style=color:#c60>layout&ne;ESC</small>':''}</div>`).join('')
+  :'<i>empty &mdash; add a .hex below</i>';}
+async function saveFw(){let f=g('fwfile').files[0];if(!f){fm('pick a .hex');return;}
+ let name=g('fwname').value||f.name.replace(/\.hex$/i,'');let fd=new FormData();fd.append('hex',f);fm('saving...');
+ let r=await(await fetch('/api/fwsave?name='+encodeURIComponent(name),{method:'POST',body:fd})).json();
+ fm(r.ok?('saved '+r.name+' ['+r.layout+']'):('error: '+(r.err||'?')));loadFwList();}
+async function flashStored(name){let i=g('fwesc').value;if(i===''){fm('scan first');return;}
+ let force=g('fwforce').checked?1:0;
+ let r=await(await fetch('/api/flashstored?name='+encodeURIComponent(name)+'&i='+i+'&force='+force,{method:'POST'})).json();
+ if(!r.ok){fm('error: '+(r.err||'?'));return;}pollFlash();}
+async function delFw(name){await fetch('/api/fwdelete?name='+encodeURIComponent(name),{method:'POST'});loadFwList();}
+async function flashFw(){let f=g('fwfile').files[0];if(!f){fm('pick a .hex first');return;}
+ let i=g('fwesc').value;if(i===''){fm('scan for an ESC first');return;}
+ let force=g('fwforce').checked?1:0,fd=new FormData();fd.append('hex',f);fm('uploading...');
+ let r=await(await fetch('/api/flash?i='+i+'&force='+force,{method:'POST',body:fd})).json();
+ if(!r.ok){fm('error: '+(r.err||'?'));return;}pollFlash();}
 async function read(i){stopTick();let d=await(await fetch('/api/read?i='+i)).json();if(d.error){msg(d.error);return;}
  let s=d.settings;g('cfg').innerHTML=`<div class=esc><h3>ESC ${i} settings (fw ${d.fw})</h3>`
   +Object.keys(s).map(k=>`<label>${k} <input id=f_${k} type=number min=0 max=255 value="${s[k]}"></label>`).join('')
@@ -257,6 +294,71 @@ static void hFlashStatus() {
 	j += ",\"msg\":\""; j+=jesc(g_flMsg); j+="\"}"; server.send(200,"application/json",j);
 }
 
+// ---- On-device firmware library (LittleFS) -----------------------------------------------------
+// Upload a .hex once; it persists under /fw as <label>.hex (+ <label>.tag = its layout). The list
+// and "flash stored" reuse the SAME parse + flash state machine — only the source of g_hexBuf/g_img
+// changes (a stored file instead of a fresh upload). Nothing distributed in-repo; you supply hexes.
+static const char* FW_DIR = "/fw";
+static String fwSafe(const String& in) {                 // -> safe short filename [A-Za-z0-9._-], <=24
+	String o; for (uint16_t k=0; k<in.length() && o.length()<24; k++) {
+		char c=in[k]; o += (isalnum(c)||c=='.'||c=='_'||c=='-') ? c : '_';
+	}
+	return o.length() ? o : String("fw");
+}
+static String fwHex(const String& n){ return String(FW_DIR)+"/"+n+".hex"; }
+static String fwTag(const String& n){ return String(FW_DIR)+"/"+n+".tag"; }
+
+static void hFwSave() {   // POST /api/fwsave?name=<label>  (hex body via hFlashUpload); validate + store
+	if (g_hexOverflow) { server.send(200,"application/json","{\"ok\":false,\"err\":\"file too large\"}"); return; }
+	if (!g_hexFresh || g_hexLen == 0) { server.send(200,"application/json","{\"ok\":false,\"err\":\"no .hex uploaded\"}"); return; }
+	g_hexFresh = false;
+	String name = fwSafe(server.arg("name"));
+	const char* perr = nullptr;
+	if (!esc_flash::parseIntelHex(g_hexBuf, g_hexLen, g_img, &perr)) {
+		String j="{\"ok\":false,\"err\":\""; j+=jesc(perr); j+="\"}"; server.send(200,"application/json",j); return;
+	}
+	LittleFS.mkdir(FW_DIR);
+	File f = LittleFS.open(fwHex(name), "w");
+	if (!f) { server.send(200,"application/json","{\"ok\":false,\"err\":\"fs write failed\"}"); return; }
+	f.write((const uint8_t*)g_hexBuf, g_hexLen); f.close();
+	File t = LittleFS.open(fwTag(name), "w"); if (t) { t.print(g_img.fwLayoutTag); t.close(); }
+	String j="{\"ok\":true,\"name\":\""; j+=jesc(name.c_str()); j+="\",\"layout\":\""; j+=jesc(g_img.fwLayoutTag); j+="\"}";
+	server.send(200,"application/json",j);
+}
+static void hFwList() {   // GET /api/fwlist -> [{name,layout,size}]
+	String j = "["; bool first = true;
+	Dir dir = LittleFS.openDir(FW_DIR);
+	while (dir.next()) {
+		String fn = dir.fileName(); int sl = fn.lastIndexOf('/'); if (sl>=0) fn = fn.substring(sl+1);
+		if (!fn.endsWith(".hex")) continue;
+		String name = fn.substring(0, fn.length()-4), layout;
+		File t = LittleFS.open(fwTag(name), "r"); if (t) { layout = t.readString(); layout.trim(); t.close(); }
+		if (!first) j += ","; first = false;
+		j += "{\"name\":\""; j+=jesc(name.c_str()); j+="\",\"layout\":\""; j+=jesc(layout.c_str());
+		j += "\",\"size\":"; j+=(unsigned)dir.fileSize(); j+="}";
+	}
+	j += "]"; server.send(200,"application/json",j);
+}
+static void hFlashStored() {   // POST /api/flashstored?name=<label>&i=<idx>&force=<0|1>
+	if (g_fl == FL_RUN || g_fl == FL_START) { server.send(200,"application/json","{\"ok\":false,\"err\":\"busy\"}"); return; }
+	int i = server.arg("i").toInt(); g_flForce = server.arg("force") == "1";
+	if (i < 0 || i >= escs::COUNT) { server.send(200,"application/json","{\"ok\":false,\"err\":\"bad-index\"}"); return; }
+	File f = LittleFS.open(fwHex(fwSafe(server.arg("name"))), "r");
+	if (!f) { server.send(200,"application/json","{\"ok\":false,\"err\":\"not found\"}"); return; }
+	g_hexLen = f.read((uint8_t*)g_hexBuf, sizeof(g_hexBuf)); f.close();
+	const char* perr = nullptr;
+	if (!g_hexLen || !esc_flash::parseIntelHex(g_hexBuf, g_hexLen, g_img, &perr)) {
+		String j="{\"ok\":false,\"err\":\""; j+=jesc(g_hexLen?perr:"empty"); j+="\"}"; server.send(200,"application/json",j); return;
+	}
+	g_flIdx = (uint8_t)i; g_flMsg[0]=0; g_fl = FL_START;
+	server.send(200,"application/json","{\"ok\":true}");
+}
+static void hFwDelete() {   // POST /api/fwdelete?name=<label>
+	String n = fwSafe(server.arg("name"));
+	LittleFS.remove(fwHex(n)); LittleFS.remove(fwTag(n));
+	server.send(200,"application/json","{\"ok\":true}");
+}
+
 // ================= USB-serial API (always) =================
 static void handleSerial() {
 	static char line[600]; static uint16_t len = 0; static uint8_t flbuf[256];
@@ -270,6 +372,10 @@ static void handleSerial() {
 
 		if (!strcmp(cmd,"ping")) { Serial.println("id esc_tool v1"); Serial.println("ok"); }
 		else if (!strcmp(cmd,"pins")) { Serial.printf("pins %u", escs::COUNT); for(uint8_t i=0;i<escs::COUNT;i++)Serial.printf(" %u",escs::PINS[i]); Serial.println(); Serial.println("ok"); }
+		else if (!strcmp(cmd,"fwlist")) { Dir dir=LittleFS.openDir(FW_DIR); int n=0;   // list on-device firmware library
+			while(dir.next()){ String fn=dir.fileName(); int sl=fn.lastIndexOf('/'); if(sl>=0)fn=fn.substring(sl+1);
+				if(fn.endsWith(".hex")){ Serial.printf("fw| %s  %u bytes\n", fn.c_str(), (unsigned)dir.fileSize()); n++; } }
+			Serial.printf("fwlist %d\n", n); Serial.println("ok"); }
 		else if (!strcmp(cmd,"mode")) { char* a=strtok(nullptr," ");
 			if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
 			Serial.printf("mode %s (wifi %s)\n", mode==SETUP?"setup":"drive", wifiUp?"on":"off"); Serial.println("ok"); }
@@ -327,6 +433,19 @@ static void handleSerial() {
 			else if(!escs::spinArmed((uint8_t)i)) Serial.println("err not-armed");
 			else { escs::spinThrust((uint8_t)i,(int16_t)atoi(v)); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<escs::COUNT) escs::spinStop((uint8_t)i); Serial.println("ok"); }
+		else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
+			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
+			else if(!strcmp(v,"stop")){ analogWrite(escs::PINS[i],0); pinMode(escs::PINS[i],INPUT); Serial.println("ok pwm-stop (reboot to use DShot again)"); }
+			else { escs::spinStop((uint8_t)i); escs::release();          // free DShot + run the ESC app
+				int us=atoi(v); if(us<900)us=900; if(us>2100)us=2100;
+				analogWriteFreq(50); analogWriteRange(20000); analogWrite(escs::PINS[i],(uint32_t)us);   // 20000us period => value=us
+				Serial.printf("pwm|%d|%dus\n",i,us); Serial.println("ok"); } }
+		else if (!strcmp(cmd,"enc")) {   // AS5600 read: enc|raw|ang|deg|md|ml|mh|agc|mag  (err if no sensor)
+			uint8_t st=0,agc=0; enc::rd(0x0B,&st,1); enc::rd(0x1A,&agc,1);
+			int raw=enc::u12(0x0C), ang=enc::u12(0x0E), mag=enc::u12(0x1B);
+			if(raw<0) Serial.println("err no-encoder");
+			else { Serial.printf("enc|%d|%d|%.1f|%d|%d|%d|%d|%d\n", raw, ang, raw*360.0f/4096.0f,
+			                     (st>>5)&1,(st>>4)&1,(st>>3)&1, agc, mag); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
 			if(i<0||i>=escs::COUNT||!escs::spinTele((uint8_t)i,t)) Serial.println("err no-telem");
 			else { Serial.printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); Serial.println("ok"); } }
@@ -340,6 +459,9 @@ void setup() {
 	pinMode(ESC_MODE_PIN, INPUT_PULLUP);
 #endif
 	delay(50);
+	if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }   // firmware library store
+	enc::begin();                                                    // AS5600 encoder (I2C0, GP16/17)
+	LittleFS.mkdir("/fw");
 	server.on("/", hIndex);
 	server.on("/api/scan", hScan);
 	server.on("/api/read", hRead);
@@ -350,8 +472,12 @@ void setup() {
 	server.on("/api/disarm", HTTP_POST, hDisarm);
 	server.on("/api/spinstop", HTTP_POST, hSpinStop);
 	server.on("/api/tele", hTele);
-	server.on("/api/flash", HTTP_POST, hFlashStart, hFlashUpload);   // upload .hex then flash
+	server.on("/api/flash", HTTP_POST, hFlashStart, hFlashUpload);   // upload .hex then flash (one-off)
 	server.on("/api/flashstatus", hFlashStatus);
+	server.on("/api/fwsave", HTTP_POST, hFwSave, hFlashUpload);      // save uploaded .hex to the library
+	server.on("/api/fwlist", hFwList);                              // list stored firmware
+	server.on("/api/flashstored", HTTP_POST, hFlashStored);        // flash a stored firmware by name
+	server.on("/api/fwdelete", HTTP_POST, hFwDelete);
 #if ESC_MODE_PIN >= 0
 	setMode(digitalRead(ESC_MODE_PIN) == LOW ? DRIVE : SETUP);  // LOW=drive; unconnected(HIGH)=setup
 #else

@@ -116,6 +116,12 @@ Browser flashing is the same app-only, layout/MCU-guarded flow as the CLI (bootl
 firmware defaults applied); it runs page-by-page in the background with a progress readout. Pick the
 `.hex`, choose the ESC, and Flash (tick *force* to override the compat guard).
 
+**Firmware library.** An uploaded `.hex` can be **Saved to library** — it persists on the Pico's
+LittleFS partition (nothing is stored in this repo) and shows up in a list tagged by layout. From
+then on you just tap **Flash to ESC _n_** — no re-uploading, which is handy from a phone. The list
+flags entries whose layout doesn't match the selected ESC. (Set the partition size with
+`board_build.filesystem_size` in `platformio.ini`.)
+
 Wi-Fi is a **surface/bench** affordance — 2.4 GHz does not travel through water, so a deployed
 underwater craft is driven over the tether/host, not Wi-Fi. (Pico W only; radio and DShot both use
 PIO — validate the combination on the bench.)
