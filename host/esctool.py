@@ -45,10 +45,20 @@ FIELD_OFF = {
     "startup_power_min": 0x04, "startup_power_max": 0x07, "startup_beep": 0x05,
     "pwm_frequency": 0x0A, "beep_strength": 0x1B, "beacon_strength": 0x1C,
     "beacon_delay": 0x1D, "temperature_protection": 0x23,
-    "low_rpm_power_protection": 0x24, "brake_on_stop": 0x27,
+    "low_rpm_power_protection": 0x09, "brake_on_stop": 0x27,
+    # BlueGill-only params (appended after Bluejay's block; ignored by stock Bluejay).
+    # On a stock Bluejay ESC these slots read 0xFF ("off").
+    "comm_timing_angle": 0x2B, "max_erpm": 0x2C, "lowspeed_damping": 0x2D,
 }
 FIELD_ENUM = {"motor_direction": DIRECTION, "comm_timing": TIMING, "demag_compensation": DEMAG}
 NAME_OFF, NAME_LEN = 0x60, 16
+
+# BlueGill max_erpm (0x2C) is in units of 1000 eRPM. The firmware's 80000/N decode is
+# exact only for N <= 136 and the high-rpm path bypasses the governor above ~156k eRPM,
+# so the effective ceiling is <= 136k eRPM; values above that are clamped (with a warning).
+# Note: for all three BlueGill params a stored byte of 255 (0xFF) reads as OFF on firmware,
+# so 255 is not a usable magnitude.
+MAX_ERPM_UNITS = 136
 
 
 def encode_value(field: str, value) -> int:
@@ -59,7 +69,12 @@ def encode_value(field: str, value) -> int:
         if value.lower() not in rev:
             raise ValueError(f"{field}: '{value}' not in {list(enum.values())}")
         return rev[value.lower()]
-    return int(value) & 0xFF
+    v = int(value)
+    if field == "max_erpm" and v > MAX_ERPM_UNITS:
+        print(f"warning: max_erpm={v} exceeds effective ceiling {MAX_ERPM_UNITS} "
+              f"(~{MAX_ERPM_UNITS}k eRPM); clamping to {MAX_ERPM_UNITS}", file=sys.stderr)
+        v = MAX_ERPM_UNITS
+    return v & 0xFF
 
 
 def encode_overrides(settings: dict) -> list[tuple[int, int]]:
@@ -161,8 +176,12 @@ def decode(raw: bytes) -> dict:
             "beacon_strength": g(0x1C),
             "beacon_delay": g(0x1D),
             "temperature_protection": g(0x23),
-            "low_rpm_power_protection": g(0x24),
+            "low_rpm_power_protection": g(0x09),
             "brake_on_stop": g(0x27),
+            # BlueGill params: raw ints (0 = off/default, 0xFF = off on stock Bluejay).
+            "comm_timing_angle": g(0x2B),
+            "max_erpm": g(0x2C),
+            "lowspeed_damping": g(0x2D),
         },
         "raw_hex": raw.hex().upper(),
     }

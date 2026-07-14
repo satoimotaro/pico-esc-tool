@@ -315,6 +315,7 @@ static void handleSerial() {
 			else { escs::Drive md=escs::Drive::AUTO;
 				if(m&&!strcmp(m,"normal"))md=escs::Drive::NORMAL; else if(m&&!strcmp(m,"bidir"))md=escs::Drive::BIDIR;
 				escs::spinArm((uint8_t)i,md);
+				if(!escs::spinInitOk((uint8_t)i)) { Serial.println("err dshot-init-failed (no free PIO SM?)"); continue; }
 				Serial.printf("arming ~3s (mode %s, %s)\n",escs::spinMode((uint8_t)i),escs::spinReversible((uint8_t)i)?"reversible":"one-way");
 				Serial.println("ok"); } }
 		else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");  // 0..2000

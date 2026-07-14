@@ -75,6 +75,7 @@ namespace detail {
 	static uint32_t          drvArmStart[COUNT] = { 0 };
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
+	static bool              drvInitFail[COUNT] = { false }; // last spinArm's DShot PIO init failed
 	static Telem             drvTele[COUNT];
 	// last-known firmware/direction, cached by connect()/scan() so spinArm() needn't re-enter the BL
 	static bool              infoBidir[COUNT] = { false };  // firmware supports bidir DShot (Bluejay/JESC)
@@ -212,6 +213,8 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
 	drvFree(idx);
 	if (mode == Drive::BIDIR) { drvB[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD); drvEdt[idx] = 20; }
 	else                      { drvN[idx] = new DShotX4(PINS[idx], 1, DSHOT_KBAUD);   drvEdt[idx] = 0;  }
+	drvInitFail[idx] = drvB[idx] ? drvB[idx]->initError() : drvN[idx]->initError();
+	if (drvInitFail[idx]) drvFree(idx);   // PIO init failed (e.g. no free SM) — don't report a false ARMED
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
 }
 inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
@@ -234,12 +237,14 @@ inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::drvRev[i
 inline const char* spinMode(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return "none";
+	if (drvInitFail[idx]) return "init-fail";
 	return drvB[idx] ? "bidir" : (drvN[idx] ? "normal" : "none");
 }
+inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::drvInitFail[idx]; }
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
-	drvTarget[idx] = 0; drvArmed[idx] = false; drvFree(idx);
+	drvTarget[idx] = 0; drvArmed[idx] = false; drvInitFail[idx] = false; drvFree(idx);
 }
 inline void spinDisarm(uint8_t idx) { spinStop(idx); }
 inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
