@@ -38,6 +38,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import esctool  # noqa: E402  (esctool lives next to this file)
 from esctool import encode_overrides, overrides_str  # noqa: E402
+# SimEscHost (the dry-run motor model), the Tele sample, and ARM_WAIT now live in the package;
+# re-exported here so `from autocal import SimEscHost, ARM_WAIT` (posctl.py) keeps working.
+from pico_esc.sim import SimEscHost  # noqa: E402,F401
+from pico_esc.types import Tele  # noqa: E402,F401
+from pico_esc.drive import ARM_WAIT  # noqa: E402,F401
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, "profiles")
@@ -50,123 +55,13 @@ class CalibrationError(RuntimeError):
 
 KA = 0.2                    # keep-alive throttle resend period (< 500 ms deadman)
 TELE_EVERY = 3              # poll telemetry every N keep-alive ticks (~0.6 s)
-ARM_WAIT = 4.0             # seconds to wait after arming before driving
 SPIN_RPM = 100             # mechanical rpm above which the motor is "spinning"
 CONFIRM_THROTTLE = 800     # max_throttle above this needs interactive confirmation
 
 
 # ---------------------------------------------------------------------------
-# Simulated ESC host (for --dry-run): a toy motor model, no hardware/serial.
-# ---------------------------------------------------------------------------
-class SimEscHost:
-    """Mimics EscHost.cmd() with a toy brushless motor model.
-
-    Cold start needs throttle >= a start threshold (eased by startup_power_max);
-    once spinning it stalls below a sustain threshold; RPM is ~linear in throttle
-    with additive noise whose amplitude grows as comm_timing / demag move away
-    from their sweet spot (so tune-smooth has a real minimum to find).
-    """
-
-    def __init__(self, seed=1234):
-        import random
-        self.armed = False
-        self.spinning = False
-        self.rpm = 0.0
-        self._rng = random.Random(seed)    # seeded -> reproducible --dry-run
-        self.cfg = {                       # decoded config the model reacts to
-            "startup_power_min": 40, "startup_power_max": 60,
-            "comm_timing": 3, "demag_compensation": 1,
-        }
-        self._off = {v: k for k, v in esctool.FIELD_OFF.items()}
-
-    # --- model tuning constants ---
-    START_BASE = 95.0          # cold-start throttle at nominal startup_power_max
-    STALL_THR = 42.0           # below this while spinning -> stall
-    RPM_GAIN = 12.0            # mechanical rpm per throttle unit above offset
-    RPM_OFFSET = 30.0
-    BASE_NOISE = 6.0
-
-    def _start_threshold(self):
-        # More startup power -> easier (lower) cold-start throttle.
-        return self.START_BASE - (self.cfg["startup_power_max"] - 60) * 0.4 \
-                                - (self.cfg["startup_power_min"] - 40) * 0.2
-
-    def _noise_amp(self):
-        dt = abs(self.cfg["comm_timing"] - 3) + abs(self.cfg["demag_compensation"] - 1)
-        return self.BASE_NOISE * (1.0 + 1.6 * dt)
-
-    def _target_rpm(self, thr):
-        return max(0.0, (thr - self.RPM_OFFSET) * self.RPM_GAIN)
-
-    def _tick(self, thr):
-        if not self.armed or thr <= 0:
-            self.spinning, self.rpm = False, 0.0
-            return
-        if not self.spinning:
-            if thr >= self._start_threshold():
-                self.spinning = True
-            else:
-                self.rpm = 0.0
-                return
-        if thr < self.STALL_THR:                # lost sync at too-low throttle
-            self.spinning, self.rpm = False, 0.0
-            return
-        target = self._target_rpm(thr)
-        self.rpm += (target - self.rpm) * 0.5   # first-order ramp
-        self.rpm = max(0.0, self.rpm + self._rng.gauss(0.0, self._noise_amp()))
-
-    def _apply_editpage(self, arg):
-        # arg = "IDX off:byte,off:byte,..." -> update decoded cfg
-        parts = arg.split()
-        pairs = parts[1] if len(parts) > 1 else ""
-        for tok in pairs.split(","):
-            if ":" not in tok:
-                continue
-            off, byte = (int(x, 16) for x in tok.split(":"))
-            name = self._off.get(off)
-            if name in self.cfg:
-                self.cfg[name] = byte
-
-    def cmd(self, line, timeout=30.0):
-        line = line.strip()
-        head, _, arg = line.partition(" ")
-        if head == "throttle":
-            thr = int(arg.split()[-1])
-            self._tick(thr)
-            return []
-        if head == "tele":
-            rpm = int(self.rpm)
-            return [f"tele|{rpm}|12.30|0|25|0"]     # rpm|volts|amps|temp|stress
-        if head == "arm":
-            self.armed, self.spinning, self.rpm = True, False, 0.0
-            return ["armed|bidir"]
-        if head in ("disarm", "run", "disconnect"):
-            self.armed = self.spinning = False
-            self.rpm = 0.0
-            return []
-        if head == "editpage":
-            self._apply_editpage(arg)
-            return ["applied"]
-        if head == "scan":
-            return ["esc|1|1|1|E8B2|8|#A_H_30#|Sim|0.21"]
-        if head in ("enter", "read"):
-            return []
-        return []
-
-    def close(self):
-        pass
-
-
-# ---------------------------------------------------------------------------
 # Drive session: keep-alive throttle + telemetry, always disarms.
 # ---------------------------------------------------------------------------
-class Tele:
-    __slots__ = ("rpm", "volts", "amps", "temp", "stress")
-
-    def __init__(self, rpm, volts, amps, temp, stress):
-        self.rpm, self.volts, self.amps, self.temp, self.stress = rpm, volts, amps, temp, stress
-
-
 class DriveSession:
     """Wraps a host (EscHost or SimEscHost) with the drive_hold.py keep-alive pattern.
 

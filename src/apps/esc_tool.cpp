@@ -18,25 +18,17 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include "esc_session.h"
+#include "esc.h"
+#include "as5600.h"
 #include "esc_flash.h"
 #include <LittleFS.h>
 #include <Wire.h>
 
-// ---- AS5600 magnetic encoder (I2C0, SDA=GP16 SCL=GP17, addr 0x36) — #4B position feedback ----
-// Read-only; independent of the ESC signal pins (GP10/GP11) and DShot PIO. Runs on core0.
-namespace enc {
-	static const uint8_t ADDR = 0x36;
-	static void begin() { Wire.setSDA(16); Wire.setSCL(17); Wire.begin(); Wire.setClock(400000); }
-	static bool rd(uint8_t reg, uint8_t* b, uint8_t n) {
-		Wire.beginTransmission(ADDR); Wire.write(reg);
-		if (Wire.endTransmission(false) != 0) return false;      // repeated-start
-		if ((uint8_t)Wire.requestFrom((int)ADDR, (int)n) != n) return false;
-		for (uint8_t i = 0; i < n; i++) b[i] = Wire.read();
-		return true;
-	}
-	static int u12(uint8_t reg) { uint8_t b[2]; if (!rd(reg, b, 2)) return -1; return ((b[0] & 0x0F) << 8) | b[1]; }
-}
+// ---- facades: the AS5600 encoder + the ESC engine (bootloader/config/flash/drive) ----
+// Both transports (this serial parser + the Wi-Fi handlers) drive these two instances only;
+// enc is the AS5600 read facade (as5600.h) and esc is the thin facade over escs:: (esc.h).
+static As5600 enc;   // AS5600 magnetic encoder (I2C0, SDA=GP16 SCL=GP17, addr 0x36), core0
+static Esc    esc;   // ESC bootloader/config/flash + DShot drive facade over the escs:: engine
 
 // Hardware config (pins, AP creds, DShot) lives in esc_config.h — the one place to edit.
 static const char* AP_SSID = ESC_AP_SSID;
@@ -79,7 +71,7 @@ static void wifiStop()  { if (!wifiUp) return; server.stop(); WiFi.softAPdisconn
 static void setMode(Mode m) {
 	mode = m;
 	if (m == SETUP) wifiStart();
-	else { escs::spinStopAll(); wifiStop(); }     // DRIVE: stop spins on entry, radio off
+	else { esc.spinStopAll(); wifiStop(); }     // DRIVE: stop spins on entry, radio off
 }
 
 // ================= Web UI (SETUP mode) =================
@@ -165,9 +157,9 @@ scan();
 static void hIndex() { server.send_P(200, "text/html", INDEX_HTML); }
 static void hScan() {
 	String j = "[";
-	for (uint8_t i = 0; i < escs::COUNT; i++) {
-		escs::Info in; bool ok = escs::scan(i, in); if (i) j += ",";
-		if (!ok) { j += "{\"present\":false,\"pin\":"; j += escs::PINS[i]; j += "}"; }
+	for (uint8_t i = 0; i < Esc::COUNT; i++) {
+		Esc::Info in; bool ok = esc.scan(i, in); if (i) j += ",";
+		if (!ok) { j += "{\"present\":false,\"pin\":"; j += Esc::pin(i); j += "}"; }
 		else { char sg[8]; snprintf(sg,sizeof(sg),"%04X",in.sig);
 			j += "{\"present\":true,\"pin\":"; j += in.pin; j += ",\"sig\":\""; j += sg;
 			j += "\",\"layout\":\""; j += jesc(in.layout); j += "\",\"name\":\""; j += jesc(in.name);
@@ -177,7 +169,7 @@ static void hScan() {
 }
 static void hRead() {
 	int i = server.arg("i").toInt(); uint8_t cfg[esc_setup::kEepromLen];
-	if (i<0||i>=escs::COUNT||!escs::readConfig((uint8_t)i,cfg)) { server.send(200,"application/json","{\"error\":\"no-connect\"}"); return; }
+	if (i<0||i>=Esc::COUNT||!esc.readConfig((uint8_t)i,cfg)) { server.send(200,"application/json","{\"error\":\"no-connect\"}"); return; }
 	esc_setup::Settings s; esc_setup::decode(cfg, esc_setup::kEepromLen, s);
 	String j = "{\"name\":\""; j += jesc(s.name); j += "\",\"fw\":\""; j += s.mainRevision; j += "."; j += s.subRevision; j += "\",\"settings\":{";
 	for (int k=0;k<NFIELD;k++){ if(k)j+=","; j+="\""; j+=FIELDS[k].name; j+="\":"; j+=cfg[FIELDS[k].off]; }
@@ -185,37 +177,37 @@ static void hRead() {
 }
 static void hSet() {
 	int i = server.arg("i").toInt();
-	if (i<0||i>=escs::COUNT) { server.send(200,"application/json","{\"error\":\"bad-index\"}"); return; }
+	if (i<0||i>=Esc::COUNT) { server.send(200,"application/json","{\"error\":\"bad-index\"}"); return; }
 	uint16_t offs[NFIELD]; uint8_t vals[NFIELD]; int n=0;
 	for (int k=0;k<NFIELD;k++) if (server.hasArg(FIELDS[k].name)) { offs[n]=FIELDS[k].off; vals[n]=(uint8_t)server.arg(FIELDS[k].name).toInt(); n++; }
 	if (!n) { server.send(200,"application/json","{\"error\":\"no-fields\"}"); return; }
-	bool ch=false; int r = escs::editConfig((uint8_t)i, offs, vals, n, ch);
+	bool ch=false; int r = esc.editConfig((uint8_t)i, offs, vals, n, ch);
 	server.send(200, "application/json", r<0 ? "{\"error\":\"write-failed\"}" : (ch?"{\"result\":\"written\"}":"{\"result\":\"unchanged\"}"));
 }
-static void hRun()      { escs::release(); server.send(200,"application/json","{\"result\":\"restarted\"}"); }
+static void hRun()      { esc.release(); server.send(200,"application/json","{\"result\":\"restarted\"}"); }
 static void hArm()      { int i=server.arg("i").toInt();
-	if (i<0||i>=escs::COUNT) { server.send(200,"application/json","{\"ok\":false}"); return; }
-	escs::Drive m = escs::Drive::AUTO; String md = server.arg("mode");
-	if (md=="normal") m=escs::Drive::NORMAL; else if (md=="bidir") m=escs::Drive::BIDIR;
-	escs::spinArm((uint8_t)i, m);
-	String j="{\"ok\":true,\"mode\":\""; j+=escs::spinMode((uint8_t)i);
-	j+="\",\"rev\":"; j+=escs::spinReversible((uint8_t)i)?"true":"false"; j+="}";
+	if (i<0||i>=Esc::COUNT) { server.send(200,"application/json","{\"ok\":false}"); return; }
+	Esc::Drive m = Esc::Drive::AUTO; String md = server.arg("mode");
+	if (md=="normal") m=Esc::Drive::NORMAL; else if (md=="bidir") m=Esc::Drive::BIDIR;
+	esc.spinArm((uint8_t)i, m);
+	String j="{\"ok\":true,\"mode\":\""; j+=esc.spinMode((uint8_t)i);
+	j+="\",\"rev\":"; j+=esc.spinReversible((uint8_t)i)?"true":"false"; j+="}";
 	server.send(200,"application/json",j); }
 static void hSpin()     { int i=server.arg("i").toInt(); int v=server.arg("v").toInt();   // armed only
-	if (i>=0&&i<escs::COUNT) {                                       // reversible ESC => v is signed thrust
-		if (escs::spinReversible((uint8_t)i)) escs::spinThrust((uint8_t)i,(int16_t)v);
-		else                                  escs::spinThrottle((uint8_t)i,(uint16_t)v);
+	if (i>=0&&i<Esc::COUNT) {                                       // reversible ESC => v is signed thrust
+		if (esc.spinReversible((uint8_t)i)) esc.spinThrust((uint8_t)i,(int16_t)v);
+		else                                  esc.spinThrottle((uint8_t)i,(uint16_t)v);
 	}
 	server.send(200,"application/json","{\"ok\":true}"); }
-static void hDisarm()   { int i=server.arg("i").toInt(); if(i>=0&&i<escs::COUNT) escs::spinStop((uint8_t)i); server.send(200,"application/json","{\"ok\":true}"); }
-static void hSpinStop() { escs::spinStopAll(); server.send(200,"application/json","{\"ok\":true}"); }
+static void hDisarm()   { int i=server.arg("i").toInt(); if(i>=0&&i<Esc::COUNT) esc.spinStop((uint8_t)i); server.send(200,"application/json","{\"ok\":true}"); }
+static void hSpinStop() { esc.spinStopAll(); server.send(200,"application/json","{\"ok\":true}"); }
 static void hTele() {
 	int i=server.arg("i").toInt();
-	if (i<0||i>=escs::COUNT) { server.send(200,"application/json","{\"ok\":false}"); return; }
-	String j = "{\"ok\":true,\"armed\":"; j += escs::spinArmed((uint8_t)i)?"true":"false";
-	j += ",\"mode\":\""; j += escs::spinMode((uint8_t)i); j += "\",\"rev\":"; j += escs::spinReversible((uint8_t)i)?"true":"false";
-	escs::Telem t;
-	if (escs::spinTele((uint8_t)i,t)) {                              // telemetry only on bidir DShot
+	if (i<0||i>=Esc::COUNT) { server.send(200,"application/json","{\"ok\":false}"); return; }
+	String j = "{\"ok\":true,\"armed\":"; j += esc.spinArmed((uint8_t)i)?"true":"false";
+	j += ",\"mode\":\""; j += esc.spinMode((uint8_t)i); j += "\",\"rev\":"; j += esc.spinReversible((uint8_t)i)?"true":"false";
+	Esc::Telem t;
+	if (esc.spinTele((uint8_t)i,t)) {                              // telemetry only on bidir DShot
 		j += ",\"tele\":true,\"rpm\":"; j+=t.rpm; j+=",\"volt\":"; j+=t.voltage; j+=",\"amp\":"; j+=t.current;
 		j += ",\"temp\":"; j+=t.tempC; j+=",\"stress\":"; j+=t.stress;
 	} else j += ",\"tele\":false";
@@ -237,7 +229,7 @@ static uint16_t g_flPage = 0, g_flLast = 0, g_flTotal = 0, g_flDone = 0;
 static char     g_flMsg[140] = {0};
 
 static void flStop(FlashState s, const char* msg) {
-	escs::release(); strncpy(g_flMsg, msg, sizeof(g_flMsg)-1); g_flMsg[sizeof(g_flMsg)-1]=0; g_fl = s;
+	esc.release(); strncpy(g_flMsg, msg, sizeof(g_flMsg)-1); g_flMsg[sizeof(g_flMsg)-1]=0; g_fl = s;
 }
 // Flash one 512B page from the parsed image: app pages from data[], the eeprom page (0x1A00) from
 // identity[] (= the firmware's default config). Erase, write 2x256, read back, compare.
@@ -247,18 +239,18 @@ static bool flPage(uint8_t idx, uint16_t p) {
 	if (p < kAppEnd) { for (uint16_t k=0;k<kPageSize;k++) if (g_img.used[p+k]) { buf[k]=g_img.data[p+k]; any=true; } }
 	else { if (!g_img.hasIdentity) return true; memcpy(buf, g_img.identity, kPageSize); any = true; }
 	if (!any) return true;
-	if (!escs::erasePage(idx, p)) return false;
-	if (!escs::writeFlash(idx, p, buf, 256) || !escs::writeFlash(idx, (uint16_t)(p+256), buf+256, 256)) return false;
+	if (!esc.erasePage(idx, p)) return false;
+	if (!esc.writeFlash(idx, p, buf, 256) || !esc.writeFlash(idx, (uint16_t)(p+256), buf+256, 256)) return false;
 	uint8_t rb[kPageSize];
-	if (!escs::readFlash(idx, p, rb, 256) || !escs::readFlash(idx, (uint16_t)(p+256), rb+256, 256)) return false;
+	if (!esc.readFlash(idx, p, rb, 256) || !esc.readFlash(idx, (uint16_t)(p+256), rb+256, 256)) return false;
 	return memcmp(rb, buf, kPageSize) == 0;
 }
 static void flashStep() {   // advance the flash job one step; called from loop()
 	using namespace esc_flash;
 	if (g_fl == FL_START) {
-		escs::spinStopAll();
-		escs::Info in;
-		if (!escs::connect(g_flIdx, in)) { flStop(FL_ERR, "could not connect to ESC"); return; }
+		esc.spinStopAll();
+		Esc::Info in;
+		if (!esc.connect(g_flIdx, in)) { flStop(FL_ERR, "could not connect to ESC"); return; }
 		Compat c = checkCompatibility(in.sig, in.layout, g_img);
 		if (!c.ok && !g_flForce) { flStop(FL_ERR, c.detail); return; }
 		g_flPage  = (uint16_t)((g_img.minAddr / kPageSize) * kPageSize);
@@ -283,7 +275,7 @@ static void hFlashUpload() {                          // receives the multipart 
 static void hFlashStart() {                           // POST /api/flash?i=<idx>&force=<0|1> (after upload)
 	if (g_fl == FL_RUN || g_fl == FL_START) { server.send(200,"application/json","{\"ok\":false,\"err\":\"busy\"}"); return; }
 	int i = server.arg("i").toInt(); g_flForce = server.arg("force") == "1";
-	if (i < 0 || i >= escs::COUNT) { server.send(200,"application/json","{\"ok\":false,\"err\":\"bad-index\"}"); return; }
+	if (i < 0 || i >= Esc::COUNT) { server.send(200,"application/json","{\"ok\":false,\"err\":\"bad-index\"}"); return; }
 	if (g_hexOverflow) { server.send(200,"application/json","{\"ok\":false,\"err\":\"file too large\"}"); return; }
 	if (!g_hexFresh || g_hexLen == 0) { server.send(200,"application/json","{\"ok\":false,\"err\":\"no .hex uploaded\"}"); return; }
 	g_hexFresh = false;
@@ -348,7 +340,7 @@ static void hFwList() {   // GET /api/fwlist -> [{name,layout,size}]
 static void hFlashStored() {   // POST /api/flashstored?name=<label>&i=<idx>&force=<0|1>
 	if (g_fl == FL_RUN || g_fl == FL_START) { server.send(200,"application/json","{\"ok\":false,\"err\":\"busy\"}"); return; }
 	int i = server.arg("i").toInt(); g_flForce = server.arg("force") == "1";
-	if (i < 0 || i >= escs::COUNT) { server.send(200,"application/json","{\"ok\":false,\"err\":\"bad-index\"}"); return; }
+	if (i < 0 || i >= Esc::COUNT) { server.send(200,"application/json","{\"ok\":false,\"err\":\"bad-index\"}"); return; }
 	File f = LittleFS.open(fwHex(fwSafe(server.arg("name"))), "r");
 	if (!f) { server.send(200,"application/json","{\"ok\":false,\"err\":\"not found\"}"); return; }
 	g_hexLen = f.read((uint8_t*)g_hexBuf, sizeof(g_hexBuf)); f.close();
@@ -377,7 +369,7 @@ static void handleSerial() {
 		auto argi = []() { char* a=strtok(nullptr," "); return a?atoi(a):-1; };
 
 		if (!strcmp(cmd,"ping")) { Serial.println("id esc_tool v1"); Serial.println("ok"); }
-		else if (!strcmp(cmd,"pins")) { Serial.printf("pins %u", escs::COUNT); for(uint8_t i=0;i<escs::COUNT;i++)Serial.printf(" %u",escs::PINS[i]); Serial.println(); Serial.println("ok"); }
+		else if (!strcmp(cmd,"pins")) { Serial.printf("pins %u", Esc::COUNT); for(uint8_t i=0;i<Esc::COUNT;i++)Serial.printf(" %u",Esc::pin(i)); Serial.println(); Serial.println("ok"); }
 		else if (!strcmp(cmd,"fwlist")) { Dir dir=LittleFS.openDir(FW_DIR); int n=0;   // list on-device firmware library
 			while(dir.next()){ String fn=dir.fileName(); int sl=fn.lastIndexOf('/'); if(sl>=0)fn=fn.substring(sl+1);
 				if(fn.endsWith(".hex")){ Serial.printf("fw| %s  %u bytes\n", fn.c_str(), (unsigned)dir.fileSize()); n++; } }
@@ -385,75 +377,75 @@ static void handleSerial() {
 		else if (!strcmp(cmd,"mode")) { char* a=strtok(nullptr," ");
 			if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
 			Serial.printf("mode %s (wifi %s)\n", mode==SETUP?"setup":"drive", wifiUp?"on":"off"); Serial.println("ok"); }
-		else if (!strcmp(cmd,"scan")) { for(uint8_t i=0;i<escs::COUNT;i++){ escs::Info in;
-			if(!escs::scan(i,in)) Serial.printf("esc|%u|%u|0\n",i,escs::PINS[i]);
+		else if (!strcmp(cmd,"scan")) { for(uint8_t i=0;i<Esc::COUNT;i++){ Esc::Info in;
+			if(!esc.scan(i,in)) Serial.printf("esc|%u|%u|0\n",i,Esc::pin(i));
 			else Serial.printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } Serial.println("ok"); }
 		else if (!strcmp(cmd,"read")) { int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
-			if(i<0||i>=escs::COUNT) Serial.println("err bad-index");
-			else if(!escs::readConfig((uint8_t)i,cfg)) Serial.println("err no-connect");
+			if(i<0||i>=Esc::COUNT) Serial.println("err bad-index");
+			else if(!esc.readConfig((uint8_t)i,cfg)) Serial.println("err no-connect");
 			else { Serial.print("cfg|"); printHex(cfg,esc_setup::kEepromLen); Serial.println(); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"enter")) { int i=argi(); escs::Info in;
-			if(i<0||i>=escs::COUNT) Serial.println("err bad-index");
-			else if(!escs::connect((uint8_t)i,in)) Serial.println("err no-connect");
+		else if (!strcmp(cmd,"enter")) { int i=argi(); Esc::Info in;
+			if(i<0||i>=Esc::COUNT) Serial.println("err bad-index");
+			else if(!esc.connect((uint8_t)i,in)) Serial.println("err no-connect");
 			else { Serial.printf("dev|%04X|%u|%u\n",in.sig,in.bootVer,in.bootPages); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"run")||!strcmp(cmd,"disconnect")) { escs::release(); Serial.println("ok"); }
+		else if (!strcmp(cmd,"run")||!strcmp(cmd,"disconnect")) { esc.release(); Serial.println("ok"); }
 		else if (!strcmp(cmd,"editpage")) { int i=argi(); char* ovr=strtok(nullptr," ");
-			if(i<0||i>=escs::COUNT||!ovr){ Serial.println("err bad-args"); continue; }
+			if(i<0||i>=Esc::COUNT||!ovr){ Serial.println("err bad-args"); continue; }
 			uint16_t offs[160]; uint8_t vals[160]; int n=0; bool bad=false;
 			for(char* tok=strtok(ovr,",");tok&&!bad;tok=strtok(nullptr,",")){ char* col=strchr(tok,':');
 				if(!col||n>=160){bad=true;break;} *col='\0'; long off=strtol(tok,nullptr,16),val=strtol(col+1,nullptr,16);
 				if(off<0||off>=(long)esc_setup::kPageLen||val<0||val>255){bad=true;break;} offs[n]=(uint16_t)off; vals[n]=(uint8_t)val; n++; }
 			if(bad){ Serial.println("err bad-override"); continue; }
-			bool ch=false; int r=escs::editConfig((uint8_t)i,offs,vals,n,ch);
+			bool ch=false; int r=esc.editConfig((uint8_t)i,offs,vals,n,ch);
 			if(r==-1)Serial.println("err no-connect"); else if(r==-2)Serial.println("err read-failed");
 			else if(r==-3)Serial.println("err bad-override"); else if(r==-4)Serial.println("err write-verify-failed");
 			else if(r==0){ Serial.println("unchanged (flash write skipped)"); Serial.println("ok"); }
 			else { Serial.printf("edited %d byte(s)\n",n); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"erase")) { int i=argi(); char* ad=strtok(nullptr," ");
-			if(i<0||i>=escs::COUNT||!ad) Serial.println("err bad-args");
-			else Serial.println(escs::erasePage((uint8_t)i,(uint16_t)strtol(ad,nullptr,16))?"ok":"err erase-failed"); }
+			if(i<0||i>=Esc::COUNT||!ad) Serial.println("err bad-args");
+			else Serial.println(esc.erasePage((uint8_t)i,(uint16_t)strtol(ad,nullptr,16))?"ok":"err erase-failed"); }
 		else if (!strcmp(cmd,"writeflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* hx=strtok(nullptr," ");
-			if(i<0||i>=escs::COUNT||!ad||!hx){ Serial.println("err bad-args"); continue; }
+			if(i<0||i>=Esc::COUNT||!ad||!hx){ Serial.println("err bad-args"); continue; }
 			int n=parseHex(hx,flbuf,sizeof(flbuf));
 			if(n<=0)Serial.println("err bad-hex");
-			else Serial.println(escs::writeFlash((uint8_t)i,(uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)n)?"ok":"err write-failed"); }
+			else Serial.println(esc.writeFlash((uint8_t)i,(uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)n)?"ok":"err write-failed"); }
 		else if (!strcmp(cmd,"readflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* ln=strtok(nullptr," ");
 			int rl=ln?atoi(ln):-1;
-			if(i<0||i>=escs::COUNT||!ad||rl<1||rl>(int)sizeof(flbuf)) Serial.println("err bad-args");
-			else if(!escs::readFlash((uint8_t)i,(uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) Serial.println("err read-failed");
+			if(i<0||i>=Esc::COUNT||!ad||rl<1||rl>(int)sizeof(flbuf)) Serial.println("err bad-args");
+			else if(!esc.readFlash((uint8_t)i,(uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) Serial.println("err read-failed");
 			else { Serial.print("data|"); printHex(flbuf,rl); Serial.println(); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"arm")) { int i=argi(); char* m=strtok(nullptr," ");   // arm <i> [normal|bidir]
-			if(i<0||i>=escs::COUNT) Serial.println("err bad-index");
-			else { escs::Drive md=escs::Drive::AUTO;
-				if(m&&!strcmp(m,"normal"))md=escs::Drive::NORMAL; else if(m&&!strcmp(m,"bidir"))md=escs::Drive::BIDIR;
-				escs::spinArm((uint8_t)i,md);
-				if(!escs::spinInitOk((uint8_t)i)) { Serial.println("err dshot-init-failed (no free PIO SM?)"); continue; }
-				Serial.printf("arming ~3s (mode %s, %s)\n",escs::spinMode((uint8_t)i),escs::spinReversible((uint8_t)i)?"reversible":"one-way");
+			if(i<0||i>=Esc::COUNT) Serial.println("err bad-index");
+			else { Esc::Drive md=Esc::Drive::AUTO;
+				if(m&&!strcmp(m,"normal"))md=Esc::Drive::NORMAL; else if(m&&!strcmp(m,"bidir"))md=Esc::Drive::BIDIR;
+				esc.spinArm((uint8_t)i,md);
+				if(!esc.spinInitOk((uint8_t)i)) { Serial.println("err dshot-init-failed (no free PIO SM?)"); continue; }
+				Serial.printf("arming ~3s (mode %s, %s)\n",esc.spinMode((uint8_t)i),esc.spinReversible((uint8_t)i)?"reversible":"one-way");
 				Serial.println("ok"); } }
 		else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");  // 0..2000
-			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
-			else if(!escs::spinArmed((uint8_t)i)) Serial.println("err not-armed");
-			else { escs::spinThrottle((uint8_t)i,(uint16_t)atoi(v)); Serial.println("ok"); } }
+			if(i<0||i>=Esc::COUNT||!v) Serial.println("err bad-args");
+			else if(!esc.spinArmed((uint8_t)i)) Serial.println("err not-armed");
+			else { esc.spinThrottle((uint8_t)i,(uint16_t)atoi(v)); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D)
-			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
-			else if(!escs::spinArmed((uint8_t)i)) Serial.println("err not-armed");
-			else { escs::spinThrust((uint8_t)i,(int16_t)atoi(v)); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<escs::COUNT) escs::spinStop((uint8_t)i); Serial.println("ok"); }
+			if(i<0||i>=Esc::COUNT||!v) Serial.println("err bad-args");
+			else if(!esc.spinArmed((uint8_t)i)) Serial.println("err not-armed");
+			else { esc.spinThrust((uint8_t)i,(int16_t)atoi(v)); Serial.println("ok"); } }
+		else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) esc.spinStopAll(); else if(i<Esc::COUNT) esc.spinStop((uint8_t)i); Serial.println("ok"); }
 		else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
-			if(i<0||i>=escs::COUNT||!v) Serial.println("err bad-args");
-			else if(!strcmp(v,"stop")){ analogWrite(escs::PINS[i],0); pinMode(escs::PINS[i],INPUT); Serial.println("ok pwm-stop (reboot to use DShot again)"); }
-			else { escs::spinStop((uint8_t)i); escs::release();          // free DShot + run the ESC app
+			if(i<0||i>=Esc::COUNT||!v) Serial.println("err bad-args");
+			else if(!strcmp(v,"stop")){ analogWrite(Esc::pin(i),0); pinMode(Esc::pin(i),INPUT); Serial.println("ok pwm-stop (reboot to use DShot again)"); }
+			else { esc.spinStop((uint8_t)i); esc.release();          // free DShot + run the ESC app
 				int us=atoi(v); if(us<900)us=900; if(us>2100)us=2100;
-				analogWriteFreq(50); analogWriteRange(20000); analogWrite(escs::PINS[i],(uint32_t)us);   // 20000us period => value=us
+				analogWriteFreq(50); analogWriteRange(20000); analogWrite(Esc::pin(i),(uint32_t)us);   // 20000us period => value=us
 				Serial.printf("pwm|%d|%dus\n",i,us); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"enc")) {   // AS5600 read: enc|raw|ang|deg|md|ml|mh|agc|mag  (err if no sensor)
-			uint8_t st=0,agc=0; enc::rd(0x0B,&st,1); enc::rd(0x1A,&agc,1);
-			int raw=enc::u12(0x0C), ang=enc::u12(0x0E), mag=enc::u12(0x1B);
+			uint8_t st=0,agc=0; enc.rd(0x0B,&st,1); enc.rd(0x1A,&agc,1);
+			int raw=enc.u12(0x0C), ang=enc.u12(0x0E), mag=enc.u12(0x1B);
 			if(raw<0) Serial.println("err no-encoder");
 			else { Serial.printf("enc|%d|%d|%.1f|%d|%d|%d|%d|%d\n", raw, ang, raw*360.0f/4096.0f,
 			                     (st>>5)&1,(st>>4)&1,(st>>3)&1, agc, mag); Serial.println("ok"); } }
-		else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
-			if(i<0||i>=escs::COUNT||!escs::spinTele((uint8_t)i,t)) Serial.println("err no-telem");
+		else if (!strcmp(cmd,"tele")) { int i=argi(); Esc::Telem t;
+			if(i<0||i>=Esc::COUNT||!esc.spinTele((uint8_t)i,t)) Serial.println("err no-telem");
 			else { Serial.printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); Serial.println("ok"); } }
 		else Serial.println("err unknown-cmd");
 	}
@@ -466,7 +458,7 @@ void setup() {
 #endif
 	delay(50);
 	if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }   // firmware library store
-	enc::begin();                                                    // AS5600 encoder (I2C0, GP16/17)
+	enc.begin();                                                    // AS5600 encoder (I2C0, GP16/17)
 	LittleFS.mkdir("/fw");
 	server.on("/", hIndex);
 	server.on("/api/scan", hScan);
@@ -493,8 +485,8 @@ void setup() {
 void loop() {
 	handleSerial();
 	if (g_fl == FL_START || g_fl == FL_RUN) flashStep();   // flashing: one page per loop (no spin)
-	else escs::spinPoll();
+	else esc.spinPoll();
 	if (wifiUp) server.handleClient();
 }
 void setup1() {}
-void loop1()  { escs::core1Poll(); }
+void loop1()  { esc.core1Poll(); }

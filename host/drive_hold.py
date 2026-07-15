@@ -2,8 +2,8 @@
 # Low-speed characterization with a KEEP-ALIVE hold: repeat throttle every 200ms to feed the
 # firmware's 500ms deadman, so the motor gets SUSTAINED power (needed to complete startup + run).
 # Reuses esctool.py EscHost. ALWAYS disarms on exit.
-import sys, time
-sys.path.insert(0, "/home/satoimo/UWR_ESC_ws/pico-esc-tool/host")
+import sys, time, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from esctool import EscHost, find_pico
 
 IDX = 1
