@@ -498,60 +498,58 @@ def calibrate_direction(drive: PosDrive, clock, opts, baseline_raw):
     -1 if negative.  Aborts if the motor did not move at all even at the ramp cap.
 
     RAMPS the probe thrust from --tmin up to min(--tmax, PROBE_MAX_THRUST) in PROBE_STEP
-    increments, stopping the instant it sees >= --probe-min-deg of net travel. A cogging
-    low-KV motor needs more than a fixed creep thrust to BREAK AWAY from its detent, and
-    that break-away level depends on sine_hold_amp / sine_amp_max — so a fixed probe is
-    unreliable (it can read 0 even though the motor is fine). Bounded in both thrust and
-    time; the caller disarms on any raised abort.
+    steps and takes the sign of the net travel only AFTER a clear confirm arc
+    (>= --probe-confirm-deg). A strongly-cogging motor's first few degrees can settle EITHER
+    way as it snaps to the nearest cog, so a tiny --probe-min-deg break-away is NOT a reliable
+    direction (it flipped +/- run-to-run on the 12N14P). Requiring a >>cog-pitch arc before
+    deciding makes the sign robust. Bounded in thrust and time; caller disarms on any abort.
     """
     start = max(opts.tmin, 30)
     cap = min(int(opts.tmax), max(start, PROBE_MAX_THRUST))
-    levels = []
-    lvl = start
-    while lvl < cap:
-        levels.append(lvl)
-        lvl = min(cap, lvl + PROBE_STEP)
-    levels.append(cap)
+    confirm = max(float(opts.probe_min_deg), float(opts.probe_confirm_deg))
     ticks_per = max(1, round(opts.probe_secs / DT))
     prev = baseline_raw
     net_deg = 0.0
     fails = 0
-    used = start
-    for probe_thrust in levels:
-        used = probe_thrust
-        moved = False
-        for _ in range(ticks_per):
-            tick_start = clock.now()
-            enc = _read_valid_enc(drive)
-            if enc is None:
-                fails += 1
-                drive.send_thrust(0)
-                if fails >= ENC_FAIL_MAX:
-                    raise Aborted("direction calibration failed: encoder unreadable during probe")
-                _pace(clock, tick_start)
-                continue
-            delta = ((enc.raw - prev + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
-            prev = enc.raw
-            if abs(delta) <= DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2):   # ignore implausible jumps
-                net_deg += delta * 360.0 / COUNTS_PER_REV
-            if abs(net_deg) >= opts.probe_min_deg:                       # break-away detected
-                moved = True
-                break
-            drive.send_thrust(probe_thrust)                             # keep-alive forward probe
+    probe_thrust = start
+    # bound total time: one probe_secs window per ramp level, plus a couple spare
+    max_ticks = ticks_per * (int((cap - start) / PROBE_STEP) + 3)
+    level_ticks = 0
+    for _ in range(max_ticks):
+        tick_start = clock.now()
+        enc = _read_valid_enc(drive)
+        if enc is None:
+            fails += 1
+            drive.send_thrust(0)
+            if fails >= ENC_FAIL_MAX:
+                raise Aborted("direction calibration failed: encoder unreadable during probe")
             _pace(clock, tick_start)
-        if moved:
+            continue
+        delta = ((enc.raw - prev + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
+        prev = enc.raw
+        if abs(delta) <= DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2):       # ignore implausible jumps
+            net_deg += delta * 360.0 / COUNTS_PER_REV
+        if abs(net_deg) >= confirm:                                      # clear arc -> sign trusted
             break
+        # this level's window elapsed without a confirmed arc -> step the thrust up
+        level_ticks += 1
+        if level_ticks >= ticks_per and probe_thrust < cap:
+            probe_thrust = min(cap, probe_thrust + PROBE_STEP)
+            level_ticks = 0
+            net_deg = 0.0                                               # re-measure the arc cleanly at the new level
+        drive.send_thrust(probe_thrust)                                 # keep-alive forward probe
+        _pace(clock, tick_start)
     drive.send_thrust(0)
 
-    if abs(net_deg) < opts.probe_min_deg:
-        raise Aborted(f"direction calibration failed: motor did not break away even at thrust "
-                      f"{used} (|Δ|={abs(net_deg):.1f}° < {opts.probe_min_deg}°). Raise "
-                      f"sine_hold_amp/sine_amp_max (more low-speed torque) or --tmax, check "
-                      f"power/wiring, or pass --invert-encoder if you already know the direction.")
+    if abs(net_deg) < confirm:
+        raise Aborted(f"direction calibration failed: motor did not rotate a clear arc "
+                      f"(|Δ|={abs(net_deg):.1f}° < {confirm:.0f}° even at thrust {probe_thrust}). "
+                      f"Raise sine_hold_amp/sine_amp_max or --tmax, check power/wiring, or pass "
+                      f"--invert-encoder / --no-autocal if you already know the direction.")
     enc_sign = 1 if net_deg > 0 else -1
     arrow = "+encoder" if enc_sign > 0 else "-encoder (inverted)"
     print(f"# direction cal: +thrust -> {arrow}; enc_sign={enc_sign} "
-          f"(broke away at thrust {used}, Δ={net_deg:+.1f}°)")
+          f"(rotated {net_deg:+.0f}° at thrust {probe_thrust})")
     return enc_sign
 
 
@@ -835,7 +833,11 @@ def add_common(p):
     p.add_argument("--probe-secs", type=float, default=0.5,
                    help="direction-cal forward-probe duration, s (default 0.5)")
     p.add_argument("--probe-min-deg", type=float, default=3.0,
-                   help="min encoder travel during probe to accept a direction, deg (default 3)")
+                   help="min encoder travel to accept the motor broke away, deg (default 3)")
+    p.add_argument("--probe-confirm-deg", type=float, default=30.0,
+                   help="clear rotation arc required before trusting the direction SIGN, deg "
+                        "(default 30; must exceed the cog pitch ~8.6 deg so cog-settling can't "
+                        "flip the sign)")
     p.add_argument("--port", help="serial port (default: auto-detect)")
     p.add_argument("--csv", help="CSV output path (default: auto-named in host/reports/)")
     p.add_argument("--dry-run", action="store_true", help="run against the simulated ESC (no hardware)")
