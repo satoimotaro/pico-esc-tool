@@ -111,23 +111,28 @@ generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/
 ## Position control (`host/posctl.py` + AS5600 encoder)
 
 Closed-loop **shaft-position** control: an **AS5600** magnetic encoder on the Pico's I2C0 feeds a
-host-side **pulse-and-settle** controller. Because a 6-step/BEMF ESC can't creep (every start runs a
-BLHeli startup ramp that flings the rotor up to ~1-2 revs before it's controllable), servoing a
-velocity just slams and hunts. Instead posctl fires a **fixed short pulse of `thrust` toward the
-target**, lets `brake_on_stop` + coast bring the rotor to rest, measures, and repeats — capped so it
-parks rather than oscillating. The Pico reads the encoder (`enc`); the loop runs on the PC.
+host-side **cascade PID velocity servo**. It targets BlueGill **S1 forced-commutation stepper mode**
+(`Pgm_Sine_Mode`), which lets the ESC creep smoothly far below the old ~185 RPM 6-step floor and
+**hold with detent torque at thrust 0** — so a real velocity servo works. An outer position PID sets
+a velocity setpoint; an inner law turns that into signed `thrust` (Kff feedforward from the firmware
+full scale + Ki trim); inside tolerance and slow, thrust drops to 0 and the ESC holds. The Pico reads
+the encoder (`enc`); the loop runs on the PC.
+
+**Requires S1 sine mode:** on stock 6-step firmware the rotor can't creep or hold, so the servo only
+works with the ESC in Bidirectional mode with `sine_mode` enabled. Use the sine profile below.
 
 **Wiring** (AS5600 → Pico): `SDA→GP16`, `SCL→GP17`, `VCC→3V3`, `GND→GND`, `DIR→GND` (I2C addr
 `0x36`). Check it first with `enc` — you want `md=1` (magnet detected), `ml=mh=0`, and `agc` mid-range.
 
-**ESC setup** — reversible + braking + a *gentle* startup (smaller startup ramp = smaller move
-quantum). A ready profile is in `host/profiles/posctl_930kv.yaml`:
+**ESC setup** — Bidirectional + braking + S1 sine mode + temperature protection. A ready profile is
+in `host/profiles/posctl_930kv_sine.yaml` (enables `sine_mode` and `temperature_protection`):
 
 ```
-python host/esctool.py apply 1 host/profiles/posctl_930kv.yaml    # 3D + brake_on_stop + gentle startup
+python host/esctool.py apply 1 host/profiles/posctl_930kv_sine.yaml   # 3D + brake + S1 sine + temp-prot
 # or by hand:
-python host/esctool.py set 1 motor_direction=Bidirectional brake_on_stop=1 startup_power_max=18
+python host/esctool.py set 1 motor_direction=Bidirectional brake_on_stop=1 temperature_protection=1 sine_mode=1
 # (re-apply after any firmware flash — flashing resets the config page)
+# (posctl_930kv.yaml, without sine, is only for the retired 6-step pulse-and-settle mode)
 ```
 
 **Usage:**
@@ -139,23 +144,27 @@ python host/posctl.py hold --deg 0                   # hold a position
 python host/posctl.py move --deg 360 --dry-run       # simulated motor, no hardware (safe smoke test)
 ```
 
-Key flags: `--esc-index 1`, `--tol 15` (deg deadband), `--pulse-thrust 35` (per-motor: raise until it
-starts, lower to shrink the step / overshoot), `--pulse-ticks 8` (pulse length, 20 ms ticks),
-`--max-pulses 5` (park after this many pulses — accept the residual vs oscillate), `--tmax`,
-`--max-secs`/`--max-revs`/`--vel-abort` (runaway aborts), `--csv` (log to `host/reports/`). On start
-it **auto-calibrates direction** (a brief probe spin to learn whether `+thrust` increases or decreases
-the encoder count); override with `--invert-encoder` / `--no-autocal`.
+posctl is a **cascade PID velocity servo** built for BlueGill **S1 forced-commutation stepper mode**
+(flash `host/profiles/posctl_930kv_sine.yaml` first — it enables `sine_mode` and temperature
+protection). Outer position PID → velocity setpoint → inner thrust (Kff feedforward + Ki trim);
+inside tolerance and slow, thrust drops to 0 and the ESC **holds** on its detent.
+
+Key flags: `--esc-index 1`, `--tol 6` (deg; ~one stepper detent), `--kp`/`--kd`/`--ki` (cascade
+gains), `--kff 0.47` (thrust per deg/s — firmware full scale, from `sine_drive_model.py`),
+`--vmax 400` (velocity clamp, deg/s), `--tmax`, `--max-secs`/`--max-revs`/`--vel-abort` (runaway
+aborts), `--csv` (log to `host/reports/`). On start it **auto-calibrates direction** (a brief probe
+spin to learn whether `+thrust` increases or decreases the encoder count); override with
+`--invert-encoder` / `--no-autocal`.
 
 **Safety:** the loop keep-alives the ESC under the 500 ms deadman, guards the encoder unwrap, and
 **always disarms** on completion, abort, or Ctrl-C. It aborts + disarms on lost magnet, stuck/
-implausible encoder reads, over-velocity, wrong-way runaway, or the time/rev limits.
+implausible encoder reads (expected-vs-measured stall), over-velocity, wrong-way runaway, or the
+time/rev limits.
 
-> **6-step limitation (important).** The move quantum is ~one BLHeli startup ramp (tens to a few
-> hundred degrees, and variable), so posctl does clean, fast, **non-oscillating** LARGE moves
-> (≥ ~1 rev → within ~±35-50°) but **cannot position finely** (sub-~90°) and can't creep slowly.
-> True fine/slow positioning + active zero-speed holding need the ESC-side open-loop **sine drive
-> mode** (the BlueGill #3 roadmap); posctl will command that mode once it lands. For now it's the
-> best 6-step can do, and the instrument that quantified the limit.
+> **Requires S1 sine mode.** On stock 6-step firmware the rotor can't creep or hold, so this
+> velocity servo only works with BlueGill S1 forced-commutation stepper mode enabled on the ESC.
+> Hold resolution is ~one stepper detent (12N14P ⇒ ~8.6°); finer needs S2 microstepping. All S1
+> firmware is bench-pending.
 
 ## Wi-Fi web tool (SETUP mode)
 

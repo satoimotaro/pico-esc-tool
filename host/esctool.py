@@ -49,6 +49,8 @@ FIELD_OFF = {
     # BlueGill-only params (appended after Bluejay's block; ignored by stock Bluejay).
     # On a stock Bluejay ESC these slots read 0xFF ("off").
     "comm_timing_angle": 0x2B, "max_erpm": 0x2C, "lowspeed_damping": 0x2D,
+    # BlueGill S1 forced-commutation stepper mode (0xFF = off/default on stock/older fw).
+    "sine_mode": 0x2E, "sine_hold_amp": 0x2F, "sine_amp_max": 0x30, "sine_ramp": 0x31,
 }
 FIELD_ENUM = {"motor_direction": DIRECTION, "comm_timing": TIMING, "demag_compensation": DEMAG}
 NAME_OFF, NAME_LEN = 0x60, 16
@@ -182,6 +184,11 @@ def decode(raw: bytes) -> dict:
             "comm_timing_angle": g(0x2B),
             "max_erpm": g(0x2C),
             "lowspeed_damping": g(0x2D),
+            # BlueGill S1 forced-commutation stepper mode (0xFF = off/default).
+            "sine_mode": g(0x2E),
+            "sine_hold_amp": g(0x2F),
+            "sine_amp_max": g(0x30),
+            "sine_ramp": g(0x31),
         },
         "raw_hex": raw.hex().upper(),
     }

@@ -64,6 +64,10 @@ static const Field FIELDS[] = {
 	{ "startup_beep",0x05 },{ "beep_strength",0x1B },{ "beacon_strength",0x1C },
 	{ "beacon_delay",0x1D },{ "temperature_protection",0x23 },
 	{ "low_rpm_power_protection",0x24 },{ "brake_on_stop",0x27 },
+	// BlueGill S1 forced-commutation stepper params (0xFF = off/default on stock/older fw).
+	{ "sine_mode",0x2E },{ "sine_hold_amp",0x2F },{ "sine_amp_max",0x30 },{ "sine_ramp",0x31 },
+	// NOTE (pre-existing, do NOT fix here): this array lists low_rpm_power_protection at
+	// 0x24 while host/esctool.py uses 0x09 for the same field, and it omits B1's 0x2B-0x2D.
 };
 static const int NFIELD = sizeof(FIELDS) / sizeof(FIELDS[0]);
 

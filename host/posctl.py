@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 satoimotaro
-"""posctl — host-side position controller for the RP2040 esc_tool protocol.
+"""posctl — host-side position servo for the RP2040 esc_tool protocol.
 
 Closes a position loop around the integrated AS5600 encoder by driving the ESC over the
-existing signed `thrust` command — NO firmware changes.
+existing signed `thrust` command. Intended for BlueGill **S1 forced-commutation stepper
+mode** (Pgm_Sine_Mode=1): the ESC then creeps smoothly far below the old ~185 RPM 6-step
+floor and, at thrust 0, HOLDS with detent torque — so a true velocity servo works.
 
-PULSE-AND-SETTLE (not a velocity servo): a 6-step/BEMF ESC cannot creep — every start
-runs a BLHeli startup ramp that flings the rotor up to ~1-2 revs before it is controllable,
-and it can't hold a sub-floor speed. So servoing a velocity just yields slam-overshoot-
-reverse-hunt. Instead this fires a FIXED SHORT pulse of thrust toward the target, lets
-`brake_on_stop` + coast bring the rotor to rest, MEASURES, and repeats — capped at
---max-pulses so it parks (accepts the residual) instead of oscillating. The command is
-always a pulse toward the target or zero — never a reverse brake of a spinning rotor.
+CASCADE PID: an outer position PID turns position error into a velocity setpoint
+(vel_sp = clamp(Kp·err − Kd·vel, ±vmax)); an inner law turns that into signed thrust
+(thrust = Kff·vel_sp + Ki·∫(vel_sp − vel), anti-windup, clamped ±tmax). Kff is the
+firmware full-scale (thrust→eRPM) computed in tools/sim/sine_drive_model.py. Inside
+tolerance AND slow, thrust drops to 0 and the ESC HOLDS — no pulsing, no bang-bang.
 
-HARD 6-STEP LIMIT (bench-measured): the move quantum is ~one startup ramp (tens to a few
-hundred degrees, and variable), so this does clean, fast, non-oscillating LARGE moves
-(≥ ~1 rev: ~±35-50°) but CANNOT position finely (sub-~90°). True fine/slow positioning
-needs the ESC-side open-loop sine mode (#3). Requires ESC in Bidirectional (3D) mode with
-brake_on_stop=1; a gentle startup_power shrinks the quantum.
+Requires the ESC in Bidirectional (3D) mode with S1 sine mode enabled
+(host/profiles/posctl_930kv_sine.yaml). Achievable hold resolution is ~one stepper detent
+(12N14P ⇒ ~8.6°); use --tol ~6°. Finer needs S2 microstepping, not tuning.
 
 Keep-alive: one `enc` + one `thrust` per ~20 ms tick (50 Hz), well under the firmware's
 500 ms spin deadman. Safety: --max-secs / --max-revs / --vel-abort aborts, encoder magnet-
-health + unwrap-fault + stuck-encoder + wrong-way guards, and on EVERY exit path (normal,
-error, SIGINT/SIGTERM) it triple-sends `thrust 0` then `disarm`.
+health + unwrap-fault + expected-vs-measured stall + wrong-way guards, and on EVERY exit
+path (normal, error, SIGINT/SIGTERM) it triple-sends `thrust 0` then `disarm`.
 
-  python posctl.py move --deg 720 --dry-run
-  python posctl.py step --seq 360,-360,720 --dry-run
+  python posctl.py move --deg 90 --dry-run
+  python posctl.py step --seq 90,-90,360 --dry-run
   python posctl.py hold --deg 0 --dry-run
 """
 from __future__ import annotations
@@ -57,10 +55,25 @@ ENC_FAIL_MAX = 8                  # consecutive enc failures/faults -> abort
 MEAN_WIN = 0.30                   # s, sliding window for the settle-mean test
 FAULT_DT_MULT = 3.0               # measured dt > this*DT -> tick's enc delta is suspect
 DELTA_FAULT_FRAC = 0.9            # |delta| > this*(half rev) -> implausible unwrap, reject
-STALL_TICKS = 25                  # ticks commanding thrust w/ no motion -> abort (~0.5 s)
-STALL_COUNTS = 3                  # |raw delta| below this (counts) == "rotor not moving"
 WRONGWAY_TICKS = 12               # push-follow ticks where motion opposes thrust -> abort
 WRONGWAY_MIN_DPOS = 5.0           # deg; per-tick motion below this is ignored (noise)
+
+# Firmware S1 full-scale: mechanical RPM at |thrust|=1000. This is the PLANT GAIN the
+# feedforward (--kff) inverts, so it is tied to the firmware fixed-point constants:
+#   eRPM      = Rcp * (1<<SINE_RCP_SHIFT) * (F_TIMER2/SINE_TICK_T2) / 65536 * (60/6)
+#   mech RPM  = eRPM / POLE_PAIRS,   Rcp ≈ 2.047 * thrust  (bidir DShot mapping)
+# with the ESC-firmware asm EQUs SINE_TICK_T2=4000, SINE_RCP_SHIFT=3, Timer2=4 MHz,
+# POLE_PAIRS=7 => 356.97 mech RPM / kff 0.4669. Printed by
+# ESC-firmware/tools/sim/sine_drive_model.py (stepper section) — keep these in sync if
+# either the asm EQUs or the sim change (the startup note below flags a mismatch).
+FULLSCALE_RPM = 357.0
+KFF_COMPUTED = 1000.0 / (FULLSCALE_RPM * 6.0)   # thrust per deg/s implied by FULLSCALE_RPM (~0.467)
+# Stall watchdog re-tuned for creep: a PID legitimately commands tiny sustained thrust at
+# low speed, so a fixed counts-per-tick floor false-trips. Instead compare measured motion
+# against the motion the commanded thrust SHOULD have produced (stepper: no floor).
+STALL_TICKS = 40                  # ticks of powered-but-not-moving -> abort (~0.8 s)
+STALL_MOVE_FRAC = 0.25            # measured < this * expected motion == "not moving"
+STALL_MIN_EXPECTED = 2.0          # counts/tick of expected motion below which we don't judge
 
 
 # ---------------------------------------------------------------------------
@@ -94,21 +107,22 @@ class SimClock:
 # wrapped 0-4095 encoder count.  Deterministic (seeded).  NEVER opens a port.
 # ---------------------------------------------------------------------------
 class SimEncEscHost(SimEscHost):
-    """SimEscHost + a signed-thrust motor with a 6-step low-speed floor.
+    """SimEscHost + a signed-thrust S1 forced-commutation STEPPER model.
 
-    thrust in [-1000,1000] -> signed target RPM: a deadband where the rotor makes
-    no torque, then a hard floor (|RPM| >= FLOOR whenever it does spin) that no
-    thrust can undercut — the exact limitation that makes fine positioning a
-    bang-bang/limit-cycle problem.  Position is the time-integral of RPM, wrapped
-    to a 12-bit count and reported through the real `enc|…` line format.
+    thrust in [-1000,1000] -> signed target mech RPM = thrust * FULLSCALE_RPM / 1000
+    (NO deadband, NO floor — the stepper drives at any rate incl. ~0). First-order
+    rotor lag toward that target. At zero thrust the rotor does not coast freely: it
+    holds on the nearest commutation DETENT via a damped detent spring (models S1's
+    zero-speed holding torque), so a converged servo sits with a small limit cycle.
+    Position is the time-integral of RPM, wrapped to a 12-bit count and reported
+    through the real `enc|…` line format.  Deterministic (seeded).
     """
 
-    T_DEADBAND = 25.0             # |thrust| below this -> no torque (coast)
-    FLOOR_RPM = 185.0             # min sustainable mechanical RPM once spinning
-    RPM_AT_MAX = 4000.0           # |RPM| at |thrust| == 1000
-    TAU = 0.05                    # first-order rotor time constant (s)
-    NOISE_RPM = 2.5               # under-power RPM jitter (seeds a real limit cycle)
-    IDLE_NOISE_RPM = 0.6          # always-on sensor/load dither (smoke-tests the hold metric)
+    TAU = 0.06                    # first-order rotor time constant (s)
+    DETENTS_PER_REV = 42          # 12N14P, 7 pole-pairs * 6 sectors -> 42 detents/rev
+    HOLD_STIFF = 12.0             # detent-spring rate at hold (1/s); pos -> nearest detent
+    NOISE_RPM = 2.0               # under-power RPM jitter while driving
+    IDLE_NOISE_RPM = 0.5          # always-on sensor/load dither (smoke-tests the hold metric)
 
     def __init__(self, clock, seed=1234, io_time=0.0, invert=False):
         super().__init__(seed)
@@ -124,23 +138,27 @@ class SimEncEscHost(SimEscHost):
         self.last_t = clock.now()
 
     def _target_rpm(self, thrust):
-        a = abs(thrust)
-        if a < self.T_DEADBAND:
-            return 0.0
-        slope = (self.RPM_AT_MAX - self.FLOOR_RPM) / (1000.0 - self.T_DEADBAND)
-        return math.copysign(self.FLOOR_RPM + (a - self.T_DEADBAND) * slope, thrust)
+        # Stepper: linear thrust->RPM, no deadband, no floor.
+        return thrust * FULLSCALE_RPM / 1000.0
 
     def _advance(self, now):
         dt = now - self.last_t
         self.last_t = now
         if dt <= 0:
             return
-        tgt = self._target_rpm(self.thrust)
-        alpha = 1.0 - math.exp(-dt / self.TAU)
-        self.rpm += (tgt - self.rpm) * alpha
-        if abs(self.thrust) >= self.T_DEADBAND:
+        if abs(self.thrust) < 1:
+            # zero thrust: hold on the nearest detent with a damped spring (holding torque)
+            step = COUNTS_PER_REV / self.DETENTS_PER_REV
+            nearest = round(self.pos_counts / step) * step
+            err_counts = nearest - self.pos_counts
+            self.rpm = self.HOLD_STIFF * err_counts / COUNTS_PER_REV * 60.0
+            self.rpm += self._rng.gauss(0.0, self.IDLE_NOISE_RPM)
+        else:
+            tgt = self._target_rpm(self.thrust)
+            alpha = 1.0 - math.exp(-dt / self.TAU)
+            self.rpm += (tgt - self.rpm) * alpha
             self.rpm += self._rng.gauss(0.0, self.NOISE_RPM)
-        self.rpm += self._rng.gauss(0.0, self.IDLE_NOISE_RPM)  # always-on dither
+            self.rpm += self._rng.gauss(0.0, self.IDLE_NOISE_RPM)
         self.pos_counts += self.rpm / 60.0 * COUNTS_PER_REV * dt
 
     def cmd(self, line, timeout=30.0):
@@ -263,40 +281,33 @@ class PosDrive:
 
 
 # ---------------------------------------------------------------------------
-# Cascade controller.
+# Cascade PID position servo (for S1 forced-commutation stepper mode).
 # ---------------------------------------------------------------------------
-class Cascade:
-    """Pulse-and-settle position controller for a drive with a hard MINIMUM speed.
+class PIDServo:
+    """Cascade PID: outer position loop -> velocity setpoint -> inner thrust law.
 
-    On 6-step firmware the rotor can't creep — it either sits still or spins at >= the
-    ~185 RPM floor — so servoing a (sub-floor) velocity is impossible and just yields the
-    slam-overshoot-reverse-hunt seen on the bench. Instead this pushes a bounded PULSE
-    toward the target, cuts early (predictive, from a learned coast estimate) and COASTS
-    to rest, then measures and repeats. It NEVER brakes a spinning rotor (only ever
-    thrusts toward the target or coasts) and never asks for a speed the motor can't do.
+    Assumes the ESC can creep and hold (BlueGill S1 sine mode), so a real velocity servo
+    works instead of pulse-and-settle:
 
-    The pulse length is planned from the remaining error and a learned deg/tick, starting
-    with the smallest move that reliably turns the motor and re-checking the encoder after
-    every pulse (auto-ramping the pulse if the motor didn't start). Achievable precision is
-    ~one min-pulse quantum — the honest 6-step limit; the #3 sine mode removes it.
-    (The class name is kept for drop-in compatibility with the run loop.)
+      outer:  vel_sp = clamp(Kp*err - Kd*vel, +-vmax)          (deg/s)
+      inner:  thrust = clamp(Kff*vel_sp + Ki*∫(vel_sp - vel), +-tmax)
+
+    Kff maps a velocity setpoint straight to the thrust that produces it (firmware full
+    scale), so feedforward carries the motion and the integral only trims stiction; the
+    integral is back-calculated on saturation (anti-windup). Inside tol AND slow, thrust
+    is 0 and the ESC HOLDS on its detent. (Name kept as a drop-in for the run loop.)
     """
 
     def __init__(self, opts):
         self.tmax = opts.tmax
         self.tmin = opts.tmin
         self.tol = opts.tol
-        self.pulse_thrust = min(opts.tmax, max(1, getattr(opts, "pulse_thrust", 35)))
-        self.vrest = getattr(opts, "vrest", 150.0)          # deg/s below this == "at rest"
-        # FIXED short pulses: this motor has a ~140ms startup dead-time then fast accel, so any
-        # long/planned pulse over-drives. We fire a fixed short pulse, brake+coast to rest, measure,
-        # and repeat toward the target — bounded ~1-quantum overshoot instead of blind over-drive.
-        self.pulse_ticks = max(1, getattr(opts, "pulse_ticks", 8))
-        self.min_move = getattr(opts, "min_move", 4.0)       # deg; below this a pulse "didn't move"
-        self.boost_step = max(1, getattr(opts, "boost_step", 3))
-        self.max_boost = max(0, getattr(opts, "max_boost", 20))
-        self.max_pulses = max(1, getattr(opts, "max_pulses", 5))
-        self.last_quantum = 90.0    # deg moved by the last pulse (park within half of it)
+        self.kp = opts.kp
+        self.kd = opts.kd
+        self.ki = opts.ki
+        self.kff = opts.kff
+        self.vmax = opts.vmax
+        self.hold_vel = getattr(opts, "hold_vel", 40.0)   # deg/s below which "slow enough to hand to hold"
         # encoder / velocity state (interface the run loop + guards depend on)
         self.enc_sign = 1          # +1/-1: maps raw counts so +thrust => +measured motion
         self.prev_raw = None
@@ -304,22 +315,13 @@ class Cascade:
         self.vel = 0.0             # low-passed velocity (deg/s)
         self.last_delta_counts = 0
         self.target = 0.0
-        self.holding = False       # True once the segment is parked within reach (run loop reads this)
-        self._reset_seg()
-
-    def _reset_seg(self):
-        self.phase = "settle"      # "settle" (brake/coast to rest, then decide) or "pulse" (driving)
-        self.pulse_dir = 0
-        self.ticks_left = 0
-        self.pos_pulse_start = 0.0
-        self.pending_learn = False
-        self.boost = 0             # extra pulse ticks added when a pulse didn't start the motor
-        self.pulses = 0            # pulses fired this segment (capped to avoid oscillation)
-        self.holding = False
+        self.holding = False       # True once within tol and slow (ESC holds) — run loop reads this
+        self.ivel = 0.0            # inner-loop velocity-error integral (thrust units)
 
     def set_target(self, deg):
         self.target = deg
-        self._reset_seg()
+        self.ivel = 0.0
+        self.holding = False
 
     def update_encoder(self, raw, dt, suspect=False):
         """Unwrap 0-4095 -> continuous position + low-passed velocity.
@@ -350,53 +352,33 @@ class Cascade:
         return "ok"
 
     def step(self, dt):
-        """Fixed-pulse approach. Returns (signed thrust, diagnostic). PosDrive re-clamps to
-        tmax. The command is ALWAYS a short pulse toward the target or zero — never a reverse
-        brake of a spinning rotor.
-
-        SETTLE: command 0 (brake_on_stop kills the coast) until at rest; measure the move,
-                park if within reach, else fire the next fixed short pulse toward the target.
-        PULSE:  drive pulse_ticks (+boost) toward the target, cutting the moment the rotor
-                reaches/passes it.  A short pulse => small bounded move (~one quantum), so a
-                large error is closed in a few clean steps with no blind over-drive.
+        """Cascade PID tick. Returns (signed thrust, velocity setpoint). PosDrive re-clamps
+        thrust to tmax; the ESC (S1) holds on its detent when thrust is 0.
         """
         err = self.target - self.pos_deg
-        av = abs(self.vel)
 
-        if self.phase == "settle":
-            if av > self.vrest:
-                return 0.0, 0.0                      # still braking/coasting — wait for rest
-            # rotor at rest: assess the pulse that just finished
-            if self.pending_learn:
-                moved = abs(self.pos_deg - self.pos_pulse_start)
-                if moved >= self.min_move:
-                    self.last_quantum = 0.5 * self.last_quantum + 0.5 * moved
-                    self.boost = 0                   # it moved — reset the startup ramp
-                elif self.boost < self.max_boost:
-                    self.boost += self.boost_step    # motor didn't start — longer next pulse
-                self.pending_learn = False
-            # park if within reach, OR after max_pulses (accept the residual rather than
-            # hunt back-and-forth forever — the startup quantum is the hard 6-step floor).
-            reach = max(self.tol, 0.5 * self.last_quantum)
-            if abs(err) <= reach or self.pulses >= self.max_pulses:
-                self.holding = True
-                return 0.0, 0.0
-            self.holding = False
-            self.phase = "pulse"                     # fire one fixed short pulse toward target
-            self.pulse_dir = 1 if err > 0 else -1
-            self.ticks_left = self.pulse_ticks + self.boost
-            self.pos_pulse_start = self.pos_deg
-            self.pending_learn = True
-            self.pulses += 1
-            self.ticks_left -= 1
-            return self.pulse_thrust * self.pulse_dir, float(self.pulse_dir)
-
-        # phase == "pulse": drive toward the target; stop the instant it reaches/passes it
-        if (err > 0) != (self.pulse_dir > 0) or self.ticks_left <= 0:
-            self.phase = "settle"
+        # Inside tol AND slow -> hand off to the ESC's holding torque (thrust 0). This is a
+        # stable resting state, not a give-up: the detent hold keeps position without power.
+        if abs(err) <= self.tol and abs(self.vel) <= self.hold_vel:
+            self.holding = True
+            self.ivel = 0.0                              # drop integral so re-entry starts clean
             return 0.0, 0.0
-        self.ticks_left -= 1
-        return self.pulse_thrust * self.pulse_dir, float(self.pulse_dir)
+        self.holding = False
+
+        # Outer position loop -> velocity setpoint (deg/s), clamped to +-vmax.
+        vel_sp = self.kp * err - self.kd * self.vel
+        vel_sp = max(-self.vmax, min(self.vmax, vel_sp))
+
+        # Inner loop: feedforward (Kff maps vel_sp -> thrust directly) + integral trim on the
+        # velocity error, with back-calculation anti-windup on the thrust clamp.
+        u_ff = self.kff * vel_sp
+        self.ivel += self.ki * (vel_sp - self.vel) * dt
+        u = u_ff + self.ivel
+        u_clamped = max(-self.tmax, min(self.tmax, u))
+        if u != u_clamped:                              # saturated -> unwind the integral
+            self.ivel = max(-self.tmax, min(self.tmax, u_clamped - u_ff))
+            u = u_clamped
+        return u, vel_sp
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +464,7 @@ def calibrate_direction(drive: PosDrive, clock, opts, baseline_raw):
 
     The probe thrust and duration are bounded; the caller disarms on any raised abort.
     """
-    probe_thrust = min(opts.tmax, max(opts.tmin, 50))
+    probe_thrust = min(opts.tmax, max(opts.tmin, 30))   # S1 creeps: a small probe suffices
     ticks = max(1, round(opts.probe_secs / DT))
     prev = baseline_raw
     net_deg = 0.0
@@ -538,7 +520,7 @@ def _rebaseline(drive, ctrl, clock, settle_secs=0.4):
     return last.raw
 
 
-def run_segments(drive: PosDrive, ctrl: Cascade, clock, writer, opts,
+def run_segments(drive: PosDrive, ctrl: PIDServo, clock, writer, opts,
                  targets, hold=False):
     """Drive through a list of position targets (relative deltas).  For `hold`
     the single target runs until --max-secs.  Returns (reason, [SegMetrics])."""
@@ -651,16 +633,20 @@ def run_segments(drive: PosDrive, ctrl: Cascade, clock, writer, opts,
 
         sent = drive.send_thrust(u)
 
-        # frozen-encoder stall watchdog (M3): commanding real thrust while the raw
-        # count doesn't move is a powered runaway that pos/vel guards can't see (they
-        # read ~0). Abort after STALL_TICKS of it.
-        if abs(sent) >= opts.tmin and abs(ctrl.last_delta_counts) < STALL_COUNTS:
+        # frozen-encoder stall watchdog (M3), re-tuned for creep: compare the measured
+        # motion to what the commanded thrust SHOULD have produced (stepper: RPM is linear
+        # in thrust, no floor). A tiny sustained creep thrust legitimately moves little, so
+        # we only judge when the expected motion is non-trivial, and trip if the measured
+        # motion is far below it — a powered runaway the pos/vel guards can't see (~0 motion).
+        exp_counts = abs(sent) * FULLSCALE_RPM / 1000.0 / 60.0 * COUNTS_PER_REV * dt
+        if (abs(sent) >= opts.tmin and exp_counts >= STALL_MIN_EXPECTED
+                and abs(ctrl.last_delta_counts) < STALL_MOVE_FRAC * exp_counts):
             stuck_ticks += 1
             if stuck_ticks >= STALL_TICKS:
                 drive.send_thrust(0)
-                raise Aborted(f"frozen-encoder stall: |thrust|>={opts.tmin} for "
-                              f"{stuck_ticks} ticks (~{stuck_ticks * DT:.1f}s) with no "
-                              f"rotor motion")
+                raise Aborted(f"stall: |thrust|>={opts.tmin} for {stuck_ticks} ticks "
+                              f"(~{stuck_ticks * DT:.1f}s) moved <{STALL_MOVE_FRAC:.0%} of "
+                              f"expected (~{exp_counts:.1f} counts/tick)")
         else:
             stuck_ticks = 0
         prev_sent = sent
@@ -669,11 +655,11 @@ def run_segments(drive: PosDrive, ctrl: Cascade, clock, writer, opts,
                          f"{ctrl.target:.3f}", f"{vel_sp:.2f}", sent])
 
         settled = seg.update(t, ctrl.pos_deg, ctrl.target, opts.tol, opts.settle_dwell)
-        # a move segment ends when the mean is within tol (settled) OR the pulse-and-settle
-        # controller has parked as close as the 6-step floor allows (ctrl.holding).
+        # a move segment ends when the mean is within tol (settled) OR the servo is within
+        # tol and slow enough that it has handed off to the ESC's detent hold (ctrl.holding).
         if (settled or ctrl.holding) and not hold:
             fin = ctrl.target - ctrl.pos_deg
-            tag = "settled" if settled else "parked (6-step floor limit — #3 sine needed for finer)"
+            tag = "settled" if settled else "holding (within tol, ESC detent hold)"
             print(f"#   {tag}: t={t:.2f}s final_err={fin:+.1f}deg "
                   f"peak_overshoot={seg.peak_overshoot:.1f}deg")
             seg_i += 1
@@ -740,28 +726,22 @@ def targets_for(mode, opts):
 # ---------------------------------------------------------------------------
 def add_common(p):
     p.add_argument("--esc-index", type=int, default=1, help="ESC index (default 1)")
-    p.add_argument("--tol", type=float, default=12.0,
-                   help="settle tolerance, deg (default 12 ~ achievable 6-step hold resolution)")
+    p.add_argument("--tol", type=float, default=6.0,
+                   help="settle tolerance, deg (default 6 ~ one S1 stepper detent hold resolution)")
     p.add_argument("--tmax", type=int, default=300, help="thrust magnitude ceiling, 0..1000 (default 300)")
     p.add_argument("--tmin", type=int, default=40, help="min thrust the guards treat as 'driving' (default 40)")
-    # --- pulse-and-settle drive (built for the 6-step minimum-speed floor) ---
-    p.add_argument("--pulse-thrust", type=int, default=35,
-                   help="thrust magnitude of one pulse — keep low so the rotor spins up briefly "
-                        "then coasts (default 55; raise if the motor won't start)")
-    p.add_argument("--vrest", type=float, default=150.0,
-                   help="deg/s below which the rotor counts as 'at rest' between pulses (default 150)")
-    p.add_argument("--pulse-ticks", type=int, default=8,
-                   help="fixed pulse length, in 20ms ticks — the smaller, the finer the step (and the "
-                        "closer it can park), but too short won't clear the ~140ms startup dead-time (default 8)")
-    p.add_argument("--boost-step", type=int, default=3,
-                   help="extra ticks added to the next pulse when a pulse failed to start the motor (default 3)")
-    p.add_argument("--max-boost", type=int, default=20,
-                   help="cap on the startup-ramp boost, ticks (default 20)")
-    p.add_argument("--max-pulses", type=int, default=5,
-                   help="park after this many pulses in a segment even if outside tol — accept the "
-                        "residual instead of oscillating (the ~startup-quantum is the hard 6-step floor; default 5)")
-    p.add_argument("--min-move", type=float, default=4.0,
-                   help="deg; a pulse that moves less is treated as 'motor didn't start' -> longer next pulse")
+    # --- cascade PID gains (S1 velocity servo) ---
+    p.add_argument("--kp", type=float, default=6.0,
+                   help="outer position gain: velocity setpoint (deg/s) per deg of error (default 6)")
+    p.add_argument("--kd", type=float, default=0.3,
+                   help="outer damping: subtract Kd*vel from the velocity setpoint (default 0.3)")
+    p.add_argument("--ki", type=float, default=0.4,
+                   help="inner integral on velocity error -> thrust, anti-windup (default 0.4)")
+    p.add_argument("--kff", type=float, default=0.47,
+                   help="inner feedforward: thrust per (deg/s) of velocity setpoint. Firmware full "
+                        "scale ~0.47 (see tools/sim/sine_drive_model.py stepper section) (default 0.47)")
+    p.add_argument("--vmax", type=float, default=400.0,
+                   help="velocity setpoint clamp, deg/s (default 400 ~ 66 RPM; keep low for gentle creep)")
     p.add_argument("--max-secs", type=float, default=30.0, help="runaway/time abort (default 30)")
     p.add_argument("--max-revs", type=float, default=20.0, help="runaway travel abort, revs (default 20)")
     p.add_argument("--vel-abort", type=float, default=12000.0, help="hard |vel| abort, deg/s (default 12000)")
@@ -803,13 +783,13 @@ def _validate(opts):
     # symmetric clamp max(-tmax, min(tmax, u)) and pin thrust to +tmax (m5).
     opts.tmax = abs(int(opts.tmax))
     opts.tmin = abs(int(opts.tmin))
-    opts.pulse_thrust = abs(int(opts.pulse_thrust))
-    for name in ("tmax", "tmin", "pulse_thrust", "vrest", "vel_abort", "tol",
+    for name in ("tmax", "tmin", "vmax", "kff", "vel_abort", "tol",
                  "max_secs", "max_revs", "probe_secs", "probe_min_deg"):
         if getattr(opts, name) <= 0:
             sys.exit(f"--{name.replace('_', '-')} must be > 0")
-    if opts.pulse_ticks < 1:
-        sys.exit("--pulse-ticks must be >= 1")
+    for name in ("kp", "kd", "ki"):                      # gains may be 0 but not negative
+        if getattr(opts, name) < 0:
+            sys.exit(f"--{name.replace('_', '-')} must be >= 0")
     if opts.tmin >= opts.tmax:
         sys.exit("--tmin must be < --tmax")
 
@@ -819,8 +799,17 @@ def main():
     _validate(opts)
     host, clock = open_host(opts)
     drive = PosDrive(host, opts.esc_index, opts.tmax, clock)
-    ctrl = Cascade(opts)
+    ctrl = PIDServo(opts)
     targets = targets_for(opts.mode, opts)
+
+    # Sanity: --kff should match the plant gain implied by FULLSCALE_RPM (the firmware full
+    # scale). A large mismatch means feedforward is fighting the plant (bad tracking) —
+    # usually a stale FULLSCALE_RPM vs a changed SINE_TICK_T2/SINE_RCP_SHIFT in the asm.
+    note = ""
+    if KFF_COMPUTED and abs(opts.kff - KFF_COMPUTED) / KFF_COMPUTED > 0.15:
+        note = f"  [WARNING: differs >15% from firmware full-scale kff — check FULLSCALE_RPM/asm EQUs]"
+    print(f"# kff={opts.kff:.4f} thrust/(deg/s)  (firmware full-scale implies {KFF_COMPUTED:.4f}; "
+          f"FULLSCALE_RPM={FULLSCALE_RPM:.0f}){note}")
 
     def _panic(*_):
         drive.disarm()
@@ -850,10 +839,17 @@ def main():
     print(f"# exit reason: {reason}")
     for i, m in enumerate(metrics, 1):
         st = f"{m.settle_t:.2f}s" if m.settle_t is not None else "never"
+        # When the segment ended via the servo's hand-off to hold (settle_t never latched),
+        # pk-pk / mean-err come from the 0.3 s APPROACH-transient window, NOT a real
+        # post-hold limit cycle — label them honestly. (The `hold` subcommand does latch.)
+        if m.settle_t is not None:
+            band = (f"limit-cycle_pk-pk={m.limit_cycle_amp():.1f}deg  "
+                    f"steady-state_mean_err={m.steady_mean_err():+.1f}deg")
+        else:
+            band = (f"approach-window_pk-pk={m.limit_cycle_amp():.1f}deg(not post-hold)  "
+                    f"approach_mean_err={m.steady_mean_err():+.1f}deg")
         print(f"# segment {i}: target={m.target:+.1f}deg  settle={st}  "
-              f"overshoot={m.peak_overshoot:.1f}deg  "
-              f"limit-cycle_pk-pk={m.limit_cycle_amp():.1f}deg  "
-              f"steady-state_mean_err={m.steady_mean_err():+.1f}deg  "
+              f"overshoot={m.peak_overshoot:.1f}deg  {band}  "
               f"final_err={m.target - m.last_pos:+.1f}deg")
     if failure:
         sys.exit(f"POSCTL ABORTED: {failure}")
