@@ -70,6 +70,8 @@ DELTA_FAULT_FRAC = 0.9            # |delta| > this*(half rev) -> implausible unw
 WRONGWAY_TICKS = 12               # push-follow ticks where motion opposes thrust -> abort
 WRONGWAY_MIN_DPOS = 5.0           # deg; per-tick motion below this is ignored (noise)
 TELE_EVERY_S = 0.5                # temperature poll period while driving (bidir DShot `tele`)
+PROBE_STEP = 40                   # direction-cal: thrust step when ramping up to find break-away
+PROBE_MAX_THRUST = 250            # direction-cal: cap on the ramped probe thrust (also bounded by --tmax)
 
 # Firmware S1 full-scale: mechanical RPM at |thrust|=1000. This is the PLANT GAIN the
 # feedforward (--kff) inverts, so it is tied to the firmware fixed-point constants:
@@ -491,44 +493,65 @@ def _read_valid_enc(drive):
 
 
 def calibrate_direction(drive: PosDrive, clock, opts, baseline_raw):
-    """Probe the wiring/DIR convention: command a bounded FORWARD thrust briefly and
-    measure the net raw-encoder travel (guarded unwrap).  Returns +1 if +thrust moved
-    the count positive, -1 if it moved it negative.  Aborts if the motor did not move
-    at all (which doubles as a 'does the motor actually start?' check).
+    """Probe the wiring/DIR convention: command a FORWARD thrust and measure the net
+    raw-encoder travel (guarded unwrap).  Returns +1 if +thrust moved the count positive,
+    -1 if negative.  Aborts if the motor did not move at all even at the ramp cap.
 
-    The probe thrust and duration are bounded; the caller disarms on any raised abort.
+    RAMPS the probe thrust from --tmin up to min(--tmax, PROBE_MAX_THRUST) in PROBE_STEP
+    increments, stopping the instant it sees >= --probe-min-deg of net travel. A cogging
+    low-KV motor needs more than a fixed creep thrust to BREAK AWAY from its detent, and
+    that break-away level depends on sine_hold_amp / sine_amp_max — so a fixed probe is
+    unreliable (it can read 0 even though the motor is fine). Bounded in both thrust and
+    time; the caller disarms on any raised abort.
     """
-    probe_thrust = min(opts.tmax, max(opts.tmin, 30))   # S1 creeps: a small probe suffices
-    ticks = max(1, round(opts.probe_secs / DT))
+    start = max(opts.tmin, 30)
+    cap = min(int(opts.tmax), max(start, PROBE_MAX_THRUST))
+    levels = []
+    lvl = start
+    while lvl < cap:
+        levels.append(lvl)
+        lvl = min(cap, lvl + PROBE_STEP)
+    levels.append(cap)
+    ticks_per = max(1, round(opts.probe_secs / DT))
     prev = baseline_raw
     net_deg = 0.0
     fails = 0
-    for _ in range(ticks):
-        tick_start = clock.now()
-        enc = _read_valid_enc(drive)
-        if enc is None:
-            fails += 1
-            drive.send_thrust(0)
-            if fails >= ENC_FAIL_MAX:
-                raise Aborted("direction calibration failed: encoder unreadable during probe")
+    used = start
+    for probe_thrust in levels:
+        used = probe_thrust
+        moved = False
+        for _ in range(ticks_per):
+            tick_start = clock.now()
+            enc = _read_valid_enc(drive)
+            if enc is None:
+                fails += 1
+                drive.send_thrust(0)
+                if fails >= ENC_FAIL_MAX:
+                    raise Aborted("direction calibration failed: encoder unreadable during probe")
+                _pace(clock, tick_start)
+                continue
+            delta = ((enc.raw - prev + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
+            prev = enc.raw
+            if abs(delta) <= DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2):   # ignore implausible jumps
+                net_deg += delta * 360.0 / COUNTS_PER_REV
+            if abs(net_deg) >= opts.probe_min_deg:                       # break-away detected
+                moved = True
+                break
+            drive.send_thrust(probe_thrust)                             # keep-alive forward probe
             _pace(clock, tick_start)
-            continue
-        delta = ((enc.raw - prev + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
-        prev = enc.raw
-        if abs(delta) <= DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2):   # ignore implausible jumps
-            net_deg += delta * 360.0 / COUNTS_PER_REV
-        drive.send_thrust(probe_thrust)                              # keep-alive forward probe
-        _pace(clock, tick_start)
+        if moved:
+            break
     drive.send_thrust(0)
 
     if abs(net_deg) < opts.probe_min_deg:
-        raise Aborted(f"direction calibration failed: motor did not respond to thrust "
-                      f"(|Δ|={abs(net_deg):.1f}° < {opts.probe_min_deg}°) — check "
-                      f"power / startup_power / wiring")
+        raise Aborted(f"direction calibration failed: motor did not break away even at thrust "
+                      f"{used} (|Δ|={abs(net_deg):.1f}° < {opts.probe_min_deg}°). Raise "
+                      f"sine_hold_amp/sine_amp_max (more low-speed torque) or --tmax, check "
+                      f"power/wiring, or pass --invert-encoder if you already know the direction.")
     enc_sign = 1 if net_deg > 0 else -1
     arrow = "+encoder" if enc_sign > 0 else "-encoder (inverted)"
     print(f"# direction cal: +thrust -> {arrow}; enc_sign={enc_sign} "
-          f"(probe Δ={net_deg:+.1f}° at thrust {probe_thrust})")
+          f"(broke away at thrust {used}, Δ={net_deg:+.1f}°)")
     return enc_sign
 
 
