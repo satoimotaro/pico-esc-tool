@@ -18,6 +18,18 @@ Requires the ESC in Bidirectional (3D) mode with S1 sine mode enabled
 (host/profiles/posctl_930kv_sine.yaml). Achievable hold resolution is ~one stepper detent
 (12N14P ⇒ ~8.6°); use --tol ~6°. Finer needs S2 microstepping, not tuning.
 
+TUNING (930 KV 12N14P, retuned 2026-07-15 after the bench showed tiny overshoot + slow
+reach): defaults are Kp=14, Kd=0.6, Ki=0.4, Kff=0.47, vmax=500. Raising Kp from the
+original 6 ~halves the reach time AND reduces the systematic undershoot (the servo coasts
+deeper into the tol band before it hands off to the detent hold), with Kd=0.6 pairing up
+to keep overshoot near zero. These were picked with the offline plant sweep
+`host/tune_posctl.py` (first-order rotor model in SimEncEscHost) and are deliberately
+moderate — the real motor has stiction/detent/inertia the model underplays, so there is
+overshoot headroom. Bench fine-tune: raise --kp until the real motor first shows a small
+overshoot, back off ~20%, then raise --kd until it is gone; bump --ki only if a steady
+final-error bias persists. Re-run `python tune_posctl.py` (drop --dry-run to sweep on real
+hardware) to re-tune for the 300 KV motor when it arrives.
+
 Keep-alive: one `enc` + one `thrust` per ~20 ms tick (50 Hz), well under the firmware's
 500 ms spin deadman. Safety: --max-secs / --max-revs / --vel-abort aborts, encoder magnet-
 health + unwrap-fault + expected-vs-measured stall + wrong-way guards, and on EVERY exit
@@ -731,17 +743,19 @@ def add_common(p):
     p.add_argument("--tmax", type=int, default=300, help="thrust magnitude ceiling, 0..1000 (default 300)")
     p.add_argument("--tmin", type=int, default=40, help="min thrust the guards treat as 'driving' (default 40)")
     # --- cascade PID gains (S1 velocity servo) ---
-    p.add_argument("--kp", type=float, default=6.0,
-                   help="outer position gain: velocity setpoint (deg/s) per deg of error (default 6)")
-    p.add_argument("--kd", type=float, default=0.3,
-                   help="outer damping: subtract Kd*vel from the velocity setpoint (default 0.3)")
+    p.add_argument("--kp", type=float, default=14.0,
+                   help="outer position gain: velocity setpoint (deg/s) per deg of error "
+                        "(default 14; retuned from 6 for faster reach — see module docstring TUNING)")
+    p.add_argument("--kd", type=float, default=0.6,
+                   help="outer damping: subtract Kd*vel from the velocity setpoint "
+                        "(default 0.6; pairs with the higher Kp to keep overshoot ~0)")
     p.add_argument("--ki", type=float, default=0.4,
                    help="inner integral on velocity error -> thrust, anti-windup (default 0.4)")
     p.add_argument("--kff", type=float, default=0.47,
                    help="inner feedforward: thrust per (deg/s) of velocity setpoint. Firmware full "
                         "scale ~0.47 (see tools/sim/sine_drive_model.py stepper section) (default 0.47)")
-    p.add_argument("--vmax", type=float, default=400.0,
-                   help="velocity setpoint clamp, deg/s (default 400 ~ 66 RPM; keep low for gentle creep)")
+    p.add_argument("--vmax", type=float, default=500.0,
+                   help="velocity setpoint clamp, deg/s (default 500 ~ 83 RPM; keep low for gentle creep)")
     p.add_argument("--max-secs", type=float, default=30.0, help="runaway/time abort (default 30)")
     p.add_argument("--max-revs", type=float, default=20.0, help="runaway travel abort, revs (default 20)")
     p.add_argument("--vel-abort", type=float, default=12000.0, help="hard |vel| abort, deg/s (default 12000)")
