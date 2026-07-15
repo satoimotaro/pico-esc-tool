@@ -51,6 +51,8 @@ FIELD_OFF = {
     "comm_timing_angle": 0x2B, "max_erpm": 0x2C, "lowspeed_damping": 0x2D,
     # BlueGill S1 forced-commutation stepper mode (0xFF = off/default on stock/older fw).
     "sine_mode": 0x2E, "sine_hold_amp": 0x2F, "sine_amp_max": 0x30, "sine_ramp": 0x31,
+    # BlueGill S3 sine<->BEMF crossover thresholds (0 = off; see --sine-crossover-erpm).
+    "sine_cross_up": 0x32, "sine_cross_dn": 0x33,
 }
 FIELD_ENUM = {"motor_direction": DIRECTION, "comm_timing": TIMING, "demag_compensation": DEMAG}
 NAME_OFF, NAME_LEN = 0x60, 16
@@ -61,6 +63,60 @@ NAME_OFF, NAME_LEN = 0x60, 16
 # Note: for all three BlueGill params a stored byte of 255 (0xFF) reads as OFF on firmware,
 # so 255 is not a usable magnitude.
 MAX_ERPM_UNITS = 136
+
+# BlueGill S3 sine<->BEMF crossover unit math. MUST match the firmware and
+# tools/sim/sine_drive_model.py print_s3_crossover_section() exactly.
+#  * Up threshold (Cross_Up, 0x32) is in Sine_Inc_H units: up eRPM = Sine_Inc*10000/65536,
+#    and one Sine_Inc_H unit = 256 in Sine_Inc, so eRPM/unit = 256*10000/65536 = 39.0625.
+#  * Down threshold (Cross_Dn, 0x33) is in Comm_Period4x_H units (INVERSE): eRPM = 80e6/
+#    Comm_Period4x, ~312500 per Comm_Period4x_H unit. Firmware clamps Cross_Dn to <= 0xEF so
+#    the down-handoff always fires before the stock 0xF0 (~1302 eRPM) min-speed exit.
+SINE_CROSS_UP_ERPM_PER_UNIT = 10000.0 / 256.0          # = 39.0625
+SINE_CROSS_DN_ERPM_NUM = 312500.0                      # eRPM = NUM / Cross_Dn
+SINE_CROSS_DN_MAX_BYTE = 0xEF                          # firmware clamp ceiling (>=0xF0 disabled)
+# The firmware seeds Comm_Period4x from a 4-sector tick window and only fires the up-handoff
+# when that window is in [SINE_CROSS_TICKS_MIN, SINE_CROSS_TICKS_MAX] ticks (else it refuses
+# and stays in forced sine). The window is 4*10000/up_eRPM ticks, so the usable up-eRPM band is
+# [4*10000/MAX, 4*10000/MIN]. Requesting an up threshold outside it would silently never hand
+# off, so reject it here with the reason. Keep MIN/MAX in lockstep with Bluejay.asm.
+SINE_CROSS_TICKS_MIN = 9                                # matches SINE_CROSS_TICKS_MIN (asm)
+SINE_CROSS_TICKS_MAX = 30                               # matches SINE_CROSS_TICKS_MAX (asm)
+SINE_CROSS_UP_ERPM_MIN = 4 * 10000.0 / SINE_CROSS_TICKS_MAX   # ~1333 eRPM
+SINE_CROSS_UP_ERPM_MAX = 4 * 10000.0 / SINE_CROSS_TICKS_MIN   # ~4444 eRPM
+
+
+def sine_crossover_bytes(up_erpm: float, dn_erpm: float) -> tuple[int, int]:
+    """(up_erpm, dn_erpm) -> (cross_up, cross_dn) bytes, validating exactly as the firmware
+    guards + hysteresis require. Returns rounded bytes; raises ValueError on any violation.
+    Recomputes the EFFECTIVE speeds back from the rounded bytes and rejects an inverted or
+    collapsed hysteresis window (dn_eff >= up_eff), and an up threshold outside the firmware's
+    handoff-able band (where the seed would be too coarse / below the BEMF floor)."""
+    if up_erpm <= 0 or dn_erpm <= 0:
+        raise ValueError("both eRPM values must be positive")
+    if not SINE_CROSS_UP_ERPM_MIN <= up_erpm <= SINE_CROSS_UP_ERPM_MAX:
+        raise ValueError(f"up eRPM {up_erpm:g} outside the handoff-able band "
+                         f"~{SINE_CROSS_UP_ERPM_MIN:.0f}..{SINE_CROSS_UP_ERPM_MAX:.0f} eRPM: below it "
+                         f"is under the BEMF floor, above it the 4-sector seed gets too coarse "
+                         f"(>~{100.0/SINE_CROSS_TICKS_MIN:.0f}%) and the firmware would refuse to hand off")
+    cross_up = round(up_erpm / SINE_CROSS_UP_ERPM_PER_UNIT)
+    cross_dn = round(SINE_CROSS_DN_ERPM_NUM / dn_erpm)
+    if not 1 <= cross_up <= 255:
+        raise ValueError(f"up eRPM {up_erpm:g} -> Cross_Up byte {cross_up} out of range 1..255 "
+                         f"(usable up range ~{SINE_CROSS_UP_ERPM_PER_UNIT:.2f}.."
+                         f"{255*SINE_CROSS_UP_ERPM_PER_UNIT:.0f} eRPM)")
+    if cross_dn > SINE_CROSS_DN_MAX_BYTE:
+        min_dn = SINE_CROSS_DN_ERPM_NUM / SINE_CROSS_DN_MAX_BYTE
+        raise ValueError(f"down eRPM {dn_erpm:g} too low -> Cross_Dn byte {cross_dn} exceeds "
+                         f"0x{SINE_CROSS_DN_MAX_BYTE:02X}; must be >= ~{min_dn:.0f} eRPM "
+                         f"(the firmware would clamp it past the stock min-speed exit)")
+    if cross_dn < 1:
+        raise ValueError(f"down eRPM {dn_erpm:g} -> Cross_Dn byte {cross_dn} out of range 1..255")
+    up_eff = cross_up * SINE_CROSS_UP_ERPM_PER_UNIT
+    dn_eff = SINE_CROSS_DN_ERPM_NUM / cross_dn
+    if dn_eff >= up_eff:
+        raise ValueError(f"no hysteresis window: effective down {dn_eff:.0f} eRPM >= effective up "
+                         f"{up_eff:.0f} eRPM (down must be below up). Widen the split.")
+    return cross_up, cross_dn
 
 
 def encode_value(field: str, value) -> int:
@@ -194,6 +250,10 @@ def decode(raw: bytes) -> dict:
             "sine_hold_amp": g(0x2F),
             "sine_amp_max": g(0x30),
             "sine_ramp": g(0x31),
+            # BlueGill S3 crossover thresholds (0/0xFF = off). Raw bytes; up is in Sine_Inc_H
+            # units (~39.06 eRPM/unit), dn is in Comm_Period4x_H units (~312500/unit, inverse).
+            "sine_cross_up": g(0x32),
+            "sine_cross_dn": g(0x33),
         },
         "raw_hex": raw.hex().upper(),
     }
@@ -290,6 +350,21 @@ def cmd_set(dev: EscHost, args):
         if not v:
             sys.exit(f"bad assignment '{kv}' (want key=value)")
         settings[k.strip()] = v.strip()
+    if getattr(args, "sine_crossover_erpm", None):
+        parts = args.sine_crossover_erpm.split(",")
+        if len(parts) != 2:
+            sys.exit("--sine-crossover-erpm expects UP,DN (two eRPM values, comma-separated)")
+        try:
+            up_erpm, dn_erpm = float(parts[0]), float(parts[1])
+            cross_up, cross_dn = sine_crossover_bytes(up_erpm, dn_erpm)
+        except ValueError as e:
+            sys.exit(f"--sine-crossover-erpm: {e}")
+        settings["sine_cross_up"] = cross_up
+        settings["sine_cross_dn"] = cross_dn
+        up_eff = cross_up * SINE_CROSS_UP_ERPM_PER_UNIT
+        dn_eff = SINE_CROSS_DN_ERPM_NUM / cross_dn
+        print(f"sine crossover: up Cross_Up=0x{cross_up:02X} (~{up_eff:.0f} eRPM), "
+              f"dn Cross_Dn=0x{cross_dn:02X} (~{dn_eff:.0f} eRPM)")
     ovs = encode_overrides(settings)
     for i in resolve_indices(dev, args.index):
         _apply_overrides(dev, i, ovs)
@@ -471,7 +546,10 @@ def main():
     rd.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
     st = sub.add_parser("set", help="change settings on an ESC (index or 'all')")
     st.add_argument("index", help="ESC index or 'all'")
-    st.add_argument("assign", nargs="+", help="e.g. motor_direction=Reversed beep_strength=60")
+    st.add_argument("assign", nargs="*", help="e.g. motor_direction=Reversed beep_strength=60")
+    st.add_argument("--sine-crossover-erpm", metavar="UP,DN",
+                    help="set sine<->BEMF crossover from two eRPM values (up,down); down must be "
+                         "below up. Converts to the Cross_Up/Cross_Dn bytes with validation.")
     st.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
     ap_ = sub.add_parser("apply", help="apply a YAML profile (index or 'all')")
     ap_.add_argument("index", help="ESC index or 'all'")
