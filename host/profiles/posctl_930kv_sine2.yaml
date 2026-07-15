@@ -27,7 +27,7 @@ settings:
   motor_direction: Bidirectional      # sine expects bidir (thrust sign = direction)
   comm_timing: Low
   demag_compensation: 'Off'
-  startup_power_min: 20
+  startup_power_min: 30
   startup_power_max: 18
   startup_beep: 1
   pwm_frequency: 24
@@ -42,6 +42,6 @@ settings:
   lowspeed_damping: 0
   # BlueGill S2 min-clamp two-phase micro-stepping
   sine_mode: 2                        # 2 = S2 (0=off, 1=S1 stepper)
-  sine_hold_amp: 8                    # ~3% duty zero-speed holding amplitude (timid)
-  sine_amp_max: 20                    # ~8% duty V/f amplitude ceiling (timid)
+  sine_hold_amp: 16                    # ~3% duty zero-speed holding amplitude (timid)
+  sine_amp_max: 45                    # ~8% duty V/f amplitude ceiling (timid)
   sine_ramp: 16                       # speed slew rate (inc-LSB/tick; ~1s to full scale)
