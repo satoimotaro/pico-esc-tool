@@ -27,7 +27,6 @@ import argparse
 import os
 import statistics
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import posctl  # noqa: E402  (reuse PosDrive / EscHost / SimEncEscHost / constants)
@@ -84,23 +83,13 @@ def _drive_measure(drive, clock, thrust, enc_sign, settle_secs, measure_secs, ma
     return mean_v, ripple, peak_temp
 
 
-def _set_amps(opts, hold_amp, amp_max):
-    """Write the two amplitude params via esctool (real hardware only). O(1) writes/combo."""
-    if opts.dry_run:
-        return
-    dev = esctool.EscHost(opts.port)
-    try:
-        dev.cmd("run", timeout=5)
-        dev.cmd("disconnect", timeout=5)
-        time.sleep(0.3)
-        # esctool.cmd_set-style single write of both fields
-        argns = argparse.Namespace(index=str(opts.esc_index),
-                                   assign=[f"sine_hold_amp={hold_amp}", f"sine_amp_max={amp_max}"])
-        argns.sine_crossover_erpm = None
-        esctool.cmd_set(dev, argns)
-    finally:
-        dev.close()
-        time.sleep(0.3)
+def _write_amps(host, index, hold_amp, amp_max):
+    """Write the two amplitude params on an already-open EscHost, then restart the app so it
+    can be driven. Uses the low-level esctool writers (not cmd_set, which needs a full CLI
+    Namespace). One editpage write per combo."""
+    ovs = esctool.encode_overrides({"sine_hold_amp": hold_amp, "sine_amp_max": amp_max})
+    esctool._apply_overrides(host, index, ovs)
+    esctool._finish(host, index, True)      # run=True: restart the app so we can arm/drive
 
 
 def main():
@@ -135,18 +124,16 @@ def main():
         for amp_max in amp_maxs:
             if amp_max < hold_amp:
                 continue                                  # amp_max is a ceiling on hold+Inc
-            try:
-                _set_amps(opts, hold_amp, amp_max)
-            except Exception as e:
-                print(f"# hold={hold_amp} amax={amp_max}: WRITE FAILED ({e}); skipped")
-                continue
             clock = posctl.SimClock() if opts.dry_run else posctl.RealClock()
             host = (posctl.SimEncEscHost(clock, seed=opts.seed, invert=opts.sim_invert)
                     if opts.dry_run else esctool.EscHost(opts.port))
-            drive = PosDrive(host, opts.esc_index, 1000, clock, verbose=False)
+            drive = None
             ripples, slips, peak = [], [], None
             aborted = None
             try:
+                if not opts.dry_run:
+                    _write_amps(host, opts.esc_index, hold_amp, amp_max)
+                drive = PosDrive(host, opts.esc_index, 1000, clock, verbose=False)
                 drive.prepare()
                 drive.arm()
                 for thr in thrusts:
@@ -162,8 +149,11 @@ def main():
                         peak = tp if peak is None else max(peak, tp)
             except Aborted as e:
                 aborted = str(e)
+            except Exception as e:
+                aborted = f"error: {e}"
             finally:
-                drive.disarm()
+                if drive is not None:
+                    drive.disarm()
                 host.close()
             if aborted:
                 print(f"# hold={hold_amp:2} amax={amp_max:2}: ABORTED ({aborted})")
