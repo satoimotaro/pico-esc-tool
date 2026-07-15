@@ -48,6 +48,7 @@ def _drive_measure(drive, clock, thrust, enc_sign, settle_secs, measure_secs, ma
     vel = 0.0
     samples = []
     peak_temp = None
+    stall_vel = 0.15 * _commanded_vel(thrust)     # below this = not really turning (stalled)
     t_end = clock.now() + settle_secs + measure_secs
     t_measure = clock.now() + settle_secs
     next_tele = clock.now()
@@ -65,6 +66,12 @@ def _drive_measure(drive, clock, thrust, enc_sign, settle_secs, measure_secs, ma
                     vel += VEL_LP_ALPHA * (inst - vel)
                     if tick >= t_measure:
                         samples.append(vel)
+        # early stall-out: an over-excited / locked combo draws near-DC current and cooks the
+        # winding (observed 153 C). If it isn't turning shortly into the measure window, stop
+        # NOW instead of driving the stall for the full window.
+        if len(samples) >= 15 and abs(statistics.mean(samples[-15:])) < stall_vel:
+            drive.send_thrust(0)
+            return statistics.mean(samples), float("inf"), peak_temp
         drive.send_thrust(thrust)
         if max_temp and tick >= next_tele:
             next_tele = tick + 0.5
