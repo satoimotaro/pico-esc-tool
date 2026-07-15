@@ -69,6 +69,7 @@ FAULT_DT_MULT = 3.0               # measured dt > this*DT -> tick's enc delta is
 DELTA_FAULT_FRAC = 0.9            # |delta| > this*(half rev) -> implausible unwrap, reject
 WRONGWAY_TICKS = 12               # push-follow ticks where motion opposes thrust -> abort
 WRONGWAY_MIN_DPOS = 5.0           # deg; per-tick motion below this is ignored (noise)
+TELE_EVERY_S = 0.5                # temperature poll period while driving (bidir DShot `tele`)
 
 # Firmware S1 full-scale: mechanical RPM at |thrust|=1000. This is the PLANT GAIN the
 # feedforward (--kff) inverts, so it is tied to the firmware fixed-point constants:
@@ -226,6 +227,8 @@ class PosDrive:
         self.clock = clock
         self.verbose = verbose
         self.armed = False
+        self.last_temp = None      # last ESC temperature (C) read from `tele`, if any
+        self.peak_temp = None      # peak ESC temperature (C) seen this run
 
     def _log(self, msg):
         if self.verbose:
@@ -287,6 +290,25 @@ class PosDrive:
                 try:
                     return EncReading(int(p[1]), int(p[4]), int(p[5]),
                                       int(p[6]), int(p[7]), int(p[8]))
+                except (ValueError, IndexError):
+                    return None
+        return None
+
+    def read_temp(self):
+        """ESC temperature in C from `tele`, or None if telemetry is absent/unparseable.
+
+        Format: tele|rpm|volts|amps|tempC|stress (bidir DShot only). A miss just skips the
+        thermal check this cycle — it never aborts on a missing sample.
+        """
+        try:
+            lines = self.host.cmd(f"tele {self.idx}", timeout=2)
+        except Exception:
+            return None
+        for ln in lines:
+            if ln.startswith("tele|"):
+                p = ln.split("|")
+                try:
+                    return int(p[4])
                 except (ValueError, IndexError):
                     return None
         return None
@@ -563,6 +585,7 @@ def run_segments(drive: PosDrive, ctrl: PIDServo, clock, writer, opts,
     stuck_ticks = 0
     wrongway_ticks = 0
     prev_sent = 0                 # thrust commanded last tick (for the wrong-way guard)
+    next_tele = t0                # first temperature poll fires on the first tick
     metrics = []
 
     seg_i = 0
@@ -644,6 +667,23 @@ def run_segments(drive: PosDrive, ctrl: PIDServo, clock, writer, opts,
                           f"({opts.vel_abort}) deg/s")
 
         sent = drive.send_thrust(u)
+
+        # temperature watch (bidir DShot `tele`): poll ~every TELE_EVERY_S, print it live, and
+        # abort if it reaches --max-temp. The ESC has NO current sensing, so at hold / low speed
+        # the sine amplitude drives near-DC winding current with only this thermal backstop —
+        # raise sine_amp_max / sine_hold_amp on the bench WATCHING this number. Polled right after
+        # the thrust keep-alive so the 500 ms deadman is never starved; a missing sample is skipped.
+        if opts.max_temp and tick_start >= next_tele:
+            next_tele = tick_start + TELE_EVERY_S
+            temp = drive.read_temp()
+            if temp is not None:
+                drive.last_temp = temp
+                drive.peak_temp = temp if drive.peak_temp is None else max(drive.peak_temp, temp)
+                print(f"#   temp={temp}C  (t={t:.1f}s vel={ctrl.vel:+.0f} err={ctrl.target - ctrl.pos_deg:+.0f})")
+                if temp >= opts.max_temp:
+                    drive.send_thrust(0)
+                    raise Aborted(f"over-temperature: ESC {temp}C >= --max-temp {opts.max_temp:.0f}C "
+                                  f"— lower sine_amp_max / sine_hold_amp (no current sensing to trip on)")
 
         # frozen-encoder stall watchdog (M3), re-tuned for creep: compare the measured
         # motion to what the commanded thrust SHOULD have produced (stepper: RPM is linear
@@ -756,6 +796,10 @@ def add_common(p):
                         "scale ~0.47 (see tools/sim/sine_drive_model.py stepper section) (default 0.47)")
     p.add_argument("--vmax", type=float, default=500.0,
                    help="velocity setpoint clamp, deg/s (default 500 ~ 83 RPM; keep low for gentle creep)")
+    p.add_argument("--max-temp", type=float, default=80.0,
+                   help="poll ESC telemetry temperature and abort at this many C (0=off, no poll). "
+                        "The only thermal backstop when raising sine_amp_max/hold_amp — no current "
+                        "sensing on EFM8BB21 (default 80)")
     p.add_argument("--max-secs", type=float, default=30.0, help="runaway/time abort (default 30)")
     p.add_argument("--max-revs", type=float, default=20.0, help="runaway travel abort, revs (default 20)")
     p.add_argument("--vel-abort", type=float, default=12000.0, help="hard |vel| abort, deg/s (default 12000)")
@@ -850,6 +894,8 @@ def main():
         host.close()
 
     print(f"# wrote CSV: {csv_path}")
+    if drive.peak_temp is not None:
+        print(f"# ESC temp: last {drive.last_temp}C, peak {drive.peak_temp}C")
     print(f"# exit reason: {reason}")
     for i, m in enumerate(metrics, 1):
         st = f"{m.settle_t:.2f}s" if m.settle_t is not None else "never"
