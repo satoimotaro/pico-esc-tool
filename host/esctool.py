@@ -76,6 +76,11 @@ def encode_value(field: str, value) -> int:
         print(f"warning: max_erpm={v} exceeds effective ceiling {MAX_ERPM_UNITS} "
               f"(~{MAX_ERPM_UNITS}k eRPM); clamping to {MAX_ERPM_UNITS}", file=sys.stderr)
         v = MAX_ERPM_UNITS
+    if field == "sine_mode" and not 0 <= v <= 2:
+        # 0=off (stock), 1=S1 forced-commutation stepper, 2=S2 min-clamp micro-stepping.
+        print(f"warning: sine_mode={v} out of range 0..2; clamping to "
+              f"{max(0, min(2, v))}", file=sys.stderr)
+        v = max(0, min(2, v))
     return v & 0xFF
 
 

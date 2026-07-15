@@ -1,0 +1,47 @@
+# posctl_930kv_sine2 — 930 KV bench motor + BlueGill S2 min-clamp two-phase micro-stepping.
+#
+# S2 (Pgm_Sine_Mode=2) replaces S1's 6-step "staircase" with true sinusoidal
+# micro-stepping: the most-negative phase is clamped to the negative rail while the
+# other two carry sinusoidal high-side duty (pair phase on PCA modules 0/1, second
+# phase on the free module 2 / CEX2 with its low-side latched off — shoot-through
+# impossible). This removes the ~8.6 deg-e detent staircase so the rotor holds and
+# creeps at ANY angle, not just the 42 detents/rev of S1.
+#
+# TIMID by design — this drives live FETs with a NOVEL topology. Bench it with
+# temperature protection ON (hold drives DC-ish stall current with no current sense)
+# and raise sine_hold_amp / sine_amp_max ONLY on the bench, watching `tele` temp.
+# Reverse direction doubles the FET test surface: bench BOTH directions.
+#
+# Reflashing resets config — re-apply this profile (and motor_direction=Bidirectional)
+# before running. EEPROM layout revision is unchanged (225): S2 reuses the existing
+# sine_* params, so esctool/firmware stay in lockstep with the S1 image.
+esc: 1
+identity:
+  name: Bluejay (.0)
+  layout: '#A_H_30#'
+  mcu: '#BLHELI$EFM8B21#'
+  eeprom_revision: '0.21'
+  layout_revision: 225
+  mode: Multi
+settings:
+  motor_direction: Bidirectional      # sine expects bidir (thrust sign = direction)
+  comm_timing: Low
+  demag_compensation: 'Off'
+  startup_power_min: 20
+  startup_power_max: 18
+  startup_beep: 1
+  pwm_frequency: 24
+  beep_strength: 40
+  beacon_strength: 80
+  beacon_delay: 4
+  temperature_protection: 1           # ENABLED: hold current has no other trip
+  low_rpm_power_protection: 9
+  brake_on_stop: 1
+  comm_timing_angle: 0
+  max_erpm: 0
+  lowspeed_damping: 0
+  # BlueGill S2 min-clamp two-phase micro-stepping
+  sine_mode: 2                        # 2 = S2 (0=off, 1=S1 stepper)
+  sine_hold_amp: 8                    # ~3% duty zero-speed holding amplitude (timid)
+  sine_amp_max: 20                    # ~8% duty V/f amplitude ceiling (timid)
+  sine_ramp: 16                       # speed slew rate (inc-LSB/tick; ~1s to full scale)
