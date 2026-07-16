@@ -60,6 +60,27 @@ def test_tune_crossover_lock_dry_run():
     assert encode_overrides(settings)              # names encode to override bytes (apply-compatible)
 
 
+def test_tune_crossover_lock_lowspeed_reverse_dry_run():
+    # The low-speed mode (descend into 6-step, hold at an encoder-reliable speed) must work in the
+    # REVERSE direction too (--sign -1) — the whole point is that reverse aliases the encoder at the
+    # top of the ramp. It must run, measure a (sim-plumbing) slip, and write an apply-compatible tune.
+    r = _run("autocal.py", "tune-crossover-lock", "--dry-run", "--lowspeed", "--sign", "-1",
+             "--name", "xolow", "--test-cmd", "900", "--measure-speed", "40",
+             "--grid-timing", "1,4", "--grid-demag", "3",
+             "--ramp-secs", "1.0", "--descend-secs", "1.0", "--hold-secs", "0.5", "--cooldown", "0")
+    assert "# DRY-RUN: SimEncEscHost (no serial port opened)" in r.stdout
+    assert "mode=lowspeed" in r.stdout
+    assert "# CHOSEN: comm_timing=" in r.stdout
+    line = next(l for l in r.stdout.splitlines() if l.startswith("# wrote profile:"))
+    prof = line.split(":", 1)[1].strip()
+    sys.path.insert(0, HOST)
+    from pico_esc.config import load_yaml, encode_overrides, TIMING, DEMAG
+    settings = load_yaml(prof).get("settings", {})
+    assert settings.get("comm_timing") in TIMING.values()
+    assert settings.get("demag_compensation") in DEMAG.values()
+    assert encode_overrides(settings)
+
+
 def test_esctool_help():
     r = _run("esctool.py", "--help")
     assert "BLHeli-S ESC CLI" in r.stdout

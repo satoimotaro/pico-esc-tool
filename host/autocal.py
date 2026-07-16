@@ -47,7 +47,7 @@ from pico_esc.drive import ARM_WAIT, Aborted  # noqa: E402,F401
 # DriveSession the other phases use) through the shared measurement loop.
 from pico_esc import ESC, EscLink, RealClock, SimClock  # noqa: E402
 from pico_esc.sim import SimEncEscHost  # noqa: E402
-from pico_esc.crossover import measure_crossover_lock  # noqa: E402
+from pico_esc.crossover import measure_crossover_lock, measure_crossover_lock_lowspeed  # noqa: E402
 from pico_esc.config import TIMING, DEMAG, sine_crossover_bytes  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -482,7 +482,10 @@ def run_crossover_lock(args):
 
     timings = _grid_ints(args.grid_timing)
     demags = _grid_ints(args.grid_demag)
-    print(f"# crossover: up=0x{cross_up:02X} dn=0x{cross_dn:02X}; test_cmd={args.test_cmd} sign={args.sign:+d}")
+    mode = (f"lowspeed (descend into 6-step, measure at ~{args.measure_speed:.0f} mech RPM)"
+            if args.lowspeed else "top-of-ramp")
+    print(f"# crossover: up=0x{cross_up:02X} dn=0x{cross_dn:02X}; test_cmd={args.test_cmd} "
+          f"sign={args.sign:+d}; mode={mode}")
     print(f"# grid: comm_timing={timings} x demag={demags} (target slip = 1.0)")
 
     def measure(ct, dm, angle=None):
@@ -495,7 +498,12 @@ def run_crossover_lock(args):
         esc.restart()
         esc.prepare(); esc.arm(bidir=True)
         try:
-            return measure_crossover_lock(
+            if args.lowspeed:                            # descend into 6-step then measure at a low,
+                return measure_crossover_lock_lowspeed(  # encoder-reliable speed (both directions)
+                    esc, clock, target_cmd=args.test_cmd, sign=args.sign,
+                    ramp_secs=args.ramp_secs, descend_secs=args.descend_secs, hold_secs=args.hold_secs,
+                    measure_rpm=args.measure_speed, rpm_ceiling=args.rpm_ceiling, max_temp=args.max_temp)
+            return measure_crossover_lock(               # hold at the top of the ramp
                 esc, clock, target_cmd=args.test_cmd, sign=args.sign,
                 ramp_secs=args.ramp_secs, hold_secs=args.hold_secs, down_secs=args.down_secs,
                 rpm_ceiling=args.rpm_ceiling, max_temp=args.max_temp)
@@ -643,8 +651,16 @@ def main():
     xo.add_argument("--ramp-secs", type=float, default=8.0, help="ramp-up duration, s (default 8)")
     xo.add_argument("--hold-secs", type=float, default=1.5, help="hold/measure duration, s (default 1.5)")
     xo.add_argument("--down-secs", type=float, default=8.0, help="ramp-down duration, s (default 8)")
+    xo.add_argument("--lowspeed", action="store_true",
+                    help="measure at a LOW encoder-reliable speed (descend into 6-step then hold) so "
+                         "BOTH --sign directions work (reverse aliases the 50Hz encoder at the top)")
+    xo.add_argument("--measure-speed", type=float, default=700.0,
+                    help="--lowspeed target mech RPM to descend to and measure at (default 700)")
+    xo.add_argument("--descend-secs", type=float, default=8.0,
+                    help="--lowspeed ramp-DOWN duration while finding the measure speed, s (default 8)")
     xo.add_argument("--rpm-ceiling", type=float, default=900.0,
-                    help="measured-speed safety cap, mech RPM (default 900)")
+                    help="measured-speed safety cap, mech RPM (default 900; --lowspeed scales it up "
+                         "for the brief high-speed 6-step entry)")
     xo.add_argument("--max-temp", type=float, default=60.0, help="temp abort, C (0=off; default 60)")
     xo.add_argument("--cooldown", type=float, default=1.0, help="pause between combos, s (default 1)")
     xo.add_argument("--fine-trim", action="store_true",

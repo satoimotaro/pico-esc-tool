@@ -3,10 +3,9 @@
 """pico_esc.crossover — one proven measurement loop for the S3 sine<->6-step crossover.
 
 Both xover_debug (the hardware connection/handoff checker) and autocal's tune-crossover-lock
-phase need to do the SAME thing: ramp the ESC command up through the crossover into 6-step,
-hold, measure steady-state lock quality, then ramp back down and see whether the rotor
-reversed. This module is the single source of truth for that loop so the two callers cannot
-drift apart.
+phase need to ramp the ESC command up through the crossover into 6-step and measure the lock
+quality. This module is the single source of truth for that loop (via the shared `_Ticker`) so
+the callers cannot drift apart.
 
 Lock quality is the SLIP ratio:
 
@@ -16,12 +15,21 @@ which is ~1.0 at true BEMF lock. In forced sine the telemetry eRPM is stale, and
 6-step lock commutates near the seed rate rather than real BEMF (slip well above 1). Auto-cal
 minimises |slip - 1| across a (comm_timing, demag_compensation) grid.
 
-Robustness the bench taught us (all handled here so every caller gets it):
-  * the guarded modulo unwrap + VEL_LP_ALPHA low-pass from posctl (no aliased sign flips),
-  * _pace every tick so the <500 ms spin deadman is never starved, and esc.thrust() re-sent
-    every tick as the keep-alive,
-  * SKIP invalid telemetry frames (volts == 0): the first ~3 frames after arm return garbage
-    temp/volts=0 and would otherwise spike peak-temp and poison the slip median,
+TWO measurement modes:
+  * measure_crossover_lock          — hold at the TOP of the ramp and measure. Works when the
+                                      6-step speed at the crossover command is in the encoder's
+                                      reliable range (forward at the crossover ~1055 mech RPM).
+  * measure_crossover_lock_lowspeed — cross into 6-step, then DESCEND the command (navigating by
+                                      telemetry eRPM) to a low, encoder-reliable speed and hold
+                                      there. This is what makes BOTH directions measurable:
+                                      reverse runs faster (~1600-2000 mech) and would otherwise
+                                      alias the 50 Hz encoder (Nyquist ~1350 mech RPM).
+
+Robustness the bench taught us (all in `_Ticker`, so every caller gets it):
+  * guarded modulo unwrap + VEL_LP_ALPHA low-pass from posctl (no aliased sign flips),
+  * _pace every tick so the <500 ms spin deadman is never starved; esc.thrust() re-sent each tick,
+  * telemetry frame validity keyed on |eRPM| (NOT volts — this firmware reports volts==0 ALWAYS;
+    the garbage first-few-frames-after-arm read rpm~0 and are rejected by the eRPM floor),
   * median (not mean) over the hold window.
 """
 from __future__ import annotations
@@ -35,7 +43,7 @@ from .control import DT, DELTA_FAULT_FRAC, VEL_LP_ALPHA, _pace
 from .drive import Aborted
 
 POLE_PAIRS = 7                     # 12N14P: telemetry eRPM = mech RPM * POLE_PAIRS
-TELE_MIN_ERPM = 50.0               # a valid (spinning) telemetry frame; garbage early-after-arm
+TELE_MIN_ERPM = 50.0               # a valid (spinning, 6-step) telemetry frame; garbage early-after-arm
                                    # frames read rpm~0. NOTE: this firmware's telemetry reports
                                    # volts==0 ALWAYS, so frame validity is keyed on eRPM, NOT volts.
 ENC_MIN_RPM = 20.0                 # |mech RPM| below this is "not clearly turning" (slip divide guard)
@@ -43,9 +51,9 @@ REV_FLOOR_RPM = 150.0              # opposite-direction |mech RPM| that counts a
                                    # true reversal runs to ~1000s; end-of-ramp settling noise << this)
 REV_MIN_CMD = 150                  # only check for reversal while still meaningfully commanded (not
                                    # the final coast to 0, where near-zero encoder noise is normal)
-REV_TICKS = 20                     # sustained opposite-direction ticks = a REAL runaway (a true
-                                   # reversal reverses for dozens of ticks; a brief high-speed
-                                   # encoder-aliasing blip on the down-ramp is only a few ticks)
+REV_TICKS = 20                     # sustained opposite-direction ticks = a REAL runaway
+ENC_ALIAS_RPM = 1350.0             # 50 Hz sampling aliases the encoder above ~this (Nyquist); the
+                                   # low-speed mode navigates by telemetry to stay well under it.
 
 
 def unwrap_rpm(prev_raw, raw, dt, vel):
@@ -65,17 +73,17 @@ def unwrap_rpm(prev_raw, raw, dt, vel):
 
 @dataclass
 class CrossoverResult:
-    """Outcome of one ramp-up / hold / ramp-down measurement."""
+    """Outcome of one measurement (top-of-ramp hold or low-speed descend+hold)."""
     enc_rpm: float = 0.0            # median mech RPM over the steady window (signed)
     tele_erpm: float = 0.0         # median telemetry eRPM over the steady window (signed)
     slip: float | None = None      # (|tele| / POLE_PAIRS) / |enc|, or None if not measurable
-    reversed: bool = False         # rotor turned opposite to the command during the down-ramp
-    top_cmd: int = 0               # signed command actually reached at the top of the ramp
-    ceiling_hit: bool = False      # measured-speed ceiling stopped the up-ramp early
-    peak_temp: float | None = None  # peak ESC temp seen on VALID (volts>0) frames
+    reversed: bool = False         # rotor turned opposite to the command during the down/coast ramp
+    top_cmd: int = 0               # signed command the measurement was taken at (hold command)
+    ceiling_hit: bool = False      # measured-speed ceiling stopped the up-ramp early (top-of-ramp mode)
+    peak_temp: float | None = None  # peak ESC temp seen on valid (spinning) frames
     n_enc: int = 0                 # steady-window encoder samples used for the median
     n_tele: int = 0                # steady-window valid telemetry samples used for the median
-    aborted: str | None = None     # abort reason if a safety trip cut the ramp short
+    aborted: str | None = None     # reason the run could not produce a clean measurement
 
     @property
     def slip_err(self) -> float:
@@ -89,119 +97,106 @@ class _Windows:
     tele: list = field(default_factory=list)
 
 
-def measure_crossover_lock(esc, clock, *, target_cmd, sign=1,
-                           ramp_secs=8.0, hold_secs=1.5, down_secs=8.0,
-                           rpm_ceiling=450.0, max_temp=60.0, tele_period=0.2,
-                           on_sample=None, stall_guard=True):
-    """Ramp |cmd| 0 -> target_cmd (in direction `sign`) through the crossover, hold, measure
-    steady slip, then ramp back down and detect reversal. Returns a CrossoverResult.
+class _Ticker:
+    """Shared per-tick mechanics for the crossover ramp loops (single source of truth).
 
-    The ESC must already be armed (bidir). This drives esc.thrust() every tick as the keep-alive
-    and never sends a throttle. Safety trips (over-speed past 1.5x rpm_ceiling, stall/desync,
-    over-temp) raise drive.Aborted — the caller is expected to disarm in a finally. A measured
-    speed that merely reaches rpm_ceiling is NOT an abort: the up-ramp stops there and the
-    down-ramp begins (bounds top speed, as on the first hardware run).
+    Each tick: read the encoder + guarded-unwrap velocity, re-send esc.thrust() (deadman
+    keep-alive), poll telemetry every tele_period (validity keyed on |eRPM|>floor since this
+    firmware reports volts==0 always), fold peak-temp + over-temp abort, enforce over-speed /
+    stall safety, fire on_sample, and _pace. It holds all per-tick state; the CALLER drives the
+    phase sequence and collects the measurement windows from `.vel` / `.tele_erpm`.
 
-    on_sample(t, cmd, enc_rpm, tele_erpm, phase, peak_temp) is called once per tick (phase is
-    "up" | "hold" | "down") so a caller can log CSV / report handoff regimes without duplicating
-    the loop. tele_erpm is the last VALID (volts>0) telemetry eRPM, or 0.0 before the first one.
-    """
-    res = CrossoverResult()
-    steady = _Windows()
-    # rolling tail of the up-ramp so a ceiling-limited run (no dwell at the ceiling) is still
-    # scored, from the samples just before the ramp was cut.
-    hold_ticks = max(1, round(hold_secs / DT))
-    tail = _Windows(enc=deque(maxlen=hold_ticks),
-                    tele=deque(maxlen=max(1, round(hold_secs / tele_period) + 1)))
+    The 50 Hz encoder ALIASES above ~ENC_ALIAS_RPM, so with use_tele_speed=True the over-speed /
+    stall guards use the telemetry-derived mech speed while 6-step is live (reliable at any speed)
+    and fall back to the encoder otherwise. The top-of-ramp mode leaves it off (its forward
+    operating point is encoder-reliable)."""
 
-    prev_raw = None
-    vel = 0.0
-    last_erpm = 0.0
-    last_t = clock.now()
-    t0 = last_t
-    next_tele = t0
-    stall_ticks = 0
-    rev_ticks = 0
-
-    def tick(cmd, phase):
-        nonlocal prev_raw, vel, last_erpm, last_t, next_tele, stall_ticks, rev_ticks
-        tick_start = clock.now()
-        enc = esc.encoder()
+    def __init__(self, esc, clock, *, sign, over_speed_rpm, max_temp, tele_period,
+                 stall_guard, on_sample, result, use_tele_speed=False):
+        self.esc, self.clock, self.sign = esc, clock, sign
+        self.over_speed_rpm = over_speed_rpm
+        self.max_temp, self.tele_period = max_temp, tele_period
+        self.stall_guard, self.on_sample = stall_guard, on_sample
+        self.res, self.use_tele_speed = result, use_tele_speed
+        self.prev_raw = None
+        self.vel = 0.0                 # low-passed encoder mech RPM (signed)
+        self.tele_erpm = 0.0           # last valid telemetry eRPM (signed)
+        self.tele_live = False         # last poll was a live 6-step frame (|eRPM|>floor)
+        self.tele_fresh = False        # a telemetry poll happened THIS tick
         now = clock.now()
-        dt = now - last_t
-        last_t = now
+        self.last_t = now
+        self.t0 = now
+        self.next_tele = now
+        self.stall_ticks = 0
+
+    @property
+    def mech_speed(self):
+        """Best available |mech RPM|: telemetry (reliable at any speed) while 6-step is live and
+        use_tele_speed is on, else the (possibly aliasing) encoder."""
+        if self.use_tele_speed and self.tele_live:
+            return abs(self.tele_erpm) / POLE_PAIRS
+        return abs(self.vel)
+
+    def tick(self, cmd, phase):
+        tick_start = self.clock.now()
+        enc = self.esc.encoder()
+        now = self.clock.now()
+        dt = now - self.last_t
+        self.last_t = now
         if enc is not None and enc.healthy:
-            vel, prev_raw = unwrap_rpm(prev_raw, enc.raw, dt, vel)
-        esc.thrust(cmd)                                     # keep-alive (feeds the deadman)
+            self.vel, self.prev_raw = unwrap_rpm(self.prev_raw, enc.raw, dt, self.vel)
+        self.esc.thrust(cmd)                               # keep-alive (feeds the deadman)
 
-        if tick_start >= next_tele:
-            next_tele = tick_start + tele_period
-            tel = esc.telemetry()
-            # SKIP invalid frames by eRPM (not volts — this firmware always reports volts==0):
-            # the first ~3 frames after arm return rpm~0 with garbage temp, and near-zero/stale
-            # eRPM must not poison the slip median. Temp is trusted only on valid spinning frames.
+        self.tele_fresh = False
+        if tick_start >= self.next_tele:
+            self.next_tele = tick_start + self.tele_period
+            tel = self.esc.telemetry()
+            self.tele_fresh = True
+            # Validity by |eRPM| (this firmware reports volts==0 always): a live 6-step frame reads
+            # |eRPM|>floor; stale-sine / garbage-startup frames read ~0. Temp trusted only when live.
             if tel is not None and tel.rpm is not None and abs(float(tel.rpm)) > TELE_MIN_ERPM:
-                last_erpm = float(tel.rpm)
+                self.tele_erpm = float(tel.rpm)
+                self.tele_live = True
                 if tel.temp is not None:
-                    res.peak_temp = tel.temp if res.peak_temp is None else max(res.peak_temp, tel.temp)
-                    if max_temp and tel.temp >= max_temp:
+                    self.res.peak_temp = (tel.temp if self.res.peak_temp is None
+                                          else max(self.res.peak_temp, tel.temp))
+                    if self.max_temp and tel.temp >= self.max_temp:
                         raise Aborted(f"over-temp {tel.temp}C")
-                if phase == "hold":
-                    steady.tele.append(last_erpm)
-                elif phase == "up":
-                    tail.tele.append(last_erpm)
-
-        if abs(vel) > rpm_ceiling * 1.5:                   # hard safety net
-            raise Aborted(f"over-speed {vel:.0f}RPM > 1.5x ceiling")
-        if stall_guard and abs(cmd) >= 200 and abs(vel) < 15.0:
-            stall_ticks += 1
-            if stall_ticks >= 30:                          # ~0.6 s powered but not turning
-                raise Aborted(f"stall/desync: cmd={cmd} but ~0 RPM for {stall_ticks} ticks")
-        else:
-            stall_ticks = 0
-
-        if phase == "hold":
-            steady.enc.append(vel)
-        elif phase == "up":
-            tail.enc.append(vel)
-        if phase == "down":                                # reversal: sustained large opposite spin
-            if abs(cmd) > REV_MIN_CMD and sign * vel < -REV_FLOOR_RPM:
-                rev_ticks += 1
-                if rev_ticks >= REV_TICKS:
-                    res.reversed = True
             else:
-                rev_ticks = 0
+                self.tele_live = False
 
-        if on_sample is not None:
-            on_sample(tick_start - t0, cmd, vel, last_erpm, phase, res.peak_temp)
-        _pace(clock, tick_start)
-        return vel
+        spd = self.mech_speed
+        if spd > self.over_speed_rpm:                      # hard safety net
+            raise Aborted(f"over-speed {spd:.0f}RPM > limit {self.over_speed_rpm:.0f}")
+        # Stall/desync = powered but not turning. Live telemetry is positive evidence the motor IS
+        # commutating (spinning), so never call it a stall while 6-step telemetry is live.
+        spinning_by_tele = self.use_tele_speed and self.tele_live
+        if self.stall_guard and abs(cmd) >= 200 and spd < 15.0 and not spinning_by_tele:
+            self.stall_ticks += 1
+            if self.stall_ticks >= 30:                     # ~0.6 s powered but not turning
+                raise Aborted(f"stall/desync: cmd={cmd} but ~0 RPM for {self.stall_ticks} ticks")
+        else:
+            self.stall_ticks = 0
 
-    # ---- ramp up (stop early if the measured-speed ceiling is hit) ----
-    n = max(1, round(ramp_secs / DT))
-    top_cmd = sign * int(target_cmd)
-    for i in range(n):
-        cmd = sign * round(target_cmd * (i + 1) / n)
-        v = tick(cmd, "up")
-        if abs(v) >= rpm_ceiling:
-            res.ceiling_hit = True
-            top_cmd = cmd
-            break
-    res.top_cmd = top_cmd
+        if self.on_sample is not None:
+            self.on_sample(tick_start - self.t0, cmd, self.vel, self.tele_erpm, phase, self.res.peak_temp)
+        _pace(self.clock, tick_start)
+        return self.vel
 
-    # ---- hold at the top and measure steady slip. If the measured-speed ceiling cut the ramp
-    #      short we do NOT dwell at that speed (safety); the up-ramp tail below is scored instead. ----
-    if not res.ceiling_hit:
-        for _ in range(hold_ticks):
-            tick(top_cmd, "hold")
 
-    # ---- ramp down through the reverse handoff, watching for reversal ----
-    n = max(1, round(down_secs / DT))
-    for i in range(n):
-        tick(sign * round(abs(top_cmd) * (n - i - 1) / n), "down")
+def _reversal_watch(tk, sign, cmd, rev_ticks, res):
+    """Flag a REAL reversal: rotor spinning strongly opposite the command for many ticks."""
+    if abs(cmd) > REV_MIN_CMD and sign * tk.vel < -REV_FLOOR_RPM:
+        rev_ticks += 1
+        if rev_ticks >= REV_TICKS:
+            res.reversed = True
+        return rev_ticks
+    return 0
 
-    # ---- reduce the steady window to robust medians (fall back to the up-ramp tail if we
-    #      never held, e.g. a ceiling-limited run) ----
+
+def _finalize(res, steady, tail=None):
+    """Reduce the steady window (falling back to the up-ramp tail) to robust medians + slip."""
+    tail = tail or _Windows()
     enc_win = list(steady.enc) or list(tail.enc)
     tele_win = list(steady.tele) or list(tail.tele)
     res.n_enc = len(enc_win)
@@ -212,4 +207,175 @@ def measure_crossover_lock(esc, clock, *, target_cmd, sign=1,
         res.tele_erpm = statistics.median(tele_win)
     if enc_win and tele_win and abs(res.enc_rpm) > ENC_MIN_RPM:
         res.slip = (abs(res.tele_erpm) / POLE_PAIRS) / abs(res.enc_rpm)
+
+
+def _coast_to_zero(tk, from_cmd, *, sign=1, res=None, secs=2.0):
+    """Ramp the command from from_cmd down to 0 (safe stop), optionally watching for reversal.
+    Never raises out (a late over-temp during the coast is moot — we are already stopping)."""
+    n = max(1, round(secs / DT))
+    start = abs(int(from_cmd))
+    s = 1 if from_cmd >= 0 else -1
+    rev_ticks = 0
+    for i in range(n):
+        cmd = s * round(start * (n - i - 1) / n)
+        try:
+            tk.tick(cmd, "down")
+        except Aborted:
+            break
+        if res is not None:
+            rev_ticks = _reversal_watch(tk, sign, cmd, rev_ticks, res)
+
+
+def measure_crossover_lock(esc, clock, *, target_cmd, sign=1,
+                           ramp_secs=8.0, hold_secs=1.5, down_secs=8.0,
+                           rpm_ceiling=450.0, max_temp=60.0, tele_period=0.2,
+                           on_sample=None, stall_guard=True):
+    """Top-of-ramp mode: ramp |cmd| 0 -> target_cmd through the crossover, hold at the top, measure
+    steady slip, then ramp down and detect reversal. Returns a CrossoverResult.
+
+    The ESC must already be armed (bidir). Drives esc.thrust() every tick as the keep-alive. Safety
+    trips (over-speed past 1.5x rpm_ceiling, stall/desync, over-temp) raise drive.Aborted — the
+    caller disarms in a finally. Merely reaching rpm_ceiling is NOT an abort: the up-ramp stops there
+    (no dwell at the ceiling) and the down-ramp begins. on_sample(t, cmd, enc_rpm, tele_erpm, phase,
+    peak_temp) is called once per tick (phase "up"|"hold"|"down") for CSV / handoff reporting."""
+    res = CrossoverResult()
+    tk = _Ticker(esc, clock, sign=sign, over_speed_rpm=rpm_ceiling * 1.5, max_temp=max_temp,
+                 tele_period=tele_period, stall_guard=stall_guard, on_sample=on_sample, result=res)
+    steady = _Windows()
+    hold_ticks = max(1, round(hold_secs / DT))
+    tail = _Windows(enc=deque(maxlen=hold_ticks),
+                    tele=deque(maxlen=max(1, round(hold_secs / tele_period) + 1)))
+
+    def collect(phase):
+        win = steady if phase == "hold" else tail
+        win.enc.append(tk.vel)
+        if tk.tele_fresh and tk.tele_live:
+            win.tele.append(tk.tele_erpm)
+
+    # ---- ramp up (stop early if the measured-speed ceiling is hit) ----
+    n = max(1, round(ramp_secs / DT))
+    top_cmd = sign * int(target_cmd)
+    for i in range(n):
+        cmd = sign * round(target_cmd * (i + 1) / n)
+        tk.tick(cmd, "up")
+        collect("up")
+        if abs(tk.vel) >= rpm_ceiling:
+            res.ceiling_hit = True
+            top_cmd = cmd
+            break
+    res.top_cmd = top_cmd
+
+    # ---- hold at the top and measure (skip the dwell if the ceiling cut us off: the up-ramp
+    #      tail is scored instead) ----
+    if not res.ceiling_hit:
+        for _ in range(hold_ticks):
+            tk.tick(top_cmd, "hold")
+            collect("hold")
+
+    # ---- ramp down through the reverse handoff, watching for reversal ----
+    n = max(1, round(down_secs / DT))
+    rev_ticks = 0
+    for i in range(n):
+        cmd = sign * round(abs(top_cmd) * (n - i - 1) / n)
+        tk.tick(cmd, "down")
+        rev_ticks = _reversal_watch(tk, sign, cmd, rev_ticks, res)
+
+    _finalize(res, steady, tail)
+    return res
+
+
+def measure_crossover_lock_lowspeed(esc, clock, *, target_cmd, sign=1,
+                                    ramp_secs=8.0, descend_secs=8.0, hold_secs=1.5,
+                                    measure_rpm=700.0, rpm_ceiling=None, max_temp=60.0,
+                                    tele_period=0.2, hold_bump=30, hold_retries=3,
+                                    on_sample=None, stall_guard=True):
+    """Low-speed mode — measure the 6-step lock at a LOW, encoder-reliable speed so BOTH directions
+    work. Returns a CrossoverResult.
+
+    Why: the encoder samples once per 50 Hz control tick, so it aliases above ~1350 mech RPM
+    (Nyquist). Forward at the crossover holds ~1055 mech (measurable); reverse runs faster
+    (~1600-2000 mech) and aliases into garbage / sign flips. The firmware also refuses Cross_Up
+    below the ~1333 eRPM BEMF floor, so the crossover itself can't be lowered.
+
+    Approach: ramp up past Cross_Up into 6-step (detected by telemetry going LIVE), then DESCEND the
+    command — navigating by TELEMETRY eRPM, which the ESC measures reliably at any speed — until the
+    mech speed reaches `measure_rpm`; HOLD there and measure the encoder-based slip (the encoder is
+    trustworthy at ~700 mech = ~0.23 rev/sample). Direction-adaptive: the hold command is FOUND by
+    descending, not hardcoded, so reverse (faster) settles at a lower command than forward.
+
+    Robustness: if the hold command is a touch too low and the ESC hands back to sine (telemetry
+    goes stale mid-hold), the hold retries at a slightly higher command (+hold_bump), bounded by
+    hold_retries. If it still can't hold 6-step, res.aborted explains why."""
+    res = CrossoverResult()
+    # Over-speed: generous during the brief high-speed entry (the encoder aliases there but the
+    # telemetry-based guard is honest, and the descend drops speed within a few ticks). An explicit
+    # rpm_ceiling still caps it; otherwise scale off the measure speed.
+    over = max((rpm_ceiling or 0.0) * 1.5, measure_rpm * 5.0)
+    tk = _Ticker(esc, clock, sign=sign, over_speed_rpm=over, max_temp=max_temp,
+                 tele_period=tele_period, stall_guard=stall_guard, on_sample=on_sample,
+                 result=res, use_tele_speed=True)
+
+    # ---- 1) ramp up until telemetry goes LIVE == we crossed into 6-step (don't dwell up high) ----
+    n = max(1, round(ramp_secs / DT))
+    top = sign * int(target_cmd)
+    for i in range(n):
+        cmd = sign * round(target_cmd * (i + 1) / n)
+        tk.tick(cmd, "up")
+        top = cmd
+        if tk.tele_live:                                   # handoff fired -> in 6-step
+            break
+    res.top_cmd = top
+    if not tk.tele_live:
+        res.aborted = "never reached 6-step (telemetry stale through the up-ramp)"
+        _coast_to_zero(tk, top, sign=sign)
+        return res
+
+    # ---- 2) descend, navigating by telemetry, until the mech speed reaches measure_rpm ----
+    hold_cmd = None
+    n = max(1, round(descend_secs / DT))
+    start = abs(top)
+    last_cmd = top
+    for i in range(n):
+        cmd = sign * max(1, round(start * (n - i - 1) / n))
+        last_cmd = cmd
+        tk.tick(cmd, "descend")
+        if not tk.tele_live:                               # handed back to sine before the target
+            break
+        if tk.mech_speed <= measure_rpm:
+            hold_cmd = cmd
+            break
+    if hold_cmd is None:
+        res.aborted = ("could not settle at the measure speed while descending — the 6-step handed "
+                       "back to sine first; raise --measure-speed above the down-handoff speed")
+        _coast_to_zero(tk, last_cmd, sign=sign)
+        return res
+
+    # ---- 3) hold at hold_cmd and measure; bump up + retry if it goes stale (dropped to sine) ----
+    steady = _Windows()
+    held = False
+    hold_ticks = max(1, round(hold_secs / DT))
+    for _ in range(hold_retries + 1):
+        steady = _Windows()
+        stale = False
+        for _ in range(hold_ticks):
+            tk.tick(hold_cmd, "hold")
+            steady.enc.append(tk.vel)
+            if tk.tele_fresh:
+                if tk.tele_live:
+                    steady.tele.append(tk.tele_erpm)
+                else:
+                    stale = True                           # handed back to sine at this command
+        if not stale and steady.tele:
+            held = True
+            break
+        hold_cmd = sign * (abs(hold_cmd) + hold_bump)      # too low -> bump the command up and retry
+    res.top_cmd = hold_cmd
+    if not held:
+        res.aborted = (res.aborted
+                       or f"could not hold 6-step at the measure speed (stale after {hold_retries} bumps)")
+
+    _finalize(res, steady)                                 # medians from the hold window only
+
+    # ---- 4) safe coast to zero, watching for reversal (encoder reliable at this low speed) ----
+    _coast_to_zero(tk, hold_cmd, sign=sign, res=res)
     return res

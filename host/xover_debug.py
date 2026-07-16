@@ -42,7 +42,8 @@ from pico_esc import ESC, EscLink, RealClock, SimClock          # noqa: E402
 from pico_esc.sim import SimEncEscHost                          # noqa: E402
 from pico_esc.drive import Aborted                              # noqa: E402
 from pico_esc.config import sine_crossover_bytes                # noqa: E402
-from pico_esc.crossover import POLE_PAIRS, measure_crossover_lock  # noqa: E402
+from pico_esc.crossover import (POLE_PAIRS, measure_crossover_lock,  # noqa: E402
+                                measure_crossover_lock_lowspeed)
 
 REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
@@ -74,6 +75,13 @@ def main():
     ap.add_argument("--up-secs", type=float, default=8.0, help="ramp-up duration, s (default 8)")
     ap.add_argument("--hold-secs", type=float, default=1.5, help="hold at top, s (default 1.5)")
     ap.add_argument("--down-secs", type=float, default=8.0, help="ramp-down duration, s (default 8)")
+    ap.add_argument("--lowspeed", action="store_true",
+                    help="measure at a LOW encoder-reliable speed (descend into 6-step then hold) so "
+                         "reverse (--sign -1) doesn't alias the 50Hz encoder at the top of the ramp")
+    ap.add_argument("--measure-speed", type=float, default=700.0,
+                    help="--lowspeed target mech RPM to descend to and measure at (default 700)")
+    ap.add_argument("--descend-secs", type=float, default=8.0,
+                    help="--lowspeed ramp-DOWN duration while finding the measure speed, s (default 8)")
     ap.add_argument("--max-temp", type=float, default=60.0, help="temp abort, C (0=off; default 60)")
     ap.add_argument("--sign", type=int, default=1, choices=(1, -1),
                     help="thrust direction to ramp: +1 forward (default), -1 reverse (bidirectional thruster)")
@@ -144,11 +152,21 @@ def main():
         else:
             esc.config.set(sine_cross_up=cross_up, sine_cross_dn=cross_dn)   # into the sim
         esc.prepare(); esc.arm(bidir=True)
-        print("# armed; ramping up through the crossover…")
-        result = measure_crossover_lock(
-            esc, clock, target_cmd=opts.cmd_max, sign=opts.sign,
-            ramp_secs=opts.up_secs, hold_secs=opts.hold_secs, down_secs=opts.down_secs,
-            rpm_ceiling=opts.rpm_ceiling, max_temp=opts.max_temp, on_sample=on_sample)
+        print("# armed; ramping up through the crossover…"
+              + (f" (lowspeed: measure at ~{opts.measure_speed:.0f} mech RPM)" if opts.lowspeed else ""))
+        if opts.lowspeed:
+            result = measure_crossover_lock_lowspeed(
+                esc, clock, target_cmd=opts.cmd_max, sign=opts.sign,
+                ramp_secs=opts.up_secs, descend_secs=opts.descend_secs, hold_secs=opts.hold_secs,
+                measure_rpm=opts.measure_speed, rpm_ceiling=opts.rpm_ceiling,
+                max_temp=opts.max_temp, on_sample=on_sample)
+        else:
+            result = measure_crossover_lock(
+                esc, clock, target_cmd=opts.cmd_max, sign=opts.sign,
+                ramp_secs=opts.up_secs, hold_secs=opts.hold_secs, down_secs=opts.down_secs,
+                rpm_ceiling=opts.rpm_ceiling, max_temp=opts.max_temp, on_sample=on_sample)
+        if result.aborted:
+            print(f"#   note: {result.aborted}")
         if result.ceiling_hit:
             print(f"#   ceiling {opts.rpm_ceiling:.0f}RPM reached at cmd={result.top_cmd} "
                   f"— held briefly then ramped down")
