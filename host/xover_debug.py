@@ -13,6 +13,10 @@ WHAT IT CHECKS
 
 "thrust" here = the signed ESC COMMAND (-1000..1000), NOT physical force.
 
+The ramp/measure loop itself lives in pico_esc.crossover.measure_crossover_lock (shared with
+autocal's tune-crossover-lock phase): guarded unwrap + low-pass, keep-alive + deadman pacing,
+volts>0 telemetry filtering, safety aborts. This CLI adds CSV logging + handoff-regime reporting.
+
 SAFETY (this is the S3 firmware's FIRST hardware crossover test — be gentle):
 - --rpm-ceiling caps the ACTUAL measured speed: the moment the encoder exceeds it we stop
   ramping and cut toward zero — this bounds the top speed regardless of regime (6-step can
@@ -28,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import os
 import signal
 import sys
@@ -38,23 +41,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pico_esc import ESC, EscLink, RealClock, SimClock          # noqa: E402
 from pico_esc.sim import SimEncEscHost                          # noqa: E402
 from pico_esc.drive import Aborted                              # noqa: E402
-from pico_esc.control import _pace, DT, DELTA_FAULT_FRAC, VEL_LP_ALPHA  # noqa: E402
-from pico_esc.constants import COUNTS_PER_REV                   # noqa: E402
 from pico_esc.config import sine_crossover_bytes                # noqa: E402
+from pico_esc.crossover import POLE_PAIRS, measure_crossover_lock  # noqa: E402
 
-POLE_PAIRS = 7
 REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
+SINE_SLOPE = 357.0 / 1000.0     # max mech RPM per command unit in sine (forced rate)
+HANDOFF_MIN_CMD = 200           # only trust the regime heuristic above this |cmd| (low-speed
+                                # sine creep otherwise produces spurious "handoff at cmd=15")
 
-def _unwrap_rpm(prev_raw, raw, dt, vel):
-    """Return (new_vel_rpm, new_prev_raw). Guarded modulo unwrap + low-pass, like posctl."""
-    if prev_raw is None:
-        return vel, raw
-    d = ((raw - prev_raw + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
-    if abs(d) > DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2) or dt <= 0:
-        return vel, raw                                          # implausible / stalled tick: hold
-    inst = (d / COUNTS_PER_REV) / dt * 60.0                      # mech RPM (signed)
-    return vel + VEL_LP_ALPHA * (inst - vel), raw
+
+def _regime_of(enc_rpm, cmd, tele_rpm):
+    # Robust, works on sim AND hardware: sine's forced rate CANNOT exceed cmd*SINE_SLOPE, so a
+    # measured speed clearly above that line means the ESC handed off to 6-step. Below
+    # HANDOFF_MIN_CMD the line is too close to the noise floor to trust, so hold "sine".
+    if abs(cmd) < HANDOFF_MIN_CMD:
+        return "sine"
+    sine_max = abs(cmd) * SINE_SLOPE
+    if abs(enc_rpm) > sine_max * 1.15 + 25.0:
+        return "6step"
+    return "sine"
 
 
 def main():
@@ -69,6 +75,8 @@ def main():
     ap.add_argument("--hold-secs", type=float, default=1.5, help="hold at top, s (default 1.5)")
     ap.add_argument("--down-secs", type=float, default=8.0, help="ramp-down duration, s (default 8)")
     ap.add_argument("--max-temp", type=float, default=60.0, help="temp abort, C (0=off; default 60)")
+    ap.add_argument("--sign", type=int, default=1, choices=(1, -1),
+                    help="thrust direction to ramp: +1 forward (default), -1 reverse (bidirectional thruster)")
     ap.add_argument("--esc-index", type=int, default=1)
     ap.add_argument("--port", default=None)
     ap.add_argument("--csv", default=None)
@@ -112,21 +120,24 @@ def main():
     fh = open(path, "w", encoding="utf-8", newline="")
     w = csv.writer(fh); w.writerow(["t", "cmd", "enc_rpm", "tele_erpm", "regime", "temp"])
 
-    up_handoff = down_handoff = None
-    peak_temp = None
-    prev_regime = "sine"
+    # handoff-regime reporting state, driven from the shared measurement loop's per-tick callback.
+    handoff = {"prev": "sine", "up": None, "down": None}
+
+    def on_sample(t, cmd, enc_rpm, tele_erpm, phase, peak_temp):
+        reg = _regime_of(enc_rpm, cmd, tele_erpm)
+        if reg != handoff["prev"]:
+            if reg == "6step" and handoff["up"] is None:
+                handoff["up"] = (cmd, round(enc_rpm, 1), round(tele_erpm))
+                print(f"#   >>> UP handoff sine->6step at cmd={cmd} enc={enc_rpm:.0f}RPM tele={tele_erpm:.0f}eRPM")
+            elif reg == "sine" and handoff["up"] is not None and handoff["down"] is None:
+                handoff["down"] = (cmd, round(enc_rpm, 1), round(tele_erpm))
+                print(f"#   <<< DOWN handoff 6step->sine at cmd={cmd} enc={enc_rpm:.0f}RPM")
+            handoff["prev"] = reg
+        w.writerow([f"{t:.3f}", cmd, f"{enc_rpm:.1f}", f"{tele_erpm:.0f}", reg,
+                    "" if peak_temp is None else peak_temp])
+
     failure = None
-    SINE_SLOPE = 357.0 / 1000.0     # max mech RPM per command unit in sine (forced rate)
-
-    def regime_of(enc_rpm, cmd, tele_rpm):
-        # Robust, works on sim AND hardware: sine's forced rate CANNOT exceed cmd*SINE_SLOPE,
-        # so a measured speed clearly above that line means the ESC handed off to 6-step.
-        # (On hardware the telemetry rpm also goes from stale->live-and-matching; logged too.)
-        sine_max = abs(cmd) * SINE_SLOPE
-        if abs(enc_rpm) > sine_max * 1.15 + 25.0:
-            return "6step"
-        return "sine"
-
+    result = None
     try:
         if not opts.dry_run:
             esc.config.set(sine_cross_up=cross_up, sine_cross_dn=cross_dn); esc.restart()
@@ -134,70 +145,13 @@ def main():
             esc.config.set(sine_cross_up=cross_up, sine_cross_dn=cross_dn)   # into the sim
         esc.prepare(); esc.arm(bidir=True)
         print("# armed; ramping up through the crossover…")
-
-        prev_raw = None; vel = 0.0; last_t = clock.now()
-        t0 = clock.now(); next_tele = t0; last_erpm = 0.0
-        phase = "up"; ceiling_hit = False; stall_ticks = 0
-
-        def tick(cmd):
-            nonlocal prev_raw, vel, last_t, next_tele, last_erpm, peak_temp, prev_regime
-            nonlocal up_handoff, down_handoff, stall_ticks
-            ts = clock.now()
-            enc = esc.encoder()
-            now = clock.now(); dt = now - last_t; last_t = now
-            if enc is not None and enc.healthy:
-                vel, prev_raw = _unwrap_rpm(prev_raw, enc.raw, dt, vel)
-            esc.thrust(cmd)                                       # keep-alive (deadman fed)
-            if ts >= next_tele:
-                next_tele = ts + 0.2
-                tel = esc.telemetry()
-                if tel is not None:
-                    last_erpm = tel.rpm
-                    if tel.temp is not None:
-                        peak_temp = tel.temp if peak_temp is None else max(peak_temp, tel.temp)
-                        if opts.max_temp and tel.temp >= opts.max_temp:
-                            raise Aborted(f"over-temp {tel.temp}C")
-            if abs(vel) > opts.rpm_ceiling * 1.5:                # hard safety net
-                raise Aborted(f"over-speed {vel:.0f}RPM > 1.5x ceiling")
-            if abs(cmd) >= 200 and abs(vel) < 15.0:              # powered but not turning = desync/stall
-                stall_ticks += 1
-                if stall_ticks >= 30:                           # ~0.6s
-                    raise Aborted(f"stall/desync: cmd={cmd} but ~0 RPM for {stall_ticks} ticks")
-            else:
-                stall_ticks = 0
-            reg = regime_of(vel, cmd, last_erpm)
-            if reg != prev_regime:
-                if reg == "6step" and up_handoff is None:
-                    up_handoff = (cmd, round(vel, 1), round(last_erpm))
-                    print(f"#   >>> UP handoff sine->6step at cmd={cmd} enc={vel:.0f}RPM tele={last_erpm:.0f}eRPM")
-                elif reg == "sine" and up_handoff is not None and down_handoff is None:
-                    down_handoff = (cmd, round(vel, 1), round(last_erpm))
-                    print(f"#   <<< DOWN handoff 6step->sine at cmd={cmd} enc={vel:.0f}RPM")
-                prev_regime = reg
-            w.writerow([f"{ts - t0:.3f}", cmd, f"{vel:.1f}", f"{last_erpm:.0f}", reg,
-                        "" if peak_temp is None else peak_temp])
-            _pace(clock, ts)
-            return vel
-
-        # ramp up (stop early if the measured-speed ceiling is hit)
-        n = max(1, round(opts.up_secs / DT))
-        for i in range(n):
-            cmd = round(opts.cmd_max * (i + 1) / n)
-            v = tick(cmd)
-            if abs(v) >= opts.rpm_ceiling:
-                ceiling_hit = True
-                print(f"#   ceiling {opts.rpm_ceiling:.0f}RPM reached at cmd={cmd} — starting ramp-down now")
-                top_cmd = cmd; break
-        else:
-            top_cmd = opts.cmd_max
-        # hold at the top ONLY if we didn't hit the speed ceiling (else go straight down)
-        if not ceiling_hit:
-            for _ in range(max(1, round(opts.hold_secs / DT))):
-                tick(top_cmd)
-        # ramp down through the reverse handoff
-        n = max(1, round(opts.down_secs / DT))
-        for i in range(n):
-            tick(round(top_cmd * (n - i - 1) / n))
+        result = measure_crossover_lock(
+            esc, clock, target_cmd=opts.cmd_max, sign=opts.sign,
+            ramp_secs=opts.up_secs, hold_secs=opts.hold_secs, down_secs=opts.down_secs,
+            rpm_ceiling=opts.rpm_ceiling, max_temp=opts.max_temp, on_sample=on_sample)
+        if result.ceiling_hit:
+            print(f"#   ceiling {opts.rpm_ceiling:.0f}RPM reached at cmd={result.top_cmd} "
+                  f"— held briefly then ramped down")
     except Aborted as e:
         failure = str(e)
     except Exception as e:                                       # noqa: BLE001
@@ -211,11 +165,16 @@ def main():
         finally:
             fh.close(); host.close()
 
+    peak_temp = result.peak_temp if result else None
+    slip = result.slip if result else None
     print(f"# wrote CSV: {path}")
     print(f"# peak temp: {peak_temp}C")
-    print(f"# UP handoff (sine->6step): {up_handoff if up_handoff else 'NOT observed'}")
-    print(f"# DOWN handoff (6step->sine): {down_handoff if down_handoff else 'NOT observed'}")
-    ok = up_handoff is not None and down_handoff is not None
+    if result is not None:
+        print(f"# steady: enc={result.enc_rpm:.0f} mechRPM  tele={result.tele_erpm:.0f} eRPM  "
+              f"slip={'%.3f' % slip if slip is not None else 'n/a'}  reversed={result.reversed}")
+    print(f"# UP handoff (sine->6step): {handoff['up'] if handoff['up'] else 'NOT observed'}")
+    print(f"# DOWN handoff (6step->sine): {handoff['down'] if handoff['down'] else 'NOT observed'}")
+    ok = handoff["up"] is not None and handoff["down"] is not None
     print(f"# RESULT: crossover {'OK both directions' if ok else 'INCOMPLETE — see log'}"
           + (f"  [ABORTED: {failure}]" if failure else ""))
     if failure:

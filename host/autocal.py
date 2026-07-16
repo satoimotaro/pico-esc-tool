@@ -42,7 +42,13 @@ from esctool import encode_overrides, overrides_str  # noqa: E402
 # re-exported here so `from autocal import SimEscHost, ARM_WAIT` (posctl.py) keeps working.
 from pico_esc.sim import SimEscHost  # noqa: E402,F401
 from pico_esc.types import Tele  # noqa: E402,F401
-from pico_esc.drive import ARM_WAIT  # noqa: E402,F401
+from pico_esc.drive import ARM_WAIT, Aborted  # noqa: E402,F401
+# tune-crossover-lock drives the SIGNED-thrust / encoder / telemetry API (not the throttle
+# DriveSession the other phases use) through the shared measurement loop.
+from pico_esc import ESC, EscLink, RealClock, SimClock  # noqa: E402
+from pico_esc.sim import SimEncEscHost  # noqa: E402
+from pico_esc.crossover import measure_crossover_lock  # noqa: E402
+from pico_esc.config import TIMING, DEMAG, sine_crossover_bytes  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, "profiles")
@@ -394,6 +400,15 @@ def write_reports(name, results, rows):
     if "smooth" in results:
         settings["comm_timing"] = results["smooth"]["comm_timing"]
         settings["demag_compensation"] = results["smooth"]["demag_compensation"]
+    if "crossover_lock" in results:
+        # Emit enums by NAME (config.encode_value / esctool apply accept the enum name) so the
+        # profile is human-readable and apply-compatible. crossover_lock wins over smooth: it is
+        # the crossover-specific tune. comm_timing_angle is only written when fine-trim found one.
+        cl = results["crossover_lock"]
+        settings["comm_timing"] = TIMING[cl["comm_timing"]]
+        settings["demag_compensation"] = DEMAG[cl["demag_compensation"]]
+        if cl.get("comm_timing_angle") is not None:
+            settings["comm_timing_angle"] = cl["comm_timing_angle"]
 
     profile = {
         "identity": {"name": name},
@@ -416,6 +431,164 @@ def write_reports(name, results, rows):
 
 
 # ---------------------------------------------------------------------------
+# Phase: tune-crossover-lock — find (comm_timing, demag) for the S3 6-step BEMF lock.
+#
+# Unlike the throttle-based DriveSession phases above, this drives the signed-thrust /
+# encoder / telemetry ESC API through pico_esc.crossover.measure_crossover_lock (the SAME
+# proven loop xover_debug uses). For each grid point it ramps into 6-step, measures steady
+# SLIP = (tele_eRPM / POLE_PAIRS) / |enc_mech_RPM| (~1.0 at true lock). It picks the combo with
+# slip closest to 1.0 (disqualifying only combos that Aborted on over-speed/stall); the down-ramp
+# reversal flag is informational only (the encoder aliases at high 6-step speed, so it is not a
+# reliable disqualifier — a real runaway shows up as a bad slip or an Abort instead).
+# ---------------------------------------------------------------------------
+def _grid_ints(spec):
+    """'1,2,3' or '1 2 3' -> (1, 2, 3)."""
+    return tuple(int(x) for x in str(spec).replace(",", " ").split())
+
+
+def run_crossover_lock(args):
+    try:
+        cross_up, cross_dn = sine_crossover_bytes(args.up_erpm, args.dn_erpm)
+    except ValueError as e:
+        sys.exit(f"crossover thresholds rejected: {e}")
+
+    if args.dry_run:
+        print("# DRY-RUN: SimEncEscHost (no serial port opened)")
+        clock = SimClock()
+        host = SimEncEscHost(clock, seed=args.seed, invert=args.sim_invert)
+    else:
+        clock = RealClock()
+        host = EscLink(args.port)
+    esc = ESC(host, args.esc_index, tmax=1000, clock=clock)
+
+    def _restore_and_disarm():
+        try:
+            esc.disarm()
+        finally:
+            if not args.dry_run:                     # always leave the ESC in normal (no-crossover) mode
+                try:
+                    esc.config.set(sine_cross_up=0, sine_cross_dn=0); esc.restart()
+                except Exception:
+                    pass
+
+    def _panic(*_):
+        _restore_and_disarm()
+        try:
+            host.close()
+        finally:
+            os._exit(1)
+    signal.signal(signal.SIGINT, _panic)
+    signal.signal(signal.SIGTERM, _panic)
+
+    timings = _grid_ints(args.grid_timing)
+    demags = _grid_ints(args.grid_demag)
+    print(f"# crossover: up=0x{cross_up:02X} dn=0x{cross_dn:02X}; test_cmd={args.test_cmd} sign={args.sign:+d}")
+    print(f"# grid: comm_timing={timings} x demag={demags} (target slip = 1.0)")
+
+    def measure(ct, dm, angle=None):
+        """Apply config (motor stopped), restart, arm, ramp into 6-step, measure. Always disarms."""
+        cfg = {"comm_timing": ct, "demag_compensation": dm,
+               "sine_cross_up": cross_up, "sine_cross_dn": cross_dn}
+        if angle is not None:
+            cfg["comm_timing_angle"] = angle
+        esc.config.set(cfg)
+        esc.restart()
+        esc.prepare(); esc.arm(bidir=True)
+        try:
+            return measure_crossover_lock(
+                esc, clock, target_cmd=args.test_cmd, sign=args.sign,
+                ramp_secs=args.ramp_secs, hold_secs=args.hold_secs, down_secs=args.down_secs,
+                rpm_ceiling=args.rpm_ceiling, max_temp=args.max_temp)
+        finally:
+            esc.disarm()
+
+    rows: list = []
+    grid: list = []
+    results: dict = {}
+    failure = None
+    try:
+        for dm in demags:
+            for ct in timings:
+                aborted = None
+                try:
+                    res = measure(ct, dm)
+                except Aborted as e:                 # over-temp / stall / over-speed -> disqualify combo
+                    res, aborted = None, str(e)
+                slip = res.slip if res else None
+                rev = bool(res.reversed) if res else False
+                grid.append({"ct": ct, "dm": dm, "slip": slip, "reversed": rev, "aborted": aborted})
+                rows.append({"phase": "crossover_lock", "comm_timing": ct, "demag": dm,
+                             "slip": "" if slip is None else round(slip, 3), "reversed": int(rev),
+                             "aborted": aborted or "",
+                             "enc_rpm": round(res.enc_rpm) if res else "",
+                             "tele_erpm": round(res.tele_erpm) if res else ""})
+                print(f"  comm_timing={ct}({TIMING.get(ct, ct)}) demag={dm}({DEMAG.get(dm, dm)}): "
+                      f"slip={'n/a' if slip is None else '%.3f' % slip} reversed={rev}"
+                      + (f" ABORTED({aborted})" if aborted else ""))
+                clock.sleep(args.cooldown)           # cool-down between combos
+
+        # Rank by the RELIABLE steady-state slip (measured at the hold, encoder trustworthy there).
+        # `reversed` is only informational: the encoder ALIASES at high 6-step speed on the down-
+        # ramp, so it is not a dependable disqualifier — a genuine runaway instead shows up as a
+        # bad slip (>>1) and/or an over-speed/stall Abort, both of which this ranking handles.
+        valid = [g for g in grid if not g["aborted"] and g["slip"] is not None]
+        if not valid:
+            raise CalibrationError("no (comm_timing, demag) combo produced a measurable lock "
+                                   "— check crossover thresholds / motor, or widen the grid")
+        best = min(valid, key=lambda g: abs(g["slip"] - 1.0))
+        best_ct, best_dm, best_slip = best["ct"], best["dm"], best["slip"]
+
+        angle = None
+        if args.fine_trim and abs(best_slip - 1.0) > args.fine_thresh:
+            print(f"# fine-trim: best |slip-1|={abs(best_slip-1.0):.3f} > {args.fine_thresh} "
+                  f"-> sweeping comm_timing_angle at comm_timing={best_ct} demag={best_dm}")
+            for a in _grid_ints(args.fine_angles):
+                try:
+                    r = measure(best_ct, best_dm, angle=a)
+                except Aborted as e:
+                    print(f"  angle={a}: ABORTED({e})"); clock.sleep(args.cooldown); continue
+                s = r.slip
+                rows.append({"phase": "crossover_lock_finetrim", "comm_timing": best_ct,
+                             "demag": best_dm, "comm_timing_angle": a,
+                             "slip": "" if s is None else round(s, 3), "reversed": int(r.reversed)})
+                print(f"  angle={a}: slip={'n/a' if s is None else '%.3f' % s} reversed={r.reversed}")
+                if s is not None and abs(s - 1.0) < abs(best_slip - 1.0):
+                    best_slip, angle = s, a
+                clock.sleep(args.cooldown)
+
+        results["crossover_lock"] = {
+            "comm_timing": best_ct, "demag_compensation": best_dm, "comm_timing_angle": angle,
+            "slip": round(best_slip, 3),
+            "grid": [[g["ct"], g["dm"], None if g["slip"] is None else round(g["slip"], 3),
+                      int(g["reversed"])] for g in grid]}
+    except CalibrationError as e:
+        failure = str(e)
+    finally:
+        _restore_and_disarm()                        # ALWAYS disarm + restore crossover=0
+        host.close()
+
+    # ---- grid table + chosen values ----
+    print("\n# ---- crossover-lock grid (slip -> 1.0 at true BEMF lock) ----")
+    print(f"#   {'comm_timing':<16} {'demag':<10} {'slip':>7}  reversed")
+    for g in grid:
+        print(f"#   {str(g['ct']) + ' ' + TIMING.get(g['ct'], ''):<16} "
+              f"{str(g['dm']) + ' ' + DEMAG.get(g['dm'], ''):<10} "
+              f"{'n/a' if g['slip'] is None else '%7.3f' % g['slip']:>7}  {int(g['reversed'])}"
+              + ("  ABORTED" if g["aborted"] else ""))
+    if "crossover_lock" in results:
+        cl = results["crossover_lock"]
+        print(f"# CHOSEN: comm_timing={cl['comm_timing']} ({TIMING[cl['comm_timing']]})  "
+              f"demag_compensation={cl['demag_compensation']} ({DEMAG[cl['demag_compensation']]})  "
+              f"comm_timing_angle={cl['comm_timing_angle']}  slip={cl['slip']}")
+
+    prof, csvp = write_reports(args.name, results, rows)
+    print(f"# wrote profile: {prof}")
+    print(f"# wrote report:  {csvp}")
+    if failure:
+        sys.exit(f"CALIBRATION FAILED: {failure}")
+
+
+# ---------------------------------------------------------------------------
 # Host selection + main
 # ---------------------------------------------------------------------------
 def open_host(args):
@@ -428,6 +601,9 @@ def open_host(args):
 
 
 PHASES = ("direction", "coldstart", "minrpm", "curve", "tune-startup", "tune-smooth")
+# tune-crossover-lock is a phase but NOT part of "all": it uses the signed-thrust/encoder API
+# and the S3 crossover regime, not the throttle DriveSession the low-speed pipeline runs on.
+CROSSOVER_PHASE = "tune-crossover-lock"
 
 
 def run_pipeline(cal: Calibrator, which):
@@ -447,7 +623,7 @@ def run_pipeline(cal: Calibrator, which):
 
 def main():
     ap = argparse.ArgumentParser(description="ESC low-speed auto-calibration")
-    ap.add_argument("phase", choices=("all",) + PHASES)
+    ap.add_argument("phase", choices=("all",) + PHASES + (CROSSOVER_PHASE,))
     ap.add_argument("--esc-index", type=int, default=1, help="ESC index (default 1)")
     ap.add_argument("--max-throttle", type=int, default=600,
                     help="throttle ceiling (default 600; >800 needs confirmation)")
@@ -456,7 +632,32 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="run the whole pipeline against a simulated ESC (no hardware)")
     ap.add_argument("--yes", action="store_true", help="skip the high-throttle confirmation")
+    # ---- tune-crossover-lock args (ignored by the other phases) ----
+    xo = ap.add_argument_group("tune-crossover-lock")
+    xo.add_argument("--up-erpm", type=float, default=2200.0, help="Cross_Up threshold eRPM (default 2200)")
+    xo.add_argument("--dn-erpm", type=float, default=1800.0, help="Cross_Dn threshold eRPM (default 1800)")
+    xo.add_argument("--test-cmd", type=int, default=660, help="crossover-region ESC command to test at (default 660)")
+    xo.add_argument("--sign", type=int, default=1, choices=(1, -1), help="thrust direction (default +1)")
+    xo.add_argument("--grid-timing", default="1,2,3,4,5", help="comm_timing grid (default 1,2,3,4,5)")
+    xo.add_argument("--grid-demag", default="3", help="demag_compensation grid (default 3=High)")
+    xo.add_argument("--ramp-secs", type=float, default=8.0, help="ramp-up duration, s (default 8)")
+    xo.add_argument("--hold-secs", type=float, default=1.5, help="hold/measure duration, s (default 1.5)")
+    xo.add_argument("--down-secs", type=float, default=8.0, help="ramp-down duration, s (default 8)")
+    xo.add_argument("--rpm-ceiling", type=float, default=900.0,
+                    help="measured-speed safety cap, mech RPM (default 900)")
+    xo.add_argument("--max-temp", type=float, default=60.0, help="temp abort, C (0=off; default 60)")
+    xo.add_argument("--cooldown", type=float, default=1.0, help="pause between combos, s (default 1)")
+    xo.add_argument("--fine-trim", action="store_true",
+                    help="if best |slip-1| exceeds --fine-thresh, sweep comm_timing_angle")
+    xo.add_argument("--fine-thresh", type=float, default=0.03, help="fine-trim trigger on |slip-1| (default 0.03)")
+    xo.add_argument("--fine-angles", default="0,6,11,16,22", help="comm_timing_angle sweep (default 0,6,11,16,22)")
+    xo.add_argument("--seed", type=int, default=1234, help="dry-run sim seed")
+    xo.add_argument("--sim-invert", action="store_true", help="dry-run: model +thrust -> -encoder")
     args = ap.parse_args()
+
+    if args.phase == CROSSOVER_PHASE:
+        run_crossover_lock(args)           # own ESC handle + shared crossover helper; always disarms
+        return
 
     if args.max_throttle > CONFIRM_THROTTLE and not args.yes and not args.dry_run:
         reply = input(f"max-throttle {args.max_throttle} > {CONFIRM_THROTTLE}. Proceed? [y/N] ")
