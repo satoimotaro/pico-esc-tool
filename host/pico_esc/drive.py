@@ -8,7 +8,7 @@ drive_hold.py's keep-alive / triple-thrust-0-then-disarm safety. Moved verbatim 
 """
 from __future__ import annotations
 
-from .types import EncReading, Telem
+from .types import EncReading, EncVel, Telem
 
 ARM_WAIT = 4.0             # seconds to wait after arming before driving
 
@@ -90,6 +90,26 @@ class PosDrive:
                 try:
                     return EncReading(int(p[1]), int(p[4]), int(p[5]),
                                       int(p[6]), int(p[7]), int(p[8]))
+                except (ValueError, IndexError):
+                    return None
+        return None
+
+    def read_encv(self):
+        """Return EncVel (device de-aliased velocity) or None if unsupported/unparseable.
+
+        `encv|accum|rpm|samples|md` — the RP2040 samples the AS5600 at ~1.25 kHz, unwraps into a
+        signed accumulator, and computes a windowed signed mech RPM on-device, so it does NOT alias
+        at high speed the way the host-side 50 Hz unwrap of `enc` does. Older firmware (or the sim
+        without encv) answers `err unknown-cmd` -> None, and callers fall back to enc+unwrap."""
+        try:
+            lines = self.host.cmd("encv", timeout=2)
+        except Exception:
+            return None
+        for ln in lines:
+            if ln.startswith("encv|"):
+                p = ln.split("|")
+                try:
+                    return EncVel(int(p[1]), float(p[2]), int(p[3]), int(p[4]))
                 except (ValueError, IndexError):
                     return None
         return None

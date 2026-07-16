@@ -19,6 +19,20 @@ class EncReading:
         return self.md == 1 and self.ml == 0 and self.mh == 0
 
 
+class EncVel:
+    """One `encv|accum|rpm|samples|md` sample — the DE-ALIASED encoder velocity computed
+    on-device (RP2040) at ~1.25 kHz. `rpm` is signed mech RPM (raw-angle-increasing = +), valid
+    at any speed (unlike the host-side 50 Hz unwrap of `enc`, which aliases above ~1350 mech)."""
+    __slots__ = ("accum", "rpm", "samples", "md")
+
+    def __init__(self, accum, rpm, samples, md):
+        self.accum, self.rpm, self.samples, self.md = accum, rpm, samples, md
+
+    @property
+    def healthy(self):
+        return self.md == 1
+
+
 class Tele:
     __slots__ = ("rpm", "volts", "amps", "temp", "stress")
 

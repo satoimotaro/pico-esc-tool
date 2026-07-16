@@ -27,7 +27,8 @@
 // ---- facades: the AS5600 encoder + the ESC engine (bootloader/config/flash/drive) ----
 // Both transports (this serial parser + the Wi-Fi handlers) drive these two instances only;
 // enc is the AS5600 read facade (as5600.h) and esc is the thin facade over escs:: (esc.h).
-static As5600 enc;   // AS5600 magnetic encoder (I2C0, SDA=GP16 SCL=GP17, addr 0x36), core0
+static As5600Tracker enc;   // AS5600 magnetic encoder (I2C0, SDA=GP16 SCL=GP17, addr 0x36), core0;
+                            // high-rate on-device de-aliasing tracker (poll()ed every core0 loop)
 static Esc    esc;   // ESC bootloader/config/flash + DShot drive facade over the escs:: engine
 
 // Hardware config (pins, AP creds, DShot) lives in esc_config.h — the one place to edit.
@@ -439,11 +440,20 @@ static void handleSerial() {
 				analogWriteFreq(50); analogWriteRange(20000); analogWrite(Esc::pin(i),(uint32_t)us);   // 20000us period => value=us
 				Serial.printf("pwm|%d|%dus\n",i,us); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"enc")) {   // AS5600 read: enc|raw|ang|deg|md|ml|mh|agc|mag  (err if no sensor)
-			uint8_t st=0,agc=0; enc.rd(0x0B,&st,1); enc.rd(0x1A,&agc,1);
-			int raw=enc.u12(0x0C), ang=enc.u12(0x0E), mag=enc.u12(0x1B);
-			if(raw<0) Serial.println("err no-encoder");
-			else { Serial.printf("enc|%d|%d|%.1f|%d|%d|%d|%d|%d\n", raw, ang, raw*360.0f/4096.0f,
-			                     (st>>5)&1,(st>>4)&1,(st>>3)&1, agc, mag); Serial.println("ok"); } }
+			// Snapshot from the high-rate tracker (single owner of I2C0) — ang reported as raw
+			// (the host ignores the ang/deg fields); magnet-health regs refreshed at 20 Hz.
+			if(!enc.present()) Serial.println("err no-encoder");
+			else { uint8_t st=enc.status(); int raw=enc.raw();
+				Serial.printf("enc|%d|%d|%.1f|%d|%d|%d|%d|%d\n", raw, raw, raw*360.0f/4096.0f,
+				             (st>>5)&1,(st>>4)&1,(st>>3)&1, enc.agc(), enc.mag()); Serial.println("ok"); } }
+		else if (!strcmp(cmd,"encv")) {  // de-aliased encoder velocity: encv|accum|rpm|samples|md (err if none)
+			// accum = unwrapped signed position (ticks, 4096/rev); rpm = signed mech RPM computed
+			// on-device over a 20 ms window at ~1.25 kHz sampling — does NOT alias at high speed the
+			// way host-side 50 Hz unwrapping does. This is what makes fast REVERSE cleanly measurable.
+			if(!enc.present()) Serial.println("err no-encoder");
+			else { uint8_t st=enc.status();
+				Serial.printf("encv|%ld|%.2f|%lu|%d\n", (long)enc.accum(), (double)enc.rpm(),
+				             (unsigned long)enc.samples(), (st>>5)&1); Serial.println("ok"); } }
 		else if (!strcmp(cmd,"tele")) { int i=argi(); Esc::Telem t;
 			if(i<0||i>=Esc::COUNT||!esc.spinTele((uint8_t)i,t)) Serial.println("err no-telem");
 			else { Serial.printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); Serial.println("ok"); } }
@@ -484,6 +494,7 @@ void setup() {
 }
 void loop() {
 	handleSerial();
+	enc.poll();                                            // high-rate AS5600 sampling (self-gated ~1 kHz)
 	if (g_fl == FL_START || g_fl == FL_RUN) flashStep();   // flashing: one page per loop (no spin)
 	else esc.spinPoll();
 	if (wifiUp) server.handleClient();

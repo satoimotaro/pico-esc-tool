@@ -25,8 +25,18 @@ TWO measurement modes:
                                       reverse runs faster (~1600-2000 mech) and would otherwise
                                       alias the 50 Hz encoder (Nyquist ~1350 mech RPM).
 
+DE-ALIASED ENCODER (the fix that made reverse honest): the AS5600 faces the motor's magnet bell, so
+its angle advances POLE_PAIRS (7) electrical cycles per mechanical rev. Sampled at the host's 50 Hz
+that ALIASES far below the naive ~1350 mech Nyquist guess (reverse ran a touch faster and aliased
+into garbage, printing fake slip 3-21 = "over-commutation" that never existed). The RP2040 now
+samples at ~1.25 kHz and reports a de-aliased signed velocity over the `encv` line; `_Ticker` prefers
+it (dividing the electrical reading by POLE_PAIRS to mechanical) and only falls back to host-side
+unwrap of the slow `enc` line when the firmware/sim lacks `encv`. With encv, BOTH directions read a
+clean slip ~1.0 — reverse locks exactly like forward.
+
 Robustness the bench taught us (all in `_Ticker`, so every caller gets it):
-  * guarded modulo unwrap + VEL_LP_ALPHA low-pass from posctl (no aliased sign flips),
+  * device-side de-aliased velocity (encv) when available, else guarded modulo unwrap + VEL_LP_ALPHA
+    low-pass from posctl (no aliased sign flips) — the host-unwrap path still aliases at high speed,
   * _pace every tick so the <500 ms spin deadman is never starved; esc.thrust() re-sent each tick,
   * telemetry frame validity keyed on |eRPM| (NOT volts — this firmware reports volts==0 ALWAYS;
     the garbage first-few-frames-after-arm read rpm~0 and are rejected by the eRPM floor),
@@ -119,6 +129,8 @@ class _Ticker:
         self.stall_guard, self.on_sample = stall_guard, on_sample
         self.res, self.use_tele_speed = result, use_tele_speed
         self.prev_raw = None
+        self.dev_vel = None            # True once the device `encv` (de-aliased) velocity is seen;
+                                       # None until probed, False if unsupported (fall back to unwrap)
         self.vel = 0.0                 # low-passed encoder mech RPM (signed)
         self.tele_erpm = 0.0           # last valid telemetry eRPM (signed)
         self.tele_live = False         # last poll was a live 6-step frame (|eRPM|>floor)
@@ -139,12 +151,32 @@ class _Ticker:
 
     def tick(self, cmd, phase):
         tick_start = self.clock.now()
-        enc = self.esc.encoder()
+        # Prefer the DEVICE de-aliased velocity (encv): the RP2040 samples the AS5600 at ~1.25 kHz
+        # and computes signed mech RPM on-device, so it does NOT alias above ~1350 mech the way the
+        # host-side 50 Hz unwrap does — this is what makes fast REVERSE measurable. Probe once; if
+        # the firmware/sim answers None (unsupported), fall back to enc + host-side guarded unwrap.
+        ev = self.esc.encoder_velocity() if self.dev_vel is not False else None
         now = self.clock.now()
         dt = now - self.last_t
         self.last_t = now
-        if enc is not None and enc.healthy:
-            self.vel, self.prev_raw = unwrap_rpm(self.prev_raw, enc.raw, dt, self.vel)
+        if ev is not None:
+            self.dev_vel = True
+            if ev.healthy:
+                # The AS5600 faces the motor's magnet bell, so its de-aliased velocity is ELECTRICAL
+                # (POLE_PAIRS cycles per mechanical rev). Divide to mechanical RPM so every downstream
+                # metric/threshold (slip, rpm_ceiling, REV_FLOOR) stays in the same mech units it
+                # always used. At true BEMF lock enc_elec == tele_eRPM, so this mech velocity ==
+                # tele_eRPM/POLE_PAIRS and slip == 1.0 (in BOTH directions — the old aliasing that
+                # made reverse look like 3-21x over-commutation is gone).
+                self.vel = ev.rpm / POLE_PAIRS
+        elif self.dev_vel is True:
+            pass                                           # device confirmed; a transient encv miss
+                                                           # just holds the last vel (no aliased mix)
+        else:
+            self.dev_vel = False                           # unsupported -> host unwrap from here on
+            enc = self.esc.encoder()
+            if enc is not None and enc.healthy:
+                self.vel, self.prev_raw = unwrap_rpm(self.prev_raw, enc.raw, dt, self.vel)
         self.esc.thrust(cmd)                               # keep-alive (feeds the deadman)
 
         self.tele_fresh = False

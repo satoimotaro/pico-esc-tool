@@ -121,6 +121,11 @@ class ESC:
         """One AS5600 EncReading (raw + magnet-health), or None on a read/parse failure."""
         return self._drive.read_enc()
 
+    def encoder_velocity(self):
+        """Device de-aliased encoder velocity (EncVel: signed mech RPM + accum), or None if the
+        firmware/sim doesn't support `encv`. Valid at any speed — use in preference to encoder()."""
+        return self._drive.read_encv()
+
     def telemetry(self):
         """One full Telem sample (rpm/volts/amps/temp/stress), or None if absent."""
         return self._drive.read_tele()
