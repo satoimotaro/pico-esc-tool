@@ -15,10 +15,12 @@ from __future__ import annotations
 from .link import EscLink, EscHost, find_pico, RealClock, SimClock
 from .esc import ESC, EscConfig
 from .types import EncReading, Tele, Telem
+from .velocity import SpeedProfile, VelocityController, measure_steady_speed
 from . import config, protocol, flash
 
 __all__ = [
     "EscLink", "EscHost", "find_pico", "RealClock", "SimClock",
     "ESC", "EscConfig", "EncReading", "Tele", "Telem",
+    "SpeedProfile", "VelocityController", "measure_steady_speed",
     "config", "protocol", "flash",
 ]

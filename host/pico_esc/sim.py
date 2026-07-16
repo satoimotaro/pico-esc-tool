@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import math
 
-from .config import FIELD_OFF
+from .config import (FIELD_OFF, SINE_CROSS_DN_ERPM_NUM,
+                     SINE_CROSS_UP_ERPM_PER_UNIT)
 from .constants import COUNTS_PER_REV, FULLSCALE_RPM
 
 
@@ -141,6 +142,14 @@ class SimEncEscHost(SimEscHost):
     NOISE_RPM = 2.0               # under-power RPM jitter while driving
     IDLE_NOISE_RPM = 0.5          # always-on sensor/load dither (smoke-tests the hold metric)
 
+    # --- S3 sine<->BEMF crossover model (only active when sine_cross_up/dn are configured) ---
+    POLE_PAIRS = 7                # 12N14P: eRPM = mech RPM * POLE_PAIRS
+    # 6-step BEMF load-line: |thrust| -> eRPM, two bench anchors from working_930kv_low
+    # (thr 55 -> ~190 eRPM breakaway, thr 700 -> ~3800 eRPM). Above Cross_Up the firmware runs
+    # this faster, more-efficient regime; the calibration curve subsumes the handoff jump.
+    LINE_THR_LO, LINE_ERPM_LO = 55.0, 190.0
+    LINE_THR_HI, LINE_ERPM_HI = 700.0, 3800.0
+
     def __init__(self, clock, seed=1234, io_time=0.0, invert=False):
         super().__init__(seed)
         self.clock = clock
@@ -153,10 +162,53 @@ class SimEncEscHost(SimEscHost):
         self.pos_counts = 0.0    # continuous (unwrapped) encoder counts
         self.raw0 = self._rng.randrange(COUNTS_PER_REV)   # random magnet offset
         self.last_t = clock.now()
+        # S3 crossover: track the two threshold bytes (dropped by the base _apply_editpage
+        # unless they exist in cfg) so a dry-run editpage can gate the crossover model. Both
+        # default OFF (0), so the model is a no-op and _advance stays byte-identical to HEAD.
+        self.cfg["sine_cross_up"] = 0
+        self.cfg["sine_cross_dn"] = 0
+        self._regime = "sine"    # sticky forced-sine <-> 6-step BEMF load-line (hysteresis)
 
     def _target_rpm(self, thrust):
         # Stepper: linear thrust->RPM, no deadband, no floor.
         return thrust * FULLSCALE_RPM / 1000.0
+
+    def _crossover_on(self):
+        """True iff both S3 crossover thresholds are configured (0/0xFF = OFF)."""
+        cu = self.cfg.get("sine_cross_up", 0)
+        cd = self.cfg.get("sine_cross_dn", 0)
+        return cu not in (0, 0xFF) and cd not in (0, 0xFF)
+
+    def _line_target_rpm(self, thrust):
+        """6-step BEMF load-line: |thrust| -> eRPM (bench anchors) -> signed mech RPM."""
+        slope = ((self.LINE_ERPM_HI - self.LINE_ERPM_LO)
+                 / (self.LINE_THR_HI - self.LINE_THR_LO))
+        erpm = self.LINE_ERPM_LO + slope * (abs(thrust) - self.LINE_THR_LO)
+        mech = max(0.0, erpm) / self.POLE_PAIRS
+        return math.copysign(mech, thrust)
+
+    def _regime_target_rpm(self):
+        """Target mech RPM for the current thrust, crossover-aware.
+
+        Crossover OFF -> the original forced-sine law, byte-for-byte (no state read, no branch
+        change, NO RNG). Configured -> sticky hysteresis: forced-sine below Cross_Up, hand off
+        to the 6-step BEMF load-line once commanded eRPM exceeds Cross_Up, drop back to sine
+        only after the ACTUAL eRPM falls below Cross_Dn (dn < up = a real hysteresis band).
+        """
+        if not self._crossover_on():
+            return self._target_rpm(self.thrust)
+        up_erpm = self.cfg["sine_cross_up"] * SINE_CROSS_UP_ERPM_PER_UNIT
+        dn_erpm = SINE_CROSS_DN_ERPM_NUM / self.cfg["sine_cross_dn"]
+        cmd_erpm = abs(self.thrust) * FULLSCALE_RPM / 1000.0 * self.POLE_PAIRS
+        act_erpm = abs(self.rpm) * self.POLE_PAIRS
+        if self._regime == "sine":
+            if cmd_erpm > up_erpm:
+                self._regime = "line"
+        elif act_erpm < dn_erpm:
+            self._regime = "sine"
+        if self._regime == "line":
+            return self._line_target_rpm(self.thrust)
+        return self._target_rpm(self.thrust)
 
     def _advance(self, now):
         dt = now - self.last_t
@@ -171,7 +223,7 @@ class SimEncEscHost(SimEscHost):
             self.rpm = self.HOLD_STIFF * err_counts / COUNTS_PER_REV * 60.0
             self.rpm += self._rng.gauss(0.0, self.IDLE_NOISE_RPM)
         else:
-            tgt = self._target_rpm(self.thrust)
+            tgt = self._regime_target_rpm()
             alpha = 1.0 - math.exp(-dt / self.TAU)
             self.rpm += (tgt - self.rpm) * alpha
             self.rpm += self._rng.gauss(0.0, self.NOISE_RPM)
@@ -195,11 +247,21 @@ class SimEncEscHost(SimEscHost):
             deg = raw * 360.0 / COUNTS_PER_REV
             # raw|ang|deg|md|ml|mh|agc|mag — healthy magnet (md=1, ml=mh=0)
             return [f"enc|{raw}|{raw}|{deg:.1f}|1|0|0|64|1800"]
+        if head == "tele" and self._crossover_on():
+            # Live eRPM above the crossover: _advance FIRST so `tele` reports the fresh rotor
+            # speed (int mech RPM, signed). GATED on a configured crossover — with the
+            # crossover OFF this branch is skipped and `tele` falls through to SimEscHost.cmd
+            # exactly as before (no _advance, draws 0 RNG), so the dry-run oracle is untouched.
+            if self.io_time:
+                self.clock.sleep(self.io_time)
+            self._advance(self.clock.now())
+            return [f"tele|{int(self.rpm)}|12.30|0|25|0"]
         if head == "arm":
             self.thrust = 0
             self.rpm = 0.0
             self.pos_counts = 0.0
             self.last_t = self.clock.now()
+            self._regime = "sine"
         elif head in ("disarm", "run", "disconnect"):
             self.thrust = 0
             self.rpm = 0.0
