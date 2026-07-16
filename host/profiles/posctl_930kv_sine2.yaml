@@ -25,8 +25,13 @@ identity:
   mode: Multi
 settings:
   motor_direction: Bidirectional      # sine expects bidir (thrust sign = direction)
-  comm_timing: Low
-  demag_compensation: 'Off'
+  comm_timing: MediumHigh             # [S3 lock] low-KV/high-L motor needs HIGH advance for true
+                                      # BEMF lock in the 6-step crossover region. Low mistimes the
+                                      # ZC -> ~29% false-lock/slip -> ramp-down reversal. MediumHigh
+                                      # (4) -> tele tracks encoder (slip ~0.96), clean up+down cycle.
+  demag_compensation: High            # [S3 lock] High blanks the demag/freewheel so the ESC reads
+                                      # the TRUE BEMF zero-cross, not an early false one (this low-KV
+                                      # motor's long demag was the false-ZC source). Off -> slip.
   startup_power_min: 30
   startup_power_max: 18
   startup_beep: 1
