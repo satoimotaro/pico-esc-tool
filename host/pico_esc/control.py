@@ -215,6 +215,56 @@ def _read_valid_enc(drive):
     return enc if (enc is not None and enc.healthy) else None
 
 
+def unwrap_rpm(prev_raw, raw, dt, vel):
+    """Guarded modulo unwrap + low-pass of the 12-bit `enc` angle -> signed MECHANICAL RPM.
+
+    Returns (new_vel, new_prev_raw). The 2-pole magnet makes COUNTS_PER_REV one mechanical rev, so
+    this is true mech RPM. Valid only when true travel is < half a rev per tick; an implausible delta
+    (aliased wrong-direction jump) or non-positive dt holds the last velocity instead of flipping
+    sign. NOTE: at the host's ~50 Hz this ALIASES above ~1350 mech — prefer the device `encv`
+    (VelReader does) whenever it is available; this host unwrap is the fallback."""
+    if prev_raw is None:
+        return vel, raw
+    d = ((raw - prev_raw + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
+    if abs(d) > DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2) or dt <= 0:
+        return vel, raw
+    inst = (d / COUNTS_PER_REV) / dt * 60.0                 # mech RPM (signed)
+    return vel + VEL_LP_ALPHA * (inst - vel), raw
+
+
+class VelReader:
+    """Single source of truth for reading a signed MECHANICAL RPM from the ESC.
+
+    Prefers the DEVICE de-aliased velocity (`encv`): the RP2040 samples the AS5600 at ~1.25 kHz and
+    reports a signed mechanical RPM that does NOT alias at any real speed. Falls back to the host-side
+    guarded unwrap of the slow `enc` angle (which aliases at high speed) only when the firmware/sim
+    lacks `encv`. Probe once, then stick with whichever source answered.
+
+    Usage: vr = VelReader(); each tick `vel = vr.read(esc, dt)` (dt only used by the fallback)."""
+
+    def __init__(self, sign=1):
+        self.sign = 1 if sign >= 0 else -1  # wiring/DIR convention: +thrust -> +vel
+        self.vel = 0.0                 # last signed mechanical RPM (already sign-corrected)
+        self.prev_raw = None           # fallback unwrap state
+        self._dev = None               # None=unprobed, True=device encv, False=host unwrap
+
+    def read(self, esc, dt):
+        ev = esc.encoder_velocity() if self._dev is not False else None
+        if ev is not None:
+            self._dev = True
+            if ev.healthy:
+                self.vel = self.sign * ev.rpm   # already de-aliased, mechanical; apply DIR sign
+            return self.vel
+        if self._dev is True:
+            return self.vel            # device confirmed; a transient miss holds the last vel
+        self._dev = False              # unsupported -> host unwrap from here on
+        enc = esc.encoder()
+        if enc is not None and enc.healthy:
+            v, self.prev_raw = unwrap_rpm(self.prev_raw, enc.raw, dt, self.sign * self.vel)
+            self.vel = self.sign * v
+        return self.vel
+
+
 def calibrate_direction(drive: PosDrive, clock, opts, baseline_raw):
     """Probe the wiring/DIR convention: command a FORWARD thrust and measure the net
     raw-encoder travel (guarded unwrap).  Returns +1 if +thrust moved the count positive,

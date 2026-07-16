@@ -118,9 +118,10 @@ class PosDrive:
         """One full bidir-DShot telemetry sample as a Telem, or None if absent/unparseable.
 
         Parses the EXISTING `tele|rpm|volts|amps|tempC|stress` response (bidir DShot only) —
-        no new command, no protocol change. Provided for closed-loop consumers that need eRPM
-        (velocity control); it is NOT called from run_segments, so the dry-run RNG order is
-        untouched. A miss just returns None (callers skip that cycle, never abort).
+        no new command, no protocol change. NOTE: the `rpm` field is MECHANICAL RPM — the RP2040
+        firmware already divides the DShot eRPM by the motor pole pairs (ESC_MOTOR_POLES/2) before
+        sending it, so consumers must NOT divide by pole pairs again. Not called from run_segments,
+        so the dry-run RNG order is untouched. A miss just returns None (callers skip, never abort).
         """
         try:
             lines = self.host.cmd(f"tele {self.idx}", timeout=2)

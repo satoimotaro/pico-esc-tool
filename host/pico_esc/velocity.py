@@ -27,16 +27,17 @@ and the run aborts over --max-temp; the CLI always disarms on every exit.
 """
 from __future__ import annotations
 
-import math
 import statistics
 
 from . import config
-from .constants import COUNTS_PER_REV, FULLSCALE_RPM
+from .constants import COUNTS_PER_REV, FULLSCALE_RPM, POLE_PAIRS  # noqa: F401 (re-exported)
 from .control import (DELTA_FAULT_FRAC, DT, ENC_FAIL_MAX, TELE_EVERY_S,
-                      VEL_LP_ALPHA, _pace)
+                      VEL_LP_ALPHA, VelReader, _pace)
 from .drive import Aborted
 
-POLE_PAIRS = 7                    # 12N14P: eRPM = mech RPM * POLE_PAIRS (no constant in constants.py)
+# POLE_PAIRS is imported from constants (single source of truth). Here it is used ONLY to convert a
+# mechanical RPM to eRPM for the crossover-regime classifier and the eRPM display — NEVER to divide
+# the already-mechanical tele.rpm. See constants.POLE_PAIRS.
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +175,10 @@ def measure_steady_speed(esc, clock, thrust, enc_sign, settle_secs, measure_secs
     MECH RPM (not deg/s). Paces every tick (< 500 ms deadman), polls temperature and raises
     Aborted over max_temp, and bails early on a clear stall. Encoder here is CALIBRATION only.
     """
-    prev_raw = None
-    vel = 0.0                                     # low-passed mech RPM
+    # Shared de-aliased reader: device `encv` (mechanical, valid at any speed) when available, else
+    # the host-side guarded unwrap — the SAME math as the previous inline code, so the sim path is
+    # byte-for-byte unchanged. This de-aliases velcal at high speed (where the raw 50 Hz unwrap folded).
+    vr = VelReader(sign=enc_sign)
     samples = []
     peak_temp = None
     cmd_rpm = abs(thrust) / 1000.0 * FULLSCALE_RPM
@@ -185,18 +188,9 @@ def measure_steady_speed(esc, clock, thrust, enc_sign, settle_secs, measure_secs
     next_tele = clock.now()
     while clock.now() < t_end:
         tick = clock.now()
-        enc = esc.encoder()
-        if enc is not None and enc.healthy:
-            if prev_raw is None:
-                prev_raw = enc.raw
-            else:
-                d = ((enc.raw - prev_raw + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
-                prev_raw = enc.raw
-                if abs(d) <= DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2):
-                    inst = enc_sign * d / COUNTS_PER_REV / DT * 60.0    # mech RPM
-                    vel += VEL_LP_ALPHA * (inst - vel)
-                    if tick >= t_measure:
-                        samples.append(vel)
+        vel = vr.read(esc, DT)                      # signed mech RPM (encv, else host unwrap)
+        if tick >= t_measure:
+            samples.append(vel)
         # early stall-out: an excited/locked combo cooks the winding with no current sense —
         # if it isn't turning shortly into the measure window, stop NOW.
         if len(samples) >= 15 and abs(statistics.mean(samples[-15:])) < stall_rpm:
@@ -290,9 +284,10 @@ class VelocityController:
             feedback is effectively OFF. Turning it ON means (a) removing the always-0 return
             and (b) DECIDING the feedback source per regime:
               - encoder (AS5600) speed: valid in BOTH regimes but is the calibration sensor;
-              - esc.telemetry().rpm (bidir-DShot eRPM): LIVE in 6-step ("line"), but STALE/absent
-                in forced-sine ("sine") — do not trust it below the seam.
-            A robust trim likely uses the encoder below the seam and eRPM above it (see
+              - esc.telemetry().rpm (bidir-DShot, MECHANICAL RPM — firmware pre-divides eRPM by pole
+                pairs): LIVE in 6-step ("line"), but STALE/absent in forced-sine ("sine") — do not
+                trust it below the seam.
+            A robust trim likely uses the encoder below the seam and telemetry above it (see
             regime()), with anti-windup and a clamp so a bad sample can't runaway the command.
           * Keep the FF term (thrust_for) as the feed-forward; this returns only the trim."""
         return 0.0

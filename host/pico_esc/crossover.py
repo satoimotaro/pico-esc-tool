@@ -45,14 +45,14 @@ import statistics
 from collections import deque
 from dataclasses import dataclass, field
 
-from .constants import COUNTS_PER_REV
-from .control import DT, DELTA_FAULT_FRAC, VEL_LP_ALPHA, _pace
+from .constants import POLE_PAIRS  # noqa: F401 (re-exported: xover_debug imports it from here)
+from .control import DT, VelReader, _pace
 from .drive import Aborted
 
-POLE_PAIRS = 7                     # 12N14P. NOTE: the `tele` line is ALREADY mechanical RPM (the
-                                   # RP2040 firmware divides eRPM by pole pairs), so slip does NOT
-                                   # divide by this. Kept only for the eRPM<->mech display of the
-                                   # Cross_Up/Cross_Dn threshold bytes (which ARE electrical).
+# POLE_PAIRS is imported from constants (single source of truth) and re-exported here for the
+# callers that still do `from pico_esc.crossover import POLE_PAIRS` (xover_debug). Reminder: the
+# `tele` line is ALREADY mechanical RPM, so slip does NOT divide by POLE_PAIRS — it is only for the
+# eRPM<->mech display of the electrical Cross_Up/Cross_Dn threshold bytes.
 TELE_MIN_ERPM = 50.0               # a valid (spinning, 6-step) telemetry frame; garbage early-after-arm
                                    # frames read rpm~0. NOTE: this firmware's telemetry reports
                                    # volts==0 ALWAYS, so frame validity is keyed on eRPM, NOT volts.
@@ -70,19 +70,8 @@ OVER_SPEED_FLOOR = 13000.0         # mech-RPM floor for the over-speed guard: ab
                                    # speed and trips only on garbage. TRUE mech (no /pole-pairs).
 
 
-def unwrap_rpm(prev_raw, raw, dt, vel):
-    """Return (new_vel_rpm, new_prev_raw). Guarded modulo unwrap + low-pass, like posctl.
-
-    The modulo unwrap is only valid when true travel is < half a rev per tick; an implausible
-    delta (aliased wrong-direction jump) or a non-positive dt holds the last velocity instead of
-    flipping the sign."""
-    if prev_raw is None:
-        return vel, raw
-    d = ((raw - prev_raw + COUNTS_PER_REV // 2) % COUNTS_PER_REV) - COUNTS_PER_REV // 2
-    if abs(d) > DELTA_FAULT_FRAC * (COUNTS_PER_REV // 2) or dt <= 0:
-        return vel, raw
-    inst = (d / COUNTS_PER_REV) / dt * 60.0                 # mech RPM (signed)
-    return vel + VEL_LP_ALPHA * (inst - vel), raw
+# Encoder velocity reading (device de-aliased encv, else host unwrap) is centralized in control.py:
+# VelReader + unwrap_rpm, shared by _Ticker here and velocity.measure_steady_speed.
 
 
 @dataclass
@@ -134,11 +123,8 @@ class _Ticker:
         self.max_temp, self.tele_period = max_temp, tele_period
         self.stall_guard, self.on_sample = stall_guard, on_sample
         self.res, self.use_tele_speed = result, use_tele_speed
-        self.prev_raw = None
-        self.dev_vel = None            # True once the device `encv` (de-aliased) velocity is seen;
-                                       # None until probed, False if unsupported (fall back to unwrap)
-        self.vel = 0.0                 # low-passed encoder mech RPM (signed)
-        self.tele_erpm = 0.0           # last valid telemetry eRPM (signed)
+        self._vr = VelReader()         # shared de-aliased mech-RPM reader (encv, fallback host unwrap)
+        self.tele_erpm = 0.0           # last valid telemetry MECH RPM (signed; firmware pre-divides)
         self.tele_live = False         # last poll was a live 6-step frame (|eRPM|>floor)
         self.tele_fresh = False        # a telemetry poll happened THIS tick
         now = clock.now()
@@ -146,6 +132,11 @@ class _Ticker:
         self.t0 = now
         self.next_tele = now
         self.stall_ticks = 0
+
+    @property
+    def vel(self):
+        """Signed mechanical RPM from the shared VelReader (device encv, else host unwrap)."""
+        return self._vr.vel
 
     @property
     def mech_speed(self):
@@ -161,32 +152,14 @@ class _Ticker:
 
     def tick(self, cmd, phase):
         tick_start = self.clock.now()
-        # Prefer the DEVICE de-aliased velocity (encv): the RP2040 samples the AS5600 at ~1.25 kHz
-        # and computes signed mech RPM on-device, so it does NOT alias above ~1350 mech the way the
-        # host-side 50 Hz unwrap does — this is what makes fast REVERSE measurable. Probe once; if
-        # the firmware/sim answers None (unsupported), fall back to enc + host-side guarded unwrap.
-        ev = self.esc.encoder_velocity() if self.dev_vel is not False else None
         now = self.clock.now()
         dt = now - self.last_t
         self.last_t = now
-        if ev is not None:
-            self.dev_vel = True
-            if ev.healthy:
-                # ev.rpm is TRUE MECHANICAL RPM: the AS5600 is a 2-pole shaft magnet (1 cycle per
-                # mechanical rev, hand-turn confirmed ~4096 cnt/turn), de-aliased on-device. The ESC
-                # telemetry `tele_erpm` is ALSO already mechanical (firmware divides eRPM by pole
-                # pairs), so at true BEMF lock enc == tele and slip == 1.0 in BOTH directions. The
-                # old "reverse over-commutates 3-21x" was pure Nyquist aliasing of the 50 Hz host
-                # sampling (the rotor really spins ~6000-7000 mech in 6-step, far past ~1350 Nyquist).
-                self.vel = ev.rpm
-        elif self.dev_vel is True:
-            pass                                           # device confirmed; a transient encv miss
-                                                           # just holds the last vel (no aliased mix)
-        else:
-            self.dev_vel = False                           # unsupported -> host unwrap from here on
-            enc = self.esc.encoder()
-            if enc is not None and enc.healthy:
-                self.vel, self.prev_raw = unwrap_rpm(self.prev_raw, enc.raw, dt, self.vel)
+        # Signed MECHANICAL RPM via the shared reader: device de-aliased `encv` when available (does
+        # NOT alias at the ~6000-9000 mech the rotor really reaches in 6-step), else the host unwrap
+        # fallback. At true BEMF lock this equals tele_erpm (also mechanical) so slip == 1.0 in BOTH
+        # directions — the old "reverse over-commutates 3-21x" was pure Nyquist aliasing.
+        self._vr.read(self.esc, dt)
         self.esc.thrust(cmd)                               # keep-alive (feeds the deadman)
 
         self.tele_fresh = False
