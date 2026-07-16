@@ -235,8 +235,14 @@ inline void spinThrust(uint8_t idx, int16_t s) {   // reversible (3D): -1000..+1
 	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;
 	if (s >  1000) s =  1000;
 	if (s < -1000) s = -1000;
-	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1000 + s)      // forward -> DShot 1048..2047
-	                                   : (uint16_t)(1001 + s));    // reverse -> DShot   48..1047
+	// DShot 3D throttle bands: 48..1047 = reverse (48 slow .. 1047 fast), 1048..2047 = forward
+	// (1048 slow .. 2047 fast), 0 = stop. Magnitude must map MONOTONICALLY within each band.
+	// (Old mapping used 1000+s / 1001+s: forward leaked into the reverse band for s<48, and reverse
+	// was INVERTED — tiny |s| -> ~1000 (near max reverse), large |s| -> ~1 (below the 48 floor) —
+	// so reverse ran fast at low command, slowed as command rose, and handed off to 6-step almost
+	// immediately. Correct: forward -> 1047+s, reverse -> 47-s.)
+	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1047 + s)      // forward s=1..1000 -> 1048..2047
+	                                   : (uint16_t)(47 - s));       // reverse s=-1..-1000 -> 48..1047
 	drvTarget[idx] = t; drvLast[idx] = millis();
 }
 inline bool spinArmed(uint8_t idx)      { return idx < COUNT && detail::drvActive(idx) && detail::drvArmed[idx]; }
