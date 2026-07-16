@@ -1,0 +1,19 @@
+# BENCH-MEASURED on real 930KV 12N14P (2026-07-16), S2 sine region only, no crossover.
+# Sensorless FF validated: velctl --rpm 50 -> command 149 -> measured ~50 RPM (mean).
+# Low-speed partial curve (<=84 RPM); extend / add crossover with a fuller supervised velcal run.
+motor: 930kv_12n14p
+pole_pairs: 7
+source: bench
+points:
+- thrust: 0.0
+  rpm: 0.0
+- thrust: 60.0
+  rpm: 20.27
+- thrust: 108.0
+  rpm: 35.57
+- thrust: 155.0
+  rpm: 51.76
+- thrust: 202.0
+  rpm: 67.63
+- thrust: 250.0
+  rpm: 83.55
