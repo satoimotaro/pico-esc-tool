@@ -64,8 +64,11 @@ def test_tune_crossover_lock_lowspeed_reverse_dry_run():
     # The low-speed mode (descend into 6-step, hold at an encoder-reliable speed) must work in the
     # REVERSE direction too (--sign -1) — the whole point is that reverse aliases the encoder at the
     # top of the ramp. It must run, measure a (sim-plumbing) slip, and write an apply-compatible tune.
+    # --measure-speed is TRUE mechanical RPM (both tele and encoder are mechanical; no /pole-pairs).
+    # 280 sits inside the sim's 6-step band (~27-543 mech) and above its down-handoff, so the descend
+    # can settle and measure there. (Was 40 back when a latent double-division scaled speeds 7x down.)
     r = _run("autocal.py", "tune-crossover-lock", "--dry-run", "--lowspeed", "--sign", "-1",
-             "--name", "xolow", "--test-cmd", "900", "--measure-speed", "40",
+             "--name", "xolow", "--test-cmd", "900", "--measure-speed", "280",
              "--grid-timing", "1,4", "--grid-demag", "3",
              "--ramp-secs", "1.0", "--descend-secs", "1.0", "--hold-secs", "0.5", "--cooldown", "0")
     assert "# DRY-RUN: SimEncEscHost (no serial port opened)" in r.stdout

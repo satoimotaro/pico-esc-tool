@@ -9,30 +9,27 @@ the callers cannot drift apart.
 
 Lock quality is the SLIP ratio:
 
-    slip = (telemetry_eRPM / POLE_PAIRS) / |encoder_mech_RPM|
+    slip = |telemetry_mech_RPM| / |encoder_mech_RPM|
 
-which is ~1.0 at true BEMF lock. In forced sine the telemetry eRPM is stale, and a mis-tuned
-6-step lock commutates near the seed rate rather than real BEMF (slip well above 1). Auto-cal
+which is ~1.0 at true BEMF lock. BOTH sides are already MECHANICAL RPM: the RP2040 firmware divides
+the DShot eRPM by the motor pole pairs (ESC_MOTOR_POLES/2) before sending `tele`, and the AS5600 is a
+2-pole shaft magnet (1 cycle / mechanical rev). Do NOT divide either side by POLE_PAIRS again — that
+was a latent double-division that made a real lock read as ~0.143 (=1/7). In forced sine the
+telemetry is stale, and a mis-tuned 6-step lock commutates off real BEMF (slip away from 1). Auto-cal
 minimises |slip - 1| across a (comm_timing, demag_compensation) grid.
 
 TWO measurement modes:
-  * measure_crossover_lock          — hold at the TOP of the ramp and measure. Works when the
-                                      6-step speed at the crossover command is in the encoder's
-                                      reliable range (forward at the crossover ~1055 mech RPM).
+  * measure_crossover_lock          — hold at the TOP of the ramp and measure.
   * measure_crossover_lock_lowspeed — cross into 6-step, then DESCEND the command (navigating by
-                                      telemetry eRPM) to a low, encoder-reliable speed and hold
-                                      there. This is what makes BOTH directions measurable:
-                                      reverse runs faster (~1600-2000 mech) and would otherwise
-                                      alias the 50 Hz encoder (Nyquist ~1350 mech RPM).
+                                      telemetry) to a lower speed and hold there.
 
-DE-ALIASED ENCODER (the fix that made reverse honest): the AS5600 faces the motor's magnet bell, so
-its angle advances POLE_PAIRS (7) electrical cycles per mechanical rev. Sampled at the host's 50 Hz
-that ALIASES far below the naive ~1350 mech Nyquist guess (reverse ran a touch faster and aliased
-into garbage, printing fake slip 3-21 = "over-commutation" that never existed). The RP2040 now
-samples at ~1.25 kHz and reports a de-aliased signed velocity over the `encv` line; `_Ticker` prefers
-it (dividing the electrical reading by POLE_PAIRS to mechanical) and only falls back to host-side
-unwrap of the slow `enc` line when the firmware/sim lacks `encv`. With encv, BOTH directions read a
-clean slip ~1.0 — reverse locks exactly like forward.
+DE-ALIASED ENCODER (the fix that made reverse honest): the rotor really spins FAST in 6-step (~6000-
+7000 mech), far past the 50 Hz host sampler's ~1350 mech Nyquist, so the old host-side unwrap of the
+`enc` angle ALIASED — worse in reverse (a touch faster), printing fake slip 3-21 = "over-commutation"
+that never existed. The RP2040 now samples the AS5600 at ~1.25 kHz and reports a de-aliased signed
+MECHANICAL velocity over the `encv` line; `_Ticker` prefers it and only falls back to host-side unwrap
+of the slow `enc` line when the firmware/sim lacks `encv`. With encv, BOTH directions read slip ~1.0 —
+reverse locks exactly like forward.
 
 Robustness the bench taught us (all in `_Ticker`, so every caller gets it):
   * device-side de-aliased velocity (encv) when available, else guarded modulo unwrap + VEL_LP_ALPHA
@@ -52,7 +49,10 @@ from .constants import COUNTS_PER_REV
 from .control import DT, DELTA_FAULT_FRAC, VEL_LP_ALPHA, _pace
 from .drive import Aborted
 
-POLE_PAIRS = 7                     # 12N14P: telemetry eRPM = mech RPM * POLE_PAIRS
+POLE_PAIRS = 7                     # 12N14P. NOTE: the `tele` line is ALREADY mechanical RPM (the
+                                   # RP2040 firmware divides eRPM by pole pairs), so slip does NOT
+                                   # divide by this. Kept only for the eRPM<->mech display of the
+                                   # Cross_Up/Cross_Dn threshold bytes (which ARE electrical).
 TELE_MIN_ERPM = 50.0               # a valid (spinning, 6-step) telemetry frame; garbage early-after-arm
                                    # frames read rpm~0. NOTE: this firmware's telemetry reports
                                    # volts==0 ALWAYS, so frame validity is keyed on eRPM, NOT volts.
@@ -62,8 +62,12 @@ REV_FLOOR_RPM = 150.0              # opposite-direction |mech RPM| that counts a
 REV_MIN_CMD = 150                  # only check for reversal while still meaningfully commanded (not
                                    # the final coast to 0, where near-zero encoder noise is normal)
 REV_TICKS = 20                     # sustained opposite-direction ticks = a REAL runaway
-ENC_ALIAS_RPM = 1350.0             # 50 Hz sampling aliases the encoder above ~this (Nyquist); the
-                                   # low-speed mode navigates by telemetry to stay well under it.
+ENC_ALIAS_RPM = 1350.0             # 50 Hz HOST sampling aliases the enc angle above ~this (Nyquist).
+                                   # The device `encv` path de-aliases (samples at ~1.25 kHz), so this
+                                   # only bounds the legacy host-unwrap fallback.
+OVER_SPEED_FLOOR = 13000.0         # mech-RPM floor for the over-speed guard: above this 930 KV motor's
+                                   # physical max (~KV*V ~= 11000 mech), so it clears real 6-step entry
+                                   # speed and trips only on garbage. TRUE mech (no /pole-pairs).
 
 
 def unwrap_rpm(prev_raw, raw, dt, vel):
@@ -85,8 +89,10 @@ def unwrap_rpm(prev_raw, raw, dt, vel):
 class CrossoverResult:
     """Outcome of one measurement (top-of-ramp hold or low-speed descend+hold)."""
     enc_rpm: float = 0.0            # median mech RPM over the steady window (signed)
-    tele_erpm: float = 0.0         # median telemetry eRPM over the steady window (signed)
-    slip: float | None = None      # (|tele| / POLE_PAIRS) / |enc|, or None if not measurable
+    tele_erpm: float = 0.0         # median telemetry MECH RPM over the steady window (signed; the
+                                   # firmware already divides eRPM by pole pairs — name kept for
+                                   # back-compat with callers, but the value is mechanical)
+    slip: float | None = None      # |tele_mech| / |enc_mech|, or None if not measurable (~1.0 = lock)
     reversed: bool = False         # rotor turned opposite to the command during the down/coast ramp
     top_cmd: int = 0               # signed command the measurement was taken at (hold command)
     ceiling_hit: bool = False      # measured-speed ceiling stopped the up-ramp early (top-of-ramp mode)
@@ -144,9 +150,13 @@ class _Ticker:
     @property
     def mech_speed(self):
         """Best available |mech RPM|: telemetry (reliable at any speed) while 6-step is live and
-        use_tele_speed is on, else the (possibly aliasing) encoder."""
+        use_tele_speed is on, else the (de-aliased device / possibly-aliasing host) encoder.
+
+        NOTE: `tele_erpm` is ALREADY mechanical RPM — the RP2040 firmware divides the DShot eRPM by
+        the pole pairs (ESC_MOTOR_POLES/2, esc_session.h) before sending it. So it is NOT divided
+        again here (doing so was a latent 7x under-count)."""
         if self.use_tele_speed and self.tele_live:
-            return abs(self.tele_erpm) / POLE_PAIRS
+            return abs(self.tele_erpm)
         return abs(self.vel)
 
     def tick(self, cmd, phase):
@@ -162,13 +172,13 @@ class _Ticker:
         if ev is not None:
             self.dev_vel = True
             if ev.healthy:
-                # The AS5600 faces the motor's magnet bell, so its de-aliased velocity is ELECTRICAL
-                # (POLE_PAIRS cycles per mechanical rev). Divide to mechanical RPM so every downstream
-                # metric/threshold (slip, rpm_ceiling, REV_FLOOR) stays in the same mech units it
-                # always used. At true BEMF lock enc_elec == tele_eRPM, so this mech velocity ==
-                # tele_eRPM/POLE_PAIRS and slip == 1.0 (in BOTH directions — the old aliasing that
-                # made reverse look like 3-21x over-commutation is gone).
-                self.vel = ev.rpm / POLE_PAIRS
+                # ev.rpm is TRUE MECHANICAL RPM: the AS5600 is a 2-pole shaft magnet (1 cycle per
+                # mechanical rev, hand-turn confirmed ~4096 cnt/turn), de-aliased on-device. The ESC
+                # telemetry `tele_erpm` is ALSO already mechanical (firmware divides eRPM by pole
+                # pairs), so at true BEMF lock enc == tele and slip == 1.0 in BOTH directions. The
+                # old "reverse over-commutates 3-21x" was pure Nyquist aliasing of the 50 Hz host
+                # sampling (the rotor really spins ~6000-7000 mech in 6-step, far past ~1350 Nyquist).
+                self.vel = ev.rpm
         elif self.dev_vel is True:
             pass                                           # device confirmed; a transient encv miss
                                                            # just holds the last vel (no aliased mix)
@@ -238,7 +248,10 @@ def _finalize(res, steady, tail=None):
     if tele_win:
         res.tele_erpm = statistics.median(tele_win)
     if enc_win and tele_win and abs(res.enc_rpm) > ENC_MIN_RPM:
-        res.slip = (abs(res.tele_erpm) / POLE_PAIRS) / abs(res.enc_rpm)
+        # Both are mechanical RPM (tele already /pole-pairs on-device; encoder is a 2-pole shaft
+        # magnet). slip = tele_mech / enc_mech ~= 1.0 at true BEMF lock. (The historical /POLE_PAIRS
+        # here was a double-division that made a real lock read as ~0.143.)
+        res.slip = abs(res.tele_erpm) / abs(res.enc_rpm)
 
 
 def _coast_to_zero(tk, from_cmd, *, sign=1, res=None, secs=2.0):
@@ -339,10 +352,12 @@ def measure_crossover_lock_lowspeed(esc, clock, *, target_cmd, sign=1,
     goes stale mid-hold), the hold retries at a slightly higher command (+hold_bump), bounded by
     hold_retries. If it still can't hold 6-step, res.aborted explains why."""
     res = CrossoverResult()
-    # Over-speed: generous during the brief high-speed entry (the encoder aliases there but the
-    # telemetry-based guard is honest, and the descend drops speed within a few ticks). An explicit
-    # rpm_ceiling still caps it; otherwise scale off the measure speed.
-    over = max((rpm_ceiling or 0.0) * 1.5, measure_rpm * 5.0)
+    # Over-speed guard (TRUE mech RPM now that the double-division is gone): the rotor genuinely
+    # spins fast in 6-step (~6000-7000 mech at the entry for this 930 KV motor) before the descend
+    # drops it, so the limit must clear the motor's real top speed (KV*V ~= 11000 mech max). The
+    # OVER_SPEED_FLOOR keeps it above legitimate operation while still catching a true garbage/
+    # runaway reading; an explicit rpm_ceiling or a high measure_rpm can raise it further.
+    over = max((rpm_ceiling or 0.0) * 1.5, measure_rpm * 5.0, OVER_SPEED_FLOOR)
     tk = _Ticker(esc, clock, sign=sign, over_speed_rpm=over, max_temp=max_temp,
                  tele_period=tele_period, stall_guard=stall_guard, on_sample=on_sample,
                  result=res, use_tele_speed=True)
