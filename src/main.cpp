@@ -1,22 +1,46 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 satoimotaro
 //
-// main — the DEFAULT, integrated object-oriented RP2040 ESC firmware (Pico W). ONE build does every
-// job the old "flash a separate app per task" model split across esc_tool.cpp + vel_demo.cpp:
-//   * config / flash BLHeli-S ESCs over the 1-wire bootloader,
-//   * DShot drive in RAW (direct thrust/throttle) OR RPM (closed-loop velocity) submode,
-//   * a USB-serial CLI (host/esctool.py) AND, in SETUP mode, a Wi-Fi web UI.
+// main — the COMPOSITION ROOT of the integrated RP2040 ESC firmware (Pico W). You declare the ESCs
+// here as Thruster objects (each with its own DShot bitrate, motor pole count, and calibrated speed
+// profile), set their per-motor gains, and compose whatever surface you want on top:
 //
-// It is composed of objects: a single EscManager owns one Thruster per wired ESC (so the ESC count
-// scales with ESC_SIGNAL_PINS in esc_config.h), the AS5600 encoder, the web server, and the flash
-// state machine. Each Thruster delegates hardware to the proven escs:: singleton (esc_session.h) by
-// index and carries its own closed-loop velocity controller (lib/vel_control). See esc_manager.h /
-// thruster.h. The legacy per-app builds (esc_tool, vel is now folded in, spikes) remain as fallbacks.
-#include "apps/esc_manager.h"
+//   * Tool build (below): hand the Thrusters to an EscTool — config/flash + USB-serial CLI
+//     (host/esctool.py) + a Wi-Fi web UI. main stays tiny.
+//   * Standalone ROV: DON'T create an EscTool. Drive the Thrusters directly from your own loop, e.g.
+//       void loop() {
+//         auto cmd = readCmdVel();                       // from the Pi / RC over serial
+//         for (uint8_t i = 0; i < NTHR; i++) { THRUSTERS[i]->setRpm(cmd[i]); THRUSTERS[i]->poll(); }
+//         escs::spinPoll();                              // one shared call keeps all DShot frames flowing
+//       }
+//
+// The escs:: engine (esc_session.h) is the singleton hardware layer (2 PIO SMs + one core1 1-wire
+// worker); each Thruster is a per-ESC object delegating to it by index. Add an ESC = add a pin to
+// ESC_SIGNAL_PINS (esc_config.h) and a Thruster below.
+#include "apps/thruster.h"
+#include "apps/esc_tool_app.h"
+#include "apps/profiles.h"
 
-static EscManager mgr;
+// --- Declare the ESCs (one Thruster each). pin = ESC_SIGNAL_PINS[bind index]; the rest is per-ESC. ---
+static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);  // pin 10: RAW / uncalibrated
+static Thruster esc1(&profiles::M_930KV, /*dshotKbaud=*/300, /*motorPoles=*/14);  // pin 11: 930KV closed-loop
 
-void setup()  { mgr.begin(); }
-void loop()   { mgr.poll(); }
+static Thruster*    THRUSTERS[] = { &esc0, &esc1 };
+static const uint8_t NTHR = sizeof(THRUSTERS) / sizeof(THRUSTERS[0]);
+
+// --- The tool surface over those ESCs (config/flash + serial CLI + Wi-Fi). Omit for a bare ROV. ---
+static EscTool tool(THRUSTERS, NTHR);
+
+void setup() {
+	for (uint8_t i = 0; i < NTHR; i++) THRUSTERS[i]->bind(i);   // attach each to escs:: index i
+
+	// Per-motor closed-loop PI gains — the declaring side owns them (esc1 = 930KV bench values; the
+	// ~30x-hotter real plant needs these, not the sim DEFAULT_GAINS). esc0 stays at library defaults.
+	esc1.vc.kp = 0.03f; esc1.vc.ki = 0.12f; esc1.vc.trim_max = 400.0f;
+	esc1.vc.blend_secs = 0.3f; esc1.vc.slew_rpm_s = 4000.0f; esc1.vc.max_temp = 0.0f;
+
+	tool.begin();
+}
+void loop()   { tool.poll(); }        // serial + Wi-Fi + each Thruster's RPM loop + shared spinPoll
 void setup1() {}
-void loop1()  { mgr.pollCore1(); }
+void loop1()  { tool.pollCore1(); }

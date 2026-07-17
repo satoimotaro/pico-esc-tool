@@ -80,6 +80,14 @@ namespace detail {
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
 	static bool              drvInitFail[COUNT] = { false }; // last spinArm's DShot PIO init failed
 	static Telem             drvTele[COUNT];
+	// Per-ESC overrides (0 = use the global ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default). Set via
+	// escs::setKbaud/setPoles so different ESCs/motors on the same board can differ (e.g. a 300 kbaud
+	// A_H_30 next to a 600 kbaud unit, or motors with different pole counts). Additive: untouched =>
+	// identical behavior to before, so the legacy esc_tool build is unaffected.
+	static uint16_t          drvKbaud[COUNT] = { 0 };
+	static uint8_t           drvPoles[COUNT] = { 0 };
+	static inline uint16_t   kbaudOf(uint8_t i) { return drvKbaud[i] ? drvKbaud[i] : (uint16_t)DSHOT_KBAUD; }
+	static inline uint8_t    polesOf(uint8_t i) { return drvPoles[i] ? drvPoles[i] : (uint8_t)MOTOR_POLES; }
 	// last-known firmware/direction, cached by connect()/scan() so spinArm() needn't re-enter the BL
 	static bool              infoBidir[COUNT] = { false };  // firmware supports bidir DShot (Bluejay/JESC)
 	static bool              infoRev[COUNT]   = { false };  // configured reversible (3D)
@@ -196,6 +204,11 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
 
+// Per-ESC drive config (call BEFORE spinArm; takes effect at the next arm). 0 restores the global
+// ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default. Lets a Thruster carry its own bitrate / pole count.
+inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < COUNT) detail::drvKbaud[idx] = kbaud; }
+inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < COUNT) detail::drvPoles[idx] = poles; }
+
 // ---- drive / spin (core0) ----------------------------------------------------------------------
 // spinArm() leaves any bootloader session (the ESC must run its app), picks the DShot mode, and
 // starts the arming stream for SPIN_ARM_MS. Then spinThrottle()/spinThrust() set the target;
@@ -221,8 +234,9 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
 	drvRev[idx] = infoRev[idx];
 	release();                                             // ESC must run its app (not the bootloader)
 	drvFree(idx);
-	if (mode == Drive::BIDIR) { drvB[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD); drvEdt[idx] = 20; }
-	else                      { drvN[idx] = new DShotX4(PINS[idx], 1, DSHOT_KBAUD);   drvEdt[idx] = 0;  }
+	uint16_t kb = kbaudOf(idx);   // per-ESC DShot bitrate (falls back to the ESC_DSHOT_KBAUD default)
+	if (mode == Drive::BIDIR) { drvB[idx] = new BidirDShotX1(PINS[idx], kb); drvEdt[idx] = 20; }
+	else                      { drvN[idx] = new DShotX4(PINS[idx], 1, kb);   drvEdt[idx] = 0;  }
 	drvInitFail[idx] = drvB[idx] ? drvB[idx]->initError() : drvN[idx]->initError();
 	if (drvInitFail[idx]) drvFree(idx);   // PIO init failed (e.g. no free SM) — don't report a false ARMED
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
@@ -280,7 +294,7 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 		if (drvB[i]) {
 			uint32_t v = 0;
 			switch (drvB[i]->getTelemetryPacket(&v)) {
-				case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); break;
+				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
 				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;

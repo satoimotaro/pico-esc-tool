@@ -170,18 +170,24 @@ verification harness + calibration tool** (same stack autocal uses). So:
   into 6-step (authority 0→1), the PI backs the command off the FF and tele settles on 5000 (~0 % error,
   ~2 % ripple). `vel_demo` has since been folded into the integrated firmware (A3, below).
 - **Phase A3 (Pico C++): INTEGRATED object-oriented firmware — DONE + hardware-verified.** Replaces the
-  "flash a separate app per job" model with ONE default build (`src/main.cpp`, env `main`) composed of
-  objects: `class EscManager` (`src/apps/esc_manager.h`) owns one `class Thruster`
-  (`src/apps/thruster.h`) per wired ESC — so the count scales with `ESC_SIGNAL_PINS`. A `Thruster`
-  delegates config/flash/drive to the `escs::` singleton by index and carries its own
-  `vel::VelocityController` (+ `EscIo` adapter + `SpeedProfile`); the declaring side (`EscManager::begin`)
-  sets the per-motor gains (`th.vc.kp = 0.03f; …`). DRIVE has two submodes: **RAW** (direct
-  thrust/throttle) and **RPM** (the closed loop; `poll()` runs `vc.step(dt)` each core0 pass). Folds in
-  all of `esc_tool` (USB-serial CLI byte-compatible with `host/esctool.py` + Wi-Fi web UI + BLHeli
-  config/flash) and adds serial `rpm <i> <v>` / `gain <i> <kp|ki|trim|slew> <v>` + a web RPM control.
-  `esc_tool` is kept as a legacy fallback env; the HAL (`escs::`) and all `lib/` are untouched. Verified
-  on the 930KV: `scan` reads the ESC identity (config path), `arm 1`→`rpm 1 5000` converges to **0.4 %**,
-  `thrust 1 300` drives RAW and disengages the loop, `gain`/`mode`/`disarm` all work.
+  "flash a separate app per job" model with ONE default build (`src/main.cpp`, env `main`). DRIVE has two
+  submodes per ESC: **RAW** (direct thrust/throttle) and **RPM** (the closed loop; `poll()` runs
+  `vc.step(dt)` each core0 pass). Serial keeps every `esc_tool` command byte-compatible with
+  `host/esctool.py` and adds `rpm <i> <v>` / `gain <i> <kp|ki|trim|slew> <v>` + a web RPM control;
+  `esc_tool` is kept as a legacy fallback env. Verified on the 930KV: `scan` reads the ESC identity
+  (config path), `arm 1`→`rpm 1 5000` converges to **0.2 %**, `thrust 1 300` drives RAW and disengages
+  the loop, `gain`/`mode`/`disarm` all work.
+- **Phase A3.1 — composable refactor (DONE + hardware-verified).** Split responsibilities so the
+  composition root owns the ESCs: **`main.cpp` DECLARES the `class Thruster` objects** (`src/apps/thruster.h`),
+  each carrying its **own per-ESC config** — DShot bitrate, motor pole count (plumbed additively into the
+  `escs::` HAL via `setKbaud`/`setPoles`, 0 = global default), calibrated `SpeedProfile`
+  (`src/apps/profiles.h`, e.g. `profiles::M_930KV`), and PI gains (`esc1.vc.kp = 0.03f;` in `setup()`).
+  **`class EscTool`** (`src/apps/esc_tool_app.h`, was the monolithic `EscManager`) is now a **composable
+  module that REFERENCES the Thrusters** (`Thruster**`, does not own them) and provides only the
+  operator surface (config/flash + serial CLI + Wi-Fi). So a **bare ROV** skips `EscTool` and drives the
+  Thrusters directly (`t->setRpm(mix); t->poll(); escs::spinPoll();`). Legacy bring-up apps
+  (spikes/demos) archived to branch `archive/legacy-apps`. HAL change is additive; both `main` and
+  `esc_tool` build; re-verified on the 930KV (RPM 0.2 %, RAW, config all OK).
 - **Phase B (later, calibration): capability autocal.** Extend `autocal` to write the `motor` +
   `capabilities` profile fields (spec defaults + encoder refinement of lock/crossover/catch); on the
   KV=300 motor, re-test the down-catch (3× BEMF should resolve the over-commutation) and set `down_catch`

@@ -1,40 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 satoimotaro
 //
-// thruster — a per-ESC OBJECT bound to one index into the escs:: engine. This is the object-oriented
-// layer that replaces the "flash a separate app per job" model: EscManager owns one Thruster per
-// wired ESC (Thruster th_[Esc::COUNT]) and binds each in begin(), so the ESC count scales with
-// ESC_SIGNAL_PINS automatically. The heavy lifting still lives in the proven singleton escs:: engine
-// (2 PIO SMs + one core1 1-wire worker) — a Thruster just delegates hardware to escs:: by its index_
-// and adds the per-ESC closed-loop velocity controller (lib/vel_control) on top.
+// thruster — a per-ESC OBJECT you DECLARE (the composition root, usually main.cpp, owns them). This
+// is the reusable library primitive: one Thruster per ESC, each carrying its OWN config (DShot
+// bitrate, motor pole count, calibrated speed profile, and PI gains) and its own closed-loop
+// velocity controller. It delegates the heavy lifting to the proven singleton escs:: engine
+// (2 PIO SMs + one core1 1-wire worker) by its index_ — that layer is inherently one-per-board, so a
+// Thruster is a lightweight handle + per-ESC config + controller on top.
 //
-// DRIVE has two submodes:
-//   RAW  — a direct thrust/throttle target (escs:: holds it; poll() does nothing).
-//   RPM  — the closed velocity loop: setRpm() sets the target, poll() runs vc.step(dt) each core0 tick.
+//   main:                                                  ROV (no tool, main drives directly):
+//     static Thruster t1(&profiles::M_930KV, 300, 14);       for (auto* t : thrusters) { t->setRpm(mix); t->poll(); }
+//     ... t1.bind(1); t1.vc.kp = 0.03f; ...                  escs::spinPoll();
+//
+// DRIVE has two submodes: RAW (a direct thrust/throttle target escs:: holds; poll() is a no-op) and
+// RPM (the closed velocity loop: setRpm() sets the target, poll() runs vc.step(dt) each core0 tick).
 #pragma once
 #include <Arduino.h>
+#include "esc_config.h"
 #include "esc_session.h"
 #include "vel_control.h"
+#include "profiles.h"
 
 // An rpm whose telemetry stamp is older than this = stale (forced sine / dropout) — the PI authority
-// then fades and the controller degrades to pure feed-forward. Mirrors vel_demo's TELE_FRESH_MS.
+// then fades and the controller degrades to pure feed-forward.
 static const uint32_t THRUSTER_TELE_FRESH_MS = 100;
-
-// ---- calibrated 930KV 12N14P curve (bench-measured 2026-07-16/17). thrust (0..1000) -> mech RPM. --
-// Copied verbatim from vel_demo.cpp: sine seed (<=250) + 6-step points; the seam gap (sine caps ~84,
-// 6-step starts ~2576) is baked in. The closed loop corrects the residual FF error at runtime.
-// File-scope statics (owned by the caller, no allocation) referenced by every Thruster's SpeedProfile.
-static const vel::CurvePoint THRUSTER_CURVE[] = {
-	{  0,    0.0f}, { 60,   20.3f}, {108,   35.6f}, {155,   51.8f}, {202,   67.6f}, {250,   83.6f},
-	{620, 2576.0f}, {700, 4645.0f}, {800, 7173.0f}, {900, 9447.0f}, {1000, 11000.0f},
-};
-static const vel::Regime THRUSTER_REGIMES[] = {
-	vel::Regime::SINE, vel::Regime::SINE, vel::Regime::SINE, vel::Regime::SINE, vel::Regime::SINE,
-	vel::Regime::SINE, vel::Regime::LINE, vel::Regime::LINE, vel::Regime::LINE, vel::Regime::LINE,
-	vel::Regime::LINE,
-};
-static const int            THRUSTER_NCURVE = sizeof(THRUSTER_CURVE) / sizeof(THRUSTER_CURVE[0]);
-static const vel::Crossover THRUSTER_CROSSOVER = { 1500.0f, 1350.0f };   // up_erpm / dn_erpm (on-bench)
 
 class Thruster {
 public:
@@ -43,16 +32,24 @@ public:
 	using Drive = escs::Drive;
 	enum Submode { RAW, RPM };
 
-	// Default-constructible so EscManager can hold a plain array and bind() each in begin(). The io
-	// adapter, calibrated profile, and controller are wired here; the controller's gains stay at their
-	// library defaults until the declaring side (EscManager::begin) sets the per-motor values.
-	Thruster()
-		: profile_(THRUSTER_CURVE, THRUSTER_NCURVE, /*pole_pairs=*/7, &THRUSTER_CROSSOVER, THRUSTER_REGIMES),
-		  vc(io_, profile_) {
+	// Declared by the composition root. profile = the calibrated FF curve for THIS motor (defaults to a
+	// trivial linear curve for RAW-only ESCs); dshotKbaud / motorPoles are this ESC's DShot bitrate and
+	// pole count (default to the esc_config.h globals). The controller's gains stay at the library
+	// DEFAULT_GAINS until the declaring side sets the per-motor values (th.vc.kp = 0.03f; ...).
+	explicit Thruster(const vel::SpeedProfile* profile = &profiles::M_LINEAR,
+	                  uint16_t dshotKbaud = ESC_DSHOT_KBAUD, uint8_t motorPoles = ESC_MOTOR_POLES)
+		: profile_(profile ? profile : &profiles::M_LINEAR),
+		  vc(io_, *profile_), kbaud_(dshotKbaud), poles_(motorPoles) {
 		io_.owner = this;
 	}
 
-	void bind(uint8_t index) { index_ = index; }
+	// Attach this object to an escs:: index (its wired pin = ESC_SIGNAL_PINS[index]) and push its
+	// per-ESC DShot config into the engine. Call once, before arming.
+	void bind(uint8_t index) {
+		index_ = index;
+		escs::setKbaud(index_, kbaud_);
+		escs::setPoles(index_, poles_);
+	}
 	uint8_t index() const { return index_; }
 
 	// ---- config / flash: pure pass-throughs to escs:: by this ESC's index ----
@@ -68,23 +65,16 @@ public:
 	void release()                                      { escs::release(); }
 
 	// ---- drive ----
-	void arm(Drive mode = Drive::AUTO) {
-		escs::spinArm(index_, mode);
-		vc.reset(); submode_ = RAW;
-	}
-	// RAW target: pick signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a
-	// RAW target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
+	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; }
+	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
+	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
 	void setRaw(int v) {
 		submode_ = RAW;
 		if (reversible()) escs::spinThrust(index_, (int16_t)v);
 		else              escs::spinThrottle(index_, (uint16_t)v);
 	}
 	// RPM target: engage the closed loop. Reset the step clock so the first dt is sane.
-	void setRpm(float rpm) {
-		submode_ = RPM;
-		vc.setTarget(rpm);
-		lastStepUs_ = micros();
-	}
+	void setRpm(float rpm) { submode_ = RPM; vc.setTarget(rpm); lastStepUs_ = micros(); }
 	void stop()   { escs::spinStop(index_); submode_ = RAW; }
 	void disarm() { stop(); }
 
@@ -95,10 +85,9 @@ public:
 	bool        tele(Telem& out) { return escs::spinTele(index_, out); }
 	Submode     submode() const { return submode_; }
 
-	// Called every core0 loop (EscManager::poll). Only the RPM submode does work here: run one closed-
-	// loop tick with the REAL elapsed dt (faster than the host's 50 Hz). On a non-OK status the loop
-	// aborted (over-speed / stall / over-temp) — stop the motor and fall back to RAW. RAW does nothing
-	// (escs:: already holds the target); both submodes still rely on EscManager's shared escs::spinPoll.
+	// Called every core0 loop. Only RPM submode does work: run one closed-loop tick with the REAL
+	// elapsed dt (faster than 50 Hz). On a non-OK status the loop aborted (over-speed / stall /
+	// over-temp) — stop the motor and fall back to RAW. Callers still run the shared escs::spinPoll().
 	void poll() {
 		if (submode_ != RPM || !armed()) return;
 		uint32_t now = micros();
@@ -106,14 +95,12 @@ public:
 		lastStepUs_ = now;
 		vel::Status st = vc.step(dt);
 		if (st != vel::Status::OK) {
-			stop();   // sets submode_ = RAW
+			stop();
 			Serial.printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
 			              index_, (int)st);
 		}
 	}
 
-	// PUBLIC controller so the firmware sets gains directly: th.vc.kp = 0.03f; (the "esc1.kp=" style).
-	// Declared last so it constructs after io_/profile_ (member init order = declaration order).
 	// ---- io adapter: the ONLY place that knows escs:: telemetry -> vel::EscIo. Reads owner->index_. --
 	struct Io : public vel::EscIo {
 		Thruster* owner = nullptr;
@@ -121,7 +108,7 @@ public:
 		bool readTele(float& mechRpm, float& tempC) override {
 			escs::Telem t;
 			if (!escs::spinTele(owner->index_, t) || !t.valid) return false;
-			if (millis() - t.rpmStampMs > THRUSTER_TELE_FRESH_MS) return false;  // stale eRPM -> sine
+			if (millis() - t.rpmStampMs > THRUSTER_TELE_FRESH_MS) return false;   // stale eRPM -> sine
 			if (t.rpm == 0) return false;                                        // no live 6-step sample
 			mechRpm = (float)t.rpm;                                              // ALREADY mechanical (fw /pp)
 			tempC   = (float)t.tempC;
@@ -129,12 +116,15 @@ public:
 		}
 	};
 
-	Io                     io_;
-	vel::SpeedProfile      profile_;
-	vel::VelocityController vc;
+	// Member order matters: profile_ and io_ construct before vc (which binds references to them).
+	const vel::SpeedProfile* profile_;
+	Io                       io_;
+	vel::VelocityController  vc;   // PUBLIC so the declaring side sets gains: th.vc.kp = 0.03f;
 
 private:
-	uint8_t  index_    = 0;
-	Submode  submode_  = RAW;
+	uint16_t kbaud_;
+	uint8_t  poles_;
+	uint8_t  index_      = 0;
+	Submode  submode_    = RAW;
 	uint32_t lastStepUs_ = 0;
 };
