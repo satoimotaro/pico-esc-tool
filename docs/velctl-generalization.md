@@ -166,6 +166,22 @@ verification harness + calibration tool** (same stack autocal uses). So:
   run on the motor (displaces `esc_tool` on the Pico); tune gains live with `g kp …`. Upper layer
   (FC/host) then commands only a target speed. Curve/gains/capabilities still ride in the profile the
   Pico holds — a host-side codegen from the YAML profile to the C++ `CurvePoint[]` is a small follow-up.
+- **Phase A2 hardware run — DONE.** Flashed on the 930KV: `vel 5000` mech → the on-device loop crosses
+  into 6-step (authority 0→1), the PI backs the command off the FF and tele settles on 5000 (~0 % error,
+  ~2 % ripple). `vel_demo` has since been folded into the integrated firmware (A3, below).
+- **Phase A3 (Pico C++): INTEGRATED object-oriented firmware — DONE + hardware-verified.** Replaces the
+  "flash a separate app per job" model with ONE default build (`src/main.cpp`, env `main`) composed of
+  objects: `class EscManager` (`src/apps/esc_manager.h`) owns one `class Thruster`
+  (`src/apps/thruster.h`) per wired ESC — so the count scales with `ESC_SIGNAL_PINS`. A `Thruster`
+  delegates config/flash/drive to the `escs::` singleton by index and carries its own
+  `vel::VelocityController` (+ `EscIo` adapter + `SpeedProfile`); the declaring side (`EscManager::begin`)
+  sets the per-motor gains (`th.vc.kp = 0.03f; …`). DRIVE has two submodes: **RAW** (direct
+  thrust/throttle) and **RPM** (the closed loop; `poll()` runs `vc.step(dt)` each core0 pass). Folds in
+  all of `esc_tool` (USB-serial CLI byte-compatible with `host/esctool.py` + Wi-Fi web UI + BLHeli
+  config/flash) and adds serial `rpm <i> <v>` / `gain <i> <kp|ki|trim|slew> <v>` + a web RPM control.
+  `esc_tool` is kept as a legacy fallback env; the HAL (`escs::`) and all `lib/` are untouched. Verified
+  on the 930KV: `scan` reads the ESC identity (config path), `arm 1`→`rpm 1 5000` converges to **0.4 %**,
+  `thrust 1 300` drives RAW and disengages the loop, `gain`/`mode`/`disarm` all work.
 - **Phase B (later, calibration): capability autocal.** Extend `autocal` to write the `motor` +
   `capabilities` profile fields (spec defaults + encoder refinement of lock/crossover/catch); on the
   KV=300 motor, re-test the down-catch (3× BEMF should resolve the over-commutation) and set `down_catch`
