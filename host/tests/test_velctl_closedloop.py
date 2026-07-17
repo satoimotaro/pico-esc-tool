@@ -50,10 +50,11 @@ def _sim(profile, seed=1234, crossover=True):
     return ESC(h, 1, clock=clock), clock, h
 
 
-def _run(profile, target, *, kp=0.4, ki=1.5, secs=5.0, slew=500.0, seed=1234, crossover=True):
+def _run(profile, target, *, kp=0.4, ki=1.5, secs=5.0, slew=500.0, seed=1234, crossover=True,
+         stop_below_rpm=0.0):
     esc, clock, h = _sim(profile, seed=seed, crossover=crossover)
     ctrl = VelocityController(esc, profile, kp=kp, ki=ki, slew_rpm_s=slew, max_temp=0,
-                              max_secs=secs, stall_secs=2.0)
+                              max_secs=secs, stall_secs=2.0, stop_below_rpm=stop_below_rpm)
     ctrl.set_speed(target)
     rows = []
 
@@ -79,6 +80,23 @@ def test_closed_loop_converges_with_misscaled_ff():
     assert meas, "expected live telemetry in the last second (loop should be in 6-step)"
     err = statistics.mean(abs(m - 700) for m in meas)
     assert err <= 0.05 * 700, f"closed loop did not converge (mean |err|={err:.1f} RPM)"
+
+
+def test_set_speed_zero_commands_stop():
+    # `rpm 0` must command a true thrust 0 (motor stops), not creep via the FF/slew/PI.
+    prof = _profile(scale=1.0)
+    reason, rows = _run(prof, 0.0, secs=2.0)
+    assert reason == "completed"
+    assert rows and all(sent == 0 for _, _, sent, _, _ in rows), "rpm 0 must hold thrust 0"
+
+
+def test_stop_below_rpm_stops_subfloor_target():
+    # A sub-floor target with stop_below_rpm set must STOP (thrust 0) rather than servo a speed the FF
+    # would otherwise command (proves the stop overrides a would-be-driving command).
+    prof = _profile(scale=1.0)
+    assert prof.thrust_for(100.0) != 0                # the FF alone would drive here
+    reason, rows = _run(prof, 100.0, secs=2.0, stop_below_rpm=150.0)
+    assert rows and all(sent == 0 for _, _, sent, _, _ in rows), "sub-floor target must stop"
 
 
 def test_pure_feedforward_misses_the_target():

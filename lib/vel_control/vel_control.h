@@ -151,6 +151,9 @@ public:
 	float blend_secs = DEFAULT_GAINS.blend_secs;
 	float slew_rpm_s   = 200.0f;    // setpoint slew rate (keeps the first command gentle)
 	float over_speed_rpm = 0.0f;    // 0 => auto: max(2*maxRpm, 1200)
+	float stop_below_rpm = 0.0f;    // a target at/below this |RPM| is a STOP: command thrust 0 and
+	                                // disengage (can't hold speed sensorlessly near 0). 0 => only an
+	                                // exact setTarget(0) stops. This makes `rpm 0` actually STOP.
 	float stall_secs   = 1.0f;      // abort if commanding into 6-step but tele stays stale this long
 	float max_temp     = 0.0f;      // 0 => no temp abort (EDT temp is unreliable on these ESCs)
 	int   tmax         = 1000;      // command magnitude ceiling
@@ -179,6 +182,16 @@ public:
 	// ABORT_* status after commanding thrust 0 (the caller should then disarm).
 	Status step(float dt) {
 		if (dt <= 0.0f) dt = VEL_DT_DEFAULT;
+
+		// STOP request: a target at/below stop_below_rpm can't be held sensorlessly (no BEMF near
+		// zero) -> command a true thrust 0 and disengage the loop, so setTarget(0) actually STOPS
+		// instead of the FF/slew/PI creeping the motor. (arm/disarm stay for enable/kill.)
+		if (fabsf(target_) <= stop_below_rpm) {
+			setpoint_ = 0.0f; i_ = 0.0f; w_ = 0.0f; live_ = false;
+			have_pending_ = false; stale_accum_ = 0.0f;
+			io_.thrust(0); last_sent_ = 0; last_applied_ = 0.0f;
+			return Status::OK;
+		}
 
 		float sp = slew(dt);
 		if (sp > 0.0f) last_sign_ = 1.0f; else if (sp < 0.0f) last_sign_ = -1.0f;

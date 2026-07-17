@@ -117,6 +117,24 @@ int main() {
 	CHECK(runExpectStatus(mis, target, /*stallPlant=*/true) == Status::ABORT_STALL,
 	      "stall aborts when 6-step never lives");
 
+	// -- STOP at zero: setTarget(0) commands thrust 0 and disengages (doesn't creep) --
+	{
+		SimEsc sim; sim.rpm = 400.0f;                 // motor already spinning
+		VelocityController vc(sim, mis);
+		vc.kp = 0.4f; vc.ki = 1.5f;
+		vc.setTarget(0.0f);
+		for (int t = 0; t < 20; t++) vc.step(0.02f);
+		CHECK(vc.command() == 0 && vc.authority() == 0.0f, "setTarget(0) -> command 0, loop disengaged");
+	}
+	{   // stop_below_rpm: a sub-floor target also stops
+		SimEsc sim; sim.rpm = 400.0f;
+		VelocityController vc(sim, mis);
+		vc.stop_below_rpm = 150.0f;
+		vc.setTarget(100.0f);
+		for (int t = 0; t < 10; t++) vc.step(0.02f);
+		CHECK(vc.command() == 0, "target below stop_below_rpm -> command 0");
+	}
+
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
 	return failures ? 1 : 0;
 }

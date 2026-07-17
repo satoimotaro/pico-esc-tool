@@ -294,7 +294,7 @@ class VelocityController:
     def __init__(self, esc, profile, *, kp=DEFAULT_GAINS["kp"], ki=DEFAULT_GAINS["ki"],
                  trim_max=DEFAULT_GAINS["trim_max"], blend_secs=DEFAULT_GAINS["blend_secs"],
                  tele_period=DT, over_speed_rpm=None, stall_secs=1.0, slew_rpm_s=200.0,
-                 max_temp=80.0, max_secs=30.0, use_encoder=False, enc_sign=1):
+                 max_temp=80.0, max_secs=30.0, use_encoder=False, enc_sign=1, stop_below_rpm=0.0):
         self.esc = esc
         self.profile = profile
         self.kp = float(kp)
@@ -308,6 +308,12 @@ class VelocityController:
                                else max(2.0 * profile.max_rpm, 1200.0))
         self.stall_secs = float(stall_secs)
         self.slew_rpm_s = float(slew_rpm_s)
+        # A target at/below this |RPM| is a STOP request: the speed can't be held sensorlessly near
+        # zero (no BEMF), so instead of servoing to it (which jitters and creeps) the loop commands a
+        # true thrust 0 and disengages. Default 0 => only an exact `set_speed(0)` stops; raise it to
+        # make any sub-floor target coast to a stop. This is what makes `rpm 0` actually STOP (arm/
+        # disarm stay for enable/kill; motion is by speed command).
+        self.stop_below_rpm = float(stop_below_rpm)
         self.max_temp = float(max_temp)
         self.max_secs = float(max_secs)
         self.use_encoder = bool(use_encoder)
@@ -470,6 +476,22 @@ class VelocityController:
             if dt <= 0:
                 dt = DT
             t = tick - t0
+
+            # STOP request: a target at/below stop_below_rpm can't be held sensorlessly (no BEMF near
+            # zero) -> command a true thrust 0 and disengage the loop, so `set_speed(0)` actually
+            # STOPS instead of the FF/slew/PI creeping the motor. Snap the setpoint to 0 too.
+            if abs(self.target) <= self.stop_below_rpm:
+                self.setpoint = 0.0
+                self._i = 0.0
+                self._w = 0.0
+                self._live = False
+                self._pending = None
+                self._stale_since = None
+                sent = self.esc.thrust(0)
+                if on_row is not None:
+                    on_row(t, self.target, 0.0, sent, None, None, None, 0.0)
+                _pace(clock, tick)
+                continue
 
             sp = self._slew(dt)
             if sp > 0:

@@ -98,6 +98,9 @@ def build_parser():
                     help="add an INDEPENDENT encoder verify-log column (NEVER feeds the command)")
     sp.add_argument("--slew", type=float, default=200.0,
                     help="setpoint slew rate, RPM/s (default 200; keeps the first command gentle)")
+    sp.add_argument("--stop-below-rpm", type=float, default=0.0,
+                    help="a target at/below this |RPM| is a STOP (command thrust 0, disengage the loop) "
+                         "— speed can't be held sensorlessly near 0 (default 0: only --rpm 0 stops)")
     sp.add_argument("--kp", type=float, default=None,
                     help="closed-loop PI proportional gain on (target - tele mech RPM); 0 = pure FF "
                          f"(default: profile control.kp, else {DEFAULT_GAINS['kp']:g})")
@@ -166,7 +169,8 @@ def main():
     ctrl = VelocityController(esc, profile, kp=kp, ki=ki, trim_max=trim_max,
                               blend_secs=blend_secs, slew_rpm_s=opts.slew,
                               max_temp=opts.max_temp, max_secs=opts.secs,
-                              use_encoder=opts.encoder, enc_sign=enc_sign)
+                              use_encoder=opts.encoder, enc_sign=enc_sign,
+                              stop_below_rpm=opts.stop_below_rpm)
     ctrl.set_speed(opts.rpm)
 
     def _panic(*_):
