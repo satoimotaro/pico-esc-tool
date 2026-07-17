@@ -151,11 +151,21 @@ verification harness + calibration tool** (same stack autocal uses). So:
   6-step ≈23 mech RPM/cmd-unit vs sim ≈0.8) and saturate the trim rail — the real motor wants
   `kp≈0.03, ki≈0.12, trim_max≈400`, so **gains are now a per-profile `control:` block** (§4), merged
   CLI > profile > `velocity.DEFAULT_GAINS`. See §5/§8 answers below; ported to C++ in A2.
-- **Phase A2 (next, Pico C++): PORT the proven law to the RP2040 firmware.** A speed-control loop in
-  `pico-esc-tool/src/apps/` (a `vel <i> <rpm>` command sets a target; the Pico closes the loop internally
-  on the latest bidir-DShot eRPM and drives the DShot target, running faster than the host's 50 Hz). The
-  SpeedProfile FF curve + gains + capabilities ride in the profile/config the Pico holds. Same control
-  law as A1, just where it belongs. Upper layer (FC/host) then commands only a target speed.
+- **Phase A2 (Pico C++): PORT the proven law to the RP2040 firmware. — DONE (builds + native-verified;
+  awaits on-motor hardware run).** The control law is a **portable, hardware-free library** at
+  `lib/vel_control/vel_control.h` (`SpeedProfile` + `VelocityController` + an injected `EscIo` backend),
+  a faithful port of A1. The declaring **main owns the plant-dependent gains and sets them directly**
+  (`esc1.kp = 0.03f; esc1.ki = 0.12f; ...`) — deps (backend + profile) are constructor-injected, gains
+  are public members (built-in `DEFAULT_GAINS` = the sim starting point). `step(dt)` runs one tick, so
+  the app closes the loop every core0 pass (faster than the host's 50 Hz). Demo app
+  `src/apps/vel_demo.cpp` (env `vel_demo`): an `EscIo` over `escs::` (with a new `rpmStampMs` freshness
+  field so a stale held rpm reads as sine, not live) + a `vel <rpm>` / `stop` / live-gain-tune serial
+  interface. Both `vel_demo` and the default `esc_tool` build clean. The port is verified by a native
+  g++ test (`lib/vel_control/test/`) mirroring the Python reference: a ×1.25-mis-scaled FF converges
+  ≤5 % with the PI (0.1 %) while pure FF misses ~19 %, and a stall aborts. NEXT: flash `vel_demo` and
+  run on the motor (displaces `esc_tool` on the Pico); tune gains live with `g kp …`. Upper layer
+  (FC/host) then commands only a target speed. Curve/gains/capabilities still ride in the profile the
+  Pico holds — a host-side codegen from the YAML profile to the C++ `CurvePoint[]` is a small follow-up.
 - **Phase B (later, calibration): capability autocal.** Extend `autocal` to write the `motor` +
   `capabilities` profile fields (spec defaults + encoder refinement of lock/crossover/catch); on the
   KV=300 motor, re-test the down-catch (3× BEMF should resolve the over-commutation) and set `down_catch`

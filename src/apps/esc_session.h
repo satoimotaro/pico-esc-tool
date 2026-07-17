@@ -37,6 +37,9 @@ struct Telem {
 	bool     valid = false;
 	uint32_t rpm = 0, current = 0, tempC = 0, stress = 0, status = 0;
 	float    voltage = 0.0f;
+	uint32_t rpmStampMs = 0;   // millis() of the last ERPM packet — lets a reader detect a STALE rpm
+	                           // (the field holds the last 6-step value even after the ESC drops to
+	                           // forced sine and stops sending eRPM; freshness distinguishes the two).
 };
 
 static const uint16_t SPIN_MAX        = 2000;   // max throttle
@@ -277,7 +280,7 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 		if (drvB[i]) {
 			uint32_t v = 0;
 			switch (drvB[i]->getTelemetryPacket(&v)) {
-				case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; break;
+				case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
 				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;
