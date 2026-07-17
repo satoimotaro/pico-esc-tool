@@ -1,253 +1,154 @@
 # pico-esc-tool
 
-An **RP2040 (Pico / Pico W)** tool for **BLHeli-S ESCs**: configure, flash firmware, and drive
-them over DShot with telemetry — **no flight controller required.** Built for underwater ROV
-thrusters (many ESCs from one PC/SBC), but works with any BLHeli-S SiLabs ESC.
+An **RP2040 (Pico / Pico W)** tool for **BLHeli-S ESCs**: configure them, flash firmware, and drive
+them over DShot with telemetry — including **closed-loop RPM control on-device** — **no flight
+controller required.** Built for underwater ROV thrusters (many ESCs from one PC/SBC), but works with
+any BLHeli-S SiLabs ESC. Developed on **ReadyToSky 45A / 30A** (SiLabs **EFM8BB21**), Bluejay firmware.
 
-Developed and tested on **ReadyToSky 45A and 30A** ESCs (SiLabs **EFM8BB21**).
+Two parts:
 
-It has two parts:
-
-- **`esc_tool`** — one Pico W firmware that configures/flashes BLHeli-S ESCs over the 1-wire
-  bootloader **and** spins thrusters over DShot, exposed over USB serial and (in SETUP mode) a
-  Wi-Fi web UI. No reflashing to switch jobs.
-- **`esctool`** — a BLHeli-Configurator-like **CLI** on the PC that drives it over USB: list ESCs,
-  read / write settings (YAML profiles), and flash firmware — with a layout/MCU **compatibility guard**.
-
-**Modes** (chosen at boot by an optional GPIO, or the `mode` command): **SETUP** brings up the
-Wi-Fi AP + web configurator and per-thruster test; **DRIVE** turns Wi-Fi off and accepts
-per-thruster commands with a deadman. cmd_vel→thruster mixing is left to the host/Pi (RL-friendly).
-
-## Features
-
-- **Discover / read / write** BLHeli-S config over the signal wire (CRC-verified, read-back checked).
-- **YAML profiles** — export a config, edit, and `apply` it (single ESC or `all`).
-- **Firmware flashing** from the CLI, app-only (bootloader + your settings-page are never touched),
-  refused unless the HEX's layout + MCU match the ESC. The firmware's own default config is
-  auto-applied after a flash.
-- **Bootloader session** — config commands keep the ESC connected (motor off) and reuse it, so a
-  batch of commands doesn't reboot the ESC between each; it restarts only on `run`/`disconnect`.
-- **Multi-ESC** — one signal pin per ESC (`ESC_SIGNAL_PINS` in `src/apps/esc_config.h`); target an index or `all`.
-- **Firmware-aware thruster drive** — the spin path detects the ESC firmware and picks the DShot
-  variant: **normal DShot** for stock BLHeli-S (throttle only), **bidirectional DShot** for
-  Bluejay/JESC (with telemetry). Arms the ESC, then holds throttle with a deadman auto-stop.
-- **Reversible / 3D** — if the ESC is configured reversible, throttle becomes a **signed thrust**
-  (−full … 0 = stop … +full); one-way ESCs use a plain 0–100% throttle.
-- **Live telemetry** (bidir firmware) — eRPM always; temperature + stress via EDT; voltage/current
-  when the ESC has the sensors. DShot via
-  [pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot).
-- **Closed-loop position control** (`host/posctl.py`) — an AS5600 encoder on the Pico + a host
-  cascade controller (position → velocity → thrust), with direction auto-cal and full safety
-  aborts. See [Position control](#position-control-hostposctlpy--as5600-encoder).
-
-## Requirements
-
-- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults **GP10**, plus **GP11** for
-  a 2nd ESC) with a common ground. All wiring — signal pins, mode pin, Wi-Fi, motor poles — is
-  configured in one place, `src/apps/esc_config.h`. See `construction/wiring/`.
-- **Firmware build:** [PlatformIO](https://platformio.org/) (earlephilhower Arduino-Pico core;
-  fetched automatically).
-- **Host CLI:** Python 3.8+ and `pyserial` (`pip install pyserial`; `pyyaml` optional).
+- **`main`** — one Pico W firmware, composed of objects: you declare your ESCs in `src/main.cpp` and it
+  gives you config/flash over the 1-wire bootloader **and** DShot drive (RAW thrust *or* closed-loop
+  RPM), over USB serial and (in SETUP mode) a Wi-Fi web UI. No reflashing to switch jobs.
+- **`esctool`** (`host/esctool.py`) — a BLHeli-Configurator-like **CLI** on the PC: list ESCs, read /
+  write settings (YAML profiles), and flash firmware, with a layout/MCU **compatibility guard**.
 
 ## Quick start
 
-Build and flash the unified firmware to the Pico:
-
 ```
-pio run -e esc_tool -t upload
-```
-
-Then drive ESCs from the PC (the Pico is auto-detected by its USB VID 2E8A):
-
-```
+pio run -e main -t upload                                      # build + flash the firmware (default env)
 python host/esctool.py list                                   # scan & list connected ESCs
 python host/esctool.py read 0 -o config.yaml                  # export ESC 0's config to YAML
-python host/esctool.py set 0 motor_direction=Reversed beep_strength=60
-python host/esctool.py apply all host/profiles/blheli-s-default.yaml
-python host/esctool.py flash 0 J_H_25_REV16_7.HEX --yes       # flash matching BLHeli-S firmware
-python host/esctool.py run 0                                  # end the session, restart the ESC
+python host/esctool.py set 0 motor_direction=Reversed
+python host/esctool.py flash 0 firmware.hex --yes             # flash matching BLHeli-S/Bluejay firmware
 ```
 
-## CLI reference
+The Pico is auto-detected (USB VID 2E8A). Wiring — signal pins, mode pin, Wi-Fi, motor poles — lives
+in one file, `src/apps/esc_config.h`; see `construction/wiring/`.
+
+## The firmware: declare your ESCs in `main.cpp`
+
+The firmware is a composition root. Each ESC is a `Thruster` object carrying its **own** config —
+DShot bitrate, motor pole count, calibrated speed curve, and PI gains — and you compose them:
+
+```cpp
+static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // RAW only
+static Thruster esc1(&profiles::M_930KV_12N14P_6STEP, /*dshotKbaud=*/300, /*poles=*/14);
+static Thruster* THRUSTERS[] = { &esc0, &esc1 };
+static EscTool  tool(THRUSTERS, 2);            // the config/flash + serial + Wi-Fi surface (optional)
+
+void setup() {
+    for (uint8_t i = 0; i < 2; i++) THRUSTERS[i]->bind(i);
+    esc1.applyGains(profiles::M_930KV_12N14P_6STEP_GAINS);   // per-motor gains from the profile
+    tool.begin();
+}
+void loop() { tool.poll(); }                   // serial + Wi-Fi + each ESC's RPM loop
+```
+
+- **Add an ESC:** add a pin to `ESC_SIGNAL_PINS` (`esc_config.h`) and a `Thruster` here.
+- **Standalone ROV (no PC tool):** skip `EscTool` and drive the ESCs straight from `loop()` —
+  `t->setRpm(mix[i]); t->poll(); escs::spinPoll();`. The `EscTool` module is only the operator surface.
+- `EscTool` = config/flash + USB-serial CLI + Wi-Fi UI; `Thruster` = one ESC (config + drive +
+  velocity). The proven dual-core DShot/bootloader engine underneath is `src/apps/esc_session.h`.
+
+## Driving thrusters (USB serial)
+
+```
+arm <i> [normal|bidir]      # arm ESC i (AUTO: bidir for Bluejay/JESC, else normal DShot)
+throttle <i> <0..2000>      # RAW one-way throttle          (armed)
+thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop
+rpm     <i> <mech-rpm>      # CLOSED-LOOP velocity target (signed); needs a calibrated profile
+gain    <i> kp|ki|trim|slew <v>   # tune the closed loop live
+tele    <i>                 # rpm | volts | amps | tempC | stress   (bidir firmware only)
+disarm  <i>                 # stop + release
+```
+
+Arming streams zero throttle ~3 s (BLHeli-S won't spin until armed); a **deadman** re-zeros if no
+command arrives within 500 ms. `throttle`/`thrust` are RAW (open loop); `rpm` engages the closed loop
+and the ESC holds the target speed. Stock BLHeli-S = normal DShot (throttle only, no telemetry);
+**Bluejay/JESC** = bidirectional DShot with eRPM/EDT telemetry and reversible support.
+
+## Closed-loop RPM control
+
+Signed target mechanical RPM → signed DShot thrust: a feed-forward from the motor's calibrated curve
+plus a PI trim on the telemetry eRPM, whose authority fades where telemetry goes stale. It is
+ESC-agnostic (works on stock Bluejay using only standard bidir-DShot telemetry). The control law is
+`lib/vel_control/` (portable, host-unit-tested); design notes in `docs/velctl-generalization.md`.
+
+**Per-motor profiles are generated from calibration, not hand-typed.** The YAML velcal profiles in
+`host/profiles/` are the single source of truth; regenerate the firmware header after a velcal:
+
+```
+python host/gen_profile_header.py            # host/profiles/vel_*.yaml -> src/apps/profiles_gen.h
+```
+
+Each `vel_<name>.yaml` becomes `profiles::M_<NAME>` + `M_<NAME>_GAINS` for a `Thruster` to use.
+
+## Host CLI reference
 
 | Command | What it does |
 |---|---|
-| `list` | Scan all configured pins and print each ESC (signature, layout, name, firmware). |
-| `connect <i\|all>` | Enter the bootloader and hold the session (motor off). |
-| `read <i\|all> [-o file.yaml]` | Read config; print YAML or write it to a file. |
+| `list` | Scan all pins, print each ESC (signature, layout, name, firmware). |
+| `read <i\|all> [-o f.yaml]` | Read config; print YAML or write it. |
 | `set <i\|all> key=value ...` | Change settings (enum names OK, e.g. `motor_direction=Reversed`). |
-| `apply <i\|all> profile.yaml` | Apply a profile's `settings:` block (`--name`, `--with-name`). |
+| `apply <i\|all> profile.yaml` | Apply a profile's `settings:` block. |
 | `flash <i> file.hex --yes` | Compat-check then erase/program/verify the app + apply defaults (`--force` to override). |
-| `run` / `disconnect` `[i]` | End the session and restart the held ESC(s). |
+| `run` / `disconnect` `[i]` | End the bootloader session and restart the ESC(s). |
 
-Config commands hold the ESC in a bootloader session (motor off) and **do not restart it** — add
-`-r` to restart after a single command, or `run`/`disconnect` when done. Get the firmware HEX for
-your ESC's layout from [github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli)
-(`BLHeli_S SiLabs/Hex files/`).
-
-## Driving thrusters
-
-`esc_tool` spins each ESC over DShot — from the Wi-Fi web UI (**Spin test**) or the USB-serial API:
-
-```
-arm <i> [normal|bidir]    # arm ESC i (AUTO picks bidir for Bluejay/JESC, else normal DShot)
-throttle <i> <0..2000>    # one-way throttle (armed)
-thrust <i> <-1000..1000>  # reversible/3D: signed thrust, 0 = stop (armed)
-tele <i>                  # rpm | volts | amps | tempC | stress   (bidir firmware only)
-enc                       # read the AS5600 encoder: raw|ang|deg|md|ml|mh|agc|mag
-disarm <i>                # stop + release the ESC
-```
-
-Arming streams zero throttle for ~3 s (BLHeli-S won't spin until it has been armed), so wait for the
-start-up beeps before applying throttle. A **deadman** re-zeros the throttle if no command arrives
-within 500 ms — resend regularly to keep it spinning (the web UI heartbeats automatically).
-
-**Firmware & telemetry.** Stock BLHeli-S understands only normal DShot (throttle, no telemetry).
-eRPM + temperature telemetry and reversible support work best on **Bluejay** (or JESC); its motor
-PWM frequency (24 / 48 / 96 kHz) is chosen by *which hex you flash*. Get Bluejay from
-[github.com/bird-sanctuary/bluejay](https://github.com/bird-sanctuary/bluejay). The Pico exposes a
-generic **per-thruster** driver — cmd_vel→thruster mixing stays on the host/Pi (RL/sim-friendly).
-
-## Position control (`host/posctl.py` + AS5600 encoder)
-
-Closed-loop **shaft-position** control: an **AS5600** magnetic encoder on the Pico's I2C0 feeds a
-host-side **cascade PID velocity servo**. It targets BlueGill **S1 forced-commutation stepper mode**
-(`Pgm_Sine_Mode`), which lets the ESC creep smoothly far below the old ~185 RPM 6-step floor and
-**hold with detent torque at thrust 0** — so a real velocity servo works. An outer position PID sets
-a velocity setpoint; an inner law turns that into signed `thrust` (Kff feedforward from the firmware
-full scale + Ki trim); inside tolerance and slow, thrust drops to 0 and the ESC holds. The Pico reads
-the encoder (`enc`); the loop runs on the PC.
-
-**Requires S1 sine mode:** on stock 6-step firmware the rotor can't creep or hold, so the servo only
-works with the ESC in Bidirectional mode with `sine_mode` enabled. Use the sine profile below.
-
-**Wiring** (AS5600 → Pico): `SDA→GP16`, `SCL→GP17`, `VCC→3V3`, `GND→GND`, `DIR→GND` (I2C addr
-`0x36`). Check it first with `enc` — you want `md=1` (magnet detected), `ml=mh=0`, and `agc` mid-range.
-
-**ESC setup** — Bidirectional + braking + S1 sine mode + temperature protection. A ready profile is
-in `host/profiles/posctl_930kv_sine.yaml` (enables `sine_mode` and `temperature_protection`):
-
-```
-python host/esctool.py apply 1 host/profiles/posctl_930kv_sine.yaml   # 3D + brake + S1 sine + temp-prot
-# or by hand:
-python host/esctool.py set 1 motor_direction=Bidirectional brake_on_stop=1 temperature_protection=1 sine_mode=1
-# (re-apply after any firmware flash — flashing resets the config page)
-# (posctl_930kv.yaml, without sine, is only for the retired 6-step pulse-and-settle mode)
-```
-
-**Usage:**
-
-```
-python host/posctl.py move --deg 720                 # rotate +720° from the current pose
-python host/posctl.py step --seq 360,-360,720        # relative moves, one after another
-python host/posctl.py hold --deg 0                   # hold a position
-python host/posctl.py move --deg 360 --dry-run       # simulated motor, no hardware (safe smoke test)
-```
-
-posctl is a **cascade PID velocity servo** built for BlueGill **S1 forced-commutation stepper mode**
-(flash `host/profiles/posctl_930kv_sine.yaml` first — it enables `sine_mode` and temperature
-protection). Outer position PID → velocity setpoint → inner thrust (Kff feedforward + Ki trim);
-inside tolerance and slow, thrust drops to 0 and the ESC **holds** on its detent.
-
-Key flags: `--esc-index 1`, `--tol 6` (deg; ~one stepper detent), `--kp`/`--kd`/`--ki` (cascade
-gains), `--kff 0.47` (thrust per deg/s — firmware full scale, from `sine_drive_model.py`),
-`--vmax 400` (velocity clamp, deg/s), `--tmax`, `--max-secs`/`--max-revs`/`--vel-abort` (runaway
-aborts), `--csv` (log to `host/reports/`). On start it **auto-calibrates direction** (a brief probe
-spin to learn whether `+thrust` increases or decreases the encoder count); override with
-`--invert-encoder` / `--no-autocal`.
-
-**Safety:** the loop keep-alives the ESC under the 500 ms deadman, guards the encoder unwrap, and
-**always disarms** on completion, abort, or Ctrl-C. It aborts + disarms on lost magnet, stuck/
-implausible encoder reads (expected-vs-measured stall), over-velocity, wrong-way runaway, or the
-time/rev limits.
-
-> **Requires S1 sine mode.** On stock 6-step firmware the rotor can't creep or hold, so this
-> velocity servo only works with BlueGill S1 forced-commutation stepper mode enabled on the ESC.
-> Hold resolution is ~one stepper detent (12N14P ⇒ ~8.6°); finer needs S2 microstepping. All S1
-> firmware is bench-pending.
+Config commands hold the ESC in a bootloader session (motor off) and don't restart it between
+commands (batch-friendly). Flash is **app-only** (the bootloader is never overwritten, so a bad flash
+is recoverable) and **refused on a layout/MCU mismatch** unless `--force`; every write is read-back
+verified. Get Bluejay from [bird-sanctuary/bluejay](https://github.com/bird-sanctuary/bluejay) or
+BLHeli-S from [bitdump/BLHeli](https://github.com/bitdump/BLHeli) — firmware images are not bundled.
 
 ## Wi-Fi web tool (SETUP mode)
 
-In SETUP mode (the default), `esc_tool` brings up a Wi-Fi Access Point. Connect your phone/PC to
-the SSID `pico-esc-tool` and open `http://192.168.4.1` for a configurator-style browser UI: scan
-ESCs, read/edit settings, run a per-thruster spin test with live telemetry, and **flash firmware**
-(upload a `.hex`) — no cables. The AP SSID/password and the mode pin are set in
-`src/apps/esc_config.h`.
+At boot the mode pin (or the `mode` command) picks **SETUP** (Wi-Fi AP on) or **DRIVE** (radio off).
+In SETUP, connect to the SSID `pico-esc-tool` → `http://192.168.4.1` for a browser UI: scan ESCs,
+edit settings, run a per-thruster spin/RPM test with live telemetry, and flash firmware (upload a
+`.hex`, or save it to the Pico's on-device library and re-flash with one tap). Same app-only,
+layout-guarded flow as the CLI. Wi-Fi is a bench affordance — 2.4 GHz doesn't travel underwater, so a
+deployed craft is driven over its tether/host.
 
-Browser flashing is the same app-only, layout/MCU-guarded flow as the CLI (bootloader preserved,
-firmware defaults applied); it runs page-by-page in the background with a progress readout. Pick the
-`.hex`, choose the ESC, and Flash (tick *force* to override the compat guard).
+## Position control (`host/posctl.py`)
 
-**Firmware library.** An uploaded `.hex` can be **Saved to library** — it persists on the Pico's
-LittleFS partition (nothing is stored in this repo) and shows up in a list tagged by layout. From
-then on you just tap **Flash to ESC _n_** — no re-uploading, which is handy from a phone. The list
-flags entries whose layout doesn't match the selected ESC. (Set the partition size with
-`board_build.filesystem_size` in `platformio.ini`.)
+A host-side closed-loop **shaft-position** servo using an **AS5600** encoder on the Pico (I2C0,
+`SDA→GP16 SCL→GP17`, addr `0x36`). Targets BlueGill S1/S2 sine mode so the rotor can creep and hold at
+low speed. `python host/posctl.py move --deg 720` (add `--dry-run` for a hardware-free smoke test).
+The encoder is a **calibration/position instrument** — the RPM closed loop above is sensorless.
 
-Wi-Fi is a **surface/bench** affordance — 2.4 GHz does not travel through water, so a deployed
-underwater craft is driven over the tether/host, not Wi-Fi. (Pico W only; radio and DShot both use
-PIO — validate the combination on the bench.)
+## Requirements
 
-## Safety
-
-- **Flash is app-only.** The 1-wire bootloader (top of flash) is never overwritten — it's how the
-  tool talks to the ESC — so a failed flash is recoverable by re-flashing.
-- **Compatibility guard.** `flash` refuses a HEX whose layout tag or MCU signature doesn't match
-  the connected ESC (wrong FET map / wrong chip), unless `--force`.
-- Every write is **read-back verified** on the device.
-
-## PlatformIO environments
-
-| Env | Purpose |
-|---|---|
-| `esc_tool` | **The tool** — unified firmware (USB serial CLI + Wi-Fi web UI + DShot spin). *The default build.* |
-| `dshot_demo` | Standalone DShot drive demo (`src/apps/dshot_demo.cpp`); Pico W by default, set `board = rpipico` for a plain Pico. |
-| `spike_*` | Standalone bring-up/diagnostic firmwares for the bootloader work. |
-
-`esc_tool` builds on the shared bootloader/session/drive logic in `src/apps/esc_session.h`.
+- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults GP10, GP11) with common
+  ground. All wiring in `src/apps/esc_config.h`.
+- **Firmware:** [PlatformIO](https://platformio.org/) (earlephilhower Arduino-Pico core, fetched
+  automatically). Envs: **`main`** (default), `esc_tool` (legacy monolithic fallback).
+- **Host:** Python 3.8+ and `pyserial` (`pip install pyserial`; `pyyaml` optional).
 
 ## Layout
 
 ```
-platformio.ini          build environments
-src/apps/esc_config.h   hardware config — EDIT THIS for your wiring (pins, Wi-Fi, motor)
-src/apps/esc_tool.cpp   the tool: unified firmware (USB serial + Wi-Fi web + DShot spin)
-src/apps/esc_session.h  shared bootloader session + drive/spin (used by esc_tool)
-src/apps/dshot_demo.cpp standalone DShot drive demo (pico / picow envs)
-src/apps/spike_*.cpp    standalone bring-up / diagnostic firmwares
-host/esctool.py         the PC CLI
-host/posctl.py          closed-loop shaft-position controller (AS5600 encoder)
-host/autocal.py         per-thruster low-speed auto-calibration
-host/profiles/          example YAML profiles
-lib/blheli_bl/          BLHeli-S 1-wire bootloader client  (PROTOCOL.md = reference)
-lib/esc_setup/          config read / write (read-modify-write a flash page)
-lib/esc_flash/          Intel-HEX parse, program/verify, compatibility check
-construction/wiring/    how to wire an ESC signal line to the Pico
-docs/                   notes; lib/blheli_bl/PROTOCOL.md is the bootloader reference
+src/main.cpp             the firmware composition root — DECLARE YOUR ESCs here
+src/apps/esc_config.h    hardware config — EDIT for your wiring (pins, Wi-Fi, motor)
+src/apps/thruster.h      Thruster: one ESC (config + drive + closed-loop velocity)
+src/apps/esc_tool_app.h  EscTool: the config/flash + serial + Wi-Fi surface (references Thrusters)
+src/apps/esc_session.h   the dual-core DShot + 1-wire bootloader engine (HAL)
+src/apps/profiles.h      per-motor curves — includes the generated profiles_gen.h
+src/apps/profiles_gen.h  GENERATED from host/profiles/*.yaml (do not edit by hand)
+lib/vel_control/         portable closed-loop velocity controller (host-unit-tested)
+lib/{blheli_bl,esc_setup,esc_flash}/   bootloader client / config codec / HEX flash
+host/esctool.py          the PC CLI                host/posctl.py   position controller
+host/gen_profile_header.py   YAML profile -> C++ header codegen
+host/profiles/           calibrated YAML profiles (source of truth for firmware curves)
+docs/                    design notes (velctl-generalization.md, etc.)
 ```
 
-## DShot demo (`dshot_demo` env)
-
-`src/apps/dshot_demo.cpp` drives one ESC over bidirectional DShot from the serial monitor (115200,
-newline): `E` enable telemetry, `A` arm, a number = throttle (0–2000), `D` disarm, `C3` beacon (when
-stopped), `?` reprint header. It's a minimal standalone reference (the full tool is `esc_tool`); pins
-and motor poles come from `src/apps/esc_config.h`.
-
-## Status & roadmap
-
-**Proven on hardware** (EFM8BB21, ReadyToSky 45A/30A): bootloader connect / read / write / flash
-with the compat guard and auto-default-config; DShot spin with eRPM + EDT telemetry on **Bluejay**
-and throttle-only spin on **stock BLHeli-S** (auto-selected); reversible / 3D signed thrust; and the
-Wi-Fi web configurator + spin test (Wi-Fi AP and DShot coexist on the Pico W's PIO). Next: multi-
-thruster simultaneous drive, firmware flashing from the browser, and RPM filtering / telemetry→
-thrust mapping on the host.
+Legacy standalone bring-up apps (`dshot_demo`, `spike_*`, `encoder_test`) live on branch
+`archive/legacy-apps`.
 
 ## License
 
-Copyright (C) 2026 satoimotaro. **GPL-3.0-or-later** — see [`LICENSE`](LICENSE).
-
-Third-party: DShot / telemetry via
-[pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot) (GPL-3.0). The BLHeli-S 1-wire
-protocol was implemented with reference to Betaflight and BLHeli_S (both GPL). BLHeli-S firmware
-images belong to their authors ([github.com/bitdump/BLHeli](https://github.com/bitdump/BLHeli))
-and are **not** distributed here.
+Copyright (C) 2026 satoimotaro. **GPL-3.0-or-later** — see [`LICENSE`](LICENSE). DShot/telemetry via
+[pico-bidir-dshot](https://github.com/bastian2001/pico-bidir-dshot) (GPL-3.0); the BLHeli-S 1-wire
+protocol was implemented with reference to Betaflight and BLHeli_S (both GPL). Firmware images belong
+to their authors and are **not** distributed here.
