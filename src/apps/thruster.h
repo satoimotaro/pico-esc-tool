@@ -78,6 +78,10 @@ public:
 	void stop()   { escs::spinStop(index_); submode_ = RAW; }
 	void disarm() { stop(); }
 
+	// Copy a profile's calibrated PI gains onto the controller (e.g. the generated M_<NAME>_GAINS).
+	// The declaring side may still override any field afterward (th.vc.slew_rpm_s = ...).
+	void applyGains(const vel::Gains& g) { vc.kp = g.kp; vc.ki = g.ki; vc.trim_max = g.trim_max; vc.blend_secs = g.blend_secs; }
+
 	bool        armed()      { return escs::spinArmed(index_); }
 	bool        reversible() { return escs::spinReversible(index_); }
 	const char* spinMode()   { return escs::spinMode(index_); }
