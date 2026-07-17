@@ -255,7 +255,13 @@ class SimEncEscHost(SimEscHost):
             if self.io_time:
                 self.clock.sleep(self.io_time)
             self._advance(self.clock.now())
-            return [f"tele|{int(self.rpm)}|12.30|0|25|0"]
+            # Regime-aware freshness, matching HARDWARE: bidir-DShot telemetry is derived from BEMF
+            # zero-crossings, so it is LIVE only in 6-step ("line") and STALE (reports ~0) in forced
+            # sine — the OPPOSITE of the pre-A1 sim, which reported a live rpm in BOTH regimes. The
+            # _advance above (and its RNG draws) are UNCHANGED, so the crossover-ON dry-run stays
+            # deterministic; only the reported number is gated. (Crossover-OFF is untouched above.)
+            rpm = int(self.rpm) if self._regime == "line" else 0
+            return [f"tele|{rpm}|12.30|0|25|0"]
         if head == "arm":
             self.thrust = 0
             self.rpm = 0.0

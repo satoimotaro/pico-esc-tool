@@ -1,10 +1,15 @@
-# Velocity control — velctl v1 (sensorless feed-forward)
+# Velocity control — velctl (feed-forward + Phase A1 closed loop)
 
-`velctl` runs a BlueGill ESC at a target mechanical **speed** without a runtime feedback
-sensor, by inverting one per-motor calibrated curve produced by `velcal`. It is ADDITIVE on
+`velctl` runs a BlueGill ESC at a target mechanical **speed** by inverting one per-motor
+calibrated curve produced by `velcal`, and (Phase A1) trims that feed-forward with a PI loop on
+bidir-DShot telemetry whose authority **fades with telemetry liveness**. It is ADDITIVE on
 `host/pico_esc/`: it adds `pico_esc.velocity` (`SpeedProfile`, `VelocityController`,
 `measure_steady_speed`) and the `velcal.py` / `velctl.py` CLIs, and extends the dry-run
 simulator; it changes no wire protocol, no existing CLI, and no existing library surface.
+
+> **Phase A1 = the Python control-law reference / bench tool.** This host loop is where the
+> control law is written, tuned, and PROVEN in the `SimEncEscHost` dry-run. The runtime home is
+> the Pico C++ port (Phase A2); A1 stays as the calibration / bench-verification tool.
 
 ## Terminology — read this first
 
@@ -46,8 +51,10 @@ points:
 ```
 
 `velctl` loads it, slews the setpoint at `--slew` RPM/s (so a step never demands a full-scale
-command jump), and each 50 Hz tick sends `SpeedProfile.thrust_for(setpoint)` over the existing
-signed `thrust` command. There is **no runtime feedback** — pure feed-forward.
+command jump), and each 50 Hz tick sends `SpeedProfile.thrust_for(setpoint)` (the feed-forward)
+**plus a telemetry-fed PI trim** over the existing signed `thrust` command (see the closed-loop
+section below). Where telemetry is stale (forced sine, below the seam) the trim fades out and the
+command is pure feed-forward.
 
 YAML I/O reuses the config codec's `config._emit_yaml` / `config.load_yaml`; the loader
 strict-**rejects** a non-monotonic curve (thrust must be strictly increasing, rpm
@@ -78,18 +85,61 @@ Sensorless is the **default**. The encoder is used only:
 
 - by `velcal`, once, to build the curve (encoder-in-the-loop calibration); and
 - optionally at runtime with `velctl --encoder`, as an **independent verify-log column**
-  (`enc_rpm`) that is written to the CSV but **never feeds back into the command** in v1.
+  (`enc_rpm`) that is written to the CSV but **never feeds back into the command** (the closed
+  loop trims on **telemetry**, not the encoder — the encoder stays a pure cross-check).
 
-## Deferred: the eRPM-PI closed loop (documented seam)
+## Phase A1: the closed loop (PI trim faded by telemetry liveness)
 
-v1 is feed-forward only. A future phase adds a runtime eRPM/encoder **PI trim** on
-`(setpoint − measured)`. The seam is already in place and is a genuine no-op today:
+Each 50 Hz tick the command is:
 
-- `VelocityController._closed_loop_trim(setpoint, meas_rpm)` returns `0.0` (v1), and the run
-  loop already threads the measured speed into it — the next phase fills in the PI here.
-- `VelocityController.regime(rpm)` classifies a speed as `"sine"` or `"line"` from the
-  profile's crossover, so the future trim can be **regime-aware** (different gains either side
-  of the handoff). It is informational in v1.
+```
+    cmd = SpeedProfile.thrust_for(setpoint) + w * trim
+```
+
+- **Feed-forward** `thrust_for(setpoint)` carries the motion (and already subsumes the crossover
+  handoff jump, since `velcal` measured across it).
+- **PI trim** on the speed error: `err = setpoint − meas`, `trim = clamp(kp·err + ∫ki·err dt,
+  ±trim_max)`. The measurement `meas` is the bidir-DShot `tele` frame's `rpm`, which is **already
+  mechanical RPM** (the firmware pre-divides eRPM by pole pairs) — it is used **directly, never
+  divided by `POLE_PAIRS`** (that double-division was a real 1/7 bug). We re-attach the commanded
+  sign: `meas = copysign(|rpm|, setpoint)`.
+- **Authority fade** `w ∈ [0,1]`: a `tele` frame is LIVE only when `|rpm| > TELE_MIN_MECH_RPM`
+  (50). While a live frame is seen, `w` ramps 0→1 over `--blend-secs`; while it is stale, `w`
+  ramps 1→0 and the integrator is **reset** when `w` hits 0. So above the seam (6-step, live
+  telemetry) the loop closes; below it (forced sine, stale telemetry) it degrades smoothly to
+  pure feed-forward. Authority is keyed **purely on tele-liveness** — never on the profile's
+  crossover or capabilities — so an ESC-agnostic stock profile still runs.
+- **Anti-windup** is back-calculation on **both** clamps — the `±trim_max` trim clamp and the
+  outer `ESC.thrust` `--tmax` clamp — mirroring `PositionController.step`: on saturation the
+  integrator is folded back to the value the delivered command implies, so it can't wind up.
+- **Guards** (all on the LIVE measurement, never on config): an over-speed abort on the measured
+  mech RPM, and — only when the *command's* implied regime is above the seam yet telemetry stays
+  stale for `--stall-secs` — a stall abort (the ESC never reached 6-step). The stall check keys on
+  the **command's** implied regime, not the nominal setpoint, because near the seam a target can
+  classify `"line"` while the command still sits in the sine "gap" (a legitimate pure-FF point).
+
+Tune with `--kp` / `--ki` / `--trim-max` / `--blend-secs`; `--kp 0 --ki 0` is pure feed-forward.
+`--debug-csv` appends `tele_rpm,trim` diagnostic columns (the default CSV header is unchanged).
+
+`VelocityController.regime(rpm)` classifies a speed as `"sine"` or `"line"` from the profile's
+crossover; it is **advisory** (display, stall, down-catch), never the PI authority signal — that
+is tele-liveness (see the SEAM CAVEAT in its docstring: the nominal-target classifier disagrees
+with the firmware's actual regime near the seam).
+
+### set_speed down-catch staging
+
+If the profile has a crossover and the ESC does **not** advertise `capabilities.down_catch`,
+a `set_speed` that drops **from above the seam to below it** is staged: the setpoint is first
+routed through ~0 (so the rotor is re-acquired **from below**) and then promoted to the real
+target once we are at ~0 / telemetry has gone stale. This is inert (a direct set) when the
+profile has no crossover, the ESC advertises `down_catch`, or the move is not a line→sine descent.
+
+### profile capabilities
+
+`SpeedProfile` carries an optional `capabilities` block (round-trips through the YAML alongside
+`crossover`). A profile with no block behaves as all-flags-false. Recognised flags: `down_catch`
+(firmware can re-catch commutation crossing the seam from above) and `sine_lowspeed` (a proven
+low-speed forced-sine regime). Absent/false → the conservative default (down-catch staging on).
 
 ## Safety (reused, not reimplemented)
 

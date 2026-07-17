@@ -16,10 +16,18 @@ ONE curve subsumes the S3 sine<->BEMF crossover: because it is measured across t
 range (crossover enabled during velcal), the seam / handoff jump is baked into the points, so
 pure feed-forward needs no regime knowledge — the firmware handles the transition itself.
 
-SCOPE (v1): feed-forward ONLY. There is NO runtime closed loop — the eRPM-PI trim is the NEXT
-phase. regime()/_closed_loop_trim() are a documented, regime-aware SEAM that returns 0 today.
-The encoder is used ONLY for calibration (velcal) and, at runtime with --encoder, for an
-independent VERIFY-LOG that NEVER feeds back into the command. Sensorless is the default.
+SCOPE (Phase A1): feed-forward + a telemetry-fed PI trim whose AUTHORITY FADES with telemetry
+liveness. Each tick the command is `thrust_for(setpoint) + w*trim`: the feed-forward carries the
+motion, and a PI on (setpoint - tele_mech) trims it. `tele.rpm` is ALREADY mechanical RPM (the
+firmware pre-divides eRPM by pole pairs) — it is used DIRECTLY, never divided by POLE_PAIRS again.
+The PI weight `w` ramps 0->1 as a live 6-step `tele` frame (|rpm|>TELE_MIN_MECH_RPM) is seen and
+1->0 while it goes stale (forced sine below the seam has no BEMF telemetry), so below the seam the
+loop degrades to pure feed-forward; the integrator resets when w reaches 0. Authority is keyed
+PURELY on tele-liveness (never on the profile's crossover / capabilities), so a stock-Bluejay-like
+profile with no crossover still runs. The AS5600 encoder is used ONLY for calibration (velcal) and,
+at runtime with --encoder, for an independent VERIFY-LOG that NEVER feeds the command. This Python
+loop is the A1 reference / bench tool; the runtime home is the Pico C++ port (A2). Sensorless FF
+is the default; the PI trim engages automatically only where telemetry is live.
 
 All thrust is routed through ESC.thrust() (-> PosDrive.send_thrust, the single clamp/choke);
 every loop branch paces at DT (well under the 500 ms firmware deadman); temperature is polled
@@ -27,10 +35,12 @@ and the run aborts over --max-temp; the CLI always disarms on every exit.
 """
 from __future__ import annotations
 
+import math
 import statistics
 
 from . import config
-from .constants import COUNTS_PER_REV, FULLSCALE_RPM, POLE_PAIRS  # noqa: F401 (re-exported)
+from .constants import (COUNTS_PER_REV, FULLSCALE_RPM, POLE_PAIRS,  # noqa: F401 (re-exported)
+                       TELE_MIN_MECH_RPM)
 from .control import (DELTA_FAULT_FRAC, DT, ENC_FAIL_MAX, TELE_EVERY_S,
                       VEL_LP_ALPHA, VelReader, _pace)
 from .drive import Aborted
@@ -38,6 +48,14 @@ from .drive import Aborted
 # POLE_PAIRS is imported from constants (single source of truth). Here it is used ONLY to convert a
 # mechanical RPM to eRPM for the crossover-regime classifier and the eRPM display — NEVER to divide
 # the already-mechanical tele.rpm. See constants.POLE_PAIRS.
+
+# Built-in closed-loop PI gains — the single source shared by VelocityController's constructor
+# defaults and velctl's fallback. These are the SIM-tuned values; the real-hardware plant gain is
+# ~30x higher (930KV 6-step ~23 mech RPM per command-unit vs the sim's ~0.8), so a bench-verified
+# profile SHOULD carry its own `control:` block (kp/ki/trim_max/blend_secs) — e.g. 930KV wants
+# kp~0.03, ki~0.12, trim_max~400. Gains are plant-dependent, like the speed curve itself, so they
+# live PER-PROFILE; these defaults only apply when a profile omits `control`.
+DEFAULT_GAINS = {"kp": 0.4, "ki": 1.5, "trim_max": 200.0, "blend_secs": 0.3}
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +74,7 @@ class SpeedProfile:
     """
 
     def __init__(self, points, *, motor="", pole_pairs=POLE_PAIRS, source="", crossover=None,
-                 regimes=None):
+                 regimes=None, capabilities=None, control=None):
         # points: iterable of (thrust, rpm). Store sorted by thrust, validated. regimes (optional)
         # is a parallel per-point tag ("sine"/"line") velcal BELIEVED each point was in — kept in
         # lockstep order with points, for auditability. It is metadata only; the FF inverse
@@ -78,6 +96,35 @@ class SpeedProfile:
         self.pole_pairs = int(pole_pairs)
         self.source = source
         self.crossover = dict(crossover) if crossover else None
+        # Optional per-ESC capability flags (velcal/bench metadata) the runtime controller reads —
+        # e.g. whether the firmware catches from above the crossover (`down_catch`) or has a proven
+        # low-speed sine regime (`sine_lowspeed`). Purely additive: absent -> every flag False, so a
+        # stock-Bluejay-like profile (no crossover, no capabilities) behaves exactly as before.
+        self.capabilities = dict(capabilities) if capabilities else None
+        # Optional per-motor closed-loop PI gains (kp/ki/trim_max/blend_secs). Plant-dependent, like
+        # the speed curve — a bench-tuned profile carries its own, and velctl merges any explicit CLI
+        # flag over these over DEFAULT_GAINS. Absent -> the runtime uses DEFAULT_GAINS unchanged.
+        self.control = dict(control) if control else None
+
+    def control_gain(self, name, default=None):
+        """A closed-loop gain from the profile's `control:` block, or `default` when absent."""
+        return (self.control or {}).get(name, default)
+
+    def _capability(self, name):
+        """A capability flag, defaulting False when the profile carries no `capabilities` block."""
+        return bool(self.capabilities.get(name, False)) if self.capabilities else False
+
+    @property
+    def sine_lowspeed(self):
+        """True iff the ESC has a proven low-speed forced-sine regime (velcal-attested)."""
+        return self._capability("sine_lowspeed")
+
+    @property
+    def down_catch(self):
+        """True iff the firmware can re-catch commutation when crossing the seam FROM ABOVE
+        (descending through it). When False/absent the controller stages a set_speed that drops
+        below the seam through ~0 so the rotor is re-acquired from below."""
+        return self._capability("down_catch")
 
     @staticmethod
     def _validate(pts):
@@ -125,6 +172,10 @@ class SpeedProfile:
         }
         if self.crossover:
             d["crossover"] = self.crossover
+        if self.capabilities:
+            d["capabilities"] = self.capabilities
+        if self.control:
+            d["control"] = self.control
         pts_out = []
         for i, (t, r) in enumerate(self.points):
             pt = {"thrust": t, "rpm": r}
@@ -159,7 +210,9 @@ class SpeedProfile:
         return cls(pts, motor=d.get("motor", ""),
                    pole_pairs=d.get("pole_pairs", POLE_PAIRS),
                    source=d.get("source", ""), crossover=d.get("crossover"),
-                   regimes=regimes if have_regime else None)
+                   regimes=regimes if have_regime else None,
+                   capabilities=d.get("capabilities"),
+                   control=d.get("control"))
 
     @classmethod
     def load(cls, path):
@@ -216,19 +269,44 @@ def measure_steady_speed(esc, clock, thrust, enc_sign, settle_secs, measure_secs
 # Sensorless feed-forward velocity controller.
 # ---------------------------------------------------------------------------
 class VelocityController:
-    """Sensorless feed-forward speed control: slew the setpoint, look the command up from the
-    calibrated curve, send it. NO runtime feedback in v1.
+    """Feed-forward speed control + a liveness-faded PI trim (Phase A1 closed loop).
 
-    The setpoint slews toward the commanded target at slew_rpm_s so a step never demands a
-    full-scale command jump. Temperature is polled every TELE_EVERY_S and the run aborts over
-    max_temp. With use_encoder the encoder speed is logged for an INDEPENDENT verify only — it
-    NEVER feeds the command (that is the deferred eRPM-PI phase).
+    Each tick: slew the setpoint toward the target at slew_rpm_s (so a step never demands a
+    full-scale command jump), look the feed-forward command up from the calibrated curve, and add
+    a PI trim on (setpoint - measured mech RPM). The measurement is the bidir-DShot `tele` frame's
+    rpm (ALREADY mechanical — NEVER divided by pole pairs); a frame is LIVE only when
+    |rpm| > TELE_MIN_MECH_RPM. The PI's AUTHORITY (weight w) ramps 0->1 over blend_secs while a live
+    frame is seen and 1->0 while it goes stale, and the integrator resets when w hits 0. So above the
+    seam (6-step, live telemetry) the loop closes; below it (forced sine, stale telemetry) it fades
+    to pure feed-forward. Authority is keyed PURELY on tele-liveness (never the profile's crossover),
+    so a stock profile with no crossover runs. The PI has a ±trim_max clamp and back-calculation
+    anti-windup on BOTH that clamp and the outer ESC.thrust tmax clamp (mirrors
+    PositionController.step). Telemetry is polled at most every tele_period; the SAME frame drives the
+    temperature abort (over max_temp; max_temp=0 disables ONLY the temp check, not the feedback).
+    With use_encoder the encoder speed is logged for an INDEPENDENT verify only — it NEVER feeds the
+    command.
     """
 
-    def __init__(self, esc, profile, *, slew_rpm_s=200.0, max_temp=80.0, max_secs=30.0,
-                 use_encoder=False, enc_sign=1):
+    _W_BACKCALC_FLOOR = 0.1        # below this PI authority, skip the outer-clamp back-calc (the trim
+                                   # barely reaches the ESC, so a clamp is FF-driven; the inner
+                                   # trim_max clamp already bounds the integrator and w->0 resets it)
+
+    def __init__(self, esc, profile, *, kp=DEFAULT_GAINS["kp"], ki=DEFAULT_GAINS["ki"],
+                 trim_max=DEFAULT_GAINS["trim_max"], blend_secs=DEFAULT_GAINS["blend_secs"],
+                 tele_period=DT, over_speed_rpm=None, stall_secs=1.0, slew_rpm_s=200.0,
+                 max_temp=80.0, max_secs=30.0, use_encoder=False, enc_sign=1):
         self.esc = esc
         self.profile = profile
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.trim_max = float(trim_max)
+        self.blend_secs = float(blend_secs)
+        self.tele_period = float(tele_period)
+        # over-speed net (live tele only): default clears twice the curve's top speed (and a 1200
+        # floor so a tiny-range curve still has headroom); an explicit value overrides.
+        self.over_speed_rpm = (float(over_speed_rpm) if over_speed_rpm is not None
+                               else max(2.0 * profile.max_rpm, 1200.0))
+        self.stall_secs = float(stall_secs)
         self.slew_rpm_s = float(slew_rpm_s)
         self.max_temp = float(max_temp)
         self.max_secs = float(max_secs)
@@ -238,11 +316,33 @@ class VelocityController:
         self.setpoint = 0.0          # slew-limited setpoint actually looked up
         self.last_temp = None
         self.peak_temp = None
+        # --- closed-loop state (no module-level mutable state) ---
+        self._i = 0.0               # PI integrator (trim units)
+        self._w = 0.0               # PI authority weight, 0..1 (faded with tele liveness)
+        self._tele_mech = None      # last LIVE measured mech RPM (signed to the setpoint), else None
+        self._live = False          # last telemetry poll was a live 6-step frame
+        self._stale_since = None    # time tele first went stale while commanding into "line"
+        self._pending = None        # a staged set_speed target (down-catch through ~0)
+        self._last_sign = 1.0       # last non-zero setpoint sign (for signing a tele MAGNITUDE at sp==0)
 
     # -- setpoint --
     def set_speed(self, rpm):
-        """Set the commanded target speed (RPM). The loop slews the setpoint toward it."""
-        self.target = float(rpm)
+        """Set the commanded target speed (RPM). The loop slews the setpoint toward it.
+
+        DOWN-CATCH staging: if the profile has a crossover and this call drops FROM ABOVE the seam
+        to BELOW it on an ESC that cannot re-catch from above (capabilities.down_catch False/absent),
+        route the setpoint through ~0 first (stage the real target in _pending) so the rotor is
+        re-acquired from below rather than dropped across the handoff. Inert (a plain target set)
+        when the profile has no crossover, the ESC advertises down_catch, or the move isn't a
+        line->sine descent."""
+        rpm = float(rpm)
+        if (self.profile.crossover and not self.profile.down_catch
+                and self.regime(rpm) == "sine" and self.regime(self.setpoint) == "line"):
+            self._pending = rpm
+            self.target = 0.0
+        else:
+            self._pending = None
+            self.target = rpm
 
     def _slew(self, dt):
         step = self.slew_rpm_s * dt
@@ -252,20 +352,19 @@ class VelocityController:
             self.setpoint = max(self.target, self.setpoint - step)
         return self.setpoint
 
-    # -- documented regime-aware SEAM for the DEFERRED eRPM-PI closed loop (v1: no-op) --
+    # -- ADVISORY regime classifier (display / stall heuristic / down-catch routing) --
     def regime(self, rpm):
         """Which firmware regime a speed falls in per the profile's crossover: "sine" below
-        the seam, "line" above. Informational in v1 — the FUTURE eRPM-PI trim will be
-        regime-aware (different gains either side of the handoff). Returns "sine" if the
-        profile carries no crossover.
+        the seam, "line" above. Returns "sine" if the profile carries no crossover.
 
-        SEAM CAVEAT for the next phase: this classifies off the NOMINAL target rpm against the
-        profile's `up_erpm`, which can DISAGREE with (a) the effective rounded-byte threshold
-        (`up_erpm` vs cross_up*39.0625) and (b) the command's ACTUAL firmware regime near the
-        seam (the firmware switches on commanded/actual eRPM + hysteresis, not on target rpm).
-        When wiring the eRPM-PI, key the classifier off the expected COMMAND's regime (or the
-        measured eRPM), not the raw target. The v1 FF command path never calls regime(), so
-        this disagreement is harmless today."""
+        ADVISORY ONLY. This is used for display, the stall heuristic, and down-catch routing — it
+        is NEVER the PI-authority signal (that is telemetry liveness alone; see run()). It classifies
+        the NOMINAL rpm against the profile's `up_erpm`, which can DISAGREE with (a) the effective
+        rounded-byte threshold (`up_erpm` vs cross_up*39.0625) and (b) the command's ACTUAL firmware
+        regime near the seam (the firmware switches on commanded/actual eRPM + hysteresis, not on the
+        nominal rpm). So near the seam a nominal-"line" target can actually run in sine (the curve
+        "gap"); the stall guard guards against this by also requiring the setpoint to be at/above the
+        profile's genuinely 6-step-REACHABLE floor (`_line_floor`), not just above `up_erpm`."""
         cx = self.profile.crossover
         if not cx:
             return "sine"
@@ -274,27 +373,70 @@ class VelocityController:
             return "sine"
         return "line" if abs(rpm) * self.profile.pole_pairs >= up else "sine"
 
-    def _closed_loop_trim(self, setpoint, meas_rpm):
-        """DEFERRED eRPM-PI hook. v1 is pure feed-forward, so this ALWAYS returns 0 (the
-        encoder/eRPM NEVER feeds the command). The next phase adds a regime-aware PI trim on
-        (setpoint - meas_rpm) here; the run loop already threads the measured speed in.
+    def _line_floor(self):
+        """Lowest setpoint |RPM| genuinely REACHABLE in the 6-step ("line") regime per THIS profile
+        (not the sim's plant gain): the min rpm among the profile's line-tagged calibration points if
+        it tags regimes, else the seam rpm (up_erpm / pole_pairs). Setpoints below this fall in the
+        crossover GAP / sine band — pure feed-forward with no telemetry — so the stall guard must NOT
+        treat them as "should be 6-step". None when the profile has no usable crossover."""
+        cx = self.profile.crossover
+        if not cx:
+            return None
+        if self.profile.regimes is not None:
+            line_rpms = [r for (_, r), reg in zip(self.profile.points, self.profile.regimes)
+                         if reg == "line"]
+            if line_rpms:
+                return min(line_rpms)
+        up = cx.get("up_erpm")
+        return (up / self.profile.pole_pairs) if up is not None else None
 
-        NEXT-DEV CONTRACT (make the seam unambiguous):
-          * Today `meas_rpm` is ONLY the --encoder verify value (None unless use_encoder), so
-            feedback is effectively OFF. Turning it ON means (a) removing the always-0 return
-            and (b) DECIDING the feedback source per regime:
-              - encoder (AS5600) speed: valid in BOTH regimes but is the calibration sensor;
-              - esc.telemetry().rpm (bidir-DShot, MECHANICAL RPM — firmware pre-divides eRPM by pole
-                pairs): LIVE in 6-step ("line"), but STALE/absent in forced-sine ("sine") — do not
-                trust it below the seam.
-            A robust trim likely uses the encoder below the seam and telemetry above it (see
-            regime()), with anti-windup and a clamp so a bad sample can't runaway the command.
-          * Keep the FF term (thrust_for) as the feed-forward; this returns only the trim."""
-        return 0.0
+    @staticmethod
+    def _measure(tel, setpoint, fallback_sign=1.0):
+        """A `tele` frame -> signed measured mechanical RPM if the frame is LIVE, else None.
+
+        INVARIANT: `tel.rpm` is ALREADY mechanical RPM (the firmware pre-divides the DShot eRPM by
+        pole pairs), so it is used DIRECTLY — dividing by POLE_PAIRS here would be the 1/7 double-
+        division bug. A frame is live only when |rpm| > TELE_MIN_MECH_RPM (rejects the garbage
+        after-arm frames and forced-sine's stale ~0). Hardware reports a MAGNITUDE; we re-attach the
+        COMMANDED sign, i.e. meas = copysign(|rpm|, setpoint) — matching err = setpoint - meas. At
+        setpoint==0 the commanded sign is ambiguous, so fall back to the last-commanded sign."""
+        if tel is None or tel.rpm is None:
+            return None
+        rpm = float(tel.rpm)
+        if abs(rpm) <= TELE_MIN_MECH_RPM:
+            return None
+        if setpoint > 0:
+            sign = 1.0
+        elif setpoint < 0:
+            sign = -1.0
+        else:
+            sign = 1.0 if fallback_sign >= 0 else -1.0
+        return sign * abs(rpm)
+
+    def _closed_loop_trim(self, setpoint, dt):
+        """PI trim on (setpoint - measured mech RPM), clamped to ±trim_max with back-calculation
+        anti-windup on the clamp (mirrors PositionController.step). Returns the UNBLENDED trim; the
+        run loop multiplies by the liveness weight w and folds the outer ESC tmax clamp back into
+        the integrator. Returns 0 (and does not integrate) when there is no live measurement.
+
+        The integrator only ACCUMULATES on a live frame: during the stale->live fade-out the last
+        measurement is frozen, so integrating against it would wind the integral against stale data
+        (a wrong-signed dip at the down-crossing). The proportional term still fades out via w."""
+        if self._tele_mech is None:
+            return 0.0
+        err = setpoint - self._tele_mech
+        if self._live:                                   # accumulate only against a FRESH live frame
+            self._i += self.ki * err * dt
+        u = self.kp * err + self._i
+        u_clamped = max(-self.trim_max, min(self.trim_max, u))
+        if u != u_clamped:                               # saturated -> unwind the integral (back-calc)
+            self._i = max(-self.trim_max, min(self.trim_max, u_clamped - self.kp * err))
+            u = u_clamped
+        return u
 
     def _read_enc_rpm(self, prev_raw, vel, dt):
         """Verify-only encoder speed (mech RPM), low-passed. Returns (rpm|None, prev_raw, vel).
-        NEVER used to compute the command — pure logging in v1."""
+        NEVER used to compute the command — pure logging (the closed loop trims on TELEMETRY)."""
         enc = self.esc.encoder()
         if enc is None or not enc.healthy:
             return None, prev_raw, vel
@@ -309,8 +451,10 @@ class VelocityController:
 
     def run(self, clock, on_row=None):
         """Drive the target speed for up to max_secs. Calls on_row(t, target, setpoint, thrust,
-        temp, enc_rpm) per tick if given. Returns an exit-reason string. Raises Aborted on
-        over-temperature. The caller ALWAYS disarms (finally)."""
+        temp, enc_rpm, tele_rpm, trim) per tick if given (tele_rpm = the live measured mech RPM or
+        None; trim = the BLENDED trim actually added to the feed-forward). Returns an exit-reason
+        string. Raises Aborted on over-temperature / over-speed / stall. The caller ALWAYS disarms
+        (finally)."""
         t0 = clock.now()
         last_t = t0
         next_tele = t0
@@ -323,12 +467,26 @@ class VelocityController:
             tick = clock.now()
             dt = tick - last_t
             last_t = tick
+            if dt <= 0:
+                dt = DT
             t = tick - t0
 
-            sp = self._slew(dt if dt > 0 else DT)
+            sp = self._slew(dt)
+            if sp > 0:
+                self._last_sign = 1.0
+            elif sp < 0:
+                self._last_sign = -1.0
+            # DOWN-CATCH: a staged (line->sine) set_speed promotes to its real target once we have
+            # descended to ~0 / dropped below the seam (telemetry gone stale in the sine regime).
+            if self._pending is not None and (abs(self.setpoint) < 1.0
+                                              or (not self._live and self.regime(sp) == "sine")):
+                self.target = self._pending
+                self._pending = None
+
+            # -- independent --encoder verify-log (NEVER feeds the command) --
             enc_rpm = None
             if self.use_encoder:
-                enc_rpm, prev_raw, vel = self._read_enc_rpm(prev_raw, vel, dt if dt > 0 else DT)
+                enc_rpm, prev_raw, vel = self._read_enc_rpm(prev_raw, vel, dt)
                 if enc_rpm is None and prev_raw is not None:
                     enc_fails += 1
                     if enc_fails >= ENC_FAIL_MAX and not enc_warned:
@@ -338,24 +496,83 @@ class VelocityController:
                 else:
                     enc_fails = 0
 
-            # Pure feed-forward: command = curve inverse + (deferred, always-0) closed-loop trim.
-            cmd = self.profile.thrust_for(sp) + self._closed_loop_trim(sp, enc_rpm)
-            sent = self.esc.thrust(cmd)
-
-            # temperature watch (polled right after the keep-alive so the deadman never starves)
+            # -- telemetry poll (throttled by tele_period): the SAME frame drives feedback AND the
+            #    temperature abort. Each poll draws sim RNG when the crossover is ON, hence the pace. --
             temp = None
-            if self.max_temp and tick >= next_tele:
-                next_tele = tick + TELE_EVERY_S
-                temp = self.esc.temperature()
-                if temp is not None:
+            if tick >= next_tele:
+                next_tele = tick + self.tele_period
+                tel = self.esc.telemetry()
+                meas = self._measure(tel, sp, self._last_sign)
+                self._live = meas is not None
+                if self._live:
+                    self._tele_mech = meas
+                if tel is not None and tel.temp is not None:
+                    temp = tel.temp
                     self.last_temp = temp
                     self.peak_temp = temp if self.peak_temp is None else max(self.peak_temp, temp)
-                    if temp >= self.max_temp:
+                    if self.max_temp and temp >= self.max_temp:
                         self.esc.thrust(0)
                         raise Aborted(f"over-temperature: ESC {temp}C >= --max-temp "
                                       f"{self.max_temp:.0f}C — lower speed / cool down")
 
+            # -- PI authority (w) fades with tele liveness: 0->1 while live, 1->0 while stale, over
+            #    blend_secs. On w==0 reset the integrator so a re-arm from below the seam starts clean. --
+            rate = dt / self.blend_secs if self.blend_secs > 0 else 1.0
+            if self._live:
+                self._w = min(1.0, self._w + rate)
+            else:
+                self._w = max(0.0, self._w - rate)
+            if self._w <= 0.0:
+                self._i = 0.0
+
+            # -- feed-forward + blended PI trim --
+            ff = self.profile.thrust_for(sp)
+            trim = self._closed_loop_trim(sp, dt)
+            applied = self._w * trim
+            cmd = ff + applied
+            sent = self.esc.thrust(cmd)
+
+            # -- back-calculation anti-windup on the OUTER ESC tmax clamp: if the ESC clamped the
+            #    command, fold the trim the ESC ACTUALLY delivered back into the integrator so a
+            #    saturated command can't wind it up (mirrors PositionController). Only when the trim
+            #    materially drove the clamp: skip when w is below a real floor (the integrator is
+            #    already bounded by trim_max and about to reset as w->0), and skip when the FF term
+            #    alone saturated (delivered opposes the desired trim) so the integrator can't flip
+            #    against the true error. `delivered` is bounded by the desired trim, so no /w blow-up. --
+            if (self._tele_mech is not None and self._w >= self._W_BACKCALC_FLOOR
+                    and sent != int(cmd)):
+                desired = applied                              # w*trim we tried to add above the FF
+                delivered = sent - int(ff)                     # trim the ESC actually delivered
+                if desired != 0.0 and delivered * desired > 0.0 and abs(delivered) < abs(desired):
+                    err = sp - self._tele_mech
+                    unblended = delivered / self._w            # |unblended| < |trim| <= trim_max
+                    self._i = max(-self.trim_max, min(self.trim_max, unblended - self.kp * err))
+
+            # -- safety guards on the LIVE measurement (never on the profile/crossover config) --
+            if self._live and abs(self._tele_mech) > self.over_speed_rpm:
+                self.esc.thrust(0)
+                raise Aborted(f"over-speed: |tele|={abs(self._tele_mech):.0f} RPM > "
+                              f"{self.over_speed_rpm:.0f} — lower speed / check the curve")
+            # stall: the setpoint is at/above the profile's genuinely 6-step-REACHABLE floor (so we
+            # EXPECT live telemetry) yet the loop is still commanding into that region (the trim
+            # hasn't backed the command off) and telemetry never went live -> the ESC failed to reach
+            # 6-step. Keyed on the PROFILE'S OWN reachable floor (not the sim's plant gain, and not the
+            # raw nominal regime), so a "gap" setpoint whose command sits in sine is NOT a stall.
+            floor = self._line_floor()
+            commanding_line = (floor is not None and abs(sp) >= floor
+                               and abs(sent) >= abs(ff) - self.trim_max)
+            if commanding_line and not self._live:
+                if self._stale_since is None:
+                    self._stale_since = tick
+                elif tick - self._stale_since >= self.stall_secs:
+                    self.esc.thrust(0)
+                    raise Aborted(f"stall: setpoint {sp:.0f} RPM is in the 6-step range but telemetry "
+                                  f"stayed stale for {self.stall_secs:.1f}s (never reached 6-step)")
+            else:
+                self._stale_since = None
+
             if on_row is not None:
-                on_row(t, self.target, sp, sent, temp, enc_rpm)
+                tele_rpm = self._tele_mech if self._live else None
+                on_row(t, self.target, sp, sent, temp, enc_rpm, tele_rpm, applied)
             _pace(clock, tick)
         return reason

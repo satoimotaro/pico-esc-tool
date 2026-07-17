@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 satoimotaro
-"""velctl — sensorless feed-forward velocity control for the RP2040 esc_tool protocol.
+"""velctl — feed-forward + telemetry-trimmed velocity control for the RP2040 esc_tool protocol.
 
-Runs a target mechanical SPEED SENSORLESSLY by inverting one per-motor calibrated curve
-(from velcal). It gently slews the setpoint and, each 50 Hz tick, looks up the ESC command
-for that speed from the curve and sends it over the existing signed `thrust` command — no
-runtime feedback (the eRPM-PI closed loop is the NEXT phase; see docs/velocity-control.md).
+Runs a target mechanical SPEED by inverting one per-motor calibrated curve (from velcal): it
+gently slews the setpoint and, each 50 Hz tick, looks up the ESC command for that speed and adds
+a PI trim on (target - measured mech RPM) whose authority FADES with telemetry liveness (Phase A1
+closed loop; see docs/velocity-control.md). Above the crossover seam (6-step, live `tele`) the
+loop closes; below it (forced sine, stale telemetry) it degrades to pure feed-forward. The command
+still goes over the existing signed `thrust` command.
 
   --rpm is the TARGET SPEED. The controller looks up the ESC command ("thrust", -1000..1000 —
   an ESC DRIVE COMMAND, NOT a physical force) from the calibrated curve. There is NO force
@@ -15,10 +17,11 @@ runtime feedback (the eRPM-PI closed loop is the NEXT phase; see docs/velocity-c
   python velctl.py speed --rpm 100 --dry-run                 # below the S3 seam (forced sine)
   python velctl.py speed --rpm 320 --crossover --dry-run     # crosses the sine<->BEMF seam
 
-ONE calibrated curve subsumes the S3 sine<->BEMF crossover, so pure feed-forward needs no
-regime knowledge; --crossover enables the firmware crossover (writes the profile's crossover
-bytes; in --dry-run it configures the sim only). --encoder adds an INDEPENDENT verify-log
-column — it NEVER feeds the command in v1. Sensorless is the default.
+ONE calibrated curve carries the feed-forward across the S3 sine<->BEMF crossover; --crossover
+enables the firmware crossover (writes the profile's crossover bytes; in --dry-run it configures
+the sim only). The PI trim (tune with --kp/--ki/--trim-max/--blend-secs; --kp 0 --ki 0 = pure FF)
+engages automatically only where telemetry is live. --encoder adds an INDEPENDENT verify-log
+column that NEVER feeds the command; --debug-csv appends tele_rpm,trim diagnostics.
 
 Safety mirrors posctl and is REUSED, not reimplemented: all thrust via ESC.thrust ->
 PosDrive.send_thrust (single clamp/choke), one command per ~20 ms tick (< 500 ms deadman),
@@ -42,7 +45,7 @@ from pico_esc.esc import ESC  # noqa: E402
 from pico_esc.link import RealClock, SimClock  # noqa: E402
 from pico_esc.sim import SimEncEscHost  # noqa: E402
 from pico_esc.drive import Aborted  # noqa: E402
-from pico_esc.velocity import SpeedProfile, VelocityController  # noqa: E402
+from pico_esc.velocity import DEFAULT_GAINS, SpeedProfile, VelocityController  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT_DIR = os.path.join(HERE, "reports")
@@ -72,6 +75,8 @@ def open_csv(opts, use_encoder):
     cols = ["t", "rpm_setpoint", "rpm_slewed", "thrust", "temp"]
     if use_encoder:
         cols.append("enc_rpm")
+    if opts.debug_csv:                      # closed-loop diagnostics (opt-in; default header unchanged)
+        cols += ["tele_rpm", "trim"]
     w.writerow(cols)
     return fh, w, path
 
@@ -93,6 +98,20 @@ def build_parser():
                     help="add an INDEPENDENT encoder verify-log column (NEVER feeds the command)")
     sp.add_argument("--slew", type=float, default=200.0,
                     help="setpoint slew rate, RPM/s (default 200; keeps the first command gentle)")
+    sp.add_argument("--kp", type=float, default=None,
+                    help="closed-loop PI proportional gain on (target - tele mech RPM); 0 = pure FF "
+                         f"(default: profile control.kp, else {DEFAULT_GAINS['kp']:g})")
+    sp.add_argument("--ki", type=float, default=None,
+                    help="closed-loop PI integral gain (trim units per RPM-second); 0 = no integral "
+                         f"(default: profile control.ki, else {DEFAULT_GAINS['ki']:g})")
+    sp.add_argument("--trim-max", type=float, default=None,
+                    help="PI trim clamp, ESC-command units "
+                         f"(default: profile control.trim_max, else {DEFAULT_GAINS['trim_max']:g})")
+    sp.add_argument("--blend-secs", type=float, default=None,
+                    help="seconds for the PI authority to fade in/out with telemetry liveness "
+                         f"(default: profile control.blend_secs, else {DEFAULT_GAINS['blend_secs']:g})")
+    sp.add_argument("--debug-csv", action="store_true",
+                    help="append closed-loop tele_rpm,trim columns to the CSV (default header unchanged)")
     sp.add_argument("--max-temp", type=float, default=80.0,
                     help="poll ESC temperature and abort at this C (0=off, no poll; default 80)")
     sp.add_argument("--secs", type=float, default=5.0, help="hold duration, s (default 5)")
@@ -132,11 +151,22 @@ def main():
         print(f"# note: --rpm {opts.rpm:g} exceeds the curve max {profile.max_rpm:.0f} RPM; "
               f"the command clamps to the curve endpoint (open-loop, no extrapolation)")
 
+    # Effective gains: explicit CLI flag wins, else the profile's own control block, else the
+    # built-in DEFAULT_GAINS. Gains are plant-dependent (see DEFAULT_GAINS) so a bench-tuned profile
+    # carries them; this is where the three tiers merge.
+    def _gain(name):
+        cli = getattr(opts, name)               # --trim-max -> opts.trim_max, --blend-secs -> blend_secs
+        return cli if cli is not None else profile.control_gain(name, DEFAULT_GAINS[name])
+    kp, ki, trim_max, blend_secs = (_gain("kp"), _gain("ki"),
+                                    _gain("trim_max"), _gain("blend_secs"))
+
     host, clock = open_host(opts)
     esc = ESC(host, opts.esc_index, tmax=opts.tmax, clock=clock)
     enc_sign = -1 if (opts.invert_encoder or opts.sim_invert) else 1
-    ctrl = VelocityController(esc, profile, slew_rpm_s=opts.slew, max_temp=opts.max_temp,
-                              max_secs=opts.secs, use_encoder=opts.encoder, enc_sign=enc_sign)
+    ctrl = VelocityController(esc, profile, kp=kp, ki=ki, trim_max=trim_max,
+                              blend_secs=blend_secs, slew_rpm_s=opts.slew,
+                              max_temp=opts.max_temp, max_secs=opts.secs,
+                              use_encoder=opts.encoder, enc_sign=enc_sign)
     ctrl.set_speed(opts.rpm)
 
     def _panic(*_):
@@ -150,16 +180,21 @@ def main():
 
     fh, writer, csv_path = open_csv(opts, opts.encoder)
 
-    def _row(t, target, sp, thrust, temp, enc_rpm):
+    def _row(t, target, sp, thrust, temp, enc_rpm, tele_rpm, trim):
         row = [f"{t:.4f}", f"{target:.3f}", f"{sp:.3f}", int(thrust),
                "" if temp is None else temp]
         if opts.encoder:
             row.append("" if enc_rpm is None else f"{enc_rpm:.1f}")
+        if opts.debug_csv:
+            row += ["" if tele_rpm is None else f"{tele_rpm:.1f}", f"{trim:.1f}"]
         writer.writerow(row)
 
     print(f"# profile: {opts.profile}  (motor={profile.motor}, {len(profile.points)} points, "
           f"max {profile.max_rpm:.0f} RPM); target {opts.rpm:g} RPM -> "
           f"start command {int(profile.thrust_for(opts.rpm))} (regime: {ctrl.regime(opts.rpm)})")
+    _gsrc = "profile" if profile.control else "default"
+    print(f"# gains: kp={kp:g} ki={ki:g} trim_max={trim_max:g} blend_secs={blend_secs:g} "
+          f"(source: CLI overrides > {_gsrc})")
 
     failure = None
     reason = "aborted"

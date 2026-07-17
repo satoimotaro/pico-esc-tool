@@ -46,6 +46,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from .constants import POLE_PAIRS  # noqa: F401 (re-exported: xover_debug imports it from here)
+from .constants import TELE_MIN_MECH_RPM
 from .control import DT, VelReader, _pace
 from .drive import Aborted
 
@@ -53,9 +54,12 @@ from .drive import Aborted
 # callers that still do `from pico_esc.crossover import POLE_PAIRS` (xover_debug). Reminder: the
 # `tele` line is ALREADY mechanical RPM, so slip does NOT divide by POLE_PAIRS — it is only for the
 # eRPM<->mech display of the electrical Cross_Up/Cross_Dn threshold bytes.
-TELE_MIN_ERPM = 50.0               # a valid (spinning, 6-step) telemetry frame; garbage early-after-arm
+TELE_MIN_ERPM = TELE_MIN_MECH_RPM  # a valid (spinning, 6-step) telemetry frame; garbage early-after-arm
                                    # frames read rpm~0. NOTE: this firmware's telemetry reports
                                    # volts==0 ALWAYS, so frame validity is keyed on eRPM, NOT volts.
+                                   # Value/meaning live in constants.TELE_MIN_MECH_RPM (honest name:
+                                   # `tele` is ALREADY mechanical); kept here as TELE_MIN_ERPM for the
+                                   # callers that import it from crossover (no behavior change).
 ENC_MIN_RPM = 20.0                 # |mech RPM| below this is "not clearly turning" (slip divide guard)
 REV_FLOOR_RPM = 150.0              # opposite-direction |mech RPM| that counts as a REAL reversal (a
                                    # true reversal runs to ~1000s; end-of-ramp settling noise << this)
@@ -331,8 +335,14 @@ def measure_crossover_lock_lowspeed(esc, clock, *, target_cmd, sign=1,
     # OVER_SPEED_FLOOR keeps it above legitimate operation while still catching a true garbage/
     # runaway reading; an explicit rpm_ceiling or a high measure_rpm can raise it further.
     over = max((rpm_ceiling or 0.0) * 1.5, measure_rpm * 5.0, OVER_SPEED_FLOOR)
+    # Low-speed mode NAVIGATES by telemetry (ramp until it goes live == 6-step; descend until the
+    # tele/enc speed reaches measure_rpm), so it must sample telemetry every control tick: the real
+    # sine->6-step handoff and the measure_rpm crossing are narrow events that a coarse tele_period
+    # would step over between polls (with honest stale-sine telemetry the up-handoff window at the top
+    # of the ramp is only a couple of ticks wide). Poll at DT (temp/over-speed ride along on the same
+    # frames). The top-of-ramp mode keeps the coarser caller-supplied tele_period.
     tk = _Ticker(esc, clock, sign=sign, over_speed_rpm=over, max_temp=max_temp,
-                 tele_period=tele_period, stall_guard=stall_guard, on_sample=on_sample,
+                 tele_period=min(tele_period, DT), stall_guard=stall_guard, on_sample=on_sample,
                  result=res, use_tele_speed=True)
 
     # ---- 1) ramp up until telemetry goes LIVE == we crossed into 6-step (don't dwell up high) ----
@@ -350,27 +360,41 @@ def measure_crossover_lock_lowspeed(esc, clock, *, target_cmd, sign=1,
         _coast_to_zero(tk, top, sign=sign)
         return res
 
-    # ---- 2) descend, navigating by telemetry, until the mech speed reaches measure_rpm ----
+    # ---- 2) STEPPED descend: hold each command briefly and navigate by the SETTLED 6-step speed,
+    #         not the LAGGING instantaneous speed. A smooth fast descend overshoots the command below
+    #         the down-handoff (the rotor lags), dropping out of 6-step — and once in forced sine the
+    #         ESC won't re-hand-off at a low command, so the measurement is lost (or, if we chased it
+    #         back up, degenerates to ~top-of-ramp). Stepping down and letting each command settle
+    #         keeps us in the live regime and stops at a genuine ~measure_rpm 6-step point. ----
+    n = max(1, round(descend_secs / DT))                   # descend tick budget
+    settle_ticks = max(2, round(0.06 / DT))                # ~one rotor time-constant to settle
+    step = max(hold_bump, round(abs(top) / 30.0))
     hold_cmd = None
-    n = max(1, round(descend_secs / DT))
-    start = abs(top)
-    last_cmd = top
-    for i in range(n):
-        cmd = sign * max(1, round(start * (n - i - 1) / n))
-        last_cmd = cmd
-        tk.tick(cmd, "descend")
-        if not tk.tele_live:                               # handed back to sine before the target
+    last_hold = top                                        # last command still ABOVE measure_rpm (6-step)
+    cmd = top
+    budget = n
+    while budget > 0 and abs(cmd) >= 1:
+        live = False
+        spd = None
+        for _ in range(settle_ticks):
+            tk.tick(cmd, "descend")
+            budget -= 1
+            if tk.tele_fresh:
+                live = tk.tele_live
+                if tk.tele_live:
+                    spd = tk.mech_speed
+        if not live:                                       # overshot into sine -> fall back to last_hold
             break
-        if tk.mech_speed <= measure_rpm:
-            hold_cmd = cmd
+        if spd is not None and spd <= measure_rpm:         # reached the target while still 6-step
+            hold_cmd = last_hold                            # the last command safely ABOVE measure_rpm
             break
+        last_hold = cmd
+        cmd = sign * max(1, abs(cmd) - step)
     if hold_cmd is None:
-        res.aborted = ("could not settle at the measure speed while descending — the 6-step handed "
-                       "back to sine first; raise --measure-speed above the down-handoff speed")
-        _coast_to_zero(tk, last_cmd, sign=sign)
-        return res
+        hold_cmd = last_hold                               # settled at the lowest holdable 6-step command
 
-    # ---- 3) hold at hold_cmd and measure; bump up + retry if it goes stale (dropped to sine) ----
+    # ---- 3) hold at hold_cmd and measure; bump up one descend-step if a longer hold sags out of
+    #         6-step (marginal point just above the down-handoff). ----
     steady = _Windows()
     held = False
     hold_ticks = max(1, round(hold_secs / DT))
@@ -385,14 +409,16 @@ def measure_crossover_lock_lowspeed(esc, clock, *, target_cmd, sign=1,
                     steady.tele.append(tk.tele_erpm)
                 else:
                     stale = True                           # handed back to sine at this command
+                    break
         if not stale and steady.tele:
             held = True
             break
-        hold_cmd = sign * (abs(hold_cmd) + hold_bump)      # too low -> bump the command up and retry
+        hold_cmd = sign * (abs(hold_cmd) + step)           # sagged -> step up one descend-step and retry
     res.top_cmd = hold_cmd
     if not held:
-        res.aborted = (res.aborted
-                       or f"could not hold 6-step at the measure speed (stale after {hold_retries} bumps)")
+        res.aborted = (res.aborted or
+                       f"could not hold 6-step near {measure_rpm:.0f} mech RPM — no stable point above "
+                       f"the down-handoff for this crossover config; raise --measure-speed")
 
     _finalize(res, steady)                                 # medians from the hold window only
 

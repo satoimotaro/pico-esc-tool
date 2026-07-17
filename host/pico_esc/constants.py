@@ -21,6 +21,14 @@ POLE_PAIRS = 7                     # 12N14P motor. IMPORTANT: the ESC `tele` lin
                                    # OTHER direction: converting a mechanical RPM to eRPM to compare
                                    # against the firmware's electrical Cross_Up/Cross_Dn thresholds.
 
+# A `tele` frame counts as a LIVE 6-step telemetry sample once |mech RPM| exceeds this floor;
+# the garbage first-few-frames-after-arm (and forced-sine, where telemetry is stale) read ~0 and
+# are rejected. Keyed on MECHANICAL RPM — the firmware pre-divides eRPM by pole pairs before
+# sending `tele`, so this is NOT an electrical threshold (the historical name TELE_MIN_ERPM in
+# crossover.py is the same value, re-exported from here). Used both by the crossover measurement
+# loop and by VelocityController to arm/disarm its closed-loop PI trim.
+TELE_MIN_MECH_RPM = 50.0
+
 # Firmware S1 full-scale: mechanical RPM at |thrust|=1000. This is the PLANT GAIN the
 # feedforward (--kff) inverts, so it is tied to the firmware fixed-point constants:
 #   eRPM      = Rcp * (1<<SINE_RCP_SHIFT) * (F_TIMER2/SINE_TICK_T2) / 65536 * (60/6)
