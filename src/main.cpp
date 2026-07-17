@@ -22,9 +22,12 @@
 #include "apps/profiles.h"
 
 // --- Declare the ESCs (one Thruster each). pin = ESC_SIGNAL_PINS[bind index]; the rest is per-ESC.
-//     The 930KV curve + gains come from host/profiles/vel_930kv_12n14p_6step.yaml via profiles_gen.h. ---
+//     esc1 uses the SINE-OFF 930KV profile (host/profiles/vel_930kv_sineoff.yaml via profiles_gen.h):
+//     the stable RPM-control config — sine floored ~380 mech and reverse-idled at DShot 0, so `rpm 0`
+//     couldn't stop. sine_mode=0 (+ motor_direction=Bidirectional-Reversed) fixes that; 6-step only.
+//     Apply the matching ESC config once: esctool apply 1 host/profiles/rpm_930kv_sineoff.yaml ---
 static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // pin 10: RAW / uncalibrated
-static Thruster esc1(&profiles::M_930KV_12N14P_6STEP, /*dshotKbaud=*/300, /*motorPoles=*/14);  // pin 11: 930KV closed-loop
+static Thruster esc1(&profiles::M_930KV_SINEOFF, /*dshotKbaud=*/300, /*motorPoles=*/14);  // pin 11: 930KV closed-loop
 
 static Thruster*    THRUSTERS[] = { &esc0, &esc1 };
 static const uint8_t NTHR = sizeof(THRUSTERS) / sizeof(THRUSTERS[0]);
@@ -37,8 +40,11 @@ void setup() {
 
 	// Per-motor closed-loop PI gains — from the same calibrated profile (the ~30x-hotter real plant
 	// needs these, not the sim DEFAULT_GAINS). esc0 stays at library defaults.
-	esc1.applyGains(profiles::M_930KV_12N14P_6STEP_GAINS);
+	esc1.applyGains(profiles::M_930KV_SINEOFF_GAINS);
 	esc1.vc.slew_rpm_s = 4000.0f; esc1.vc.max_temp = 0.0f;   // non-PI controller settings
+	// Below ~1000 mech the 930KV's weak BEMF makes 6-step marginal (can desync/flip), so treat a
+	// sub-1000 target as a STOP (thrust 0) rather than trying to hold it. `rpm 0` also stops cleanly.
+	esc1.vc.stop_below_rpm = 1000.0f;
 
 	tool.begin();
 }

@@ -1,0 +1,25 @@
+# 930KV 12N14P, SINE-OFF (sine_mode=0, motor_direction=Bidirectional-Reversed) — the stable RPM-control config. 6-step only: rpm 0 stops cleanly, no crossover, no low-speed sine (sine floored ~380mech and reverse-signed, unusable). Loop holds ~1000-11000 mech; below ~1000 the 930KV weak BEMF is marginal -> use stop_below_rpm~1000. ESC config: profiles/rpm_930kv_sineoff.yaml.
+motor: 930kv_12n14p_sineoff
+pole_pairs: 7
+source: bench
+capabilities:
+  sine_lowspeed: false
+  down_catch: false
+control:
+  kp: 0.03
+  ki: 0.12
+  trim_max: 400.0
+  blend_secs: 0.3
+points:
+- thrust: 0.0
+  rpm: 0.0
+- thrust: 620.0
+  rpm: 2576.0
+- thrust: 700.0
+  rpm: 4645.0
+- thrust: 800.0
+  rpm: 7173.0
+- thrust: 900.0
+  rpm: 9447.0
+- thrust: 1000.0
+  rpm: 11000.0
