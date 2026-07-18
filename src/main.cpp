@@ -24,8 +24,9 @@
 // --- Declare the ESCs (one Thruster each). pin = ESC_SIGNAL_PINS[bind index]; the rest is per-ESC.
 //     esc1 = 930KV, SINE config (sine_mode=2): forced-sine gives a smooth low-speed start and the
 //     firmware's virtual-eRPM telemetry lets the loop climb through sine into 6-step from rest. `rpm 0`
-//     stops cleanly via the Thruster's signal-loss stop (thruster.h) — a 3D DShot 0 does NOT stop the
-//     ESC otherwise. Apply the matching ESC config once:
+//     stops cleanly via a proper NEUTRAL (thruster.h holds throttle 0 while armed; the BlueGill firmware
+//     detects the near-zero magnitude and parks the ESC in wait_for_start) so the rotor really stops and
+//     the next non-zero target restarts with no re-arm. Apply the matching ESC config once:
 //         esctool apply 1 host/profiles/rpm_930kv_sine2.yaml
 //     (For a pure 6-step / no-sine setup use profiles::M_930KV_SINEOFF + host/profiles/rpm_930kv_sineoff.yaml.) ---
 static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // pin 10: RAW / uncalibrated

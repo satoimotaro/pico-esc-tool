@@ -503,8 +503,7 @@ private:
 				else { float fv=atof(v);
 					if(!strcmp(g,"kp")) th_[i]->vc.kp=fv; else if(!strcmp(g,"ki")) th_[i]->vc.ki=fv;
 					else if(!strcmp(g,"trim")) th_[i]->vc.trim_max=fv; else if(!strcmp(g,"slew")) th_[i]->vc.slew_rpm_s=fv;
-					else if(!strcmp(g,"rearm")) th_[i]->rearm_ms=(uint16_t)fv;
-					else { Serial.println("err bad-gain (kp|ki|trim|slew|rearm)"); continue; }
+					else { Serial.println("err bad-gain (kp|ki|trim|slew)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>

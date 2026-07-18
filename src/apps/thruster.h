@@ -94,24 +94,18 @@ public:
 	// over-temp) — stop the motor and fall back to RAW. Callers still run the shared escs::spinPoll().
 	void poll() {
 		if (submode_ != RPM || !armed()) return;
-		// STOP request (|target| <= stop_below_rpm): hold a signal-loss stop. A thrust-0 command does NOT
-		// stop a 3D ESC (DShot 0 isn't the firmware's Rcp_Stop; the rotor idles at the weak-BEMF floor),
-		// so pause the DShot signal each tick -> the ESC times out -> exits run mode -> STOPS. The driver
-		// stays alive, so the next non-zero target resumes within the pause window (no 3 s re-arm).
+		// STOP request (|target| <= stop_below_rpm): hold the PROPER NEUTRAL while staying ARMED. A
+		// throttle-0 command sets the firmware's Flag_Rcp_Stop; with the BlueGill sine loop now exiting on
+		// Rcp_Stop (SineMode.asm), the ESC leaves the drive loop to wait_for_start (ARMED idle, signal
+		// still flowing) so the rotor coasts to a real stop instead of limping at the low sine floor.
+		// Keep streaming 0 (don't cut the signal, don't disarm) -> the next non-zero target restarts the
+		// motor immediately from wait_for_start, with NO re-arm. Reset the integrator so restart is bump-free.
 		if (fabsf(vc.target()) <= vc.stop_below_rpm) {
-			escs::spinPauseSignal(index_, 40);
-			if (!stopping_) { vc.reset(); stopping_ = true; }
-			return;
-		}
-		// Leaving a stop: the signal-loss cold-disarmed the ESC, so re-arm it once before driving again
-		// (the arm streams zero ~SPIN_ARM_MS, then armed() goes true and the loop below runs).
-		if (stopping_) {
-			stopping_ = false;
-			escs::spinArm(index_, Drive::AUTO, rearm_ms);   // re-arm the cold-disarmed ESC (keeps RPM submode)
+			escs::spinThrust(index_, 0);   // neutral: keep armed + signal alive; firmware stops via Rcp_Stop
+			vc.reset();
 			lastStepUs_ = micros();
 			return;
 		}
-		if (!armed()) return;   // re-arm in progress
 		uint32_t now = micros();
 		float dt = (now - lastStepUs_) * 1e-6f;
 		lastStepUs_ = now;
@@ -142,16 +136,11 @@ public:
 	const vel::SpeedProfile* profile_;
 	Io                       io_;
 	vel::VelocityController  vc;   // PUBLIC so the declaring side sets gains: th.vc.kp = 0.03f;
-	uint16_t rearm_ms = 900;       // zero-stream window to re-arm the ESC after a signal-loss stop. A
-	                               // run-mode re-arm needs far less than the cold-boot SPIN_ARM_MS: bench
-	                               // (930KV) 800 ms restarts, 600 ms fails -> 900 ms with margin (~1.6 s
-	                               // total restart incl. spin-up). Tune live with `gain <i> rearm <ms>`.
 
 private:
 	uint16_t kbaud_;
 	uint8_t  poles_;
 	uint8_t  index_      = 0;
 	Submode  submode_    = RAW;
-	bool     stopping_   = false;   // in a signal-loss stop (target ~0)
 	uint32_t lastStepUs_ = 0;
 };
