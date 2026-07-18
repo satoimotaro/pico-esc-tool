@@ -74,6 +74,11 @@ namespace detail {
 	static DShotX4*          drvN[COUNT] = { nullptr };   // normal DShot: idle LOW, throttle only
 	static volatile uint16_t drvTarget[COUNT] = { 0 };
 	static uint32_t          drvLast[COUNT] = { 0 };
+	static uint32_t          drvPauseUntil[COUNT] = { 0 };  // spinPoll skips sending until this millis
+	                                                        // (deliberate brief signal loss = firm STOP:
+	                                                        // in 3D, DShot 0 does NOT set the ESC's
+	                                                        // Rcp_Stop, so a timeout is the only reliable
+	                                                        // stop; see spinPauseSignal)
 	static bool              drvArmed[COUNT] = { false };
 	static uint32_t          drvArmStart[COUNT] = { 0 };
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
@@ -271,6 +276,13 @@ inline const char* spinMode(uint8_t idx) {
 	return drvB[idx] ? "bidir" : (drvN[idx] ? "normal" : "none");
 }
 inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::drvInitFail[idx]; }
+// Firm STOP without disarming: pause the DShot signal for `ms` (spinPoll sends nothing), so the ESC's
+// Rcp_Timeout fires -> exit run mode -> motor stops. Needed because in 3D (bidir) DShot 0 does NOT set
+// the firmware's Rcp_Stop (the 3D neutral is mid-range, not 0), so a throttle-0 command just idles the
+// rotor at the weak-BEMF floor. The driver stays alive, so the next command restarts quickly (no re-arm).
+inline void spinPauseSignal(uint8_t idx, uint16_t ms) {
+	if (idx < COUNT) detail::drvPauseUntil[idx] = millis() + ms;
+}
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
@@ -288,6 +300,7 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 	bool any = false;
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!drvActive(i)) continue;
+		if (millis() < drvPauseUntil[i]) continue;   // signal-loss STOP window: send nothing (see spinPauseSignal)
 		any = true;
 		if (!drvArmed[i]) { drvTarget[i] = 0; if (millis() - drvArmStart[i] > SPIN_ARM_MS) drvArmed[i] = true; }
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)

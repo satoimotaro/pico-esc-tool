@@ -94,6 +94,24 @@ public:
 	// over-temp) — stop the motor and fall back to RAW. Callers still run the shared escs::spinPoll().
 	void poll() {
 		if (submode_ != RPM || !armed()) return;
+		// STOP request (|target| <= stop_below_rpm): hold a signal-loss stop. A thrust-0 command does NOT
+		// stop a 3D ESC (DShot 0 isn't the firmware's Rcp_Stop; the rotor idles at the weak-BEMF floor),
+		// so pause the DShot signal each tick -> the ESC times out -> exits run mode -> STOPS. The driver
+		// stays alive, so the next non-zero target resumes within the pause window (no 3 s re-arm).
+		if (fabsf(vc.target()) <= vc.stop_below_rpm) {
+			escs::spinPauseSignal(index_, 40);
+			if (!stopping_) { vc.reset(); stopping_ = true; }
+			return;
+		}
+		// Leaving a stop: the signal-loss cold-disarmed the ESC, so re-arm it once before driving again
+		// (the arm streams zero ~SPIN_ARM_MS, then armed() goes true and the loop below runs).
+		if (stopping_) {
+			stopping_ = false;
+			escs::spinArm(index_);   // re-arm the cold-disarmed ESC (keeps RPM submode); ~SPIN_ARM_MS
+			lastStepUs_ = micros();
+			return;
+		}
+		if (!armed()) return;   // re-arm in progress
 		uint32_t now = micros();
 		float dt = (now - lastStepUs_) * 1e-6f;
 		lastStepUs_ = now;
@@ -130,5 +148,6 @@ private:
 	uint8_t  poles_;
 	uint8_t  index_      = 0;
 	Submode  submode_    = RAW;
+	bool     stopping_   = false;   // in a signal-loss stop (target ~0)
 	uint32_t lastStepUs_ = 0;
 };
