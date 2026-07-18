@@ -193,6 +193,9 @@ def main():
     ap.add_argument("--hold", type=float, default=4.0, help="seconds per --targets step (default 4)")
     ap.add_argument("--slew", type=float, default=4000.0,
                     help="controller slew rate for the reference overlay (default 4000 rpm/s)")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VAL",
+                    help="push a gain before the sweep, e.g. --set slew=1500 --set kd=0.008 "
+                         "(KEY in kp|ki|kd|dtau|trim|slew). Repeatable. slew= also sets the reference.")
     ap.add_argument("--out", default="host/reports/rpm_sweep",
                     help="output path prefix (writes <out>.json and <out>.html)")
     ap.add_argument("--no-report", action="store_true", help="write only the JSON data")
@@ -206,6 +209,12 @@ def main():
 
     host = EscHost(args.port)
     try:
+        for kv in args.set:                                  # push gains before driving
+            k, _, v = kv.partition("=")
+            host.cmd(f"gain {args.esc} {k.strip()} {v.strip()}")
+            print(f"set gain {k.strip()} = {v.strip()}")
+            if k.strip() == "slew":
+                args.slew = float(v)                         # keep the reference overlay consistent
         use_enc = probe_encoder(host)
         print("shaft encoder (AS5600): " + ("present -> logging ground-truth speed" if use_enc else "not found"))
         samples = run_sweep(host, args.esc, schedule, use_enc=use_enc)

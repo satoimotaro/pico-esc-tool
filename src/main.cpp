@@ -44,7 +44,10 @@ void setup() {
 	// Per-motor closed-loop PI gains — from the same calibrated profile (the ~30x-hotter real plant
 	// needs these, not the sim DEFAULT_GAINS). esc0 stays at library defaults.
 	esc1.applyGains(profiles::M_930KV_12N14P_6STEP_GAINS);
-	esc1.vc.slew_rpm_s = 4000.0f; esc1.vc.max_temp = 0.0f;   // non-PI controller settings
+	esc1.vc.slew_rpm_s = 2000.0f; esc1.vc.max_temp = 0.0f;   // 2000 balances overshoot vs. rise: a
+	                       // 1500->3500 step went 40%->33% peak overshoot vs. 4000 for ~0.16 s more rise
+	                       // (steady-state still 0.1%). Lower (~1200) cuts overshoot further but the
+	                       // response gets sluggish; a prop under water load damps the spike anyway.
 	esc1.vc.kd = 0.008f;   // derivative-on-measurement: damps steady-state hunting (bench: jitter down,
 	                       // SS error 0.2%->0.07%); above ~0.02 the eRPM quantization adds jitter. It does
 	                       // NOT fix the up-step overshoot on the unloaded bench (a low-inertia momentum
