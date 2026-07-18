@@ -498,12 +498,13 @@ private:
 				if(i<0||i>=n_||!v) Serial.println("err bad-args");
 				else if(!th_[i]->armed()) Serial.println("err not-armed");
 				else { th_[i]->setRpm(atof(v)); Serial.println("ok"); } }
-			else if (!strcmp(cmd,"gain")) { int i=argi(); char* g=strtok(nullptr," "); char* v=strtok(nullptr," ");   // NEW: gain <i> <kp|ki|trim|slew> <v>
+			else if (!strcmp(cmd,"gain")) { int i=argi(); char* g=strtok(nullptr," "); char* v=strtok(nullptr," ");   // gain <i> <kp|ki|kd|dtau|trim|slew> <v>
 				if(i<0||i>=n_||!g||!v) Serial.println("err bad-args");
 				else { float fv=atof(v);
 					if(!strcmp(g,"kp")) th_[i]->vc.kp=fv; else if(!strcmp(g,"ki")) th_[i]->vc.ki=fv;
+					else if(!strcmp(g,"kd")) th_[i]->vc.kd=fv; else if(!strcmp(g,"dtau")) th_[i]->vc.d_tau=fv;
 					else if(!strcmp(g,"trim")) th_[i]->vc.trim_max=fv; else if(!strcmp(g,"slew")) th_[i]->vc.slew_rpm_s=fv;
-					else { Serial.println("err bad-gain (kp|ki|trim|slew)"); continue; }
+					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>

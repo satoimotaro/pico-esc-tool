@@ -45,6 +45,10 @@ void setup() {
 	// needs these, not the sim DEFAULT_GAINS). esc0 stays at library defaults.
 	esc1.applyGains(profiles::M_930KV_12N14P_6STEP_GAINS);
 	esc1.vc.slew_rpm_s = 4000.0f; esc1.vc.max_temp = 0.0f;   // non-PI controller settings
+	esc1.vc.kd = 0.008f;   // derivative-on-measurement: damps steady-state hunting (bench: jitter down,
+	                       // SS error 0.2%->0.07%); above ~0.02 the eRPM quantization adds jitter. It does
+	                       // NOT fix the up-step overshoot on the unloaded bench (a low-inertia momentum
+	                       // spike — lower `slew_rpm_s` for that; a prop load damps it). Tune: `gain 1 kd`.
 	esc1.vc.stop_below_rpm = 0.0f;   // only an exact rpm 0 stops (sine low-speed still runs); raise to
 	                                 // cut off a marginal low band and treat it as stop.
 

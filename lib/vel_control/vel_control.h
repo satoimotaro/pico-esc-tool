@@ -149,6 +149,12 @@ public:
 	float ki        = DEFAULT_GAINS.ki;
 	float trim_max  = DEFAULT_GAINS.trim_max;
 	float blend_secs = DEFAULT_GAINS.blend_secs;
+	// Derivative trim on the MEASURED velocity (not the error) so a slewed setpoint step gives no
+	// derivative kick — it only damps how fast the shaft is actually accelerating, which curbs the
+	// overshoot on hard up-steps. Low-passed (d_tau) because the eRPM telemetry is quantized, and it
+	// rides the same liveness fade as the PI (contributes 0 in forced sine). 0 => disabled (default).
+	float kd        = 0.0f;
+	float d_tau     = 0.04f;    // derivative low-pass time constant (s)
 	float slew_rpm_s   = 200.0f;    // setpoint slew rate (keeps the first command gentle)
 	float over_speed_rpm = 0.0f;    // 0 => auto: max(2*maxRpm, 1200)
 	float stop_below_rpm = 0.0f;    // a target at/below this |RPM| is a STOP: command thrust 0 and
@@ -175,6 +181,7 @@ public:
 	void reset() {
 		i_ = 0.0f; w_ = 0.0f; have_tele_ = false; tele_mech_ = 0.0f; live_ = false;
 		stale_accum_ = 0.0f; last_sent_ = 0; last_applied_ = 0.0f;
+		prev_meas_ = 0.0f; have_prev_meas_ = false; d_filt_ = 0.0f; last_d_ = 0.0f;
 	}
 
 	// One control tick. dt = elapsed seconds since the last step (<=0 -> VEL_DT_DEFAULT). Reads
@@ -242,7 +249,7 @@ public:
 			if (desired != 0.0f && delivered * desired > 0.0f && fabsf(delivered) < fabsf(desired)) {
 				float err = sp - tele_mech_;
 				float unblended = delivered / w_;            // |unblended| < |trim| <= trim_max
-				i_ = clampf(unblended - kp * err, -trim_max, trim_max);
+				i_ = clampf(unblended - kp * err - last_d_, -trim_max, trim_max);
 			}
 		}
 
@@ -287,9 +294,20 @@ private:
 		if (!have_tele_) return 0.0f;
 		float err = sp - tele_mech_;
 		if (live_) i_ += ki * err * dt;                  // accumulate only against a FRESH live frame
-		float u = kp * err + i_;
+		// derivative on MEASUREMENT (low-passed), updated only on a fresh live frame; -kd opposes rising
+		// speed so it damps the approach. Frozen (not decayed) during a fade-out; w_ scales it to 0 anyway.
+		if (kd > 0.0f && live_) {
+			if (have_prev_meas_ && dt > 0.0f) {
+				float dmeas = (tele_mech_ - prev_meas_) / dt;
+				float a = (d_tau > 0.0f) ? dt / (d_tau + dt) : 1.0f;
+				d_filt_ += (dmeas - d_filt_) * a;
+			}
+			prev_meas_ = tele_mech_; have_prev_meas_ = true;
+		}
+		last_d_ = (kd > 0.0f) ? -kd * d_filt_ : 0.0f;
+		float u = kp * err + i_ + last_d_;
 		float uc = clampf(u, -trim_max, trim_max);
-		if (u != uc) { i_ = clampf(uc - kp * err, -trim_max, trim_max); u = uc; }
+		if (u != uc) { i_ = clampf(uc - kp * err - last_d_, -trim_max, trim_max); u = uc; }
 		return u;
 	}
 
@@ -316,6 +334,7 @@ private:
 	float pending_ = 0.0f; bool have_pending_ = false;
 	float i_ = 0.0f, w_ = 0.0f;
 	float tele_mech_ = 0.0f; bool have_tele_ = false, live_ = false;
+	float prev_meas_ = 0.0f; bool have_prev_meas_ = false; float d_filt_ = 0.0f, last_d_ = 0.0f;
 	float last_sign_ = 1.0f;
 	float stale_accum_ = 0.0f;
 	int   last_sent_ = 0; float last_applied_ = 0.0f;
