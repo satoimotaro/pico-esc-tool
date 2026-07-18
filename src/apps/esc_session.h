@@ -81,6 +81,8 @@ namespace detail {
 	                                                        // stop; see spinPauseSignal)
 	static bool              drvArmed[COUNT] = { false };
 	static uint32_t          drvArmStart[COUNT] = { 0 };
+	static uint16_t          drvArmMs[COUNT] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
+	                                                    // a re-arm after a run-mode stop can be short
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
 	static bool              drvInitFail[COUNT] = { false }; // last spinArm's DShot PIO init failed
@@ -221,7 +223,7 @@ inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < COUNT) detail::drv
 // DShot (idle HIGH, eRPM + EDT telemetry); otherwise normal DShot (idle LOW), which any BLHeli-S
 // spins. Reversible (3D) rotation is read from the config so throttle can be a signed thrust.
 // Call spinPoll() every core0 loop to keep frames flowing, run arming + deadman, and read telemetry.
-inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
+inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	using namespace detail;
 	if (idx >= COUNT) return;
 	// Resolve firmware/direction from the cache (populated by scan/connect). Only re-read config when
@@ -245,6 +247,7 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
 	drvInitFail[idx] = drvB[idx] ? drvB[idx]->initError() : drvN[idx]->initError();
 	if (drvInitFail[idx]) drvFree(idx);   // PIO init failed (e.g. no free SM) — don't report a false ARMED
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
+	drvArmMs[idx] = armMs;   // 0 => SPIN_ARM_MS (see spinPoll)
 }
 inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
 	using namespace detail;
@@ -302,7 +305,8 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 		if (!drvActive(i)) continue;
 		if (millis() < drvPauseUntil[i]) continue;   // signal-loss STOP window: send nothing (see spinPauseSignal)
 		any = true;
-		if (!drvArmed[i]) { drvTarget[i] = 0; if (millis() - drvArmStart[i] > SPIN_ARM_MS) drvArmed[i] = true; }
+		if (!drvArmed[i]) { drvTarget[i] = 0; uint32_t win = drvArmMs[i] ? drvArmMs[i] : SPIN_ARM_MS;
+		                    if (millis() - drvArmStart[i] > win) drvArmed[i] = true; }
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		if (drvB[i]) {
 			uint32_t v = 0;

@@ -107,7 +107,7 @@ public:
 		// (the arm streams zero ~SPIN_ARM_MS, then armed() goes true and the loop below runs).
 		if (stopping_) {
 			stopping_ = false;
-			escs::spinArm(index_);   // re-arm the cold-disarmed ESC (keeps RPM submode); ~SPIN_ARM_MS
+			escs::spinArm(index_, Drive::AUTO, rearm_ms);   // re-arm the cold-disarmed ESC (keeps RPM submode)
 			lastStepUs_ = micros();
 			return;
 		}
@@ -142,6 +142,10 @@ public:
 	const vel::SpeedProfile* profile_;
 	Io                       io_;
 	vel::VelocityController  vc;   // PUBLIC so the declaring side sets gains: th.vc.kp = 0.03f;
+	uint16_t rearm_ms = 900;       // zero-stream window to re-arm the ESC after a signal-loss stop. A
+	                               // run-mode re-arm needs far less than the cold-boot SPIN_ARM_MS: bench
+	                               // (930KV) 800 ms restarts, 600 ms fails -> 900 ms with margin (~1.6 s
+	                               // total restart incl. spin-up). Tune live with `gain <i> rearm <ms>`.
 
 private:
 	uint16_t kbaud_;
