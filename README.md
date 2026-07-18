@@ -57,8 +57,8 @@ void loop() { tool.poll(); }                   // serial + Wi-Fi + each ESC's RP
 arm <i> [normal|bidir]      # arm ESC i (AUTO: bidir for Bluejay/JESC, else normal DShot)
 throttle <i> <0..2000>      # RAW one-way throttle          (armed)
 thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop
-rpm     <i> <mech-rpm>      # CLOSED-LOOP velocity target (signed); needs a calibrated profile
-gain    <i> kp|ki|trim|slew <v>   # tune the closed loop live
+rpm     <i> <mech-rpm>      # CLOSED-LOOP velocity target (signed); 0 = clean stop; needs a profile
+gain    <i> kp|ki|kd|dtau|trim|slew <v>   # tune the closed loop live
 tele    <i>                 # rpm | volts | amps | tempC | stress   (bidir firmware only)
 disarm  <i>                 # stop + release
 ```
@@ -71,9 +71,24 @@ and the ESC holds the target speed. Stock BLHeli-S = normal DShot (throttle only
 ## Closed-loop RPM control
 
 Signed target mechanical RPM → signed DShot thrust: a feed-forward from the motor's calibrated curve
-plus a PI trim on the telemetry eRPM, whose authority fades where telemetry goes stale. It is
-ESC-agnostic (works on stock Bluejay using only standard bidir-DShot telemetry). The control law is
-`lib/vel_control/` (portable, host-unit-tested); design notes in `docs/velctl-generalization.md`.
+plus a PI trim on the telemetry eRPM (with an optional derivative-on-measurement term, `kd`), whose
+authority fades where telemetry goes stale. It is ESC-agnostic (works on stock Bluejay using only
+standard bidir-DShot telemetry). The control law is `lib/vel_control/` (portable, host-unit-tested);
+design notes in `docs/velctl-generalization.md`.
+
+`rpm 0` is a **clean stop**: the controller holds neutral while staying armed, and (on BlueGill sine
+firmware) the ESC parks itself so the rotor really stops and the next non-zero target restarts warm —
+no re-arm. Gains are plant-dependent; set them per motor in `main.cpp` (`esc1.vc.kd = ...`) or live
+with `gain`. `slew_rpm_s` trades overshoot for rise time (a gentler slew overshoots less).
+
+**Evaluate/tune the loop:** `host/rpm_sweep.py` drives a stepped RPM schedule, logs the tracking at
+the full telemetry rate (and an AS5600 shaft encoder as ground-truth, if present), and writes a
+self-contained HTML report with per-step metrics (steady-state error, overshoot, rise, settle):
+
+```
+python host/rpm_sweep.py 1 --out host/reports/run       # sweep ESC 1, write run.json + run.html
+python host/rpm_sweep.py 1 --set slew=1500 --set kd=0.01 # push gains first, then sweep
+```
 
 **Per-motor profiles are generated from calibration, not hand-typed.** The YAML velcal profiles in
 `host/profiles/` are the single source of truth; regenerate the firmware header after a velcal:
@@ -138,6 +153,7 @@ src/apps/profiles_gen.h  GENERATED from host/profiles/*.yaml (do not edit by han
 lib/vel_control/         portable closed-loop velocity controller (host-unit-tested)
 lib/{blheli_bl,esc_setup,esc_flash}/   bootloader client / config codec / HEX flash
 host/esctool.py          the PC CLI                host/posctl.py   position controller
+host/rpm_sweep.py        velocity-loop sweep + HTML evaluation report (rpm_sweep_report.py)
 host/gen_profile_header.py   YAML profile -> C++ header codegen
 host/profiles/           calibrated YAML profiles (source of truth for firmware curves)
 docs/                    design notes (velctl-generalization.md, etc.)
