@@ -24,7 +24,7 @@ jobs:
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
 
       - name: Install PlatformIO + test deps
-        run: pip install platformio pyserial pytest
+        run: pip install platformio pyserial pytest pyyaml
 
       - name: Build all firmware environments
         run: pio run -e main -e esc_tool
