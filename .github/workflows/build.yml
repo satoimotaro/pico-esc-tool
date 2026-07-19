@@ -23,14 +23,14 @@ jobs:
             ~/.cache/pip
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
 
-      - name: Install PlatformIO + pyserial
-        run: pip install platformio pyserial
+      - name: Install PlatformIO + test deps
+        run: pip install platformio pyserial pytest
 
       - name: Build all firmware environments
-        run: >
-          pio run
-          -e esc_tool -e dshot_demo
-          -e spike_setup -e spike_program -e spike_write -e spike_boot -e spike_flash
+        run: pio run -e main -e esc_tool
 
-      - name: Syntax-check the host CLI
-        run: python -m py_compile host/esctool.py
+      - name: Compile-check the host tools
+        run: python -m compileall -q host
+
+      - name: Run host unit tests
+        run: python -m pytest host/tests -q
