@@ -1,0 +1,50 @@
+# 930KV 12N14P full curve (sine seed + 6-step), bench-measured 2026-07-16/17.
+# Single source of truth for the firmware curve: run tools/gen_profile_header.py to regenerate src/apps/profiles_gen.h.
+motor: 930kv_12n14p
+pole_pairs: 7
+source: bench
+crossover:
+  up_erpm: 1500.0
+  dn_erpm: 1350.0
+capabilities:
+  sine_lowspeed: true
+  down_catch: false
+control:
+  kp: 0.03
+  ki: 0.12
+  trim_max: 400.0
+  blend_secs: 0.3
+points:
+- thrust: 0.0
+  rpm: 0.0
+  regime: sine
+- thrust: 60.0
+  rpm: 20.3
+  regime: sine
+- thrust: 108.0
+  rpm: 35.6
+  regime: sine
+- thrust: 155.0
+  rpm: 51.8
+  regime: sine
+- thrust: 202.0
+  rpm: 67.6
+  regime: sine
+- thrust: 250.0
+  rpm: 83.6
+  regime: sine
+- thrust: 620.0
+  rpm: 2576.0
+  regime: line
+- thrust: 700.0
+  rpm: 4645.0
+  regime: line
+- thrust: 800.0
+  rpm: 7173.0
+  regime: line
+- thrust: 900.0
+  rpm: 9447.0
+  regime: line
+- thrust: 1000.0
+  rpm: 11000.0
+  regime: line

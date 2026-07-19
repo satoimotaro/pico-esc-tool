@@ -1,0 +1,32 @@
+esc: 1
+identity:
+  name: Bluejay (.0)
+  layout: '#A_H_30#'
+  mcu: '#BLHELI$EFM8B21#'
+  eeprom_revision: '0.21'
+  layout_revision: 226
+  mode: Multi
+settings:
+  motor_direction: Bidirectional-Reversed
+  comm_timing: MediumHigh
+  demag_compensation: High
+  startup_power_min: 30
+  startup_power_max: 18
+  startup_beep: 1
+  pwm_frequency: 24
+  beep_strength: 40
+  beacon_strength: 80
+  beacon_delay: 4
+  temperature_protection: 1
+  low_rpm_power_protection: 9
+  brake_on_stop: 1
+  comm_timing_angle: 0
+  max_erpm: 0
+  lowspeed_damping: 0
+  sine_mode: 0
+  sine_hold_amp: 16
+  sine_amp_max: 45
+  sine_ramp: 16
+  sine_cross_up: 38
+  sine_cross_dn: 231
+raw_hex: 0015E2FF1E01FF12FF091804FF55AAFFFFFFFFFFFF04FFFFFFFFFF285004FF03FFFFFF01FFFFFF0100020000000000102D1026E7FFFFFFFFFFFFFFFFFFFFFFFF23415F485F333023202020202020202023424C48454C492445464D3842323123426C75656A617920282E302920202020023A0420FF106F1463187800A61F7800FE106F1463187800FE1000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF

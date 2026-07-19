@@ -26,5 +26,5 @@
 #define ESC_AP_PASS       "esctool1234"    // >= 8 chars (WPA2); change before real use
 
 // --- DShot / motor ----------------------------------------------------------------------------
-#define ESC_DSHOT_KBAUD   600              // DShot bitrate in kbaud (600 = DShot600)
+#define ESC_DSHOT_KBAUD   300              // DShot bitrate in kbaud  [TEST: A_H_30 ESCs may need 300, not 600]
 #define ESC_MOTOR_POLES   14               // motor magnet poles (for eRPM -> RPM); motor-dependent

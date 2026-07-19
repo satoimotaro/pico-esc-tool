@@ -1,0 +1,37 @@
+# posctl_930kv_sine — 930 KV bench motor + BlueGill S1 forced-commutation stepper mode.
+#
+# Same as posctl_930kv.yaml but enables sine mode (zero-speed holding torque + smooth
+# sub-185-RPM crawl for the posctl.py PID servo) and turns temperature protection ON,
+# because at hold S1 drives DC stall current through one winding with no current sense.
+# Amps are the timid firmware defaults; raise sine_hold_amp / sine_amp_max ONLY on the
+# bench with temp_prot on, watching the tele temperature (see docs/low-speed-tuning.md).
+esc: 1
+identity:
+  name: Bluejay (.0)
+  layout: '#A_H_30#'
+  mcu: '#BLHELI$EFM8B21#'
+  eeprom_revision: '0.21'
+  layout_revision: 225
+  mode: Multi
+settings:
+  motor_direction: Bidirectional      # S1 expects bidir (thrust sign = direction)
+  comm_timing: Low
+  demag_compensation: 'Off'
+  startup_power_min: 20
+  startup_power_max: 18
+  startup_beep: 1
+  pwm_frequency: 24
+  beep_strength: 40
+  beacon_strength: 80
+  beacon_delay: 4
+  temperature_protection: 1           # ENABLED: hold current has no other trip
+  low_rpm_power_protection: 9
+  brake_on_stop: 1
+  comm_timing_angle: 0
+  max_erpm: 0
+  lowspeed_damping: 0
+  # BlueGill S1 forced-commutation stepper mode
+  sine_mode: 1                        # enable stepper mode
+  sine_hold_amp: 8                    # ~3% duty zero-speed holding amplitude
+  sine_amp_max: 20                    # ~8% duty V/f amplitude ceiling
+  sine_ramp: 16                       # speed slew rate (inc-LSB/tick; ~1s to full scale)

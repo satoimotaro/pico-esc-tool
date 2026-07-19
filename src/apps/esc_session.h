@@ -37,6 +37,9 @@ struct Telem {
 	bool     valid = false;
 	uint32_t rpm = 0, current = 0, tempC = 0, stress = 0, status = 0;
 	float    voltage = 0.0f;
+	uint32_t rpmStampMs = 0;   // millis() of the last ERPM packet — lets a reader detect a STALE rpm
+	                           // (the field holds the last 6-step value even after the ESC drops to
+	                           // forced sine and stops sending eRPM; freshness distinguishes the two).
 };
 
 static const uint16_t SPIN_MAX        = 2000;   // max throttle
@@ -73,9 +76,20 @@ namespace detail {
 	static uint32_t          drvLast[COUNT] = { 0 };
 	static bool              drvArmed[COUNT] = { false };
 	static uint32_t          drvArmStart[COUNT] = { 0 };
+	static uint16_t          drvArmMs[COUNT] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
+	                                                    // a re-arm after a run-mode stop can be short
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
+	static bool              drvInitFail[COUNT] = { false }; // last spinArm's DShot PIO init failed
 	static Telem             drvTele[COUNT];
+	// Per-ESC overrides (0 = use the global ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default). Set via
+	// escs::setKbaud/setPoles so different ESCs/motors on the same board can differ (e.g. a 300 kbaud
+	// A_H_30 next to a 600 kbaud unit, or motors with different pole counts). Additive: untouched =>
+	// identical behavior to before, so the legacy esc_tool build is unaffected.
+	static uint16_t          drvKbaud[COUNT] = { 0 };
+	static uint8_t           drvPoles[COUNT] = { 0 };
+	static inline uint16_t   kbaudOf(uint8_t i) { return drvKbaud[i] ? drvKbaud[i] : (uint16_t)DSHOT_KBAUD; }
+	static inline uint8_t    polesOf(uint8_t i) { return drvPoles[i] ? drvPoles[i] : (uint8_t)MOTOR_POLES; }
 	// last-known firmware/direction, cached by connect()/scan() so spinArm() needn't re-enter the BL
 	static bool              infoBidir[COUNT] = { false };  // firmware supports bidir DShot (Bluejay/JESC)
 	static bool              infoRev[COUNT]   = { false };  // configured reversible (3D)
@@ -160,19 +174,26 @@ inline int editConfig(uint8_t idx, const uint16_t* offs, const uint8_t* vals, in
 		if (page[offs[k]] != vals[k]) { page[offs[k]] = vals[k]; changed = true; }
 	}
 	if (!changed) return 0;
-	return runOp(Op::WRITEPAGE, PINS[idx]) ? 1 : -4;
+	int r = runOp(Op::WRITEPAGE, PINS[idx]) ? 1 : -4;
+	if (r == 1) infoKnown[idx] = false;   // config changed -> re-detect (direction) on next spinArm
+	return r;
 }
 
 // Raw flash primitives (for firmware flashing). Each requires idx connectable.
 inline bool erasePage (uint8_t idx, uint16_t addr) {
 	using namespace detail;
 	if (idx >= COUNT || !ensureConnected(idx)) return false;
-	flAddr = addr; return runOp(Op::ERASE, PINS[idx]);
+	flAddr = addr; bool ok = runOp(Op::ERASE, PINS[idx]);
+	if (ok) infoKnown[idx] = false;       // flashing -> firmware (bidir/normal) may change
+	return ok;
 }
 inline bool writeFlash(uint8_t idx, uint16_t addr, const uint8_t* data, uint16_t len) {
 	using namespace detail;
 	if (idx >= COUNT || len > sizeof(flBuf) || !ensureConnected(idx)) return false;
-	memcpy(flBuf, data, len); flAddr = addr; flLen = len; return runOp(Op::WRITEFLASH, PINS[idx]);
+	memcpy(flBuf, data, len); flAddr = addr; flLen = len;
+	bool ok = runOp(Op::WRITEFLASH, PINS[idx]);
+	if (ok) infoKnown[idx] = false;       // flashing -> firmware (bidir/normal) may change
+	return ok;
 }
 inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 	using namespace detail;
@@ -185,6 +206,11 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
 
+// Per-ESC drive config (call BEFORE spinArm; takes effect at the next arm). 0 restores the global
+// ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default. Lets a Thruster carry its own bitrate / pole count.
+inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < COUNT) detail::drvKbaud[idx] = kbaud; }
+inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < COUNT) detail::drvPoles[idx] = poles; }
+
 // ---- drive / spin (core0) ----------------------------------------------------------------------
 // spinArm() leaves any bootloader session (the ESC must run its app), picks the DShot mode, and
 // starts the arming stream for SPIN_ARM_MS. Then spinThrottle()/spinThrust() set the target;
@@ -192,7 +218,7 @@ inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RU
 // DShot (idle HIGH, eRPM + EDT telemetry); otherwise normal DShot (idle LOW), which any BLHeli-S
 // spins. Reversible (3D) rotation is read from the config so throttle can be a signed thrust.
 // Call spinPoll() every core0 loop to keep frames flowing, run arming + deadman, and read telemetry.
-inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
+inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	using namespace detail;
 	if (idx >= COUNT) return;
 	// Resolve firmware/direction from the cache (populated by scan/connect). Only re-read config when
@@ -210,9 +236,13 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO) {
 	drvRev[idx] = infoRev[idx];
 	release();                                             // ESC must run its app (not the bootloader)
 	drvFree(idx);
-	if (mode == Drive::BIDIR) { drvB[idx] = new BidirDShotX1(PINS[idx], DSHOT_KBAUD); drvEdt[idx] = 20; }
-	else                      { drvN[idx] = new DShotX4(PINS[idx], 1, DSHOT_KBAUD);   drvEdt[idx] = 0;  }
+	uint16_t kb = kbaudOf(idx);   // per-ESC DShot bitrate (falls back to the ESC_DSHOT_KBAUD default)
+	if (mode == Drive::BIDIR) { drvB[idx] = new BidirDShotX1(PINS[idx], kb); drvEdt[idx] = 20; }
+	else                      { drvN[idx] = new DShotX4(PINS[idx], 1, kb);   drvEdt[idx] = 0;  }
+	drvInitFail[idx] = drvB[idx] ? drvB[idx]->initError() : drvN[idx]->initError();
+	if (drvInitFail[idx]) drvFree(idx);   // PIO init failed (e.g. no free SM) — don't report a false ARMED
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
+	drvArmMs[idx] = armMs;   // 0 => SPIN_ARM_MS (see spinPoll)
 }
 inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
 	using namespace detail;
@@ -225,8 +255,14 @@ inline void spinThrust(uint8_t idx, int16_t s) {   // reversible (3D): -1000..+1
 	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;
 	if (s >  1000) s =  1000;
 	if (s < -1000) s = -1000;
-	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1000 + s)      // forward -> DShot 1048..2047
-	                                   : (uint16_t)(1001 + s));    // reverse -> DShot   48..1047
+	// DShot 3D throttle bands: 48..1047 = reverse (48 slow .. 1047 fast), 1048..2047 = forward
+	// (1048 slow .. 2047 fast), 0 = stop. Magnitude must map MONOTONICALLY within each band.
+	// (Old mapping used 1000+s / 1001+s: forward leaked into the reverse band for s<48, and reverse
+	// was INVERTED — tiny |s| -> ~1000 (near max reverse), large |s| -> ~1 (below the 48 floor) —
+	// so reverse ran fast at low command, slowed as command rose, and handed off to 6-step almost
+	// immediately. Correct: forward -> 1047+s, reverse -> 47-s.)
+	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1047 + s)      // forward s=1..1000 -> 1048..2047
+	                                   : (uint16_t)(47 - s));       // reverse s=-1..-1000 -> 48..1047
 	drvTarget[idx] = t; drvLast[idx] = millis();
 }
 inline bool spinArmed(uint8_t idx)      { return idx < COUNT && detail::drvActive(idx) && detail::drvArmed[idx]; }
@@ -234,12 +270,14 @@ inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::drvRev[i
 inline const char* spinMode(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return "none";
+	if (drvInitFail[idx]) return "init-fail";
 	return drvB[idx] ? "bidir" : (drvN[idx] ? "normal" : "none");
 }
+inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::drvInitFail[idx]; }
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
-	drvTarget[idx] = 0; drvArmed[idx] = false; drvFree(idx);
+	drvTarget[idx] = 0; drvArmed[idx] = false; drvInitFail[idx] = false; drvFree(idx);
 }
 inline void spinDisarm(uint8_t idx) { spinStop(idx); }
 inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
@@ -254,12 +292,13 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!drvActive(i)) continue;
 		any = true;
-		if (!drvArmed[i]) { drvTarget[i] = 0; if (millis() - drvArmStart[i] > SPIN_ARM_MS) drvArmed[i] = true; }
+		if (!drvArmed[i]) { drvTarget[i] = 0; uint32_t win = drvArmMs[i] ? drvArmMs[i] : SPIN_ARM_MS;
+		                    if (millis() - drvArmStart[i] > win) drvArmed[i] = true; }
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		if (drvB[i]) {
 			uint32_t v = 0;
 			switch (drvB[i]->getTelemetryPacket(&v)) {
-				case BidirDshotTelemetryType::ERPM:        drvTele[i].rpm = (MOTOR_POLES > 1) ? v / (MOTOR_POLES / 2) : v; drvTele[i].valid = true; break;
+				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
 				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;

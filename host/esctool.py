@@ -9,215 +9,37 @@ Commands: list, connect, read, set, apply <profile.yaml>, flash <hex>, run/disco
   python esctool.py list
   python esctool.py read 0 -o config.yaml
   python esctool.py apply all host/profiles/blheli-s-default.yaml
+
+This is now a thin CLI wrapper: the transport, config codec, and flash helpers live in the
+pico_esc package. The names below are re-exported so `from esctool import EscHost`,
+`esctool.encode_overrides`, `esctool._apply_overrides`, etc. keep working for autocal.py /
+tune_sine_amp.py, and the protocol / printed strings are byte-identical.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
-import time
 
 try:  # Windows consoles default to cp932 and crash on any non-ASCII output
     sys.stdout.reconfigure(errors="replace")
 except Exception:
     pass
 
-try:
-    import serial
-    from serial.tools import list_ports
-except ImportError:
-    sys.exit("pyserial required:  pip install pyserial")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    import yaml  # optional; a minimal emitter is used if absent
-except ImportError:
-    yaml = None
-
-RPI_VID = 0x2E8A
-
-DIRECTION = {1: "Normal", 2: "Reversed", 3: "Bidirectional", 4: "Bidirectional-Reversed"}
-TIMING    = {1: "Low", 2: "MediumLow", 3: "Medium", 4: "MediumHigh", 5: "High"}
-DEMAG     = {1: "Off", 2: "Low", 3: "High"}
-MODE      = {0x55AA: "Multi", 0xA55A: "Main", 0x5AA5: "Tail"}
-
-# Writable settings: field name -> offset in the config block. (identity/mode/raw_hex are read-only.)
-FIELD_OFF = {
-    "motor_direction": 0x0B, "comm_timing": 0x15, "demag_compensation": 0x1F,
-    "startup_power_min": 0x04, "startup_power_max": 0x07, "startup_beep": 0x05,
-    "pwm_frequency": 0x0A, "beep_strength": 0x1B, "beacon_strength": 0x1C,
-    "beacon_delay": 0x1D, "temperature_protection": 0x23,
-    "low_rpm_power_protection": 0x24, "brake_on_stop": 0x27,
-}
-FIELD_ENUM = {"motor_direction": DIRECTION, "comm_timing": TIMING, "demag_compensation": DEMAG}
-NAME_OFF, NAME_LEN = 0x60, 16
-
-
-def encode_value(field: str, value) -> int:
-    """Field value (int, numeric string, or enum name) -> byte."""
-    enum = FIELD_ENUM.get(field)
-    if enum and isinstance(value, str) and not value.lstrip("-").isdigit():
-        rev = {v.lower(): k for k, v in enum.items()}
-        if value.lower() not in rev:
-            raise ValueError(f"{field}: '{value}' not in {list(enum.values())}")
-        return rev[value.lower()]
-    return int(value) & 0xFF
-
-
-def encode_overrides(settings: dict) -> list[tuple[int, int]]:
-    """Settings dict -> [(page_offset, byte)]. Unknown keys are skipped; 'name' -> 16 bytes."""
-    ovs: list[tuple[int, int]] = []
-    for k, v in settings.items():
-        if k == "name":
-            nm = str(v)[:NAME_LEN].ljust(NAME_LEN)
-            ovs += [(NAME_OFF + j, ord(c) & 0xFF) for j, c in enumerate(nm)]
-        elif k in FIELD_OFF:
-            ovs.append((FIELD_OFF[k], encode_value(k, v)))
-    return ovs
-
-
-def overrides_str(ovs: list[tuple[int, int]]) -> str:
-    return ",".join(f"{o:02X}:{b:02X}" for o, b in ovs)
-
-
-def find_pico(port: str | None) -> str:
-    if port:
-        return port
-    # retry briefly: right after an upload the CDC port takes a moment to re-enumerate
-    for _ in range(40):
-        for p in list_ports.comports():
-            if p.vid == RPI_VID:
-                return p.device
-        time.sleep(0.1)
-    sys.exit("no RP2040 (VID 2E8A) found - is esc_tool flashed and the monitor closed?")
-
-
-class EscHost:
-    """Line-based transport: send a command, collect reply lines until 'ok'/'err'."""
-
-    def __init__(self, port: str | None = None):
-        self.ser = None
-        p = find_pico(port)
-        for _ in range(30):                         # port can be briefly un-openable after an upload
-            try:
-                self.ser = serial.Serial(p, 115200, timeout=10)
-                break
-            except serial.SerialException:
-                time.sleep(0.15)
-                p = find_pico(port)
-        if self.ser is None:
-            sys.exit(f"could not open {p}")
-        time.sleep(0.3)
-        self.ser.reset_input_buffer()
-
-    def cmd(self, line: str, timeout: float = 30.0) -> list[str]:
-        self.ser.write((line + "\n").encode())
-        self.ser.flush()
-        out, end = [], time.time() + timeout
-        while time.time() < end:
-            ln = self.ser.readline().decode("utf-8", "replace").strip()
-            if not ln:
-                continue
-            if ln == "ok":
-                return out
-            if ln.startswith("err"):
-                raise RuntimeError(f"device: {ln}")
-            out.append(ln)
-        raise TimeoutError(f"no 'ok' for: {line}")
-
-    def close(self):
-        self.ser.close()
-
-
-def _tag(raw: bytes, off: int, n: int = 16) -> str:
-    s = bytearray()
-    for b in raw[off:off + n]:
-        if b in (0x00, 0xFF):
-            break
-        s.append(b if 32 <= b < 127 else ord("."))
-    return s.decode().rstrip()
-
-
-def decode(raw: bytes) -> dict:
-    """Decode the BLHeli-S/BlueJay config block (offsets shared across the family)."""
-    g = lambda o: raw[o]
-    mode = (raw[0x0D] << 8) | raw[0x0E]
-    return {
-        "identity": {
-            "name": _tag(raw, 0x60),
-            "layout": _tag(raw, 0x40),
-            "mcu": _tag(raw, 0x50),
-            "eeprom_revision": f"{g(0x00)}.{g(0x01)}",
-            "layout_revision": g(0x02),
-            "mode": MODE.get(mode, f"0x{mode:04X}"),
-        },
-        "settings": {
-            "motor_direction": DIRECTION.get(g(0x0B), g(0x0B)),
-            "comm_timing": TIMING.get(g(0x15), g(0x15)),
-            "demag_compensation": DEMAG.get(g(0x1F), g(0x1F)),
-            "startup_power_min": g(0x04),
-            "startup_power_max": g(0x07),
-            "startup_beep": g(0x05),
-            "pwm_frequency": g(0x0A),
-            "beep_strength": g(0x1B),
-            "beacon_strength": g(0x1C),
-            "beacon_delay": g(0x1D),
-            "temperature_protection": g(0x23),
-            "low_rpm_power_protection": g(0x24),
-            "brake_on_stop": g(0x27),
-        },
-        "raw_hex": raw.hex().upper(),
-    }
-
-
-def _emit_yaml(d: dict) -> str:
-    if yaml:
-        return yaml.safe_dump(d, sort_keys=False, default_flow_style=False)
-    def q(v):
-        if isinstance(v, str):                      # always quote strings so '#', ':', '0.21'
-            return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
-        return v
-    def rec(o, ind=0):
-        out = []
-        pad = "  " * ind
-        for k, v in o.items():
-            if isinstance(v, dict):
-                out.append(f"{pad}{k}:")
-                out.append(rec(v, ind + 1))
-            else:
-                out.append(f"{pad}{k}: {q(v)}")
-        return "\n".join(out)
-    return rec(d) + "\n"
-
-
-def load_yaml(path: str) -> dict:
-    if yaml:
-        with open(path, encoding="utf-8") as fh:
-            return yaml.safe_load(fh) or {}
-    # minimal fallback for our own 2-level export format (key: value, one nesting level)
-    root: dict = {}
-    cur = root
-    for raw in open(path, encoding="utf-8"):
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        indent = len(raw) - len(raw.lstrip())
-        key, _, val = raw.strip().partition(":")
-        key, val = key.strip(), val.strip()
-        if val == "":
-            cur = root[key] = {}
-        else:
-            if val[0] in "\"'":                       # quoted string (keep as-is, drop trailer)
-                q = val[0]
-                end = val.find(q, 1)
-                val = val[1:end] if end > 0 else val[1:]
-            else:
-                cpos = val.find(" #")                 # strip an inline comment
-                if cpos >= 0:
-                    val = val[:cpos].rstrip()
-                try:
-                    val = int(val)
-                except ValueError:
-                    pass
-            (cur if indent else root)[key] = val
-    return root
+# Re-exported for backward compatibility (autocal.py / tune_sine_amp.py import these from here).
+from pico_esc.config import (  # noqa: E402,F401
+    DIRECTION, TIMING, DEMAG, MODE, FIELD_OFF, FIELD_ENUM, NAME_OFF, NAME_LEN,
+    MAX_ERPM_UNITS, SINE_CROSS_UP_ERPM_PER_UNIT, SINE_CROSS_DN_ERPM_NUM,
+    SINE_CROSS_DN_MAX_BYTE, SINE_CROSS_TICKS_MIN, SINE_CROSS_TICKS_MAX,
+    SINE_CROSS_UP_ERPM_MIN, SINE_CROSS_UP_ERPM_MAX, sine_crossover_bytes,
+    encode_value, encode_overrides, overrides_str, _tag, decode, _emit_yaml, load_yaml, yaml,
+)
+from pico_esc.link import RPI_VID, find_pico, EscHost  # noqa: E402,F401
+from pico_esc.flash import (  # noqa: E402,F401
+    APP_END, EEPROM_BASE, BOOT_BASE, SIG_FOR_MCU, parse_hex, hex_tag, _pages_from,
+)
 
 
 def _finish(dev: EscHost, index: int, run: bool):
@@ -259,6 +81,21 @@ def cmd_set(dev: EscHost, args):
         if not v:
             sys.exit(f"bad assignment '{kv}' (want key=value)")
         settings[k.strip()] = v.strip()
+    if getattr(args, "sine_crossover_erpm", None):
+        parts = args.sine_crossover_erpm.split(",")
+        if len(parts) != 2:
+            sys.exit("--sine-crossover-erpm expects UP,DN (two eRPM values, comma-separated)")
+        try:
+            up_erpm, dn_erpm = float(parts[0]), float(parts[1])
+            cross_up, cross_dn = sine_crossover_bytes(up_erpm, dn_erpm)
+        except ValueError as e:
+            sys.exit(f"--sine-crossover-erpm: {e}")
+        settings["sine_cross_up"] = cross_up
+        settings["sine_cross_dn"] = cross_dn
+        up_eff = cross_up * SINE_CROSS_UP_ERPM_PER_UNIT
+        dn_eff = SINE_CROSS_DN_ERPM_NUM / cross_dn
+        print(f"sine crossover: up Cross_Up=0x{cross_up:02X} (~{up_eff:.0f} eRPM), "
+              f"dn Cross_Dn=0x{cross_dn:02X} (~{dn_eff:.0f} eRPM)")
     ovs = encode_overrides(settings)
     for i in resolve_indices(dev, args.index):
         _apply_overrides(dev, i, ovs)
@@ -292,60 +129,6 @@ def cmd_connect(dev: EscHost, args):
 def cmd_run(dev: EscHost, args):
     dev.cmd("disconnect")
     print("released bootloader session; ESC(s) restarted.")
-
-
-APP_END, EEPROM_BASE, BOOT_BASE = 0x1A00, 0x1A00, 0x1C00
-# MCU-tag fragment -> signature. Mirror of lib/blheli_bl kMcuTable (keep in sync when adding MCUs).
-SIG_FOR_MCU = {"B10": "E8B1", "B21": "E8B2", "B51": "E8B5"}
-
-
-def parse_hex(path: str):
-    """Intel-HEX -> (app{addr:byte} <0x1A00, ident{addr:byte} 0x1A00..0x1BFF, boot_byte_count)."""
-    app, ident, boot, upper = {}, {}, 0, 0
-    for ln in open(path, encoding="utf-8"):
-        ln = ln.strip()
-        if not ln.startswith(":"):
-            continue
-        rec = bytes.fromhex(ln[1:])
-        if sum(rec) & 0xFF:
-            raise ValueError(f"bad checksum: {ln}")
-        bc, addr, tt, data = rec[0], (rec[1] << 8) | rec[2], rec[3], rec[4:4 + rec[0]]
-        if tt == 4:
-            upper = (data[0] << 8) | data[1]
-        elif tt == 0:
-            for k, b in enumerate(data):
-                a = (upper << 16) | (addr + k)
-                if a < APP_END:
-                    app[a] = b
-                elif a < BOOT_BASE:
-                    ident[a] = b
-                else:
-                    boot += 1
-    return app, ident, boot
-
-
-def hex_tag(ident: dict, off: int) -> str:
-    s = bytearray()
-    for j in range(16):
-        b = ident.get(EEPROM_BASE + off + j, 0xFF)
-        if b in (0, 0xFF):
-            break
-        s.append(b)
-    return s.decode("ascii", "replace").rstrip()
-
-
-def _pages_from(app: dict, ident: dict) -> dict:
-    """Assemble {page_addr: bytearray(512)} for the app pages plus the config page (firmware
-    defaults from the HEX's eeprom section -> auto-applied config)."""
-    pages: dict[int, bytearray] = {}
-    for a, b in app.items():
-        pages.setdefault(a & ~0x1FF, bytearray(b"\xff" * 512))[a & 0x1FF] = b
-    if ident:
-        buf = bytearray(b"\xff" * 512)
-        for a, b in ident.items():
-            buf[a - EEPROM_BASE] = b
-        pages[EEPROM_BASE] = buf
-    return pages
 
 
 def cmd_flash(dev: EscHost, args):
@@ -440,7 +223,10 @@ def main():
     rd.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
     st = sub.add_parser("set", help="change settings on an ESC (index or 'all')")
     st.add_argument("index", help="ESC index or 'all'")
-    st.add_argument("assign", nargs="+", help="e.g. motor_direction=Reversed beep_strength=60")
+    st.add_argument("assign", nargs="*", help="e.g. motor_direction=Reversed beep_strength=60")
+    st.add_argument("--sine-crossover-erpm", metavar="UP,DN",
+                    help="set sine<->BEMF crossover from two eRPM values (up,down); down must be "
+                         "below up. Converts to the Cross_Up/Cross_Dn bytes with validation.")
     st.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
     ap_ = sub.add_parser("apply", help="apply a YAML profile (index or 'all')")
     ap_.add_argument("index", help="ESC index or 'all'")
