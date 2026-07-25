@@ -87,6 +87,12 @@ public:
 		return sign * pts_[n_ - 1].thrust;                          // unreachable (guarded above)
 	}
 
+	// Re-point the curve at runtime (e.g. after `motor <kv> <pp> <v>` regenerates the buffer via
+	// MotorModel::fillProfile into the SAME caller-owned array). The profile object is stable, so a
+	// VelocityController holding a reference to it transparently picks up the new curve. pts must stay
+	// monotone (thrust strictly increasing, rpm non-decreasing).
+	void setPoints(const CurvePoint* pts, int n) { pts_ = pts; n_ = n; }
+
 	float maxRpm() const { return pts_[n_ - 1].rpm; }
 	int   polePairs() const { return pole_pairs_; }
 	bool  hasCrossover() const { return cx_ != nullptr; }
@@ -142,7 +148,12 @@ struct EscIo {
 // ---------------------------------------------------------------------------------------------------
 class VelocityController {
 public:
-	VelocityController(EscIo& io, const SpeedProfile& profile) : io_(io), profile_(profile) {}
+	VelocityController(EscIo& io, const SpeedProfile& profile) : io_(io), profile_(&profile) {}
+
+	// Swap the FF curve at runtime (e.g. after `motor <kv> <pp> <v>` regenerates it via MotorModel).
+	// The profile object must outlive the controller. With SpeedProfile::setPoints this makes the Pico
+	// velocity loop reconfigurable from serial without recompiling.
+	void setProfile(const SpeedProfile& p) { profile_ = &p; }
 
 	// --- tunables: set directly in main (esc1.kp = 0.03f;). Defaults = sim-tuned DEFAULT_GAINS. ---
 	float kp        = DEFAULT_GAINS.kp;
@@ -168,8 +179,8 @@ public:
 	// and no down_catch, a drop from above the seam to below it routes the setpoint through ~0 first
 	// (re-acquire from below) rather than dropping across the handoff. Inert otherwise.
 	void setTarget(float rpm) {
-		if (profile_.hasCrossover() && !profile_.downCatch()
-		    && profile_.regime(rpm) == Regime::SINE && profile_.regime(setpoint_) == Regime::LINE) {
+		if (profile_->hasCrossover() && !profile_->downCatch()
+		    && profile_->regime(rpm) == Regime::SINE && profile_->regime(setpoint_) == Regime::LINE) {
 			pending_ = rpm; have_pending_ = true; target_ = 0.0f;
 		} else {
 			have_pending_ = false; target_ = rpm;
@@ -205,7 +216,7 @@ public:
 
 		// A staged (line->sine) target promotes once we have descended to ~0 / dropped below the seam.
 		if (have_pending_ && (fabsf(setpoint_) < 1.0f
-		                      || (!live_ && profile_.regime(sp) == Regime::SINE))) {
+		                      || (!live_ && profile_->regime(sp) == Regime::SINE))) {
 			target_ = pending_; have_pending_ = false;
 		}
 
@@ -232,7 +243,7 @@ public:
 		if (w_ <= 0.0f) i_ = 0.0f;
 
 		// -- feed-forward + blended PI trim --
-		float ff = profile_.thrustFor(sp);
+		float ff = profile_->thrustFor(sp);
 		float trim = closedLoopTrim(sp, dt);
 		float applied = w_ * trim;
 		float cmd = ff + applied;
@@ -260,7 +271,7 @@ public:
 		// live telemetry) yet the command is still driving into that region and telemetry never went
 		// live -> the ESC failed to reach 6-step.
 		float floor;
-		bool commanding_line = profile_.lineFloor(floor) && fabsf(sp) >= floor
+		bool commanding_line = profile_->lineFloor(floor) && fabsf(sp) >= floor
 		                       && (float)abs(sent) >= fabsf(ff) - trim_max;
 		if (commanding_line && !live_) {
 			stale_accum_ += dt;
@@ -321,13 +332,13 @@ private:
 	}
 	float effectiveOverSpeed() const {
 		if (over_speed_rpm > 0.0f) return over_speed_rpm;
-		float twice = 2.0f * profile_.maxRpm();
+		float twice = 2.0f * profile_->maxRpm();
 		return twice > 1200.0f ? twice : 1200.0f;
 	}
 	static float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
 	EscIo&             io_;
-	const SpeedProfile& profile_;
+	const SpeedProfile* profile_;
 
 	// --- state (no static/global mutable state) ---
 	float target_ = 0.0f, setpoint_ = 0.0f;
