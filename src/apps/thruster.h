@@ -19,6 +19,7 @@
 #include "esc_config.h"
 #include "esc_session.h"
 #include "vel_control.h"
+#include "motor_model.h"
 #include "profiles.h"
 
 // An rpm whose telemetry stamp is older than this = stale (forced sine / dropout) — the PI authority
@@ -82,6 +83,18 @@ public:
 	// The declaring side may still override any field afterward (th.vc.slew_rpm_s = ...).
 	void applyGains(const vel::Gains& g) { vc.kp = g.kp; vc.ki = g.ki; vc.trim_max = g.trim_max; vc.blend_secs = g.blend_secs; }
 
+	// Regenerate the feed-forward curve PARAMETRICALLY from motor KV + pole-pairs + supply V (the
+	// parametric vel::MotorModel) and switch the controller onto it — the runtime `motor <i> <kv> <pp>
+	// <v>` path. No recompile, no bench sweep: KV+PP+V predict the curve (RMSE ~12 rpm), and an eRPM
+	// self-cal can refine it later. The owned ffprof_/ffbuf_ outlive vc, so setProfile is safe.
+	void setMotor(float kv, int polePairs, float vSupply) {
+		mm_.set(kv, polePairs, vSupply);
+		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])));
+		if (n < 2) return;
+		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs);
+		vc.setProfile(ffprof_);
+	}
+
 	bool        armed()      { return escs::spinArmed(index_); }
 	bool        reversible() { return escs::spinReversible(index_); }
 	const char* spinMode()   { return escs::spinMode(index_); }
@@ -143,4 +156,9 @@ private:
 	uint8_t  index_      = 0;
 	Submode  submode_    = RAW;
 	uint32_t lastStepUs_ = 0;
+	// Owned FF curve for the parametric `motor` path: MotorModel::fillProfile writes ffbuf_, ffprof_
+	// references it, and vc.setProfile(ffprof_) swaps the controller onto it. Untouched until setMotor.
+	vel::CurvePoint   ffbuf_[24];
+	vel::SpeedProfile ffprof_{ffbuf_, 0, 7};
+	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF
 };
