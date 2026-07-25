@@ -33,3 +33,10 @@ debug/
 # generated autocal outputs
 host/reports/
 host/profiles/*_autocal.yaml
+
+# generated sysid/sim intermediates (regenerable via host/sysid.py etc.)
+host/models/
+host/profiles/*_smoke_sysid.yaml
+host/profiles/simcheck_sysid.yaml
+host/profiles/wrongKV*.yaml
+.vscode/
