@@ -95,6 +95,15 @@ public:
 		vc.setProfile(ffprof_);
 	}
 
+	// ESC perception (soft-sensor): infer effective supply voltage + a relative load signal from the
+	// LIVE command + measured 6-step tele rpm — no voltage/current/force sensor. senseVoltage ~= battery
+	// V at light load; senseLoad = (Vref - Vest) grows with current => torque => thrust (relative). 0
+	// outside 6-step (needs live BEMF tele). Set the motor first with setMotor()/`motor`.
+	float senseVoltage() { return senseValid_ ? vestFilt_ : 0.0f; }         // gated + low-passed
+	float senseLoad()    { return senseValid_ ? (mm_.voltage() - vestFilt_) : 0.0f; }
+	float senseVref()    { return mm_.voltage(); }
+	bool  senseValid()   { return senseValid_; }                            // false = not BEMF-live 6-step
+
 	bool        armed()      { return escs::spinArmed(index_); }
 	bool        reversible() { return escs::spinReversible(index_); }
 	const char* spinMode()   { return escs::spinMode(index_); }
@@ -128,6 +137,16 @@ public:
 			Serial.printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
 			              index_, (int)st);
 		}
+		// SOFT-SENSOR update: sample the voltage estimate ONLY when the loop is BEMF-live (real 6-step).
+		// In forced sine / startup the eRPM is virtual (~182) so the estimate is garbage -> mark invalid.
+		// Low-pass the live estimate (tele is quantized) so `sense` reads a clean, gated value.
+		if (vc.live()) {
+			float ve = mm_.estimateV((float)vc.command(), vc.measured());
+			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
+			senseValid_ = true;
+		} else {
+			senseValid_ = false;
+		}
 	}
 
 	// ---- io adapter: the ONLY place that knows escs:: telemetry -> vel::EscIo. Reads owner->index_. --
@@ -160,5 +179,7 @@ private:
 	// references it, and vc.setProfile(ffprof_) swaps the controller onto it. Untouched until setMotor.
 	vel::CurvePoint   ffbuf_[24];
 	vel::SpeedProfile ffprof_{ffbuf_, 0, 7};
-	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF
+	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF + the soft-sensor
+	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
+	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
 };
