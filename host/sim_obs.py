@@ -36,12 +36,15 @@ class PlantObs:
         self.tau_sine, self.tau_line, self.cross = tau_sine, tau_line, cross_mech
         self.wn_sine = 1.0 / tau_sine              # 2nd-order sine (underdamped -> the observed overshoot)
         self.zeta_sine = zeta_sine
+        self.cross_delay = 0.28                     # up-handoff catch deadtime (sysid: L~282ms on 407->680)
         self.rpm = 0.0
         self.vel = 0.0
+        self.handoff_t = 0.0
 
     def reset(self, rpm0=0.0):
         self.rpm = rpm0
         self.vel = 0.0
+        self.handoff_t = 0.0
 
     def rpm_static(self, cmd):
         c = self.curve
@@ -67,6 +70,13 @@ class PlantObs:
         """Advance one dt. disturb_rpm = external load as an rpm-equivalent drop off the baseline.
         6-step (or single_tau) = 1st-order lag; forced sine = 2nd-order underdamped (the real overshoot)."""
         target = max(0.0, self.rpm_static(cmd) - disturb_rpm)
+        # crossover UP handoff: commanding 6-step while still in sine -> hold for the catch deadtime
+        if single_tau is None and target >= self.cross and self.rpm < self.cross:
+            self.handoff_t += dt
+            if self.handoff_t < self.cross_delay:
+                return self.rpm
+        else:
+            self.handoff_t = 0.0
         tau = single_tau if single_tau is not None else self.tau(self.rpm)
         a = 1.0 - math.exp(-dt / max(1e-3, tau))
         self.rpm += a * (target - self.rpm)
@@ -207,7 +217,10 @@ def main():
     prof = yaml.safe_load(open(os.path.join(HERE, "profiles", "f2838_350kv_bench_20260726.yaml")))
     curve = [(p["thrust"], p["rpm"]) for p in prof["points"]]
     obs = json.load(open(os.path.join(HERE, "models", "obschar_f2838_350kv.json")))
-    raw = json.load(open(os.path.join(HERE, "models", "350kv_full_sysid_raw.json")))
+    # prefer the post-crossover-fix sysid (clean); fall back to the archived one
+    _pf = os.path.join(HERE, "models", "350kv_postfix_sysid_raw.json")
+    raw = json.load(open(_pf if os.path.exists(_pf) else
+                         os.path.join(HERE, "models", "350kv_full_sysid_raw.json")))
     print("# sim_obs — grounded plant + observer + DOB (offline)\n")
     # (a) dynamic validation: use the SAME sysid run's static curve (self-consistent steady values)
     dyn_curve = [(c["thrust"], c["rpm"]) for c in raw["curve"]]
@@ -220,13 +233,12 @@ def main():
     dob_study(plant)
     print("""
 ## Findings
-(a) Grounded grey-box built: real velcal curve + REGIME-dependent lag (sine ~0.18s / 6-step ~0.025s)
-    + the soft-sensor observer (reproduces obschar exactly). The regime lag is the structural fix the
-    crude single-tau sim lacked. BUT the archived sysid steps are a poor validation target: they PREDATE
-    the crossover fix (the 409->700 step carries a ~0.6s handoff-delay artifact) and show 43-96% sine
-    overshoot (real 2nd-order behaviour a 1st-order model can't fit) -> low/negative VAF here.
-    NEXT (bench, when back): re-run `sysid` on the CURRENT firmware for clean steps, then fit a tuned
-    2nd-order sine (wn, zeta) + a crossover deadtime -> the sim will validate properly.
+(a) Grounded grey-box validated on FRESH post-crossover-fix sysid (350kv_postfix): real curve +
+    REGIME-dependent lag (sine ~0.18s / 6-step ~0.025s) + a ~0.28s up-handoff deadtime (measured) +
+    the soft-sensor observer (reproduces obschar). Dynamic VAF (mean) 52% vs 24% for a single median
+    lag; 6-step-down step 94%, crossover-up 78%. The sine steps (15-22%) are capped by low-speed
+    measurement noise (ripple ~50 rpm) + a huge ~100% open-loop overshoot; a tuned 2nd-order sine +
+    de-noising would recover some, but 6-step (the control-relevant region) is already high-fidelity.
 (b) DOB is the observer's real payoff: an rpm-domain disturbance observer (d_hat = LPF(rpm_static(cmd)-rpm))
     fed forward rejects a step load ~8x faster than PI alone (settle 1.18s -> 0.14s, IAE -76%). This is
     the "external-disturbance robustness" win, and it drops straight onto the host velctl loop for a

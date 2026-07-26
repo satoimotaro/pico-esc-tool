@@ -1,0 +1,24 @@
+motor: 350kv_postfix
+pole_pairs: 9
+source: bench-sysid
+points:
+- thrust: 65.0
+  rpm: 39.1
+- thrust: 133.0
+  rpm: 61.1
+- thrust: 202.0
+  rpm: 84.8
+- thrust: 270.0
+  rpm: 108.1
+- thrust: 338.0
+  rpm: 131.3
+- thrust: 407.0
+  rpm: 155.3
+- thrust: 475.0
+  rpm: 177.2
+- thrust: 543.0
+  rpm: 794.4
+- thrust: 612.0
+  rpm: 1510.4
+- thrust: 680.0
+  rpm: 2212.7

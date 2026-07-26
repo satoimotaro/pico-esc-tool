@@ -1,0 +1,118 @@
+{
+  "name": "350kv_postfix",
+  "generated": "2026-07-27T00:15:03",
+  "supply_v": 11.2,
+  "pole": {
+    "enc_rpm": 134.70626666666666,
+    "tele_rpm": 182,
+    "configured_pp": 7,
+    "real_pp": 9.457614938973391,
+    "nearest_pp": 9,
+    "ratio": 1.3510878484247701
+  },
+  "no_load_top_rpm": 2212.7,
+  "deadband_thrust": {
+    "fwd": 65,
+    "rev": null
+  },
+  "static_curve": [
+    {
+      "thrust": 65,
+      "rpm": 39.1
+    },
+    {
+      "thrust": 133,
+      "rpm": 61.1
+    },
+    {
+      "thrust": 202,
+      "rpm": 84.8
+    },
+    {
+      "thrust": 270,
+      "rpm": 108.1
+    },
+    {
+      "thrust": 338,
+      "rpm": 131.3
+    },
+    {
+      "thrust": 407,
+      "rpm": 155.3
+    },
+    {
+      "thrust": 475,
+      "rpm": 177.2
+    },
+    {
+      "thrust": 543,
+      "rpm": 794.4
+    },
+    {
+      "thrust": 612,
+      "rpm": 1510.4
+    },
+    {
+      "thrust": 680,
+      "rpm": 2212.7
+    }
+  ],
+  "dynamic": {
+    "tau_s_median": 0.1673,
+    "K_rpm_per_cmd_median": 3.8446,
+    "delay_s_median": 0.04,
+    "per_step": [
+      {
+        "bias": 65,
+        "target": 407,
+        "r0": 50.5,
+        "r_inf": 153.2,
+        "K_rpm_per_cmd": 0.3003,
+        "tau_s": 0.2077,
+        "delay_s": 0.04,
+        "overshoot_pct": 93.1,
+        "rmse_rpm": 10.84
+      },
+      {
+        "bias": 407,
+        "target": 680,
+        "r0": 193.6,
+        "r_inf": 2210.7,
+        "K_rpm_per_cmd": 7.3889,
+        "tau_s": 0.1268,
+        "delay_s": 0.2815,
+        "overshoot_pct": 1.7,
+        "rmse_rpm": 140.17
+      },
+      {
+        "bias": 680,
+        "target": 407,
+        "r0": 2212.2,
+        "r_inf": 153.9,
+        "K_rpm_per_cmd": 7.5396,
+        "tau_s": 0.0369,
+        "delay_s": 0.0,
+        "overshoot_pct": 2.5,
+        "rmse_rpm": 35.36
+      },
+      {
+        "bias": 407,
+        "target": 65,
+        "r0": 132.4,
+        "r_inf": 38.0,
+        "K_rpm_per_cmd": 0.2761,
+        "tau_s": 0.2077,
+        "delay_s": 0.04,
+        "overshoot_pct": 116.3,
+        "rmse_rpm": 17.97
+      }
+    ]
+  },
+  "sim_seed": {
+    "tau_s": 0.1673,
+    "fullscale_rpm_at_1000cmd": 3254.0,
+    "deadband_thrust_fwd": 65,
+    "note": "first-order rotor lag rpm += (tgt-rpm)*(1-exp(-dt/tau)); compare against sim.py TAU/FULLSCALE_RPM"
+  },
+  "profile_yaml": "/home/satoimo/UWR_ESC_ws/pico-esc-tool/host/profiles/350kv_postfix_sysid.yaml"
+}
