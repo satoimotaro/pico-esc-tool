@@ -1,0 +1,40 @@
+motor: f2838_350kv
+pole_pairs: 7
+source: parametric KV=350 V=11.1 eff=0.997
+points:
+- thrust: 60.0
+  rpm: 21.4
+- thrust: 178.0
+  rpm: 63.7
+- thrust: 297.0
+  rpm: 105.9
+- thrust: 415.0
+  rpm: 148.2
+- thrust: 534.0
+  rpm: 190.5
+- thrust: 546.0
+  rpm: 832.3
+- thrust: 559.0
+  rpm: 963.8
+- thrust: 572.0
+  rpm: 1095.2
+- thrust: 585.0
+  rpm: 1226.7
+- thrust: 598.0
+  rpm: 1358.1
+- thrust: 610.0
+  rpm: 1489.6
+- thrust: 623.0
+  rpm: 1621.0
+- thrust: 636.0
+  rpm: 1752.5
+- thrust: 649.0
+  rpm: 1883.9
+- thrust: 662.0
+  rpm: 2015.4
+- thrust: 674.0
+  rpm: 2146.9
+- thrust: 687.0
+  rpm: 2278.3
+- thrust: 700.0
+  rpm: 2409.8
