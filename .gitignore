@@ -40,3 +40,4 @@ host/profiles/*_smoke_sysid.yaml
 host/profiles/simcheck_sysid.yaml
 host/profiles/wrongKV*.yaml
 .vscode/
+host/vbatt_cal.json
