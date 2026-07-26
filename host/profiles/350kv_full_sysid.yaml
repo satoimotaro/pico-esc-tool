@@ -1,0 +1,28 @@
+motor: 350kv_full
+pole_pairs: 8
+source: bench-sysid
+points:
+- thrust: 60.0
+  rpm: 38.3
+- thrust: 118.0
+  rpm: 56.9
+- thrust: 176.0
+  rpm: 76.7
+- thrust: 235.0
+  rpm: 95.9
+- thrust: 293.0
+  rpm: 115.7
+- thrust: 351.0
+  rpm: 136.1
+- thrust: 409.0
+  rpm: 156.1
+- thrust: 467.0
+  rpm: 174.4
+- thrust: 525.0
+  rpm: 601.1
+- thrust: 584.0
+  rpm: 1138.6
+- thrust: 642.0
+  rpm: 1684.2
+- thrust: 700.0
+  rpm: 2220.0

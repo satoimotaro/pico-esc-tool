@@ -1,0 +1,20 @@
+motor: 350kv_sine
+pole_pairs: 7
+source: bench-sysid
+points:
+- thrust: 65.0
+  rpm: 36.5
+- thrust: 177.0
+  rpm: 77.5
+- thrust: 289.0
+  rpm: 115.4
+- thrust: 401.0
+  rpm: 152.6
+- thrust: 514.0
+  rpm: 190.1
+- thrust: 626.0
+  rpm: 229.2
+- thrust: 738.0
+  rpm: 264.3
+- thrust: 850.0
+  rpm: 300.6
