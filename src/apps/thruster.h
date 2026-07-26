@@ -66,7 +66,7 @@ public:
 	void release()                                      { escs::release(); }
 
 	// ---- drive ----
-	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; }
+	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; senseVref_ = 0.0f; }
 	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
 	void setRaw(int v) {
@@ -101,6 +101,17 @@ public:
 		vc.setProfile(ffprof_);
 	}
 
+	// ESC perception (soft-sensor): infer effective supply voltage + a relative load signal from the
+	// LIVE command + measured 6-step tele rpm — no voltage/current/force sensor. senseVoltage ~= battery
+	// V at light load; senseLoad = (Vref - Vest) grows with current => torque => thrust (relative). 0
+	// outside 6-step (needs live BEMF tele). Set the motor first with setMotor()/`motor`.
+	float senseVoltage() { return senseValid_ ? vestFilt_ : 0.0f; }         // gated + low-passed
+	// [#7.1] load = deviation from the LEARNED light-load reference (0 until it settles), not the typed V.
+	float senseLoad()    { return (senseValid_ && senseVref_ > 0.0f) ? (senseVref_ - vestFilt_) : 0.0f; }
+	float senseVref()    { return senseVref_; }                             // learned no-load V_eff (0 = not yet)
+	void  senseZero()    { if (senseValid_) senseVref_ = vestFilt_; }        // re-baseline the reference on command
+	bool  senseValid()   { return senseValid_; }                            // false = not BEMF-live 6-step
+
 	bool        armed()      { return escs::spinArmed(index_); }
 	bool        reversible() { return escs::spinReversible(index_); }
 	const char* spinMode()   { return escs::spinMode(index_); }
@@ -134,6 +145,19 @@ public:
 			Serial.printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
 			              index_, (int)st);
 		}
+		// SOFT-SENSOR update: sample the voltage estimate ONLY when the loop is BEMF-live (real 6-step).
+		// In forced sine / startup the eRPM is virtual (~182) so the estimate is garbage -> mark invalid.
+		// Low-pass the live estimate (tele is quantized) so `sense` reads a clean, gated value.
+		if (vc.live()) {
+			float ve = mm_.estimateV((float)vc.command(), vc.measured());
+			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
+			senseValid_ = true;
+		} else {
+			senseValid_ = false;
+		}
+		// [#7.1] The no-load REFERENCE is captured on command via `sense <i> zero` (senseZero()) at a
+		// known steady light-load operating point — NOT the typed supply V (which read ~-2.2 V under
+		// no load and needed the operator to measure the battery). load stays 0 until baselined.
 	}
 
 	// ---- io adapter: the ONLY place that knows escs:: telemetry -> vel::EscIo. Reads owner->index_. --
@@ -169,5 +193,8 @@ private:
 	// once `motor` swaps the curve in. up==dn==the firmware handoff floor (mech = HANDOFF_ERPM/pp).
 	vel::Crossover    ffcx_{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
 	vel::SpeedProfile ffprof_{ffbuf_, 2, 7, &ffcx_};
-	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF
+	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF + the soft-sensor
+	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
+	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
+	float             senseVref_ = 0.0f;       // [#7.1] no-load V_eff reference (0 = not baselined; set via `sense zero`)
 };

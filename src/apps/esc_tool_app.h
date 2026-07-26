@@ -512,6 +512,11 @@ private:
 					else if(th_[i]->armed()) Serial.println("err motor: disarm first (replaces the FF curve)");
 				else { th_[i]->setMotor(kvf, ppi, vvf);
 					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s\n", i, kv, pp, vv); Serial.println("ok"); } }
+			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
+				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero])");
+					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseValid()) Serial.println("err sense-zero: not BEMF-live (spin steady into 6-step first)"); else { th_[i]->senseZero(); Serial.printf("sense|%d|zeroed vref=%.2f\n", i, th_[i]->senseVref()); Serial.println("ok"); } }
+				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad();
+					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|valid=%d\n", i, ve, vr, ld, th_[i]->senseValid()?1:0); Serial.println("ok"); } }
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
 				if(i<0||i>=n_||!v) Serial.println("err bad-args");
