@@ -132,6 +132,22 @@ A host-side closed-loop **shaft-position** servo using an **AS5600** encoder on 
 low speed. `python host/posctl.py move --deg 720` (add `--dry-run` for a hardware-free smoke test).
 The encoder is a **calibration/position instrument** — the RPM closed loop above is sensorless.
 
+## ESC soft-sensor (voltage + load, no extra sensors)
+
+Infer **effective supply voltage** and a **relative load/thrust** signal from just the DShot telemetry
+RPM + the motor model — no voltage, current, or force sensor. `V_eff = rpm/(KV·duty) = V_supply −
+I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
+
+```
+motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
+sense 1                                   # -> sense|1|vest=..|vref=..|load=..|valid=..
+sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
+python host/vbatt.py calibrate --known-v 11.2   # one-time (per motor+config); host/vbatt.py monitor -> V_batt
+```
+
+Rough battery gauge (max-over-time ≈ supply, ~1 % after one calibration) + fouled-prop / entanglement
+load detection. Only valid while spinning in live 6-step. **Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).**
+
 ## Requirements
 
 - **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults GP10, GP11) with common
