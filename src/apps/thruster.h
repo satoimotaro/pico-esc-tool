@@ -91,7 +91,13 @@ public:
 		mm_.set(kv, polePairs, vSupply);
 		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])));
 		if (n < 2) return;
-		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs);
+		// [#6.1] keep the engine's pole count in sync with the new curve — tele mech-rpm is eRPM/pp,
+		// so a differing pp (the whole point of `motor`) would otherwise scale the feedback wrong.
+		poles_ = (uint8_t)(polePairs * 2);
+		escs::setPoles(index_, poles_);
+		// [#6.3] reconstruct WITH the crossover metadata (&ffcx_) so hasCrossover()/lineFloor() stay
+		// live — otherwise the "commanded 6-step but tele never went live" ABORT_STALL goes inert.
+		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs, &ffcx_);
 		vc.setProfile(ffprof_);
 	}
 
@@ -158,7 +164,10 @@ private:
 	uint32_t lastStepUs_ = 0;
 	// Owned FF curve for the parametric `motor` path: MotorModel::fillProfile writes ffbuf_, ffprof_
 	// references it, and vc.setProfile(ffprof_) swaps the controller onto it. Untouched until setMotor.
-	vel::CurvePoint   ffbuf_[24];
-	vel::SpeedProfile ffprof_{ffbuf_, 0, 7};
+	vel::CurvePoint   ffbuf_[24] = {{0.0f, 0.0f}, {1.0f, 0.1f}};  // 2-pt stub until setMotor (no OOB read)
+	// FF regime metadata attached to ffprof_ so hasCrossover()/lineFloor() (=> ABORT_STALL) stay live
+	// once `motor` swaps the curve in. up==dn==the firmware handoff floor (mech = HANDOFF_ERPM/pp).
+	vel::Crossover    ffcx_{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
+	vel::SpeedProfile ffprof_{ffbuf_, 2, 7, &ffcx_};
 	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF
 };

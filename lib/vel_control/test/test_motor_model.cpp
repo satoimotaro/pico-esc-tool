@@ -68,6 +68,13 @@ int main() {
 	// ESC config recipe is the KV-independent working one
 	CHECK(a.crossUpByte() == 34 && a.crossDnByte() == 255, "esc config bytes");
 
+	// soft-sensor: estimateV inverts rpm6step back to the supply voltage (a=350/7/11.1, eff=1)
+	float cmdE = 600.0f, rpmE = a.rpm6step(cmdE);
+	NEAR(a.estimateV(cmdE, rpmE), 11.1f, 0.1f, "estimateV recovers supply V");
+	NEAR(a.estimateLoad(cmdE, rpmE), 0.0f, 0.1f, "estimateLoad ~0 at model rpm");
+	CHECK(a.estimateLoad(cmdE, rpmE * 0.9f) > 0.5f, "estimateLoad > 0 under droop");   // slower than model => load
+	CHECK(a.estimateV(0.0f, 0.0f) == 0.0f, "estimateV 0 outside live 6-step");         // no BEMF -> invalid
+
 	printf(fails ? "\n%d CHECK(s) FAILED\n" : "\nall motor_model checks passed\n", fails);
 	return fails ? 1 : 0;
 }

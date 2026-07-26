@@ -39,3 +39,4 @@ jobs:
         run: |
           cd lib/vel_control/test
           g++ -std=c++17 -O2 -Wall -o /tmp/tvc test_vel_control.cpp && /tmp/tvc
+          g++ -std=c++17 -O2 -Wall -o /tmp/tmm test_motor_model.cpp && /tmp/tmm
