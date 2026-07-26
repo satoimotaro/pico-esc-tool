@@ -38,6 +38,7 @@ namespace vel {
 static const float TELE_MIN_MECH_RPM = 50.0f;
 static const float VEL_DT_DEFAULT     = 0.02f;   // dt fallback when a caller passes <=0 (50 Hz)
 static const float W_BACKCALC_FLOOR   = 0.1f;    // outer-clamp back-calc only above this authority
+static const float DOB_LIVE_FLOOR     = 0.9f;    // DOB engages only when liveness is (near) fully established
 
 // Built-in PI gains — the single default shared with the constructor below. These are the SIM-tuned
 // values; a real motor's plant gain is ~30x higher (930KV 6-step ~23 mech RPM per command-unit), so
@@ -85,6 +86,31 @@ public:
 			}
 		}
 		return sign * pts_[n_ - 1].thrust;                          // unreachable (guarded above)
+	}
+
+	// Forward map (thrust -> mech RPM): the inverse of thrustFor, used by the DOB to predict the rpm a
+	// command SHOULD produce (the deficit vs measured = the disturbance). Same odd-symmetric interp.
+	float rpmFor(float thrust) const {
+		float sign = thrust < 0 ? -1.0f : 1.0f;
+		float a = fabsf(thrust);
+		if (a <= pts_[0].thrust)      return sign * pts_[0].rpm;
+		if (a >= pts_[n_ - 1].thrust) return sign * pts_[n_ - 1].rpm;
+		for (int i = 0; i + 1 < n_; i++) {
+			float t0 = pts_[i].thrust, t1 = pts_[i + 1].thrust;
+			if (t0 <= a && a <= t1) {
+				if (t1 == t0) return sign * pts_[i].rpm;
+				float frac = (a - t0) / (t1 - t0);
+				return sign * (pts_[i].rpm + frac * (pts_[i + 1].rpm - pts_[i].rpm));
+			}
+		}
+		return sign * pts_[n_ - 1].rpm;
+	}
+
+	// Local gain drpm/dthrust at a command (>= a small floor), to convert a DOB rpm deficit into a
+	// command compensation. Clamped positive so a plateau can't blow up the compensation.
+	float rpmSlopeAt(float thrust, float h = 10.0f) const {
+		float s = (rpmFor(fabsf(thrust) + h) - rpmFor(fabsf(thrust) - h)) / (2.0f * h);
+		return s > 0.05f ? s : 0.05f;
 	}
 
 	// Re-point the curve at runtime (e.g. after `motor <kv> <pp> <v>` regenerates the buffer via
@@ -166,6 +192,16 @@ public:
 	// rides the same liveness fade as the PI (contributes 0 in forced sine). 0 => disabled (default).
 	float kd        = 0.0f;
 	float d_tau     = 0.04f;    // derivative low-pass time constant (s)
+	// Disturbance observer (DOB): d_hat = LPF(rpmFor(last cmd) - measured mech RPM) — the deficit vs the
+	// profile's forward prediction IS the load disturbance (fouled prop / flow / entanglement). Fed back
+	// as command compensation (dob * d_hat / local-gain), it rejects load steps far faster than the PI
+	// integral alone. Rides the same liveness fade as the PI (0 in forced sine). 0 => disabled (default,
+	// opt-in). Set per-motor (esc1.dob = 0.6f;) or over serial (gain <i> dob 0.6).
+	float dob       = 0.0f;
+	float dob_tau   = 0.08f;    // DOB low-pass time constant (s)
+	float dob_max   = 150.0f;   // clamp on the DOB command compensation — a MIS-calibrated FF makes the
+	                            // model deficit look like a huge load; this bounds the over-drive (the PI
+	                            // then trims the residual). Use an ACCURATE profile for the full benefit.
 	float slew_rpm_s   = 200.0f;    // setpoint slew rate (keeps the first command gentle)
 	float over_speed_rpm = 0.0f;    // 0 => auto: max(2*maxRpm, 1200)
 	float stop_below_rpm = 0.0f;    // a target at/below this |RPM| is a STOP: command thrust 0 and
@@ -190,7 +226,7 @@ public:
 	// Clear all closed-loop state (integrator/authority/measurement). Call before starting a fresh
 	// run so a re-arm from below the seam starts clean.
 	void reset() {
-		i_ = 0.0f; w_ = 0.0f; have_tele_ = false; tele_mech_ = 0.0f; live_ = false;
+		i_ = 0.0f; w_ = 0.0f; have_tele_ = false; tele_mech_ = 0.0f; live_ = false; d_hat_ = 0.0f;
 		stale_accum_ = 0.0f; last_sent_ = 0; last_applied_ = 0.0f;
 		prev_meas_ = 0.0f; have_prev_meas_ = false; d_filt_ = 0.0f; last_d_ = 0.0f;
 	}
@@ -246,7 +282,19 @@ public:
 		float ff = profile_->thrustFor(sp);
 		float trim = closedLoopTrim(sp, dt);
 		float applied = w_ * trim;
-		float cmd = ff + applied;
+		// -- disturbance-observer compensation (opt-in, dob>0): the deficit between the profile's forward
+		//    prediction for the LAST command and the measured rpm IS the load disturbance; compensate via
+		//    the local gain. Updates only on a live measurement; weight fades with liveness (w_). --
+		float comp = 0.0f;
+		if (dob > 0.0f && live_ && w_ >= DOB_LIVE_FLOOR) {   // only SOLIDLY live (past the catch/fade transient)
+			float d_meas = profile_->rpmFor((float)last_sent_) - tele_mech_;
+			float a = (dob_tau > 0.0f) ? dt / dob_tau : 1.0f; if (a > 1.0f) a = 1.0f;
+			d_hat_ += a * (d_meas - d_hat_);
+			comp = clampf(w_ * dob * d_hat_ / profile_->rpmSlopeAt((float)last_sent_), -dob_max, dob_max);
+		} else {
+			d_hat_ = 0.0f;   // no wound-up estimate from the catch / forced-sine transient
+		}
+		float cmd = ff + applied + comp;
 		int sent = clampCmd(cmd);
 		io_.thrust(sent);
 		last_sent_ = sent; last_applied_ = applied;
@@ -290,6 +338,7 @@ public:
 	float measured() const { return tele_mech_; }        // last live mech RPM (signed); stale if !live()
 	bool  live()     const { return live_; }
 	float authority() const { return w_; }               // PI weight 0..1
+	float dhat()     const { return d_hat_; }             // DOB load estimate (rpm-equivalent)
 
 private:
 	float slew(float dt) {
@@ -343,7 +392,7 @@ private:
 	// --- state (no static/global mutable state) ---
 	float target_ = 0.0f, setpoint_ = 0.0f;
 	float pending_ = 0.0f; bool have_pending_ = false;
-	float i_ = 0.0f, w_ = 0.0f;
+	float i_ = 0.0f, w_ = 0.0f, d_hat_ = 0.0f;
 	float tele_mech_ = 0.0f; bool have_tele_ = false, live_ = false;
 	float prev_meas_ = 0.0f; bool have_prev_meas_ = false; float d_filt_ = 0.0f, last_d_ = 0.0f;
 	float last_sign_ = 1.0f;

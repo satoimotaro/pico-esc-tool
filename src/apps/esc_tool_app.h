@@ -504,7 +504,8 @@ private:
 					if(!strcmp(g,"kp")) th_[i]->vc.kp=fv; else if(!strcmp(g,"ki")) th_[i]->vc.ki=fv;
 					else if(!strcmp(g,"kd")) th_[i]->vc.kd=fv; else if(!strcmp(g,"dtau")) th_[i]->vc.d_tau=fv;
 					else if(!strcmp(g,"trim")) th_[i]->vc.trim_max=fv; else if(!strcmp(g,"slew")) th_[i]->vc.slew_rpm_s=fv;
-					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew)"); continue; }
+					else if(!strcmp(g,"dob")) th_[i]->vc.dob=fv; else if(!strcmp(g,"dobtau")) th_[i]->vc.dob_tau=fv;
+					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"motor")) { int i=argi(); char* kv=strtok(nullptr," "); char* pp=strtok(nullptr," "); char* vv=strtok(nullptr," ");   // motor <i> <kv> <pp> <v>: regenerate the FF curve parametrically (MotorModel)
 				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence
@@ -513,10 +514,13 @@ private:
 				else { th_[i]->setMotor(kvf, ppi, vvf);
 					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s\n", i, kv, pp, vv); Serial.println("ok"); } }
 			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
-				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero])");
+				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero|vcal <V>])");
 					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseValid()) Serial.println("err sense-zero: not BEMF-live (spin steady into 6-step first)"); else { th_[i]->senseZero(); Serial.printf("sense|%d|zeroed vref=%.2f\n", i, th_[i]->senseVref()); Serial.println("ok"); } }
-				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad();
-					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|valid=%d\n", i, ve, vr, ld, th_[i]->senseValid()?1:0); Serial.println("ok"); } }
+					else if(sub && !strcmp(sub,"vcal")) { char* v=strtok(nullptr," "); float kv=v?atof(v):0.0f;   // [vbatt] one-time calibration to a known battery voltage
+						if(kv<=0.0f) Serial.println("err sense-vcal: need a known battery voltage (sense <i> vcal 11.2)");
+						else { th_[i]->senseVcal(kv); Serial.printf("sense|%d|vcal to %.2f V -> vbatt=%.2f\n", i, kv, th_[i]->senseVbatt()); Serial.println("ok"); } }
+				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad(), vb=th_[i]->senseVbatt();
+					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d\n", i, ve, vr, ld, vb, th_[i]->senseValid()?1:0); Serial.println("ok"); } }
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
 				if(i<0||i>=n_||!v) Serial.println("err bad-args");

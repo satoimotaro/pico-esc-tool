@@ -26,6 +26,11 @@
 // then fades and the controller degrades to pure feed-forward.
 static const uint32_t THRUSTER_TELE_FRESH_MS = 100;
 
+// vbatt (resident battery-voltage estimate): gate the rolling max to solid 6-step (above the crossover,
+// where the duty model is accurate), and leak it slowly so it tracks a draining pack.
+static const float THRUSTER_VBATT_RPM_FLOOR = 800.0f;
+static const float THRUSTER_VBATT_DECAY = 2.0e-5f;   // per-poll (~0.001 V/s @ 50 Hz)
+
 class Thruster {
 public:
 	using Info  = escs::Info;
@@ -111,6 +116,10 @@ public:
 	float senseVref()    { return senseVref_; }                             // learned no-load V_eff (0 = not yet)
 	void  senseZero()    { if (senseValid_) senseVref_ = vestFilt_; }        // re-baseline the reference on command
 	bool  senseValid()   { return senseValid_; }                            // false = not BEMF-live 6-step
+	// [vbatt] resident battery-voltage estimate = scale * gated rolling-max of vest (~= supply). One-time
+	// per-motor calibration: senseVcal(known_battery_V) sets the scale so the absolute value tracks.
+	float senseVbatt()   { return vbattScale_ * vbattMax_; }
+	void  senseVcal(float knownV) { if (vbattMax_ > 0.1f) vbattScale_ = knownV / vbattMax_; }
 
 	bool        armed()      { return escs::spinArmed(index_); }
 	bool        reversible() { return escs::spinReversible(index_); }
@@ -152,6 +161,14 @@ public:
 			float ve = mm_.estimateV((float)vc.command(), vc.measured());
 			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
 			senseValid_ = true;
+			// [vbatt] gated rolling-MAX of the estimate ~= supply voltage: V_eff <= V_supply, so the
+			// lightest-load / highest-duty sample approaches the true supply. Gate on an rpm floor
+			// (above the crossover, where duty is well modelled). Leaky so it TRACKS a draining battery
+			// (slow decay) while rejecting transient load droops (which recover before the decay bites).
+			if (fabsf(vc.measured()) >= THRUSTER_VBATT_RPM_FLOOR) {
+				if (vestFilt_ > vbattMax_) vbattMax_ = vestFilt_;
+				else                       vbattMax_ -= THRUSTER_VBATT_DECAY;
+			}
 		} else {
 			senseValid_ = false;
 		}
@@ -197,4 +214,6 @@ private:
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
 	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
 	float             senseVref_ = 0.0f;       // [#7.1] no-load V_eff reference (0 = not baselined; set via `sense zero`)
+	float             vbattMax_ = 0.0f;        // [vbatt] gated rolling-max of vest ~= supply V (persists across arms)
+	float             vbattScale_ = 1.0f;      // [vbatt] one-time calibration scale (senseVcal)
 };

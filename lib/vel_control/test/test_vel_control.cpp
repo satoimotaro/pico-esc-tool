@@ -32,11 +32,16 @@ struct SimEsc : EscIo {
 	float tau = 0.15f;     // plant time constant (s)
 	int   last_sent = 0;
 	bool  never_live = false;   // force a stall scenario (plant that never reaches 6-step)
+	float disturb = 0.0f;       // external load: reduces the achieved rpm for a given command (rpm)
 
 	void thrust(int cmd) override {
 		last_sent = cmd;
 		float target = never_live ? 0.0f : copysignf(lineMech(cmd), (float)cmd);
 		if (cmd == 0) target = 0.0f;
+		if (target != 0.0f) {                                   // load droop
+			float m = fabsf(target) - disturb; if (m < 0.0f) m = 0.0f;
+			target = copysignf(m, target);
+		}
 		rpm += (target - rpm) * (dt / tau);
 	}
 	bool readTele(float& mechRpm, float& tempC) override {
@@ -86,6 +91,23 @@ static float run(SpeedProfile& prof, float target, float kp, float ki, float tri
 	return cnt ? sum / cnt : 0.0f;
 }
 
+// DOB: run to a 6-step target, apply a step load at t=4s, return mean |error| over [4s, 6s].
+static float run_dob(SpeedProfile& prof, float target, float dob, float load) {
+	SimEsc sim; sim.dt = 0.02f;
+	VelocityController vc(sim, prof);
+	vc.kp = 0.06f; vc.ki = 0.25f; vc.trim_max = 300.0f; vc.slew_rpm_s = 2000.0f;
+	vc.dob = dob; vc.dob_tau = 0.08f;
+	vc.setTarget(target);
+	float dt = 0.02f; int on = (int)(4.0f / dt), win = (int)(6.0f / dt);
+	float sum = 0.0f; int cnt = 0;
+	for (int t = 0; t < win; t++) {
+		sim.disturb = (t >= on) ? load : 0.0f;
+		if (vc.step(dt) != Status::OK) break;
+		if (t >= on) { sum += fabsf(target - fabsf(vc.measured())); cnt++; }
+	}
+	return cnt ? sum / cnt : 1e9f;
+}
+
 // A stall must ABORT (command into 6-step, telemetry never lives).
 static Status runExpectStatus(SpeedProfile& prof, float target, bool stallPlant) {
 	SimEsc sim; sim.never_live = stallPlant;
@@ -133,6 +155,17 @@ int main() {
 		vc.setTarget(100.0f);
 		for (int t = 0; t < 10; t++) vc.step(0.02f);
 		CHECK(vc.command() == 0, "target below stop_below_rpm -> command 0");
+	}
+
+	{   // DOB rejects a step load faster/better than PI alone
+		CurvePoint pdpts[12]; Crossover pdcx{UP_ERPM, DN_ERPM};
+		SpeedProfile pdp = Prof::build(pdpts, &pdcx, 1.0f);
+		float target = 600.0f, load = 100.0f;              // 6-step target, 100-rpm step load at t=4s
+		float e_pi  = run_dob(pdp, target, 0.0f, load);
+		float e_dob = run_dob(pdp, target, 0.8f, load);
+		printf("   DOB: mean|err| over the load window  PI=%.1f  DOB=%.1f rpm\n", e_pi, e_dob);
+		CHECK(e_dob < 0.6f * e_pi, "DOB cuts step-load error >40% vs PI-only");
+		CHECK(run_dob(pdp, target, 0.0f, 0.0f) < 15.0f, "no load: baseline tracks target (sanity)");
 	}
 
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
