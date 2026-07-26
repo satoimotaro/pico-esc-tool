@@ -34,3 +34,8 @@ jobs:
 
       - name: Run host unit tests
         run: python -m pytest host/tests -q
+
+      - name: Run native vel_control tests
+        run: |
+          cd lib/vel_control/test
+          g++ -std=c++17 -O2 -Wall -o /tmp/tvc test_vel_control.cpp && /tmp/tvc
