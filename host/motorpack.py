@@ -60,6 +60,7 @@ def cmd_selfcal(m, opts):
         print(f"# self-cal: arming, sampling tele eRPM in 6-step (enc_sign {opts.enc_sign})")
         esc.arm(bidir=True)
         for cmd in opts.cal_cmds:
+            cmd = int(cmd)                          # [#6.5] --cal-cmds parses floats; {cmd:4d} + int thrust need int
             t_end = clock.now() + 2.5
             erpms = []
             while clock.now() < t_end:

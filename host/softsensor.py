@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import statistics
 
 from pico_esc.motor_model import DUTY6_A, DUTY6_B
 
@@ -42,6 +40,8 @@ def estimate(kv, pp, samples):
     pts = [(c, r) for c, r in samples if duty(c) > 0.02 and abs(r) > 100]
     if len(pts) < 2:
         return {"error": "need >=2 six-step points"}
+    pts.sort(key=lambda cr: abs(cr[1]))   # [#7.2] ascending rpm so resid[-1] IS the max-duty top point
+                                          # (offline JSON is unsorted; the load_present test uses max(duty))
     # least-squares scale: rpm = s * (KV*duty) => s = <rpm, base> / <base, base>
     num = sum(abs(r) * (kv * duty(c)) for c, r in pts)
     den = sum((kv * duty(c)) ** 2 for c, r in pts)

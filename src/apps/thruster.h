@@ -66,7 +66,7 @@ public:
 	void release()                                      { escs::release(); }
 
 	// ---- drive ----
-	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; }
+	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; senseVref_ = 0.0f; senseWarm_ = 0; }
 	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
 	void setRaw(int v) {
@@ -91,7 +91,13 @@ public:
 		mm_.set(kv, polePairs, vSupply);
 		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])));
 		if (n < 2) return;
-		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs);
+		// [#6.1] keep the engine's pole count in sync with the new curve — tele mech-rpm is eRPM/pp,
+		// so a differing pp (the whole point of `motor`) would otherwise scale the feedback wrong.
+		poles_ = (uint8_t)(polePairs * 2);
+		escs::setPoles(index_, poles_);
+		// [#6.3] reconstruct WITH the crossover metadata (&ffcx_) so hasCrossover()/lineFloor() stay
+		// live — otherwise the "commanded 6-step but tele never went live" ABORT_STALL goes inert.
+		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs, &ffcx_);
 		vc.setProfile(ffprof_);
 	}
 
@@ -100,8 +106,10 @@ public:
 	// V at light load; senseLoad = (Vref - Vest) grows with current => torque => thrust (relative). 0
 	// outside 6-step (needs live BEMF tele). Set the motor first with setMotor()/`motor`.
 	float senseVoltage() { return senseValid_ ? vestFilt_ : 0.0f; }         // gated + low-passed
-	float senseLoad()    { return senseValid_ ? (mm_.voltage() - vestFilt_) : 0.0f; }
-	float senseVref()    { return mm_.voltage(); }
+	// [#7.1] load = deviation from the LEARNED light-load reference (0 until it settles), not the typed V.
+	float senseLoad()    { return (senseValid_ && senseVref_ > 0.0f) ? (senseVref_ - vestFilt_) : 0.0f; }
+	float senseVref()    { return senseVref_; }                             // learned no-load V_eff (0 = not yet)
+	void  senseZero()    { if (senseValid_) senseVref_ = vestFilt_; }        // re-baseline the reference on command
 	bool  senseValid()   { return senseValid_; }                            // false = not BEMF-live 6-step
 
 	bool        armed()      { return escs::spinArmed(index_); }
@@ -144,8 +152,13 @@ public:
 			float ve = mm_.estimateV((float)vc.command(), vc.measured());
 			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
 			senseValid_ = true;
+			// [#7.1] LEARN the no-load reference: latch vref_ once the estimate has settled (warmup),
+			// so senseLoad is the deviation from the ACTUAL light-load V_eff — NOT the typed supply V
+			// (which needs the operator to measure the battery, defeating "no sensor"). senseZero() re-baselines.
+			if (senseVref_ <= 0.0f && ++senseWarm_ >= 25) senseVref_ = vestFilt_;
 		} else {
 			senseValid_ = false;
+			senseWarm_ = 0;
 		}
 	}
 
@@ -177,9 +190,14 @@ private:
 	uint32_t lastStepUs_ = 0;
 	// Owned FF curve for the parametric `motor` path: MotorModel::fillProfile writes ffbuf_, ffprof_
 	// references it, and vc.setProfile(ffprof_) swaps the controller onto it. Untouched until setMotor.
-	vel::CurvePoint   ffbuf_[24];
-	vel::SpeedProfile ffprof_{ffbuf_, 0, 7};
+	vel::CurvePoint   ffbuf_[24] = {{0.0f, 0.0f}, {1.0f, 0.1f}};  // 2-pt stub until setMotor (no OOB read)
+	// FF regime metadata attached to ffprof_ so hasCrossover()/lineFloor() (=> ABORT_STALL) stay live
+	// once `motor` swaps the curve in. up==dn==the firmware handoff floor (mech = HANDOFF_ERPM/pp).
+	vel::Crossover    ffcx_{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
+	vel::SpeedProfile ffprof_{ffbuf_, 2, 7, &ffcx_};
 	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF + the soft-sensor
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
 	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
+	float             senseVref_ = 0.0f;       // [#7.1] learned no-load V_eff reference (0 = not yet settled)
+	uint16_t          senseWarm_ = 0;          // consecutive live polls before latching senseVref_
 };

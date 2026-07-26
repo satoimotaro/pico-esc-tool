@@ -507,11 +507,14 @@ private:
 					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"motor")) { int i=argi(); char* kv=strtok(nullptr," "); char* pp=strtok(nullptr," "); char* vv=strtok(nullptr," ");   // motor <i> <kv> <pp> <v>: regenerate the FF curve parametrically (MotorModel)
-				if(i<0||i>=n_||!kv||!pp||!vv) Serial.println("err bad-args (motor <i> <kv> <pp> <v>)");
-				else { th_[i]->setMotor(atof(kv), atoi(pp), atof(vv));
+				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence
+					if(i<0||i>=n_||kvf<=0.0f||ppi<1||vvf<=0.0f) Serial.println("err bad-args (motor <i> <kv> <pp> <v>): need kv>0 pp>=1 v>0");   // kv/pp/v=0 -> div-by-zero -> NaN into the live FF curve
+					else if(th_[i]->armed()) Serial.println("err motor: disarm first (replaces the FF curve)");
+				else { th_[i]->setMotor(kvf, ppi, vvf);
 					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s\n", i, kv, pp, vv); Serial.println("ok"); } }
-			else if (!strcmp(cmd,"sense")) { int i=argi();   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
-				if(i<0||i>=n_) Serial.println("err bad-args (sense <i>)");
+			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
+				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero])");
+					else if(sub && !strcmp(sub,"zero")) { th_[i]->senseZero(); Serial.printf("sense|%d|zeroed vref=%.2f\n", i, th_[i]->senseVref()); Serial.println("ok"); }
 				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad();
 					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|valid=%d\n", i, ve, vr, ld, th_[i]->senseValid()?1:0); Serial.println("ok"); } }
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }

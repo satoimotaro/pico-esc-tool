@@ -92,7 +92,7 @@ def main(argv=None):
     # 0. disable crossover (hardware only) — the no-load 350KV cannot 6-step
     if not opts.dry_run and not opts.keep_crossover and want("crossover"):
         ok, _ = run_tool(["esctool.py", *port, "set", "1",
-                          "sine_cross_up=0", "sine_cross_dn=0"], "crossover-off")
+                          "sine_cross_up=0", "sine_cross_dn=0", "-r"], "crossover-off")
         mark(st, "crossover", ok, "pure forced-sine")
 
     # 1. sysid
