@@ -1,0 +1,60 @@
+motor: f2838_350kv
+pole_pairs: 7
+source: bench
+crossover:
+  up_erpm: 1400.0
+  dn_erpm: 1308.0
+  bytes:
+  - 36
+  - 239
+control:
+  kp: 0.06
+  ki: 0.25
+  trim_max: 80
+  blend_secs: 0.3
+points:
+- thrust: 0.0
+  rpm: 0.0
+  regime: sine
+- thrust: 60.0
+  rpm: 35.64
+  regime: sine
+- thrust: 115.0
+  rpm: 55.54
+  regime: sine
+- thrust: 171.0
+  rpm: 74.45
+  regime: sine
+- thrust: 226.0
+  rpm: 93.25
+  regime: sine
+- thrust: 282.0
+  rpm: 111.59
+  regime: sine
+- thrust: 337.0
+  rpm: 130.05
+  regime: sine
+- thrust: 392.0
+  rpm: 148.9
+  regime: sine
+- thrust: 448.0
+  rpm: 168.06
+  regime: sine
+- thrust: 503.0
+  rpm: 186.75
+  regime: sine
+- thrust: 558.0
+  rpm: 628.1
+  regime: sine
+- thrust: 614.0
+  rpm: 1211.14
+  regime: line
+- thrust: 669.0
+  rpm: 1777.24
+  regime: line
+- thrust: 725.0
+  rpm: 2355.68
+  regime: line
+- thrust: 780.0
+  rpm: 2921.47
+  regime: line
