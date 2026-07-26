@@ -66,7 +66,7 @@ public:
 	void release()                                      { escs::release(); }
 
 	// ---- drive ----
-	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; senseVref_ = 0.0f; senseWarm_ = 0; }
+	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; senseVref_ = 0.0f; }
 	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
 	void setRaw(int v) {
@@ -152,14 +152,12 @@ public:
 			float ve = mm_.estimateV((float)vc.command(), vc.measured());
 			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
 			senseValid_ = true;
-			// [#7.1] LEARN the no-load reference: latch vref_ once the estimate has settled (warmup),
-			// so senseLoad is the deviation from the ACTUAL light-load V_eff — NOT the typed supply V
-			// (which needs the operator to measure the battery, defeating "no sensor"). senseZero() re-baselines.
-			if (senseVref_ <= 0.0f && ++senseWarm_ >= 25) senseVref_ = vestFilt_;
 		} else {
 			senseValid_ = false;
-			senseWarm_ = 0;
 		}
+		// [#7.1] The no-load REFERENCE is captured on command via `sense <i> zero` (senseZero()) at a
+		// known steady light-load operating point — NOT the typed supply V (which read ~-2.2 V under
+		// no load and needed the operator to measure the battery). load stays 0 until baselined.
 	}
 
 	// ---- io adapter: the ONLY place that knows escs:: telemetry -> vel::EscIo. Reads owner->index_. --
@@ -198,6 +196,5 @@ private:
 	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF + the soft-sensor
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
 	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
-	float             senseVref_ = 0.0f;       // [#7.1] learned no-load V_eff reference (0 = not yet settled)
-	uint16_t          senseWarm_ = 0;          // consecutive live polls before latching senseVref_
+	float             senseVref_ = 0.0f;       // [#7.1] no-load V_eff reference (0 = not baselined; set via `sense zero`)
 };
