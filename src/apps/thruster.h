@@ -28,6 +28,7 @@ static const uint32_t THRUSTER_TELE_FRESH_MS = 100;
 
 // vbatt (resident battery-voltage estimate): gate the rolling max to solid 6-step (above the crossover,
 // where the duty model is accurate), and leak it slowly so it tracks a draining pack.
+static const float THRUSTER_SENSE_RPM_FLOOR = 650.0f;  // vest/load valid only solidly above the crossover
 static const float THRUSTER_VBATT_RPM_FLOOR = 800.0f;
 static const float THRUSTER_VBATT_DECAY = 2.0e-5f;   // per-poll (~0.001 V/s @ 50 Hz)
 
@@ -154,10 +155,11 @@ public:
 			Serial.printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
 			              index_, (int)st);
 		}
-		// SOFT-SENSOR update: sample the voltage estimate ONLY when the loop is BEMF-live (real 6-step).
-		// In forced sine / startup the eRPM is virtual (~182) so the estimate is garbage -> mark invalid.
-		// Low-pass the live estimate (tele is quantized) so `sense` reads a clean, gated value.
-		if (vc.live()) {
+		// SOFT-SENSOR update: sample the voltage estimate ONLY in GENUINE 6-step. vc.live() alone can be
+		// fooled by the firmware's virtual-sine eRPM (it reports a fresh non-zero rpm in forced sine), so
+		// ALSO require the speed to be solidly above the crossover — where V_eff = rpm/(KV*duty) actually
+		// holds. Below it (sine / gap / a fooled-live floor) the estimate is meaningless -> mark invalid.
+		if (vc.live() && fabsf(vc.measured()) >= THRUSTER_SENSE_RPM_FLOOR) {
 			float ve = mm_.estimateV((float)vc.command(), vc.measured());
 			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
 			senseValid_ = true;
