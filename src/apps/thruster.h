@@ -84,7 +84,7 @@ public:
 	// constant (persisted by `cfg save`) and is deliberately kept.
 	void arm(Drive mode = Drive::AUTO) {
 		escs::spinArm(index_, mode); vc.reset(); submode_ = RAW;
-		senseVref_ = 0.0f; vbattMax_ = 0.0f;
+		senseVref_ = 0.0f; vbattMax_ = 0.0f; senseValid_ = false;
 	}
 	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
@@ -95,7 +95,10 @@ public:
 	}
 	// RPM target: engage the closed loop. Reset the step clock so the first dt is sane.
 	void setRpm(float rpm) { submode_ = RPM; vc.setTarget(rpm); lastStepUs_ = micros(); }
-	void stop()   { escs::spinStop(index_); submode_ = RAW; }
+	// Stopping ends the only condition under which the soft-sensor is meaningful, so the validity flag
+	// has to fall with it: poll() returns early when not in RPM mode, so senseValid_ would otherwise keep
+	// its last value and `sense` would report a stale vest as valid on a motionless motor.
+	void stop()   { escs::spinStop(index_); submode_ = RAW; senseValid_ = false; }
 	void disarm() { stop(); }
 
 	// Copy a profile's calibrated PI gains onto the controller (e.g. the generated M_<NAME>_GAINS).
