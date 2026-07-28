@@ -28,8 +28,13 @@ static const uint32_t THRUSTER_TELE_FRESH_MS = 100;
 
 // vbatt (resident battery-voltage estimate): gate the rolling max to solid 6-step (above the crossover,
 // where the duty model is accurate), and leak it slowly so it tracks a draining pack.
-static const float THRUSTER_SENSE_RPM_FLOOR = 650.0f;  // vest/load valid only solidly above the crossover
-static const float THRUSTER_VBATT_RPM_FLOOR = 800.0f;
+// [#8] The gate rpm is DERIVED from the active profile (SpeedProfile::lineFloor() = the lowest genuinely
+// 6-step-reachable speed), because `motor <i> <kv> <pp> <v>` moves that boundary while a literal would
+// stay put — the old 650 sat INSIDE the 350KV's 190..834 no-steady-state gap. These literals remain only
+// as the fallback for a profile with no crossover/regime metadata (e.g. the RAW linear default).
+static const float THRUSTER_SENSE_RPM_FLOOR = 650.0f;  // fallback only: no lineFloor() available
+static const float THRUSTER_VBATT_RPM_FLOOR = 800.0f;  // fallback only
+static const float THRUSTER_VBATT_MARGIN    = 1.1f;    // vbatt gates this much above the 6-step landing
 static const float THRUSTER_VBATT_DECAY = 2.0e-5f;   // per-poll (~0.001 V/s @ 50 Hz)
 
 class Thruster {
@@ -72,7 +77,15 @@ public:
 	void release()                                      { escs::release(); }
 
 	// ---- drive ----
-	void arm(Drive mode = Drive::AUTO) { escs::spinArm(index_, mode); vc.reset(); submode_ = RAW; senseVref_ = 0.0f; }
+	// [#5] arm() clears BOTH soft-sensor baselines: the load reference (senseVref_) and the vbatt rolling
+	// max. The max only ever decays at THRUSTER_VBATT_DECAY (~0.001 V/s), so a swap to a MORE DEPLETED
+	// pack would otherwise keep reading the old, higher pack for ~27 min of running — high, which is the
+	// wrong direction for the one decision this number exists to inform. The calibration SCALE is a model
+	// constant (persisted by `cfg save`) and is deliberately kept.
+	void arm(Drive mode = Drive::AUTO) {
+		escs::spinArm(index_, mode); vc.reset(); submode_ = RAW;
+		senseVref_ = 0.0f; vbattMax_ = 0.0f;
+	}
 	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
 	void setRaw(int v) {
@@ -95,7 +108,9 @@ public:
 	// self-cal can refine it later. The owned ffprof_/ffbuf_ outlive vc, so setProfile is safe.
 	void setMotor(float kv, int polePairs, float vSupply) {
 		mm_.set(kv, polePairs, vSupply);
-		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])));
+		// [#8] tag each generated point's regime so the profile's lineFloor() reports the real 6-step
+		// LANDING (~sixstepFloorRpm) rather than the seam — the soft-sensor gates below key off it.
+		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])), 700.0f, 4, ffreg_);
 		if (n < 2) return;
 		// [#6.1] keep the engine's pole count in sync with the new curve — tele mech-rpm is eRPM/pp,
 		// so a differing pp (the whole point of `motor`) would otherwise scale the feedback wrong.
@@ -103,9 +118,19 @@ public:
 		escs::setPoles(index_, poles_);
 		// [#6.3] reconstruct WITH the crossover metadata (&ffcx_) so hasCrossover()/lineFloor() stay
 		// live — otherwise the "commanded 6-step but tele never went live" ABORT_STALL goes inert.
-		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs, &ffcx_);
+		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs, &ffcx_, ffreg_);
 		vc.setProfile(ffprof_);
+		motorSet_ = true;
 	}
+
+	// Motor identity as last configured by `motor` — what `cfg save` persists (nothing to persist until
+	// the operator has actually set it; the compile-time profile is the fallback).
+	bool  motorConfigured() const { return motorSet_; }
+	float motorKv()         const { return mm_.kv(); }
+	int   motorPolePairs()  const { return mm_.polePairs(); }
+	float motorVolts()      const { return mm_.voltage(); }
+	float vbattScale()      const { return vbattScale_; }
+	void  setVbattScale(float s)  { if (s > 0.0f) vbattScale_ = s; }
 
 	// ESC perception (soft-sensor): infer effective supply voltage + a relative load signal from the
 	// LIVE command + measured 6-step tele rpm — no voltage/current/force sensor. senseVoltage ~= battery
@@ -117,10 +142,26 @@ public:
 	float senseVref()    { return senseVref_; }                             // learned no-load V_eff (0 = not yet)
 	void  senseZero()    { if (senseValid_) senseVref_ = vestFilt_; }        // re-baseline the reference on command
 	bool  senseValid()   { return senseValid_; }                            // false = not BEMF-live 6-step
-	// [vbatt] resident battery-voltage estimate = scale * gated rolling-max of vest (~= supply). One-time
-	// per-motor calibration: senseVcal(known_battery_V) sets the scale so the absolute value tracks.
+	// [#8] The |rpm| gates above which the soft-sensor is trusted, DERIVED from the ACTIVE profile — its
+	// lowest genuinely 6-step-reachable speed — so `motor <kv> <pp> <v>` (which moves that boundary) can't
+	// leave a literal behind. vbatt sits a margin higher: its rolling max wants the well-modelled,
+	// high-duty end. senseRpmFloor() is reported by `sense` so the gate is inspectable.
+	float senseRpmFloor() const { float lf = lineFloor_(); return lf > 0.0f ? lf : THRUSTER_SENSE_RPM_FLOOR; }
+	float vbattRpmFloor() const {
+		float lf = lineFloor_();
+		return lf > 0.0f ? lf * THRUSTER_VBATT_MARGIN : THRUSTER_VBATT_RPM_FLOOR;
+	}
+	// [vbatt] resident battery-voltage estimate = scale * gated rolling-max of vest (~= supply). Per-motor
+	// calibration: senseVcal(known_battery_V) sets the scale so the absolute value tracks. The
+	// scale is a MOTOR/model constant so it survives arms and is persisted by `cfg save`; the rolling max
+	// itself is per-session (arm() clears it — see #5 there). Returns false when there is no estimate to
+	// calibrate against yet, so the caller can report it instead of silently no-op'ing.
 	float senseVbatt()   { return vbattScale_ * vbattMax_; }
-	void  senseVcal(float knownV) { if (vbattMax_ > 0.1f) vbattScale_ = knownV / vbattMax_; }
+	bool  senseVcal(float knownV) {
+		if (vbattMax_ <= 0.1f) return false;
+		vbattScale_ = knownV / vbattMax_;
+		return true;
+	}
 
 	bool        armed()      { return escs::spinArmed(index_); }
 	bool        reversible() { return escs::spinReversible(index_); }
@@ -157,17 +198,18 @@ public:
 		}
 		// SOFT-SENSOR update: sample the voltage estimate ONLY in GENUINE 6-step. vc.live() alone can be
 		// fooled by the firmware's virtual-sine eRPM (it reports a fresh non-zero rpm in forced sine), so
-		// ALSO require the speed to be solidly above the crossover — where V_eff = rpm/(KV*duty) actually
-		// holds. Below it (sine / gap / a fooled-live floor) the estimate is meaningless -> mark invalid.
-		if (vc.live() && fabsf(vc.measured()) >= THRUSTER_SENSE_RPM_FLOOR) {
+		// ALSO require the speed to be at/above the profile's own 6-step landing (senseRpmFloor(), #8) —
+		// where V_eff = rpm/(KV*duty) actually holds. Below it (sine / gap / a fooled-live floor) the
+		// estimate is meaningless -> mark invalid.
+		if (vc.live() && fabsf(vc.measured()) >= senseRpmFloor()) {
 			float ve = mm_.estimateV((float)vc.command(), vc.measured());
 			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
 			senseValid_ = true;
 			// [vbatt] gated rolling-MAX of the estimate ~= supply voltage: V_eff <= V_supply, so the
-			// lightest-load / highest-duty sample approaches the true supply. Gate on an rpm floor
-			// (above the crossover, where duty is well modelled). Leaky so it TRACKS a draining battery
+			// lightest-load / highest-duty sample approaches the true supply. Gated a margin ABOVE the
+			// 6-step landing (where duty is well modelled). Leaky so it TRACKS a draining battery
 			// (slow decay) while rejecting transient load droops (which recover before the decay bites).
-			if (fabsf(vc.measured()) >= THRUSTER_VBATT_RPM_FLOOR) {
+			if (fabsf(vc.measured()) >= vbattRpmFloor()) {
 				if (vestFilt_ > vbattMax_) vbattMax_ = vestFilt_;
 				else                       vbattMax_ -= THRUSTER_VBATT_DECAY;
 			}
@@ -200,6 +242,16 @@ public:
 	vel::VelocityController  vc;   // PUBLIC so the declaring side sets gains: th.vc.kp = 0.03f;
 
 private:
+	// The active profile's 6-step landing, or 0 when it carries no regime tags to trust. Requires the
+	// TAGS, not merely a crossover: untagged, lineFloor() degrades to the seam eRPM = the BOTTOM of the
+	// no-steady-state gap, which is the unsafe direction for a soft-sensor validity gate.
+	float lineFloor_() const {
+		const vel::SpeedProfile& p = vc.profile();
+		float lf = 0.0f;
+		if (p.hasRegimes() && p.lineFloor(lf) && lf > 0.0f) return lf;
+		return 0.0f;
+	}
+
 	uint16_t kbaud_;
 	uint8_t  poles_;
 	uint8_t  index_      = 0;
@@ -211,11 +263,15 @@ private:
 	// FF regime metadata attached to ffprof_ so hasCrossover()/lineFloor() (=> ABORT_STALL) stay live
 	// once `motor` swaps the curve in. up==dn==the firmware handoff floor (mech = HANDOFF_ERPM/pp).
 	vel::Crossover    ffcx_{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
-	vel::SpeedProfile ffprof_{ffbuf_, 2, 7, &ffcx_};
+	// [#8] per-point regime tags (filled by MotorModel::fillProfile) so lineFloor() reports the real
+	// 6-step landing instead of the seam. The stub's two points are both below it => SINE.
+	vel::Regime       ffreg_[24] = {vel::Regime::SINE, vel::Regime::SINE};
+	vel::SpeedProfile ffprof_{ffbuf_, 2, 7, &ffcx_, ffreg_};
 	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF + the soft-sensor
+	bool              motorSet_ = false;       // has `motor`/setMotor run? (else mm_ holds only defaults)
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
 	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
 	float             senseVref_ = 0.0f;       // [#7.1] no-load V_eff reference (0 = not baselined; set via `sense zero`)
-	float             vbattMax_ = 0.0f;        // [vbatt] gated rolling-max of vest ~= supply V (persists across arms)
-	float             vbattScale_ = 1.0f;      // [vbatt] one-time calibration scale (senseVcal)
+	float             vbattMax_ = 0.0f;        // [vbatt] gated rolling-max of vest ~= supply V (cleared by arm(), #5)
+	float             vbattScale_ = 1.0f;      // [vbatt] calibration scale (senseVcal; persisted by `cfg save`)
 };
