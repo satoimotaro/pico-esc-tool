@@ -93,6 +93,25 @@ Bench result (real supply 11.2 V): raw `V_eff.p90 = 9.14 V` → `scale = 1.2254`
 **11.30 V (~1 %)**. Enough for a rough remaining-charge gauge / low-voltage warning. The voltage→%
 mapping is a separate, per-chemistry table (not provided here).
 
+## `dhat` — the disturbance observer's load estimate
+
+`sense` also reports `dhat`, the DOB's estimate of the load in **rpm** (`rpmFor(last command) −
+measured`, low-passed): the same physical quantity as `load` in different units, and the one an upper
+layer (attitude / thrust allocation) actually wants per thruster. It is 0 while the observer is off
+(`gain <i> dob 0`) or gated — outside solid 6-step, or while the setpoint is still slewing (`settled`
+reports that gate, 0…1).
+
+**`dhat` is only load if the feed-forward curve is accurate**, because the observer inverts that curve;
+otherwise it reports the model error instead. Bench, 350KV at 1600 rpm with no load:
+
+| feed-forward curve | mean `dhat` |
+|---|---|
+| measured (`curvepush`, matched `cross_up`) | **−15 rpm** (10 % of `dob_max`) |
+| parametric (`motor`), wrong at that `cross_up` | **+325 rpm** (217 % of `dob_max` — clamped) |
+
+So push a measured curve before trusting `dhat` (see the README's `curvepush` note, especially the
+`sine_cross_up` dependency). The `dob_max` clamp exists precisely so a bad curve cannot over-drive.
+
 ## Offline analysis — `host/softsensor.py`
 
 Fit `V_eff` and a load-droop trend from a `(cmd, rpm)` sweep (e.g. a `sysid` curve or a `cmd_measure`
