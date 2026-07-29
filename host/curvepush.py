@@ -25,6 +25,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pico_esc.config import SINE_CROSS_UP_ERPM_PER_UNIT   # noqa: E402
 from pico_esc.esc import EscConfig                    # noqa: E402
 from pico_esc.link import EscHost, SimClock          # noqa: E402
 from pico_esc.sim import SimEncEscHost                # noqa: E402
@@ -54,15 +55,19 @@ def thin(points, regimes, cap):
     if cap < 2:
         raise ValueError("cap must be >= 2")
     jumps = sorted(range(1, n), key=lambda i: points[i][1] - points[i - 1][1], reverse=True)
-    must = {0, n - 1, jumps[0] - 1, jumps[0]}                    # ends + both sides of the seam
+    # Priority ORDER, not a set: with cap < 4 there is not room for all four mandatory points, and
+    # truncating a sorted set would drop the highest index — the last point, which defines the top of
+    # the feed-forward range. Keep the ends first so they survive any cap >= 2.
+    ranked = [0, n - 1, jumps[0] - 1, jumps[0]]
+    must = list(dict.fromkeys(i for i in ranked if 0 <= i < n))   # de-dup, order preserved
     if len(must) >= cap:
-        idx = sorted(must)[:cap]
+        idx = sorted(must[:cap])
     else:
         rest = [i for i in range(n) if i not in must]
         slots = cap - len(must)
         step = (len(rest) - 1) / float(slots - 1) if slots > 1 else 0.0
         fill = {rest[min(len(rest) - 1, int(round(k * step)))] for k in range(slots)}
-        idx = sorted(must | fill)
+        idx = sorted(set(must) | fill)
     return [points[i] for i in idx], ([regimes[i] for i in idx] if regimes else None)
 
 
@@ -78,11 +83,22 @@ def check_crossover(dev, idx, prof, apply_it):
 
     Returns True when it is safe to proceed.
     """
-    want = (prof.crossover or {}).get("bytes")
+    cx = prof.crossover or {}
+    want = cx.get("bytes")
     if not want:
         print("note: profile carries no crossover bytes — cannot verify the ESC threshold the curve "
               "was measured at; the curve is only valid at that threshold")
         return True
+    # [#11-8] The profile states the same seam TWICE — as ESC bytes and as up_erpm — and this function
+    # compares the bytes while push() sends up_erpm. If the YAML's two representations disagree, the
+    # ESC check would pass while the device got the wrong seam: precisely the failure mode this guard
+    # exists to prevent, arriving through the back door.
+    up_from_bytes = int(want[0]) * SINE_CROSS_UP_ERPM_PER_UNIT
+    up_stated = float(cx.get("up_erpm", up_from_bytes))
+    if abs(up_from_bytes - up_stated) > SINE_CROSS_UP_ERPM_PER_UNIT / 2.0:
+        raise SystemExit(f"profile is self-inconsistent: crossover.bytes[0]={want[0]} means "
+                         f"{up_from_bytes:.0f} eRPM but up_erpm says {up_stated:.0f} — fix the YAML "
+                         f"before pushing (the ESC check and the uploaded seam would disagree)")
     cfg = EscConfig(dev, idx)
     cur = cfg.read()
     cfg.restart()                                   # never leave the ESC held in the bootloader
@@ -127,6 +143,11 @@ def push(dev, idx, prof, cap=FW_MAX_POINTS):
         kept.append(i)
     if len(rounded) < len(pts):
         print(f"note: {len(pts) - len(rounded)} point(s) dropped — thrust collided at 0.1 resolution")
+    if len(rounded) < 2:
+        # Stop here with the real cause: letting this through produces `err curve-begin: need 2..24
+        # points` from the device, which says nothing about the rounding that actually caused it.
+        raise SystemExit(f"only {len(rounded)} point(s) survive the 0.1 wire resolution "
+                         f"(profile has {len(pts)}) — the thrust values are too closely spaced to send")
     pts = rounded
     regs = [regs[i] for i in kept] if regs else None
 
@@ -137,14 +158,26 @@ def push(dev, idx, prof, cap=FW_MAX_POINTS):
         raise SystemExit("profile has no crossover.up_erpm — the firmware needs the seam to tag regimes "
                          "and to gate the soft-sensor; add a `crossover:` block to the YAML")
 
+    # [#11-7] Tagging is ALL-OR-NOTHING on the device: the firmware's `stageTagged_` is one flag for the
+    # whole table, so a single point sent without a tag makes commit discard EVERY tag and fall back to
+    # deriving them from the seam — silently, including any explicit `line` tag below it. Decide here,
+    # once, and say which way it went.
+    tags = [str(regs[i]).lower()[:1] if (regs and regs[i]) else None for i in range(len(pts))]
+    tagged = [t for t in tags if t]
+    if tagged and len(tagged) != len(pts):
+        print(f"note: {len(pts) - len(tagged)} of {len(pts)} point(s) carry no regime tag — sending the "
+              f"curve UNTAGGED (the device tags all-or-nothing); regimes will be derived from the seam")
+        tags = [None] * len(pts)
+
     dev.cmd(f"curve {idx} begin {len(pts)}")
-    for i, (t, r) in enumerate(pts):
-        tag = ""
-        if regs and regs[i]:
-            tag = " l" if str(regs[i]).lower().startswith("l") else " s"
+    for (t, r), g in zip(pts, tags):
+        tag = "" if not g else (" l" if g == "l" else " s")
         dev.cmd(f"curve {idx} add {t:.1f} {r:.1f}{tag}")
     dev.cmd(f"curve {idx} commit {prof.pole_pairs} {up:.0f} {dn:.0f}")
-    return pts
+    # Expected regimes AFTER the device's rules: derived from the seam, and an explicit `sine` above the
+    # seam is promoted to line (Thruster::setCurve). Returned so the caller can verify the tags too.
+    expect = [("l" if (r * prof.pole_pairs >= up or g == "l") else "s") for (_, r), g in zip(pts, tags)]
+    return pts, expect
 
 
 def readback(dev, idx):
@@ -193,7 +226,7 @@ def main(argv=None):
             kv, pp, v = (x.strip() for x in opts.motor.split(","))
             print("motor:", *dev.cmd(f"motor {opts.index} {kv} {pp} {v}"))
 
-        sent = push(dev, opts.index, prof, opts.max_points)
+        sent, expect = push(dev, opts.index, prof, opts.max_points)
         print(f"pushed {len(sent)} point(s) from {os.path.basename(opts.profile)} "
               f"(profile has {len(prof.points)})")
 
@@ -208,6 +241,20 @@ def main(argv=None):
             # the device prints one decimal, so compare at that resolution
             if abs(ts - tg) > 0.05 or abs(rs - rg) > 0.05:
                 print(f"MISMATCH: sent ({ts:.1f}, {rs:.1f}) got ({tg:.1f}, {rg:.1f})")
+                bad += 1
+        # [#11-6] Verify the REGIME TAGS and the metadata too, not just the points. Mis-handled tags are
+        # the failure this whole change exists to prevent (they move lineFloor(), hence the soft-sensor
+        # gate), and a pp that disagrees with the commit is exactly what slipped past the first version.
+        got_tags = [g for *_, g in got]
+        if len(got) == len(expect) and got_tags != expect:
+            print(f"MISMATCH: regimes expected {''.join(expect)} got {''.join(got_tags)}")
+            bad += 1
+        cx = prof.crossover or {}
+        for field, want in (("pp", prof.pole_pairs),
+                            ("up", round(float(cx.get("up_erpm", 0)))),
+                            ("dn", round(float(cx.get("dn_erpm", cx.get("up_erpm", 0)))))):
+            if meta.get(field) is not None and int(float(meta[field])) != int(want):
+                print(f"MISMATCH: {field} sent {want}, device reports {meta[field]}")
                 bad += 1
         print("verify: OK — the live curve matches what was sent" if not bad
               else f"verify: {bad} MISMATCH(es)")

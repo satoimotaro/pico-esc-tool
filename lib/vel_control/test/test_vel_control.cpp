@@ -221,6 +221,45 @@ int main() {
 		CHECK(p_open > p_gated, "ungated DOB DOES over-drive the ramp (the gate is doing work)");
 	}
 
+	{   // -- uploaded-curve semantics (the `curve` command's rules), tested in C++ rather than only via
+		//    the Python mirror in SimEscHost — the two had already begun to diverge.
+		CurvePoint ok3[] = {{0, 0}, {100, 50}, {200, 900}};
+		CHECK(validateCurve(ok3, 3), "validateCurve accepts a monotone curve");
+		CHECK(!validateCurve(ok3, 1), "validateCurve rejects fewer than 2 points");
+		CurvePoint backT[] = {{0, 0}, {200, 50}, {150, 90}};      // thrust goes backwards
+		CHECK(!validateCurve(backT, 3), "validateCurve rejects non-increasing thrust");
+		CurvePoint backR[] = {{0, 0}, {100, 90}, {200, 50}};      // rpm decreases -> non-invertible
+		CHECK(!validateCurve(backR, 3), "validateCurve rejects decreasing rpm");
+		CurvePoint neg[] = {{0, 0}, {100, -5}};
+		CHECK(!validateCurve(neg, 2), "validateCurve rejects negative rpm");
+
+		// pp=7, seam 1400 eRPM => 200 mech. Point 1 (50 rpm) is below, point 2 (900) far above.
+		const float UP = 1400.0f;
+		Regime out[3];
+		tagRegimes(ok3, 3, POLE_PAIRS, UP, nullptr, out);
+		CHECK(out[0] == Regime::SINE && out[1] == Regime::SINE && out[2] == Regime::LINE,
+		      "tagRegimes derives from the seam when untagged");
+
+		Regime sineEverywhere[] = {Regime::SINE, Regime::SINE, Regime::SINE};
+		tagRegimes(ok3, 3, POLE_PAIRS, UP, sineEverywhere, out);
+		CHECK(out[2] == Regime::LINE,
+		      "tagRegimes PROMOTES a sine tag above the seam (velcal mislabels the handoff point)");
+
+		// ...and never demotes: an explicit LINE below the seam is a real hysteresis-band measurement.
+		Regime lineLow[] = {Regime::SINE, Regime::LINE, Regime::LINE};
+		tagRegimes(ok3, 3, POLE_PAIRS, UP, lineLow, out);
+		CHECK(out[1] == Regime::LINE, "tagRegimes keeps an explicit line tag below the seam");
+
+		// The promotion is what moves lineFloor(), i.e. the soft-sensor gate: with the tags taken at
+		// face value the floor would be the NEXT point up.
+		Crossover cxu{UP, UP};
+		Regime tagged[3];
+		tagRegimes(ok3, 3, POLE_PAIRS, UP, sineEverywhere, tagged);
+		SpeedProfile up(ok3, 3, POLE_PAIRS, &cxu, tagged);
+		float lf = 0.0f;
+		CHECK(up.lineFloor(lf) && fabsf(lf - 900.0f) < 1e-3f, "lineFloor reports the promoted point");
+	}
+
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
 	return failures ? 1 : 0;
 }

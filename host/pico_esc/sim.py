@@ -131,6 +131,10 @@ class SimEscHost:
         if not f:
             raise RuntimeError("device: err bad-args (curve)")
         idx, sub = int(f[0]), (f[1] if len(f) > 1 else None)
+        need = {"begin": 3, "add": 4, "commit": 5}.get(sub)
+        if need and len(f) < need:      # firmware: missing args -> err, not a crash
+            raise RuntimeError("device: err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|"
+                               "commit <pp> <up> <dn>])")
         st = self._curve_stage
         if sub is None:
             live = self._curve_live.get(idx)
@@ -163,9 +167,16 @@ class SimEscHost:
                 raise RuntimeError("device: err curve-commit: nothing staged")
             if len(st["pts"]) != st["want"]:
                 raise RuntimeError(f"device: err curve-commit: staged {len(st['pts'])} of {st['want']} points")
+            if pp < 1 or up <= 0.0:
+                raise RuntimeError("device: err curve-commit: need <pole_pairs> <up_erpm> <dn_erpm>")
+            if self.armed:
+                raise RuntimeError("device: err curve-commit: disarm first (replaces the FF curve)")
             pts = st["pts"]
-            for i in range(1, len(pts)):
-                if pts[i][0] <= pts[i - 1][0] or pts[i][1] < pts[i - 1][1]:
+            for i, (t, r, _) in enumerate(pts):
+                if t < 0.0 or r < 0.0:
+                    raise RuntimeError("device: err curve-commit: rejected (need >=2 points, thrust "
+                                       "strictly increasing, rpm non-decreasing)")
+                if i and (t <= pts[i - 1][0] or r < pts[i - 1][1]):
                     raise RuntimeError("device: err curve-commit: rejected (need >=2 points, thrust "
                                        "strictly increasing, rpm non-decreasing)")
             # Regimes: derived from the seam when untagged, and an explicit SINE tag that contradicts

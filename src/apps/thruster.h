@@ -132,24 +132,10 @@ public:
 	bool setCurve(const vel::CurvePoint* pts, int n, int polePairs, float upErpm, float dnErpm,
 	              const vel::Regime* regimes = nullptr) {
 		const int cap = (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0]));
-		if (!pts || n < 2 || n > cap || polePairs < 1 || upErpm <= 0.0f) return false;
-		for (int i = 0; i < n; i++) {
-			if (pts[i].thrust < 0.0f || pts[i].rpm < 0.0f) return false;
-			if (i && (pts[i].thrust <= pts[i - 1].thrust || pts[i].rpm < pts[i - 1].rpm)) return false;
-		}
-		for (int i = 0; i < n; i++) {
-			ffbuf_[i] = pts[i];
-			// A point whose speed is above the seam IS 6-step — that is the same rpm*pp >= up_erpm test
-			// SpeedProfile::regime() uses everywhere else. So an uploaded SINE tag that contradicts it is
-			// promoted rather than trusted: velcal's classifier mislabels the handoff point (the bench
-			// profile tags 628 rpm = 4397 eRPM as "sine" against a 1400 eRPM seam), and taking that at
-			// face value would put lineFloor() — hence the soft-sensor gate — at the NEXT point up,
-			// needlessly blanking a band where the estimate is valid. An explicit LINE tag is never
-			// demoted: a point measured in the hysteresis band coming down is real information.
-			bool aboveSeam = pts[i].rpm * (float)polePairs >= upErpm;
-			ffreg_[i] = (!regimes || aboveSeam) ? (aboveSeam ? vel::Regime::LINE : vel::Regime::SINE)
-			                                    : regimes[i];
-		}
+		if (n > cap || polePairs < 1 || upErpm <= 0.0f) return false;
+		if (!vel::validateCurve(pts, n)) return false;
+		for (int i = 0; i < n; i++) ffbuf_[i] = pts[i];
+		vel::tagRegimes(pts, n, polePairs, upErpm, regimes, ffreg_);
 		ffcx_ = vel::Crossover{upErpm, dnErpm};
 		installCurve_(n, polePairs);
 		curveMeasured_ = true;
@@ -169,8 +155,22 @@ public:
 	// persisted point-by-point).
 	bool  curveMeasured() const { return curveMeasured_; }
 	int   curveCount()    const { return curveMeasured_ ? ffn_ : 0; }
-	const vel::CurvePoint& curvePoint(int i)  const { return ffbuf_[i]; }
-	vel::Regime            curveRegime(int i) const { return ffreg_[i]; }
+	// [#11-1] The pole count the LIVE CURVE was installed with — NOT mm_'s. `curve commit <pp>` sets the
+	// profile's pp without touching the parametric model, so the two can differ; persisting or reporting
+	// mm_'s would restore the curve under the wrong pp after a reset, mis-scaling both the tele mech-rpm
+	// (poles_) and the regime test (rpm*pp >= up_erpm) that lineFloor() — hence the soft-sensor gate —
+	// depends on. Read it from the profile, which is the single source of truth for the installed curve.
+	int   curvePolePairs() const { return vc.profile().polePairs(); }
+	// Bounds-clamped: these are public and the natural loop bound (curveCount()) is a separate call,
+	// so an off-by-one at a call site should not read past the buffer.
+	const vel::CurvePoint& curvePoint(int i) const {
+		return ffbuf_[i < 0 ? 0 : (i >= (int)(sizeof(ffbuf_)/sizeof(ffbuf_[0]))
+		                           ? (int)(sizeof(ffbuf_)/sizeof(ffbuf_[0])) - 1 : i)];
+	}
+	vel::Regime curveRegime(int i) const {
+		return ffreg_[i < 0 ? 0 : (i >= (int)(sizeof(ffreg_)/sizeof(ffreg_[0]))
+		                           ? (int)(sizeof(ffreg_)/sizeof(ffreg_[0])) - 1 : i)];
+	}
 	float crossUpErpm()   const { return ffcx_.up_erpm; }
 	float crossDnErpm()   const { return ffcx_.dn_erpm; }
 

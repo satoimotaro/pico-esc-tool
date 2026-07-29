@@ -28,11 +28,12 @@ SPAN = [(0.0, 0.0), (200.0, 60.0), (503.0, 186.8), (540.0, 850.0), (700.0, 1900.
 
 def test_round_trip_matches_exactly():
     dev = _host()
-    sent = curvepush.push(dev, 1, _profile(SPAN))
+    sent, expect = curvepush.push(dev, 1, _profile(SPAN))
     meta, got = curvepush.readback(dev, 1)
     assert meta["measured"] == "1"
     assert int(meta["n"]) == len(sent) == len(SPAN)
     assert [(t, r) for t, r, _ in got] == sent
+    assert [g for *_, g in got] == expect          # push() predicts the device's regime rules
 
 
 def test_regimes_derived_from_the_seam_when_untagged():
@@ -109,3 +110,116 @@ def test_thin_keeps_the_endpoints_and_both_sides_of_the_seam():
 def test_thin_is_a_no_op_below_the_cap():
     out, regs = curvepush.thin(SPAN, None, 24)
     assert out == SPAN and regs is None
+
+
+@pytest.mark.parametrize("cap", [2, 3, 4, 5])
+def test_thin_keeps_the_endpoints_at_every_cap(cap):
+    # The mandatory points outnumber the cap at 2 and 3, and truncating a sorted SET dropped the
+    # highest index — the last point, which defines the top of the feed-forward range.
+    pts = [(float(i * 10), float(i)) for i in range(40)]
+    pts[25] = (250.0, 900.0)
+    out, _ = curvepush.thin(pts, None, cap)
+    assert len(out) <= cap
+    assert out[0] == pts[0], f"cap {cap} dropped the first point"
+    assert out[-1] == pts[-1], f"cap {cap} dropped the LAST point"
+
+
+def test_rounding_collision_below_two_points_explains_itself():
+    # Sub-0.1 thrust spacing collapses on the wire; the device would only say "need 2..24 points".
+    prof = _profile([(0.0, 0.0), (0.02, 10.0), (0.04, 20.0)])
+    with pytest.raises(SystemExit, match="0.1 wire resolution"):
+        curvepush.push(_host(), 1, prof)
+
+
+def test_mixed_regime_tags_are_downgraded_to_untagged():
+    # The device's tagged-flag is table-wide, so one missing tag discards them ALL. push() must not
+    # send a half-tagged table and let an explicit `line` vanish without a word.
+    dev = _host()
+    regs = ["sine", None, "line", "line", "line"]      # index 2 (503 rpm) is below the 4000 seam
+    curvepush.push(dev, 1, _profile(SPAN, regimes=regs, up=4000.0, dn=3800.0))
+    _, got = curvepush.readback(dev, 1)
+    # untagged => derived purely from the seam: only 850 and 1900 rpm clear 4000/7 = 571
+    assert [g for *_, g in got] == ["s", "s", "s", "l", "l"]
+
+
+# --- check_crossover: the safety mechanism the PR calls "the important part" -----------------------
+
+class _FakeCfg:
+    """Stands in for EscConfig: canned read(), records set()/restart()."""
+    instances = []
+
+    def __init__(self, link, index):
+        self.link, self.index = link, index
+        self.sets, self.restarts = [], 0
+        _FakeCfg.instances.append(self)
+
+    def read(self):
+        return _FakeCfg.canned
+
+    def set(self, **kw):
+        self.sets.append(kw)
+
+    def restart(self):
+        self.restarts += 1
+
+
+@pytest.fixture
+def fake_cfg(monkeypatch):
+    _FakeCfg.instances = []
+    _FakeCfg.canned = {"settings": {"sine_cross_up": 34, "sine_cross_dn": 239}}
+    monkeypatch.setattr(curvepush, "EscConfig", _FakeCfg)
+    return _FakeCfg
+
+
+def test_crossover_check_passes_when_the_profile_states_no_bytes(fake_cfg):
+    prof = SpeedProfile(SPAN, pole_pairs=7, crossover={"up_erpm": 1400.0, "dn_erpm": 1308.0})
+    assert curvepush.check_crossover(_host(), 1, prof, False) is True
+
+
+def test_crossover_check_passes_on_a_match(fake_cfg):
+    prof = _profile(SPAN, up=34 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [34, 239]
+    assert curvepush.check_crossover(_host(), 1, prof, False) is True
+    assert fake_cfg.instances[-1].sets == []
+
+
+def test_crossover_check_REFUSES_on_a_mismatch(fake_cfg):
+    prof = _profile(SPAN, up=36 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [36, 239]
+    assert curvepush.check_crossover(_host(), 1, prof, False) is False
+    assert fake_cfg.instances[-1].sets == []          # refusing must not write anything
+
+
+def test_crossover_check_applies_when_asked(fake_cfg):
+    prof = _profile(SPAN, up=36 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [36, 239]
+    assert curvepush.check_crossover(_host(), 1, prof, True) is True
+    assert fake_cfg.instances[-1].sets == [{"sine_cross_up": 36, "sine_cross_dn": 239}]
+    assert fake_cfg.instances[-1].restarts >= 1       # the ESC must be restarted, not left in bootloader
+
+
+def test_crossover_check_rejects_a_self_inconsistent_profile(fake_cfg):
+    # bytes say 36 (= 1406 eRPM) but up_erpm says 1400*2 — the ESC check would pass while the device
+    # received a different seam, which is the exact failure this guard exists to prevent.
+    prof = _profile(SPAN, up=2800.0, dn=1308.0)
+    prof.crossover["bytes"] = [36, 239]
+    with pytest.raises(SystemExit, match="self-inconsistent"):
+        curvepush.check_crossover(_host(), 1, prof, False)
+
+
+# --- main() exit codes: the contract automation sees -----------------------------------------------
+
+def test_main_returns_2_when_the_crossover_is_refused(fake_cfg, tmp_path):
+    prof = _profile(SPAN, up=36 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [36, 239]
+    p = tmp_path / "p.yaml"
+    prof.save(str(p))
+    assert curvepush.main([str(1), str(p), "--dry-run"]) == 2
+
+
+def test_main_returns_0_on_a_clean_push(fake_cfg, tmp_path):
+    prof = _profile(SPAN, up=34 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [34, 239]
+    p = tmp_path / "p.yaml"
+    prof.save(str(p))
+    assert curvepush.main([str(1), str(p), "--dry-run"]) == 0

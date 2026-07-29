@@ -168,8 +168,14 @@ public:
 		// and `motor` are no longer per-power-cycle. main.cpp has already applied the compile-time
 		// defaults, so a stored config deliberately wins over them; an absent/corrupt one changes nothing.
 		LittleFS.mkdir(settings::CFG_DIR);
-		int restored = settings::load(th_, n_);
-		if (restored > 0) Serial.printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
+		uint16_t storedVer = 0;
+		int restored = settings::load(th_, n_, &storedVer);
+		if (restored > 0)
+			Serial.printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
+		else if (storedVer && storedVer != settings::CFG_VERSION)
+			Serial.printf("# cfg: IGNORED a stored config written as v%u (this build wants v%u) — "
+			              "gains/vcal are at compile-time defaults; re-save with `cfg save`\n",
+			              storedVer, settings::CFG_VERSION);
 
 		// Wi-Fi routes: lambdas capturing `this` bind each HTTP path to a member handler.
 		server_.on("/", [this]{ hIndex(); });
@@ -558,8 +564,11 @@ private:
 			//   curve <i>            -> dump the live curve for readback
 			else if (!strcmp(cmd,"curve")) { int i=argi(); char* sub=strtok(nullptr," ");
 				if(i<0||i>=n_) Serial.println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])");
+				// [#11-1] report the pp the LIVE CURVE carries, not the parametric model's — otherwise a
+				// commit/model mismatch is invisible to the host's read-back check, which is the one
+				// place it could have been caught.
 				else if(!sub) { Serial.printf("curve|%d|n=%d|measured=%d|pp=%d|up=%.0f|dn=%.0f\n", i, th_[i]->curveCount(),
-						th_[i]->curveMeasured()?1:0, th_[i]->motorPolePairs(), th_[i]->crossUpErpm(), th_[i]->crossDnErpm());
+						th_[i]->curveMeasured()?1:0, th_[i]->curvePolePairs(), th_[i]->crossUpErpm(), th_[i]->crossDnErpm());
 					for(int k=0;k<th_[i]->curveCount();k++) Serial.printf("pt|%d|%.1f|%.1f|%c\n", k,
 						th_[i]->curvePoint(k).thrust, th_[i]->curvePoint(k).rpm,
 						th_[i]->curveRegime(k)==vel::Regime::LINE?'l':'s');
@@ -586,6 +595,12 @@ private:
 					else if(!th_[i]->setCurve(stage_, stageN_, ppi, upf, dnf, stageTagged_?stageReg_:nullptr))
 						Serial.println("err curve-commit: rejected (need >=2 points, thrust strictly increasing, rpm non-decreasing)");
 					else { Serial.printf("curve|%d|installed %d point(s) pp=%d up=%.0f dn=%.0f\n", i, stageN_, ppi, upf, dnf);
+						// [#11-1] A motor has ONE pole count, so a curve committed at a different pp than
+						// `motor` configured is an operator error (usually curvepush without --motor).
+						// The curve's pp wins from here on; say so rather than letting it diverge quietly.
+						if(th_[i]->motorConfigured() && th_[i]->motorPolePairs()!=ppi)
+							Serial.printf("# warn: curve pp=%d differs from `motor` pp=%d — the curve's wins\n",
+							              ppi, th_[i]->motorPolePairs());
 						stageWant_=0; stageN_=0; stageIdx_=-1; stageTagged_=true; Serial.println("ok"); } }
 				else Serial.println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])"); }
 			// cfg: persist / restore the RUNTIME config (motor identity, gains, DOB, vbatt scale) on the
@@ -603,13 +618,16 @@ private:
 					else Serial.println("err cfg-save: filesystem write failed"); }
 				else if(!strcmp(sub,"load")) { bool anyArmed=false; for(uint8_t i=0;i<n_;i++) if(th_[i]->armed()) anyArmed=true;
 					if(anyArmed) Serial.println("err cfg-load: disarm first (replaces the FF curve)");
-					else { int k=settings::load(th_,n_); if(k>0) { Serial.printf("cfg|restored %d ESC(s)\n", k); Serial.println("ok"); }
-						else Serial.println("err cfg-load: no valid stored config (magic/version/size/CRC)"); } }
+					else { uint16_t sv=0; int k=settings::load(th_,n_,&sv); if(k>0) { Serial.printf("cfg|restored %d ESC(s)\n", k); Serial.println("ok"); }
+						else if(sv && sv!=settings::CFG_VERSION) Serial.printf("err cfg-load: stored config is v%u, this build wants v%u — re-save\n", sv, settings::CFG_VERSION);
+						else Serial.println("err cfg-load: no valid stored config (magic/size/CRC)"); } }
 				else if(!strcmp(sub,"clear")) { if(settings::clear()) Serial.println("ok"); else Serial.println("err cfg-clear: nothing stored"); }
 				else Serial.println("err bad-args (cfg [show|save|load|clear])"); }
 			// Stop-all goes through each Thruster rather than escs::spinStopAll() alone: the engine call
 			// silences the DShot frames but leaves the objects' submode / soft-sensor validity untouched,
-			// so a bare `disarm` used to leave `sense` reporting a stale estimate as valid.
+			// so a bare `disarm` used to leave `sense` reporting a stale estimate as valid. The trailing
+			// spinStopAll() is then redundant for the bound Thrusters and DELIBERATELY kept: it also
+			// covers any escs:: index with no Thruster attached, and a stop path is worth belt-and-braces.
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi();
 				if(i<0) { for(uint8_t k=0;k<n_;k++) th_[k]->stop(); escs::spinStopAll(); }
 				else if(i<n_) th_[i]->stop();
