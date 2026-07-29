@@ -160,7 +160,7 @@ I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
 
 ```
 motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
-sense 1                                   # -> sense|1|vest|vref|load|vbatt|valid|floor|dhat|settled
+sense 1                                   # -> sense|1|vest|vref|load|vbatt|valid|floor|dhat|settled|trim|cmd
 sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
 sense 1 vcal 11.2                         # calibrate vbatt to a known battery voltage (per motor+config)
 cfg save                                  # persist motor/gains/DOB/vcal to the Pico's flash (else RAM-only)

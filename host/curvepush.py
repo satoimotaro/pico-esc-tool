@@ -110,6 +110,7 @@ def check_crossover(dev, idx, prof, apply_it):
     have_up, have_dn = s.get("sine_cross_up"), s.get("sine_cross_dn")
     if (have_up, have_dn) == (cu, cd):
         print(f"crossover: ESC matches the profile (sine_cross_up={cu} sine_cross_dn={cd})")
+        sync_crossup(dev, idx, cu)
         return True
     print(f"CROSSOVER MISMATCH: ESC has sine_cross_up={have_up} sine_cross_dn={have_dn}, "
           f"the curve was measured at {cu}/{cd}.")
@@ -121,7 +122,29 @@ def check_crossover(dev, idx, prof, apply_it):
     cfg.set(sine_cross_up=cu, sine_cross_dn=cd)
     cfg.restart()
     print(f"  applied sine_cross_up={cu} sine_cross_dn={cd} and restarted the ESC")
+    sync_crossup(dev, idx, cu)
     return True
+
+
+def sync_crossup(dev, idx, cross_up):
+    """Tell the CONTROLLER which sine_cross_up the ESC is on (firmware `crossup`).
+
+    Two different consumers, both wrong without it:
+      * the parametric FF — cross_up shifts the 6-step duty map by a constant, and
+      * the SOFT-SENSOR — `estimateV`/`estimateLoad` invert that same map, so `vest`/`load`/`vbatt`
+        stay biased by the shift even while a MEASURED curve is driving the feed-forward.
+    Nothing else sets it: `motor` can, but it discards the measured curve, which is the opposite of
+    what this tool just did. Best-effort — an older firmware without the command must not fail a push.
+    """
+    try:
+        for ln in dev.cmd(f"crossup {idx} {cross_up}", timeout=6):
+            if ln.startswith("crossup|"):
+                print(f"  controller: {ln}")
+                return True
+    except Exception as e:
+        print(f"  note: could not set the controller's cross_up ({e}); `vest`/`load` stay biased if it "
+              f"is not already {cross_up}. Older firmware? Set it by hand: crossup {idx} {cross_up}")
+    return False
 
 
 def push(dev, idx, prof, cap=FW_MAX_POINTS):

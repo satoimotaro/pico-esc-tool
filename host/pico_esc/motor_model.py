@@ -29,6 +29,23 @@ from .velocity import SpeedProfile
 # 6-step: duty_eff(cmd) = rpm / (KV*V) = A6*cmd + B6, for cmd in the 6-step region. (350KV fit.)
 DUTY6_A = 0.00265
 DUTY6_B = -1.233
+# The ESC's `cross_rescale_duty` maps the 6-step demand relative to `Cross_Up`, so changing Cross_Up
+# SHIFTS this affine's intercept and leaves its slope alone. DUTY6_A/B above were fitted at Cross_Up=34.
+# Measured 2026-07-29 (host/duty_sweep.py, two no-load sweeps at 34 and 36, PSU-current corrected):
+# slopes agreed to 0.19%, intercepts differed by 0.0843 over 2 units. Mirrors vel::DUTY6_CROSSUP_* in
+# lib/vel_control/motor_model.h — keep the two in step.
+DUTY6_CROSSUP_REF = 34.0
+DUTY6_CROSSUP_K = 0.0421
+
+
+def duty6(cmd, cross_up=DUTY6_CROSSUP_REF):
+    """Effective 6-step duty = rpm/(KV*V_supply) at command `cmd` on an ESC set to `cross_up`."""
+    return DUTY6_A * abs(cmd) + DUTY6_B - DUTY6_CROSSUP_K * (cross_up - DUTY6_CROSSUP_REF)
+
+
+def cmd_for_duty6(duty, cross_up=DUTY6_CROSSUP_REF):
+    """Exact inverse of duty6()."""
+    return (duty - DUTY6_B + DUTY6_CROSSUP_K * (cross_up - DUTY6_CROSSUP_REF)) / DUTY6_A
 # sine: mech RPM = (cmd/1000) * SINE_FULLSCALE_MECH, SINE_FULLSCALE_MECH = SINE_FULLSCALE_ERPM / PP.
 SINE_FULLSCALE_ERPM = 2499.0      # firmware S1 full-scale eRPM at cmd 1000 (SINE_RCP_SHIFT=3 etc.)
 HANDOFF_ERPM = SINE_CROSS_UP_ERPM_MIN     # ~1333 eRPM: the lowest the firmware will hand off (min slip)
@@ -39,12 +56,15 @@ class MotorModel:
     and is what the eRPM self-cal fits (default 1.0 = ideal). Optional cmd_floor overrides the predicted
     6-step floor cmd."""
 
-    def __init__(self, kv, pole_pairs, v_supply, eff=1.0, name=""):
+    def __init__(self, kv, pole_pairs, v_supply, eff=1.0, name="", cross_up=DUTY6_CROSSUP_REF):
         self.kv = float(kv)
         self.pp = int(pole_pairs)
         self.v = float(v_supply)
         self.eff = float(eff)
         self.name = name or f"{int(kv)}kv"
+        # The ESC's sine_cross_up. Defaults to the value DUTY6_A/B were fitted at, so an existing
+        # caller that never passes it gets byte-identical numbers to before.
+        self.cross_up = float(cross_up)
 
     # ---- scalar predictions ----
     def no_load_top(self) -> float:
@@ -76,7 +96,7 @@ class MotorModel:
 
     def rpm_6step(self, cmd: float) -> float:
         """6-step mech RPM at cmd (KV*V-scaled universal shape), clamped [0, no-load top]."""
-        duty = DUTY6_A * abs(cmd) + DUTY6_B
+        duty = duty6(cmd, self.cross_up)
         if duty <= 0:
             return 0.0
         rpm = self.kv * self.v * self.eff * duty
@@ -85,7 +105,7 @@ class MotorModel:
     def cmd_for_6step(self, rpm: float) -> float:
         """Invert the 6-step curve: cmd that produces `rpm` mech (6-step region)."""
         duty = rpm / (self.kv * self.v * self.eff)
-        return (duty - DUTY6_B) / DUTY6_A
+        return cmd_for_duty6(duty, self.cross_up)
 
     def cmd_for_sine(self, rpm: float) -> float:
         return rpm / self.sine_fullscale_mech() * 1000.0
@@ -142,7 +162,7 @@ class MotorModel:
         ratios = []
         for cmd, erpm in samples:
             mech = abs(erpm) / self.pp
-            ideal = self.kv * self.v * (DUTY6_A * abs(cmd) + DUTY6_B)   # eff=1 prediction
+            ideal = self.kv * self.v * duty6(cmd, self.cross_up)        # eff=1 prediction
             if ideal > 1:
                 ratios.append(mech / ideal)
         if ratios:
@@ -176,6 +196,7 @@ class MotorModel:
                 f"  handoff       : {self.handoff_mech():.0f} mech ; 6-step landing ~"
                 f"{self.sixstep_floor_rpm():.0f} rpm ; gap {self.handoff_mech():.0f}-"
                 f"{self.sixstep_floor_rpm():.0f}\n"
-                f"  6-step curve  : rpm = KV*V*eff*({DUTY6_A}*cmd {DUTY6_B:+g})\n"
+                f"  6-step curve  : rpm = KV*V*eff*({DUTY6_A}*cmd {DUTY6_B:+g}"
+                f"{' ' if self.cross_up == DUTY6_CROSSUP_REF else f' - {DUTY6_CROSSUP_K}*(cross_up-{DUTY6_CROSSUP_REF:g})'})\n"
                 f"  ESC config    : cross_up={self.esc_config()['sine_cross_up']} "
                 f"cross_dn={self.esc_config()['sine_cross_dn']} low_rpm_prot=0")

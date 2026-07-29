@@ -26,11 +26,15 @@ from __future__ import annotations
 import argparse
 import json
 
-from pico_esc.motor_model import DUTY6_A, DUTY6_B
+from pico_esc.motor_model import DUTY6_CROSSUP_REF, duty6
 
 
-def duty(cmd):
-    d = DUTY6_A * abs(cmd) + DUTY6_B
+def duty(cmd, cross_up=DUTY6_CROSSUP_REF):
+    """Effective 6-step duty. `cross_up` MATTERS: the shape constants were fitted at 34, and the ESC's
+    cross_rescale_duty shifts the duty by ~0.042 per Cross_Up unit. Leaving it at the default on a bench
+    running 36 makes V_eff read ~0.6% high at cmd 780 and ~44% high at cmd 570 — and the load/droop
+    numbers below then absorb that model error as if it were physics."""
+    d = duty6(cmd, cross_up)
     return d if d > 0 else 0.0
 
 
@@ -115,7 +119,7 @@ def _report(res, kv, v_known=None):
     if v_known:
         print(f"    known supply {v_known:.1f} V -> implied eff {res['v_eff']/v_known:.3f} "
               f"(load/IR pulls this below 1)")
-    print(f"  per-point V:  " + "  ".join(f"{v:.1f}" for _, v in res['per_point_v']))
+    print("  per-point V:  " + "  ".join(f"{v:.1f}" for _, v in res['per_point_v']))
     print(f"  load signature: droop@top {res['droop_top_rpm']:+.0f} rpm, k_load {res['k_load_rpm2']:.2e} /rpm^2"
           f"  -> {'LOAD detected' if res['load_present'] else '~no load'}")
 

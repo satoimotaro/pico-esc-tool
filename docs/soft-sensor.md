@@ -39,7 +39,8 @@ V_eff = rpm / (KV · duty(cmd)) = V_supply − I·R / duty
 ## The `sense` command
 
 ```
-sense <i>            -> sense|<i>|vest=<V>|vref=<V>|load=<V>|valid=<0|1>
+sense <i>            -> sense|<i>|vest=<V>|vref=<V>|load=<V>|vbatt=<V>|valid=<0|1>|floor=<rpm>
+                        |dhat=<rpm>|settled=<0..1>|trim=<cmd units>|cmd=<int>
 sense <i> zero       -> baseline the no-load reference at the current vest (errors if not BEMF-live)
 ```
 
@@ -111,6 +112,31 @@ otherwise it reports the model error instead. Bench, 350KV at 1600 rpm with no l
 
 So push a measured curve before trusting `dhat` (see the README's `curvepush` note, especially the
 `sine_cross_up` dependency). The `dob_max` clamp exists precisely so a bad curve cannot over-drive.
+
+## `trim` / `cmd` — the control effort, i.e. the drift channel
+
+A closed velocity loop is **blind to plant drift by design**: as the winding heats (R +0.393 %/°C) or
+the magnets weaken (KV +0.11 %/°C), the loop simply works harder and `rpm` keeps reporting the target.
+The effort is where the drift is visible.
+
+| field  | meaning |
+|--------|---------|
+| `trim` | the blended PI correction actually added to the feed-forward, in **ESC command units** — the same units as `ff` and `cmd` (thrust, −1000…1000), *not* rpm (`vc.trim()`; signed, bounded by `gain <i> trim` = `trim_max`). |
+| `cmd`  | the command actually sent, `= clamp(ff(setpoint) + trim + dob_comp)` (`vc.command()`). Logged so a drift trace is self-contained — no need to re-evaluate the FF curve offline. |
+
+To read `trim` as rpm, divide by the curve slope at that operating point: on the 350KV bench the
+6-step segment runs ≈**10.3 rpm per command unit**, so 1 unit of `trim` ≈ 10 rpm of correction.
+(`trim_max`, `dob_max` and `dob`'s internal `comp` are all in these same command units — `comp`
+divides `d_hat` by `rpmSlopeAt()` precisely to get there.)
+
+At a **fixed setpoint**, `trim` walking away from its cold value is the drift signal; `rpm` will not
+move until `trim` saturates at `trim_max`. Rough scale on the 350KV bench: a 40 °C rise is worth
+≈70 rpm at 1600 rpm, i.e. only ≈**7 command units** of `trim` against a `trim_max` of 80 — small, but
+well clear of saturation and resolvable at the 0.1-unit print precision.
+
+Caveat: `trim` responds to **load** exactly as it responds to drift. Interpreting it as drift needs a
+benign reference condition (a known setpoint at known low load), or — on a multi-thruster vehicle —
+cross-thruster comparison, where common-mode is the environment and an outlier is the unit.
 
 ## Offline analysis — `host/softsensor.py`
 
