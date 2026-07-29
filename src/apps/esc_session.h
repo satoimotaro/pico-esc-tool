@@ -40,6 +40,10 @@ struct Telem {
 	uint32_t rpmStampMs = 0;   // millis() of the last ERPM packet — lets a reader detect a STALE rpm
 	                           // (the field holds the last 6-step value even after the ESC drops to
 	                           // forced sine and stops sending eRPM; freshness distinguishes the two).
+	uint32_t tempStampMs = 0;  // millis() of the last TEMPERATURE packet — same idea, but SEPARATE on
+	                           // purpose: EDT temperature keeps arriving in forced sine (where eRPM does
+	                           // not), and forced sine is the hottest regime. 0 = never seen one, which
+	                           // is also the pre-arm state (EDT is only enabled after arming, below).
 };
 
 static const uint16_t SPIN_MAX        = 2000;   // max throttle
@@ -301,7 +305,7 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
-				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; break;
+				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; drvTele[i].tempStampMs = millis(); break;
 				case BidirDshotTelemetryType::STRESS:      drvTele[i].stress = v & ESC_STATUS_MAX_STRESS_MASK; break;
 				case BidirDshotTelemetryType::STATUS:      drvTele[i].status = v; break;
 				default: break;

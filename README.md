@@ -161,6 +161,7 @@ I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
 ```
 motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
 sense 1                                   # -> sense|1|vest|vref|load|vbatt|valid|floor|dhat|settled|trim|cmd
+                                          #    |why|cmdfloor|loadok|vbok|temp|tpeak|tlim|tstate
 sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
 sense 1 vcal 11.2                         # calibrate vbatt to a known battery voltage (per motor+config)
 cfg save                                  # persist motor/gains/DOB/vcal to the Pico's flash (else RAM-only)
@@ -168,7 +169,10 @@ python host/vbatt.py calibrate --known-v 11.2   # host-side equivalent; host/vba
 ```
 
 Rough battery gauge (max-over-time ≈ supply, ~1 % after one calibration) + fouled-prop / entanglement
-load detection. Only valid while spinning in live 6-step. **Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).**
+load detection. Only valid inside a deliberately narrow **validity window** (command above the derived
+6-step handoff, duty below saturation, held for 0.3 s) — outside it `valid=0` and `why=` names the
+condition, because a number you cannot tell apart from a good one is worse than no number.
+**Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).**
 
 ## Requirements
 

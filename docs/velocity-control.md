@@ -149,9 +149,84 @@ All of `velctl`/`velcal`'s safety is the same machinery `posctl` uses:
 - one command per ~20 ms tick (`_pace`) in **every** loop branch, including `velcal`'s
   settle/measure waits — well under the firmware's 500 ms spin deadman;
 - temperature is polled (`tele`) every 0.5 s and the run **aborts** over `--max-temp` (the
-  EFM8BB21 has no current sensing — this is the only thermal backstop at hold);
+  EFM8BB21 has no current sensing). This used to be the *only* thermal backstop at hold; since B.7
+  the firmware carries its own staged limiter as well (below). The host abort is still the one that
+  fires first on the bench — the host defaults (60 C for `autocal`/`xover_debug`, 80 C for
+  `driftsoak`/`velcal`/`posctl`) bracket the firmware band, and it covers **RAW** drive too, which
+  the firmware limiter does not;
 - on **every** exit path (normal, error, SIGINT/SIGTERM) the ESC is disarmed;
 - `--dry-run` never opens a serial port and never writes EEPROM.
+
+## Thermal protection (firmware, `vel::VelocityController`)
+
+> **The EDT temperature is the ESC's own MCU, not the winding.** It is measured on the ESC board by
+> the EFM8BB21 itself. There is no winding sensor on this hardware and Bluejay's EDT emits
+> temperature / status / debug / demag only (no volts, no amps), so this is the *only* thermal
+> observable that exists here — and it is a lagging proxy for the thing that actually burns.
+
+Two stages, on top of each other:
+
+| stage | when | effect |
+|---|---|---|
+| **derate** | `warn_temp ≤ T < max_temp` | the command **ceiling** is scaled linearly from `1.0` down to `temp_min_scale`; the loop keeps running |
+| **abort** | `T ≥ max_temp` for `3` consecutive readings | `Status::ABORT_TEMP` — thrust 0, the app stops the motor and falls back to RAW |
+
+Defaults (`vel::DEFAULT_TEMP_*`, applied to **every** Thruster in `src/main.cpp`): **60 °C** warn,
+**80 °C** abort, **0.35** floor. The band is chosen to sit *entirely below* the ESC's own protection so
+the two can never fight: BlueGill/Bluejay's limiter (`Modules/Scheduler.asm` + `Settings.asm`) is a
+step-down PWM staircase (255→200→150→100→50, i.e. ~100/80/60/40/20 %, in ~5 °C steps) whose **lowest
+selectable onset is 80 °C** (`Layouts/Base.inc`, `TEMP_LIMIT_2S`/`TEMP_LIMIT_1S`).
+
+Why a **command ceiling** and not a scaled setpoint: a scaled setpoint hides the limit inside the
+tracking error, and the disturbance observer then reads the reduction as *load* and fights it. As a
+ceiling it reuses the existing outer-clamp path, and it stays visible in `cmd`. While the ceiling is
+the binding constraint the controller also **freezes the integrator** (no windup against a limit it
+cannot beat — the release is then bump-free), **freezes `d_hat`** and **suppresses `ABORT_STALL`**: we
+are the ones withholding the command, so neither "load" nor "the ESC failed to reach 6-step" is a
+sound inference.
+
+**Fail open, but never silently.** `tstate` (in `sense`) is one of:
+
+| `tstate` | meaning | limit |
+|---|---|---|
+| `none` | no temperature has *ever* been reported (pre-arm, EDT not enabled, or an adapter with no `readTemp`) | `1.00` — behaviour is **bit-identical** to the limiter being disabled; there is no limp mode |
+| `ok` | fresh reading below `warn_temp` | `1.00` |
+| `derate` | inside the band | `< 1.00` |
+| `stale` | a temperature *was* being seen and stopped arriving for `temp_stale_secs` (2 s) | released to `1.00` — **no thermal protection**, and the app prints a notice |
+
+`none` is the one state with no transition to announce, and the most likely real failure: EDT is only
+enabled **post-arm** (`esc_session.h` sends DShot command 13 a few times after the arm window), so if
+that never takes, the session runs unprotected and the only evidence is the absence of a line nobody was
+waiting for. So it is timed out instead: after 5 s of closed-loop drive with no temperature at all the app
+says so once, per ESC, per arm.
+
+Temperature is read through `EscIo::readTemp(float& tempC, uint32_t& stampMs)`, which is **independent
+of eRPM freshness** — forced sine has stale eRPM and is the hottest regime, so a limiter riding on
+`readTele` would be blind exactly where it is needed. The adapter is **stateless**: it reports the last
+decoded value and the stamp of the frame it came from, and the controller derives both edges from that —
+what counts as a *new reading* (the stamp moved) and when to age one out (`temp_stale_secs` since it last
+moved). There is deliberately **one** staleness policy, in one place: an adapter-side freshness window
+plus a controller-side one would have summed on the first-read-after-a-gap path.
+That also makes the abort debounce count **EDT frames, not control ticks** — 3 consecutive over-limit
+readings, because EDT temperature is an integer °C in a frame that can garble and one bad frame must not
+stop a thruster underwater. (An adapter that simply returned its held value every tick would otherwise
+have collapsed the debounce to ~15 ms; the native suite pins the frame-counting behaviour at one frame
+per 20 ticks.)
+
+Runtime: `gain <i> warntemp <C>` / `gain <i> maxtemp <C>` (`maxtemp 0` disables the check entirely,
+`warntemp 0` disables only the derate); `cfg show` reports both; `sense <i>` reports
+`temp`/`tpeak`/`tlim`/`tstate`. These thresholds are **deliberately not persisted** by `cfg save`, so a
+power cycle always restores the conservative compile-time band and loosening it is a conscious act.
+
+**RAW drive is NOT protected.** Only the RPM submode runs `vc.step()`, so `thrust` / `throttle` (and
+the sinesweep / steptrace / coastdown tools that use them) get no firmware thermal limiting at all —
+the host-side `--max-temp` abort is still the only backstop there.
+
+Known limitation: the abort stage still *stops* the motor. On a real ROV, cutting a thruster underwater
+is arguably worse than holding `temp_min_scale`; the existing `ABORT_TEMP` semantics were kept
+deliberately (smallest change, and the derate makes reaching the abort much less likely). Also: none of
+these thresholds is bench-validated — nothing correlates 60/80 °C EDT integers to real junction
+temperature on this board revision yet.
 
 ## S3 firmware is BENCH-UNTESTED — warning
 

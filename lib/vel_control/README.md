@@ -57,6 +57,17 @@ double-division bug. Pole pairs is used *only* to convert an rpm to eRPM for the
 not the last held value — that staleness is how the PI authority fades out. The RP2040 adapter uses
 the `rpmStampMs` freshness field on `escs::Telem`.
 
+`EscIo::readTemp(float& tempC, uint32_t& stampMs)` is **optional** (defaulted to "no temperature", so an
+existing adapter still compiles) and feeds the staged thermal limiter. Unlike `readTele` it is
+**stateless**: report the last decoded temperature and the stamp of the frame it came from — any
+monotonic per-frame tick, only *changes* matter — and return false only when nothing has ever been
+decoded. The controller derives newness (the stamp moved) and staleness (`temp_stale_secs` since it last
+moved) itself, so the abort debounce counts **EDT frames rather than control ticks** without every
+adapter keeping dedupe state and re-implementing the aging policy. Implement it **independently of eRPM
+freshness**: forced sine has stale eRPM and is the hottest regime, so a limiter riding on `readTele` is
+blind exactly where it is needed. The RP2040 adapter uses the separate `tempStampMs` field on
+`escs::Telem`.
+
 ## Test
 
 `test/test_vel_control.cpp` is a native (host g++) test — the library pulls in no Arduino/PIO headers,
@@ -67,4 +78,13 @@ cd test && g++ -std=c++17 -O2 -Wall -o /tmp/tvc test_vel_control.cpp && /tmp/tvc
 ```
 
 A deliberately mis-scaled feed-forward (×1.25) must converge within 5 % once the PI closes on live
-telemetry, while pure FF (`kp=ki=0`) misses by ~19 %; a stall must abort.
+telemetry, while pure FF (`kp=ki=0`) misses by ~19 %; a stall must abort. The same file covers the
+staged thermal limiter (below `warn_temp` the command is bit-identical to a run with no temperature at
+all; never-seen ≠ derated; seen-then-stale releases the limit and reports it).
+
+`test/test_sense_gate.cpp` covers `sense_gate.h`, the soft-sensor's validity window (the headline case
+is the bench's forced-sine "virtual 182 rpm at every command from 60 to 450", which must read invalid):
+
+```sh
+cd test && g++ -std=c++17 -O2 -Wall -o /tmp/tsg test_sense_gate.cpp && /tmp/tsg
+```

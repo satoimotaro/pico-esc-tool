@@ -20,11 +20,17 @@
 #include "esc_session.h"
 #include "vel_control.h"
 #include "motor_model.h"
+#include "sense_gate.h"
 #include "profiles.h"
 
 // An rpm whose telemetry stamp is older than this = stale (forced sine / dropout) — the PI authority
 // then fades and the controller degrades to pure feed-forward.
 static const uint32_t THRUSTER_TELE_FRESH_MS = 100;
+// NOTE: there is deliberately NO temperature counterpart to the constant above. Io::readTemp reports the
+// last decoded EDT temperature WITH ITS STAMP and lets vel::VelocityController own both edges — newness
+// (the stamp moved) and expiry (vel::DEFAULT_TEMP_STALE_SECS since it last moved). Two independently
+// tunable 2-second windows for the same quantity, on either side of the EscIo boundary, would have summed
+// on the first-read-after-a-gap path and been impossible to reason about from either file alone.
 
 // vbatt (resident battery-voltage estimate): gate the rolling max to solid 6-step (above the crossover,
 // where the duty model is accurate), and leak it slowly so it tracks a draining pack.
@@ -84,21 +90,29 @@ public:
 	// constant (persisted by `cfg save`) and is deliberately kept.
 	void arm(Drive mode = Drive::AUTO) {
 		escs::spinArm(index_, mode); vc.reset(); submode_ = RAW;
-		senseVref_ = 0.0f; vbattMax_ = 0.0f; senseValid_ = false;
+		senseVref_ = 0.0f; vbattMax_ = 0.0f; senseZeroCmd_ = 0.0f;
+		gate_.reset();   // dwell, hysteresis latch and both tiers: an arm ends the condition under which
+		                 // anything measured before it is comparable to anything measured after.
 	}
 	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
+	// [B.6-fix] ...and that disengagement must close the soft-sensor with it: poll() returns early at
+	// submode_ != RPM, so a latched gate would otherwise survive `rpm 1 1600` -> `thrust 1 300` and
+	// `sense` would report a minutes-old vest as valid=1|why=ok while the motor runs at an arbitrary
+	// RAW throttle — and `sense zero` would succeed there, recording a stale command as the off-point
+	// centre and poisoning every later `load`. Same reasoning as stop(), same fix.
 	void setRaw(int v) {
 		submode_ = RAW;
+		gate_.reset();
 		if (reversible()) escs::spinThrust(index_, (int16_t)v);
 		else              escs::spinThrottle(index_, (uint16_t)v);
 	}
 	// RPM target: engage the closed loop. Reset the step clock so the first dt is sane.
 	void setRpm(float rpm) { submode_ = RPM; vc.setTarget(rpm); lastStepUs_ = micros(); }
 	// Stopping ends the only condition under which the soft-sensor is meaningful, so the validity flag
-	// has to fall with it: poll() returns early when not in RPM mode, so senseValid_ would otherwise keep
+	// has to fall with it: poll() returns early when not in RPM mode, so the gate would otherwise keep
 	// its last value and `sense` would report a stale vest as valid on a motionless motor.
-	void stop()   { escs::spinStop(index_); submode_ = RAW; senseValid_ = false; }
+	void stop()   { escs::spinStop(index_); submode_ = RAW; gate_.reset(); }
 	void disarm() { stop(); }
 
 	// Copy a profile's calibrated PI gains onto the controller (e.g. the generated M_<NAME>_GAINS).
@@ -119,7 +133,14 @@ public:
 		// LANDING (~sixstepFloorRpm) rather than the seam — the soft-sensor gates below key off it.
 		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])), 700.0f, 4, ffreg_);
 		if (n < 2) return;
-		ffcx_ = vel::Crossover{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
+		// [B.6-fix] The seam is DERIVED from the configured cross_up, not pinned to the firmware
+		// minimum. It used to be hardcoded to HANDOFF_ERPM here, which made crossUpErpm() — the source
+		// the soft-sensor gate's command floor comes from — stop tracking `crossup <i> <byte>`
+		// entirely: at cross_up 36 the real seam is 1406 eRPM (handoff command 563) while the gate
+		// still opened at 560, so the advertised +5 % margin was really -0.5 %; at cross_up 50 the gate
+		// would have latched valid across a ~220-count band that is ENTIRELY forced sine — exactly the
+		// synthesised-telemetry regime B.6 exists to exclude, reachable through a persisted CLI command.
+		ffcx_ = vel::Crossover{mm_.crossUpErpm(), mm_.crossUpErpm()};
 		installCurve_(n, polePairs);
 		motorSet_ = true;
 		curveMeasured_ = false;   // the parametric prediction REPLACES any uploaded curve
@@ -164,6 +185,11 @@ public:
 		if (crossUp < 1.0f || crossUp > 255.0f) return false;
 		mm_.setCrossUp(crossUp);
 		if (motorSet_ && !curveMeasured_) setMotor(mm_.kv(), mm_.polePairs(), mm_.voltage(), crossUp);
+		// [B.6-fix] cross_up MOVES THE SEAM as well as shifting the duty, so the seam metadata has to
+		// follow it even when there is no parametric curve to regenerate — it is what the soft-sensor's
+		// command floor is derived from. A MEASURED curve is exempt: `curve commit <pp> <up> <dn>`
+		// supplies a seam that was actually observed, and that measurement outranks this arithmetic.
+		else if (!curveMeasured_) ffcx_ = vel::Crossover{mm_.crossUpErpm(), mm_.crossUpErpm()};
 		return true;
 	}
 	float vbattScale()      const { return vbattScale_; }
@@ -196,12 +222,29 @@ public:
 	// LIVE command + measured 6-step tele rpm — no voltage/current/force sensor. senseVoltage ~= battery
 	// V at light load; senseLoad = (Vref - Vest) grows with current => torque => thrust (relative). 0
 	// outside 6-step (needs live BEMF tele). Set the motor first with setMotor()/`motor`.
-	float senseVoltage() { return senseValid_ ? vestFilt_ : 0.0f; }         // gated + low-passed
+	float senseVoltage() { return gate_.valid() ? vestFilt_ : 0.0f; }       // gated + low-passed
 	// [#7.1] load = deviation from the LEARNED light-load reference (0 until it settles), not the typed V.
-	float senseLoad()    { return (senseValid_ && senseVref_ > 0.0f) ? (senseVref_ - vestFilt_) : 0.0f; }
+	// [B.6] ...and only while we are still NEAR the operating point that reference was captured at: the
+	// residual no-load I*R/duty deficit is operating-point dependent (it flips worst-case between air and
+	// water), so a difference taken somewhere else is two different biases subtracted, not a load.
+	float senseLoad()    { return (gate_.loadOk() && senseVref_ > 0.0f) ? (senseVref_ - vestFilt_) : 0.0f; }
 	float senseVref()    { return senseVref_; }                             // learned no-load V_eff (0 = not yet)
-	void  senseZero()    { if (senseValid_) senseVref_ = vestFilt_; }        // re-baseline the reference on command
-	bool  senseValid()   { return senseValid_; }                            // false = not BEMF-live 6-step
+	// Re-baseline the reference on command. Refused unless the gate is valid — a reference captured on an
+	// invalid estimate poisons every `load` reading taken against it. Records the COMMAND it was captured
+	// at, which is what the off-point band is measured against afterwards.
+	bool  senseZero()    {
+		if (!gate_.valid()) return false;
+		senseVref_ = vestFilt_; senseZeroCmd_ = fabsf((float)vc.command());
+		return true;
+	}
+	float senseZeroCmd() const { return senseZeroCmd_; }
+	bool  senseValid()   { return gate_.valid(); }                          // false = not BEMF-live 6-step
+	// [B.6] the three-flag split, and WHY the gate is closed when it is. `load` must survive load (that is
+	// the sensor's primary product), so the load conditions are separate flags rather than terms of valid.
+	bool  senseLoadOk()  const { return gate_.loadOk(); }                   // comparable to the zero point
+	bool  senseVbattOk() const { return gate_.vbattOk(); }                  // light-load subset (vcal tier)
+	const char* senseWhy() const { return gate_.whyName(); }
+	float senseCmdFloor() const { return gate_.cmdFloor(); }                // command needed to OPEN the gate
 	// [#8] The |rpm| gates above which the soft-sensor is trusted, DERIVED from the ACTIVE profile — its
 	// lowest genuinely 6-step-reachable speed — so `motor <kv> <pp> <v>` (which moves that boundary) can't
 	// leave a literal behind. vbatt sits a margin higher: its rolling max wants the well-modelled,
@@ -217,6 +260,9 @@ public:
 	// itself is per-session (arm() clears it — see #5 there). Returns false when there is no estimate to
 	// calibrate against yet, so the caller can report it instead of silently no-op'ing.
 	float senseVbatt()   { return vbattScale_ * vbattMax_; }
+	// [B.6] vbattMax_ only ever advances while the gate's LIGHT-LOAD tier is open (see poll()), so "there
+	// is an estimate" now also means "it was taken where vcal's multiplicative scale can actually cancel
+	// the residual deficit". Refusing here is what keeps that true for the stored scale.
 	bool  senseVcal(float knownV) {
 		if (vbattMax_ <= 0.1f) return false;
 		vbattScale_ = knownV / vbattMax_;
@@ -244,6 +290,12 @@ public:
 		if (fabsf(vc.target()) <= vc.stop_below_rpm) {
 			escs::spinThrust(index_, 0);   // neutral: keep armed + signal alive; firmware stops via Rcp_Stop
 			vc.reset();
+			// [B.6-fix] The gate has to fall with the controller. This branch RETURNS before the
+			// soft-sensor update below, so a gate latched at speed would stay valid=1 with a frozen
+			// vest/load for as long as the thruster is held at zero-but-armed. And it is not even
+			// coasting: this PR's own coastdown evidence is 3100 rpm -> dead stop in 0.19-0.54 s,
+			// because zero throttle BRAKES. Mirrors stop(); keeps the promise made at senseValid().
+			gate_.reset();
 			lastStepUs_ = micros();
 			return;
 		}
@@ -255,26 +307,41 @@ public:
 			stop();
 			Serial.printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
 			              index_, (int)st);
+			return;   // stop() already reset the gate; do NOT re-open it on a dead motor's last frame
 		}
-		// SOFT-SENSOR update: sample the voltage estimate ONLY in GENUINE 6-step. vc.live() alone can be
-		// fooled by the firmware's virtual-sine eRPM (it reports a fresh non-zero rpm in forced sine), so
-		// ALSO require the speed to be at/above the profile's own 6-step landing (senseRpmFloor(), #8) —
-		// where V_eff = rpm/(KV*duty) actually holds. Below it (sine / gap / a fooled-live floor) the
-		// estimate is meaningless -> mark invalid.
-		if (vc.live() && fabsf(vc.measured()) >= senseRpmFloor()) {
-			float ve = mm_.estimateV((float)vc.command(), vc.measured());
-			vestFilt_ = senseValid_ ? vestFilt_ + 0.12f * (ve - vestFilt_) : ve;
-			senseValid_ = true;
+		// SOFT-SENSOR update, decided by vel::SenseGate (lib/vel_control/sense_gate.h). The gate keys on
+		// the COMMAND we chose rather than on `tele`, because below the seam the ESC synthesises a virtual
+		// eRPM: the 2026-07-30 bench run saw a constant 182 rpm reported for every command from 60 to 450
+		// while the rotor went 39 -> 170. The old test (`vc.live() && |measured| >= senseRpmFloor()`) read
+		// BOTH its terms from that fiction and so could not detect its own invalidity.
+		// Configured every tick rather than cached at install time: the seam and the 6-step landing are
+		// properties of the LIVE profile, and `curve commit <pp>` / `cfg load` can move either without
+		// passing through the same code path (the class of divergence PR #11 found).
+		gate_.configure(crossUpErpm(), senseRpmFloor());
+		float cmd = (float)vc.command();
+		float ve  = mm_.estimateV(cmd, vc.measured());
+		// The droop handed to the gate is the INSTANTANEOUS one (raw estimate, not the filter): the vbatt
+		// tier is a per-sample light-load selector, so it has to judge THIS sample, not a history.
+		float droop = (senseVref_ > 0.0f) ? senseVref_ - ve : 0.0f;
+		// The off-point band is in DUTY (see SENSE_OFFPOINT_DUTY), so the zero point goes through the same
+		// duty map as the live command. Both shift by the same constant if cross_up changes, which makes
+		// the comparison invariant to it — a command-unit band was not.
+		float zeroDuty = (senseZeroCmd_ > 0.0f) ? mm_.duty6(senseZeroCmd_) : 0.0f;
+		gate_.update(vc.live(), cmd, vc.measured(), mm_.duty6(cmd), droop, senseVref_, zeroDuty, dt);
+		if (gate_.inWindow()) {
+			// Filter DURING the dwell (not only once valid) so the first published sample is already
+			// settled; but RE-SEED on a fresh entry — continuing a filter whose history came from a
+			// different, invalid operating point is how a stale estimate survives into a valid window.
+			vestFilt_ = gate_.freshEntry() ? ve : vestFilt_ + 0.12f * (ve - vestFilt_);
 			// [vbatt] gated rolling-MAX of the estimate ~= supply voltage: V_eff <= V_supply, so the
-			// lightest-load / highest-duty sample approaches the true supply. Gated a margin ABOVE the
-			// 6-step landing (where duty is well modelled). Leaky so it TRACKS a draining battery
-			// (slow decay) while rejecting transient load droops (which recover before the decay bites).
-			if (fabsf(vc.measured()) >= vbattRpmFloor()) {
+			// lightest-load / highest-duty sample approaches the true supply. Gated on the gate's
+			// LIGHT-LOAD tier (vbattOk) and, as before, a margin ABOVE the 6-step landing (where duty is
+			// well modelled). Leaky so it TRACKS a draining battery (slow decay) while rejecting transient
+			// load droops (which recover before the decay bites).
+			if (gate_.vbattOk() && fabsf(vc.measured()) >= vbattRpmFloor()) {
 				if (vestFilt_ > vbattMax_) vbattMax_ = vestFilt_;
 				else                       vbattMax_ -= THRUSTER_VBATT_DECAY;
 			}
-		} else {
-			senseValid_ = false;
 		}
 		// [#7.1] The no-load REFERENCE is captured on command via `sense <i> zero` (senseZero()) at a
 		// known steady light-load operating point — NOT the typed supply V (which read ~-2.2 V under
@@ -292,6 +359,21 @@ public:
 			if (t.rpm == 0) return false;                                        // no live 6-step sample
 			mechRpm = (float)t.rpm;                                              // ALREADY mechanical (fw /pp)
 			tempC   = (float)t.tempC;
+			return true;
+		}
+		// Temperature, INDEPENDENT of eRPM freshness — forced sine has stale eRPM and is the hottest
+		// regime, so this must not ride on the rpm window. STATELESS by contract: just report the last
+		// decoded value and the stamp of the frame it came from; the controller decides what counts as a
+		// new reading and when to age it out (see EscIo::readTemp and updateTemp_), so the debounce
+		// counts EDT FRAMES rather than control ticks without dedupe state living out here.
+		// `t.valid` is deliberately NOT required: it is set by the ERPM decode alone, which is exactly
+		// what this must be independent of.
+		bool readTemp(float& tempC, uint32_t& stampMs) override {
+			escs::Telem t;
+			if (!escs::spinTele(owner->index_, t)) return false;
+			if (t.tempStampMs == 0) return false;      // no EDT TEMPERATURE frame ever (pre-arm / EDT off)
+			tempC = (float)t.tempC;
+			stampMs = t.tempStampMs;
 			return true;
 		}
 	};
@@ -334,7 +416,11 @@ private:
 	// references it, and vc.setProfile(ffprof_) swaps the controller onto it. Untouched until setMotor.
 	vel::CurvePoint   ffbuf_[24] = {{0.0f, 0.0f}, {1.0f, 0.1f}};  // 2-pt stub until setMotor (no OOB read)
 	// FF regime metadata attached to ffprof_ so hasCrossover()/lineFloor() (=> ABORT_STALL) stay live
-	// once `motor` swaps the curve in. up==dn==the firmware handoff floor (mech = HANDOFF_ERPM/pp).
+	// once `motor` swaps the curve in, AND the seam the soft-sensor's command floor is derived from.
+	// The initialiser is the firmware handoff floor, which is exactly what mm_'s default cross_up (34,
+	// the duty-fit reference) resolves to — setMotor()/setCrossUp() then keep it tracking the configured
+	// byte, and `curve commit` replaces it with a MEASURED seam. Static init cannot call mm_, hence the
+	// literal; it must stay equal to MotorModel{...}.crossUpErpm() at DUTY6_CROSSUP_REF.
 	vel::Crossover    ffcx_{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
 	// [#8] per-point regime tags (filled by MotorModel::fillProfile) so lineFloor() reports the real
 	// 6-step landing instead of the seam. The stub's two points are both below it => SINE.
@@ -345,8 +431,11 @@ private:
 	bool              motorSet_ = false;       // has `motor`/setMotor run? (else mm_ holds only defaults)
 	bool              curveMeasured_ = false;  // is ffbuf_ a MEASURED curve (`curve`) rather than parametric?
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
-	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
+	// [B.6] the soft-sensor's validity window — command-derived, hysteretic, dwelled. Owns what used to
+	// be the inline `senseValid_` test in poll(); reset by arm()/stop().
+	vel::SenseGate    gate_;
 	float             senseVref_ = 0.0f;       // [#7.1] no-load V_eff reference (0 = not baselined; set via `sense zero`)
+	float             senseZeroCmd_ = 0.0f;    // [B.6] |command| senseVref_ was captured at (0 = never)
 	float             vbattMax_ = 0.0f;        // [vbatt] gated rolling-max of vest ~= supply V (cleared by arm(), #5)
 	float             vbattScale_ = 1.0f;      // [vbatt] calibration scale (senseVcal; persisted by `cfg save`)
 };

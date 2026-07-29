@@ -49,6 +49,47 @@ static const Gains DEFAULT_GAINS = { 0.4f, 1.5f, 200.0f, 0.3f };
 enum class Regime : uint8_t { SINE, LINE };
 enum class Status : uint8_t { OK, ABORT_OVERSPEED, ABORT_STALL, ABORT_TEMP };
 
+// ---- staged thermal protection (see step()/updateTemp_ below) --------------------------------------
+// The ONLY thermal observable this hardware has is the EDT temperature of the ESC's OWN MCU — there is
+// no winding sensor, and Bluejay's EDT emits temperature/status/debug/demag only (no V, no A). Treat it
+// as a lagging proxy, never as a winding temperature.
+// The band is chosen to sit ENTIRELY BELOW the ESC's own protection so the two can never fight: the
+// BlueGill/Bluejay limiter (src/Modules/Scheduler.asm + Settings.asm) is a step-down PWM staircase
+// (255->200->150->100->50, i.e. ~100/80/60/40/20 %, in ~5 C steps) whose LOWEST selectable onset is
+// 80 C (Layouts/Base.inc: TEMP_LIMIT_2S/1S). 60 C is also the most conservative host abort already in
+// this repo (autocal.py / xover_debug.py --max-temp 60) and 80 C is the driftsoak/velcal/posctl
+// default, so on the bench the HOST abort still fires first and the firmware is only the backstop.
+static const float DEFAULT_TEMP_WARN_C     = 60.0f;   // derate starts here
+static const float DEFAULT_TEMP_ABORT_C    = 80.0f;   // derate is at its floor here, and we abort
+static const float DEFAULT_TEMP_MIN_SCALE  = 0.35f;   // keep ~a third of the command authority at the
+                                                      // bottom of the band: ABOVE the 20 % PWM floor
+                                                      // the ESC's own staircase bottoms out at (its
+                                                      // source calls that "forced landing"), so this
+                                                      // derate is never what makes a vehicle
+                                                      // unmanoeuvrable. Not bench-validated.
+static const float DEFAULT_TEMP_STALE_SECS = 2.0f;    // temperature this old is no longer evidence.
+                                                      // EDT frames are interleaved with the eRPM ones,
+                                                      // so 2 s should be many frames — but that cadence
+                                                      // was never measured, which is exactly why this
+                                                      // is a named constant and not a literal.
+static const int   TEMP_ABORT_READINGS     = 3;       // consecutive over-limit READINGS before aborting
+                                                      // — EDT temperature is an integer C in a frame
+                                                      // that can garble, and one bad frame must not
+                                                      // stop a thruster underwater.
+
+// What the limiter currently knows. NONE and STALE both mean "no protection" — the difference is that
+// NONE never had any and STALE lost it, and both are reported so the absence is never silent.
+enum class TempState : uint8_t { NONE, OK, DERATE, STALE };
+inline const char* tempStateName(TempState s) {
+	switch (s) {
+		case TempState::NONE:   return "none";
+		case TempState::OK:     return "ok";
+		case TempState::DERATE: return "derate";
+		case TempState::STALE:  return "stale";
+	}
+	return "?";
+}
+
 // The firmware sine<->6-step crossover seam, in eRPM (as configured on the ESC).
 struct Crossover { float up_erpm; float dn_erpm; };
 
@@ -229,6 +270,17 @@ struct EscIo {
 	// return true. Return false when there is no fresh frame (forced sine, dropout, pre-arm) — the
 	// controller then treats this tick as "no measurement" and its PI authority fades out.
 	virtual bool readTele(float& mechRpm, float& tempC) = 0;
+	// Latest ESC TEMPERATURE + the timestamp of the frame it came from, INDEPENDENT of eRPM freshness —
+	// forced sine has stale rpm (readTele false) and is the hottest regime, so a thermal limiter riding
+	// on readTele is blind exactly where it is needed.
+	// STATELESS CONTRACT, deliberately unlike readTele: just report the last decoded temperature and its
+	// stamp (any monotonic per-frame tick — millis(), a frame counter — only CHANGES matter), and return
+	// false only when nothing has ever been decoded. The controller derives newness (the stamp moved) and
+	// staleness (temp_stale_secs since it last moved) itself, so the abort debounce counts EDT FRAMES
+	// rather than control ticks without every adapter having to keep dedupe state and re-implement the
+	// aging policy. DEFAULTED to "no temperature", so an adapter written against the old EscIo still
+	// compiles and keeps its readTele tempC path.
+	virtual bool readTemp(float& tempC, uint32_t& stampMs) { (void)tempC; (void)stampMs; return false; }
 };
 
 // ---------------------------------------------------------------------------------------------------
@@ -281,7 +333,14 @@ public:
 	                                // disengage (can't hold speed sensorlessly near 0). 0 => only an
 	                                // exact setTarget(0) stops. This makes `rpm 0` actually STOP.
 	float stall_secs   = 1.0f;      // abort if commanding into 6-step but tele stays stale this long
-	float max_temp     = 0.0f;      // 0 => no temp abort (EDT temp is unreliable on these ESCs)
+	// Thermal staging. max_temp keeps its ORIGINAL meaning — the abort — and 0 still means "no temp
+	// check at all" (neither derate nor abort), so a caller that never sets these is unchanged. The
+	// derate runs over [warn_temp, max_temp] and needs BOTH set (warn_temp > 0 && max_temp > warn_temp);
+	// the composition root sets them from DEFAULT_TEMP_* above. Never persisted: see src/main.cpp.
+	float warn_temp    = 0.0f;      // 0 => no derate (library default: exactly the pre-B.7 behaviour)
+	float max_temp     = 0.0f;      // 0 => no temp check at all (EDT temp is the ESC MCU, not the winding)
+	float temp_min_scale = DEFAULT_TEMP_MIN_SCALE;   // command ceiling at/above max_temp, as a fraction
+	float temp_stale_secs = DEFAULT_TEMP_STALE_SECS; // temperature older than this releases the limit
 	int   tmax         = 1000;      // command magnitude ceiling
 
 	// Set the commanded target (signed mech RPM). Down-catch staging: on a profile with a crossover
@@ -303,6 +362,11 @@ public:
 		d_hat_ = 0.0f; settle_ = 0.0f;
 		stale_accum_ = 0.0f; last_sent_ = 0; last_applied_ = 0.0f;
 		prev_meas_ = 0.0f; have_prev_meas_ = false; d_filt_ = 0.0f; last_d_ = 0.0f;
+		// The thermal DEBOUNCE COUNTER and the clamp flag are loop state, so they clear here with
+		// everything else — a counter that outlived the reset clearing every other latch would re-abort
+		// a freshly re-armed controller. The temperature itself (last/peak/age/state) deliberately does
+		// NOT clear: it is an observation about the hardware, and an arm/disarm does not cool the MCU.
+		over_readings_ = 0; temp_clamped_ = false;
 	}
 
 	// One control tick. dt = elapsed seconds since the last step (<=0 -> VEL_DT_DEFAULT). Reads
@@ -330,20 +394,24 @@ public:
 			target_ = pending_; have_pending_ = false;
 		}
 
-		// -- telemetry: the SAME frame drives feedback AND the temp abort --
+		// -- telemetry: this frame drives the feedback (temperature is acquired separately, below) --
 		bool have_meas = false;
 		float mr = 0.0f, tc = 0.0f;
 		if (io_.readTele(mr, tc)) {
-			if (max_temp > 0.0f && tc > 0.0f) {
-				last_temp_ = tc; peak_temp_ = (peak_temp_ < tc) ? tc : peak_temp_;
-				if (tc >= max_temp) { io_.thrust(0); return Status::ABORT_TEMP; }
-			}
 			if (fabsf(mr) > TELE_MIN_MECH_RPM) {                 // live: re-attach the commanded sign
 				float sign = (sp > 0.0f) ? 1.0f : (sp < 0.0f) ? -1.0f : (last_sign_ >= 0.0f ? 1.0f : -1.0f);
 				tele_mech_ = sign * fabsf(mr); have_tele_ = true; have_meas = true;
 			}
+		} else {
+			tc = 0.0f;                                           // no frame => no legacy temperature
 		}
 		live_ = have_meas;
+
+		// -- staged thermal protection. Deliberately NOT on the readTele path any more: temperature has
+		//    to be observed even when eRPM is stale (forced sine — the hottest regime). The derate is a
+		//    ceiling on the COMMAND (see clampCmd/cmdCeiling), so the limit stays visible in `cmd`
+		//    instead of hiding inside the tracking error where the DOB would fight it. --
+		if (updateTemp_(tc, dt)) { io_.thrust(0); return Status::ABORT_TEMP; }
 
 		// -- PI authority (w) fades with liveness: 0->1 live, 1->0 stale, over blend_secs. Reset the
 		//    integrator at w==0 so a re-arm from below the seam starts clean. --
@@ -368,9 +436,19 @@ public:
 		float gs = updateSettleGate(dt);
 		if (dob > 0.0f && live_ && w_ >= DOB_LIVE_FLOOR) {
 			if (gs > 0.0f) {
-				float d_meas = profile_->rpmFor((float)last_sent_) - tele_mech_;
-				float a = (dob_tau > 0.0f) ? dt / dob_tau : 1.0f; if (a > 1.0f) a = 1.0f;
-				d_hat_ += a * (d_meas - d_hat_);
+				// FREEZE THE UPDATE, NEVER THE OUTPUT. temp_clamped_ holds LAST tick's verdict, so
+				// suppressing `comp` itself made the thermal ceiling self-oscillating: clamped tick ->
+				// comp 0 next tick -> command drops below the ceiling -> unclamped -> comp returns ->
+				// clamped again. Measured on a 60->80 C ramp with dob=0.8 and a real 100 rpm load, the
+				// command square-waved 537<->590 for seconds at the core0 loop rate, flickering the
+				// integrator freeze and the ABORT_STALL suppression with it. Holding the last honest
+				// estimate in the output keeps the loop continuous while still refusing to LEARN from a
+				// deficit we caused ourselves by withholding command.
+				if (!temp_clamped_) {
+					float d_meas = profile_->rpmFor((float)last_sent_) - tele_mech_;
+					float a = (dob_tau > 0.0f) ? dt / dob_tau : 1.0f; if (a > 1.0f) a = 1.0f;
+					d_hat_ += a * (d_meas - d_hat_);
+				}
 				comp = clampf(gs * w_ * dob * d_hat_ / profile_->rpmSlopeAt((float)last_sent_),
 				              -dob_max, dob_max);
 			}
@@ -381,10 +459,26 @@ public:
 		int sent = clampCmd(cmd);
 		io_.thrust(sent);
 		last_sent_ = sent; last_applied_ = applied;
+		// Was the THERMAL ceiling what bit this tick? Used by the guards below and by the next tick's
+		// observer: while we are the ones withholding command, neither "load" nor "the ESC failed to
+		// reach 6-step" is a sound inference. Three conditions, and all three are needed:
+		//   a derate is active; the clamp ACTUALLY changed the command (sent != (int)cmd — comparing
+		//   |cmd| against the ceiling instead false-positives on the fractional part, e.g. cmd 350.7
+		//   with ceiling 350 truncates to 350 and was never clamped); and the request was within the
+		//   UNDERATED outer ceiling, because past that the ±tmax/±1000 clamp would have bound anyway and
+		//   attributing it to temperature would suppress ABORT_STALL for a genuine stall that merely
+		//   coincided with a mild derate.
+		temp_clamped_ = (temp_scale_ < 1.0f) && (sent != (int)cmd)
+		                && (fabsf(cmd) <= (float)outerCeiling());
 
 		// -- back-calculation anti-windup on the OUTER ±tmax clamp. Only when the trim materially drove
 		//    the clamp: skip below a real authority floor, and skip when the FF term alone saturated
-		//    (delivered opposes the desired trim) so the integrator can't flip against the true error. --
+		//    (delivered opposes the desired trim) so the integrator can't flip against the true error.
+		//    A THERMAL clamp is handled PRIMARILY by freezing the integrator (closedLoopTrim) — not
+		//    exclusively: when the trim itself is what the ceiling cut, delivered and desired still share
+		//    a sign and this fold runs in the same tick, which is correct (both drive i_ toward what was
+		//    actually delivered). What the freeze adds is the case the fold declines: FF alone over the
+		//    ceiling, where the fold is skipped and the integrator would otherwise wind to ±trim_max. --
 		if (have_tele_ && w_ >= W_BACKCALC_FLOOR && sent != (int)cmd) {
 			float desired = applied;                         // w*trim we tried to add above the FF
 			float delivered = (float)(sent - (int)ff);       // trim the ESC actually delivered
@@ -401,9 +495,11 @@ public:
 		// stall: the setpoint is at/above the profile's genuinely 6-step-reachable floor (so we EXPECT
 		// live telemetry) yet the command is still driving into that region and telemetry never went
 		// live -> the ESC failed to reach 6-step.
+		// While the thermal ceiling binds, the ESC may legitimately never reach 6-step BECAUSE WE ASKED
+		// IT NOT TO — that is a derate, not a failure to commutate, so the stall accumulator stays clear.
 		float floor;
 		bool commanding_line = profile_->lineFloor(floor) && fabsf(sp) >= floor
-		                       && (float)abs(sent) >= fabsf(ff) - trim_max;
+		                       && (float)abs(sent) >= fabsf(ff) - trim_max && !temp_clamped_;
 		if (commanding_line && !live_) {
 			stale_accum_ += dt;
 			if (stale_accum_ >= stall_secs) { io_.thrust(0); return Status::ABORT_STALL; }
@@ -423,8 +519,63 @@ public:
 	float authority() const { return w_; }               // PI weight 0..1
 	float dhat()     const { return d_hat_; }             // DOB load estimate (rpm-equivalent)
 	float settled()  const { return settle_; }            // DOB settle gate 0..1 (1 = settled, DOB full)
+	float temp()      const { return last_temp_; }        // last ESC MCU temperature seen (C; 0 = never)
+	float peakTemp()  const { return peak_temp_; }        // high-water mark since power-on
+	float tempLimit() const { return temp_scale_; }       // command-ceiling scale 0..1 (1 = unlimited)
+	TempState tempState() const { return temp_state_; }
 
 private:
+	// Staged thermal limiter. Returns true when the ABORT stage has fired. Fails OPEN (scale 1.0) but
+	// never SILENTLY: "never seen a temperature" and "had one and lost it" are distinct reported states,
+	// because a permanent limp mode and a silent absence of protection are the two failure modes here.
+	bool updateTemp_(float teleTemp, float dt) {
+		// NEWNESS IS DECIDED HERE, not by the adapter: a reading counts once, when its stamp moves. That
+		// is what makes TEMP_ABORT_READINGS count EDT frames instead of control ticks — an adapter that
+		// simply reports the value it is holding (the obvious implementation) would otherwise turn one
+		// garbled frame into an abort in 3 ticks (~15 ms), the exact failure the debounce prevents.
+		float tc = 0.0f; uint32_t stamp = 0;
+		bool have = io_.readTemp(tc, stamp) && tc > 0.0f;
+		if (have) have_readtemp_ = true;
+		bool fresh = have && (stamp != temp_stamp_ || !have_temp_);
+		// Back-compat: an adapter written against the OLD EscIo contract delivers its temperature in the
+		// readTele frame, with no stamp to dedupe on. Honour it only while readTemp has never produced
+		// anything, and accept that on that path a reading is per-tick (the pre-B.7 behaviour).
+		if (!have && !have_readtemp_ && teleTemp > 0.0f) { tc = teleTemp; fresh = true; }
+
+		if (fresh) {
+			last_temp_ = tc; if (tc > peak_temp_) peak_temp_ = tc;
+			temp_stamp_ = stamp; temp_age_ = 0.0f; have_temp_ = true;
+		} else if (have_temp_) {
+			temp_age_ += dt;                   // ages from the last NEW reading, however often we ask
+		}
+
+		if (!have_temp_) {                     // never seen one: bit-identical to the limiter disabled
+			temp_scale_ = 1.0f; temp_state_ = TempState::NONE; over_readings_ = 0; return false;
+		}
+		if (temp_age_ > temp_stale_secs) {     // seen, then lost: RELEASE the limit and say so
+			temp_scale_ = 1.0f; temp_state_ = TempState::STALE; over_readings_ = 0; return false;
+		}
+		// -- abort stage: max_temp keeps its original meaning, now debounced over TEMP_ABORT_READINGS
+		//    consecutive readings so one garbled EDT frame cannot stop a thruster. --
+		if (fresh) {
+			if (max_temp > 0.0f && last_temp_ >= max_temp) over_readings_++;
+			else                                           over_readings_ = 0;
+		}
+		// -- derate stage: authority ramps linearly down over [warn_temp, max_temp] to temp_min_scale --
+		float scale = 1.0f;
+		if (warn_temp > 0.0f && max_temp > warn_temp) {
+			if (last_temp_ >= max_temp) scale = temp_min_scale;
+			else if (last_temp_ > warn_temp)
+				scale = 1.0f - (last_temp_ - warn_temp) / (max_temp - warn_temp) * (1.0f - temp_min_scale);
+		}
+		temp_scale_ = scale;
+		temp_state_ = (scale < 1.0f) ? TempState::DERATE : TempState::OK;
+		// Gated on `fresh` so the abort can only fire ON a reading. Without it, a re-armed controller
+		// whose counter had reached the threshold would re-abort on its very first tick — before any new
+		// EDT frame has had a chance to say the ESC has cooled (and reset() now clears the counter too).
+		return fresh && over_readings_ >= TEMP_ABORT_READINGS;
+	}
+
 	// DOB settle gate: forced to 0 while the setpoint is still slewing, then faded back to 1 over
 	// dob_settle_secs from the moment it ARRIVES. Deliberately keyed on |target - setpoint| and not on
 	// the tracking error, so a large steady error never gates the observer off.
@@ -447,7 +598,13 @@ private:
 	float closedLoopTrim(float sp, float dt) {
 		if (!have_tele_) return 0.0f;
 		float err = sp - tele_mech_;
-		if (live_) i_ += ki * err * dt;                  // accumulate only against a FRESH live frame
+		// Accumulate only against a FRESH live frame — and NOT while the thermal ceiling is what is
+		// clamping the command (temp_clamped_ holds the previous tick's verdict). No increase of the
+		// trim can be delivered through that ceiling, so integrating there is pure windup: it would
+		// saturate i_ at ±trim_max and the release would then be a step (measured: with back-calc alone
+		// the integrator parks at -trim_max and takes ~2.8 s to unwind). Frozen, the release is
+		// bump-free — the loop resumes at exactly the command it was holding before the derate.
+		if (live_ && !temp_clamped_) i_ += ki * err * dt;
 		// derivative on MEASUREMENT (low-passed), updated only on a fresh live frame; -kd opposes rising
 		// speed so it damps the approach. Frozen (not decayed) during a fade-out; w_ scales it to 0 anyway.
 		if (kd > 0.0f && live_) {
@@ -465,12 +622,20 @@ private:
 		return u;
 	}
 
+	// The command-magnitude ceiling with NO derate: the pre-B.7 clamp, min(1000, tmax).
+	int outerCeiling() const { int lim = tmax < 1000 ? tmax : 1000; return lim < 0 ? 0 : lim; }
+	// ...and the effective one, scaled by the thermal limiter. A CEILING rather than a setpoint scale on
+	// purpose — scaling the setpoint would hide the limit inside the tracking error, and the DOB would
+	// then read the reduction as load and fight it. With no derate this IS outerCeiling().
+	int cmdCeiling() const {
+		int lim = outerCeiling();
+		return (temp_scale_ >= 1.0f) ? lim : (int)((float)lim * temp_scale_);
+	}
 	int clampCmd(float cmd) const {
 		int v = (int)cmd;                                // truncate toward zero (matches Python int())
-		if (v >  1000) v =  1000;
-		if (v < -1000) v = -1000;
-		if (v >  tmax) v =  tmax;
-		if (v < -tmax) v = -tmax;
+		int lim = cmdCeiling();
+		if (v >  lim) v =  lim;
+		if (v < -lim) v = -lim;
 		return v;
 	}
 	float effectiveOverSpeed() const {
@@ -493,6 +658,13 @@ private:
 	float stale_accum_ = 0.0f;
 	int   last_sent_ = 0; float last_applied_ = 0.0f;
 	float last_temp_ = 0.0f, peak_temp_ = 0.0f;
+	// thermal limiter state (NOT cleared by reset(): a temperature is a physical observation about the
+	// hardware, not closed-loop state, and an arm/disarm does not cool the MCU down)
+	float     temp_scale_ = 1.0f, temp_age_ = 0.0f;
+	uint32_t  temp_stamp_ = 0;              // stamp of the last NEW reading (see updateTemp_)
+	bool      have_temp_ = false, have_readtemp_ = false, temp_clamped_ = false;
+	int       over_readings_ = 0;
+	TempState temp_state_ = TempState::NONE;
 };
 
 }  // namespace vel

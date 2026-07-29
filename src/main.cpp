@@ -39,12 +39,31 @@ static const uint8_t NTHR = sizeof(THRUSTERS) / sizeof(THRUSTERS[0]);
 static EscTool tool(THRUSTERS, NTHR);
 
 void setup() {
-	for (uint8_t i = 0; i < NTHR; i++) THRUSTERS[i]->bind(i);   // attach each to escs:: index i
+	for (uint8_t i = 0; i < NTHR; i++) {
+		THRUSTERS[i]->bind(i);                                  // attach each to escs:: index i
+		// STAGED THERMAL PROTECTION, on EVERY thruster (the gains below are per-motor; a thermal limit
+		// is not — an un-tuned ESC needs it at least as much). Read this first: the EDT temperature is
+		// the ESC's OWN MCU, measured on the ESC board. It is NOT a winding sensor and NOT a motor
+		// temperature — this hardware has no winding sensor at all — so treat it as a lagging proxy.
+		// [60, 80] C sits entirely BELOW the ESC's own protection, whose lowest selectable onset is 80 C
+		// (bluegill Layouts/Base.inc TEMP_LIMIT_2S/1S; Scheduler.asm then steps the PWM 100/80/60/40/20 %
+		// in ~5 C stages), so the two can never fight. 60 C is also the most conservative host abort in
+		// this repo (autocal.py / xover_debug.py --max-temp 60) and 80 C the driftsoak/velcal default, so
+		// on the bench the HOST abort still fires first and this is only the backstop.
+		// DELIBERATELY NOT PERSISTED: these are not in settings::Record, so `cfg save` cannot store a
+		// loosened limit and a power cycle always restores this conservative band. Loosening it has to be
+		// a conscious `gain <i> warntemp|maxtemp` each session. (It also avoids a CFG_VERSION v4 whose
+		// migration would have to choose between "reproduce the old behaviour" and "safe default".)
+		// NOTE: only the RPM submode runs vc.step(), so RAW drive (`thrust`/`throttle`) is UNPROTECTED.
+		THRUSTERS[i]->vc.warn_temp      = vel::DEFAULT_TEMP_WARN_C;
+		THRUSTERS[i]->vc.max_temp       = vel::DEFAULT_TEMP_ABORT_C;
+		THRUSTERS[i]->vc.temp_min_scale = vel::DEFAULT_TEMP_MIN_SCALE;
+	}
 
 	// Per-motor closed-loop PI gains — from the same calibrated profile (the ~30x-hotter real plant
 	// needs these, not the sim DEFAULT_GAINS). esc0 stays at library defaults.
 	esc1.applyGains(profiles::M_930KV_12N14P_6STEP_GAINS);
-	esc1.vc.slew_rpm_s = 2000.0f; esc1.vc.max_temp = 0.0f;   // 2000 balances overshoot vs. rise: a
+	esc1.vc.slew_rpm_s = 2000.0f;   // 2000 balances overshoot vs. rise: a
 	                       // 1500->3500 step went 40%->33% peak overshoot vs. 4000 for ~0.16 s more rise
 	                       // (steady-state still 0.1%). Lower (~1200) cuts overshoot further but the
 	                       // response gets sluggish; a prop under water load damps the spike anyway.

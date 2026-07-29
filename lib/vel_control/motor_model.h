@@ -46,6 +46,15 @@ static const float DUTY6_CROSSUP_K   = 0.0421f;    // measured d(duty)/d(Cross_U
                                                    // (32*2.5/2047) = 0.0391, measured runs 7.9 % higher
 static const float SINE_FULLSCALE_ERPM = 2499.0f;   // firmware S1 full-scale eRPM at cmd 1000
 static const float HANDOFF_ERPM = 1333.0f;          // lowest handoff the firmware allows (min slip)
+// The ESC's `sine_cross_up` BYTE -> the seam it actually hands off at, in eRPM. Cross_Up is in
+// Sine_Inc_H units (one unit = 256 in Sine_Inc, and up eRPM = Sine_Inc*10000/65536), so
+// eRPM/unit = 256*10000/65536 = 39.0625. MUST stay in lockstep with
+// host/pico_esc/config.py:SINE_CROSS_UP_ERPM_PER_UNIT and tools/sim/sine_drive_model.py.
+// This exists because cross_up has TWO independent effects and only one of them was modelled: it
+// shifts the 6-step duty (DUTY6_CROSSUP_K, above) AND it MOVES THE SEAM. Anything that derives a
+// handoff speed/command must go through crossUpErpm(), or it silently keeps using the firmware
+// minimum while the operator has configured something else.
+static const float SINE_CROSS_UP_ERPM_PER_UNIT = 10000.0f / 256.0f;   // = 39.0625
 
 class MotorModel {
 public:
@@ -60,6 +69,14 @@ public:
 	// exactly the pre-2026-07-29 behaviour rather than a silent shift.
 	void  setCrossUp(float cu) { if (cu > 0.0f) crossUp_ = cu; }
 	float crossUp() const      { return crossUp_; }
+	// The SEAM the configured cross_up puts the handoff at, in eRPM — floored at the firmware's own
+	// minimum (HANDOFF_ERPM), because the ESC cannot hand off below it however low the byte is set
+	// (cross_up 34 => 1328 eRPM, i.e. just under the floor: that is why 34 reads as ~the minimum).
+	// This is the ONE place a seam-derived quantity may come from on the parametric path.
+	float crossUpErpm() const {
+		float e = crossUp_ * SINE_CROSS_UP_ERPM_PER_UNIT;
+		return e > HANDOFF_ERPM ? e : HANDOFF_ERPM;
+	}
 
 	// THE 6-step duty map and its exact inverse. Every duty user goes through this pair — four call
 	// sites open-coded `DUTY6_A*cmd + DUTY6_B` before, which is how the Cross_Up term would get

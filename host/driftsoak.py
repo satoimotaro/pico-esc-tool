@@ -110,6 +110,19 @@ def sample(dev, idx):
         "vbatt":   float(s.get("vbatt", "nan")),
         "load":    float(s.get("load", "nan")),
         "valid":   int(float(s.get("valid", 0))),
+        # Soft-sensor validity window (firmware vel::SenseGate). `why` is the whole point of logging
+        # these: the gate is deliberately stricter than the old rpm-only test, so a valid=0 row has to
+        # say WHICH condition closed it instead of looking like a regression. loadok/vbok are the two
+        # sub-tiers — `load` is only comparable near the command `sense zero` was taken at, and `vbatt`
+        # only advances at light load. `.get` defaults keep an OLD-format firmware parsing fine.
+        "why":     s.get("why", ""),
+        "loadok":  int(float(s.get("loadok", 0))),
+        "vbok":    int(float(s.get("vbok", 0))),
+        # Firmware thermal limiter: tlim = the command-ceiling scale it is applying (1.00 = none),
+        # tstate = none|ok|derate|stale. A derate means the firmware is withholding command, so `trim`
+        # and `cmd` stop being a pure drift signal — the soak has to be read differently from there on.
+        "tlim":    float(s.get("tlim", "nan")),
+        "tstate":  s.get("tstate", ""),
         "tele_rpm": t.get("rpm", float("nan")),
         "tempC":    t.get("tempC", float("nan")),
         "stress":   t.get("stress", float("nan")),
@@ -144,8 +157,12 @@ def run(dev, opts, state):
         if s["valid"] and s["settled"] >= 1.0 and s["tele_rpm"] > opts.stall_rpm:
             break
         if time.time() - t_wait > opts.settle_timeout:
+            # `why` names the condition that blocked the lock (cmdlow = the setpoint never asked for a
+            # command above the soft-sensor's floor; rpmlow = it did and the rotor never caught; ...).
+            # Without it "valid=0" is the same message for every possible cause.
             raise Aborted(f"never reached a settled 6-step lock in {opts.settle_timeout:g}s "
-                          f"(valid={s['valid']} settled={s['settled']} rpm={s['tele_rpm']})")
+                          f"(valid={s['valid']} why={s['why'] or '?'} settled={s['settled']} "
+                          f"rpm={s['tele_rpm']})")
         time.sleep(0.5)
     print(f"# locked after {time.time() - t_wait:.1f}s")
 
@@ -165,7 +182,7 @@ def run(dev, opts, state):
         print(f"# note: sense zero failed ({e}); `load` stays 0")
 
     rows, t0, stall_run, blind_run = state["rows"], time.time(), 0, 0
-    base = None
+    base, last_tstate = None, ""
     deadline = t0 + opts.minutes * 60.0
     next_tick = t0
 
@@ -193,6 +210,17 @@ def run(dev, opts, state):
                               f"(link dropout or desync); stopping rather than running on unguarded")
         else:
             blind_run = 0
+
+        # The FIRMWARE thermal limiter changes what this log MEANS: under a derate `trim`/`cmd` are
+        # bounded by a ceiling instead of tracking the plant, and `stale` means the firmware has no
+        # thermal protection at all any more. Report every transition; the host --max-temp abort below
+        # is unchanged and still fires first at its own threshold.
+        if s["tstate"] and s["tstate"] != last_tstate:
+            if s["tstate"] in ("derate", "stale"):
+                print(f"  !! firmware thermal {s['tstate']} at t={s['t']:.0f}s "
+                      f"(tlim={s['tlim']:.2f}, ESC {s['tempC']}C) — `trim`/`cmd` are no longer a "
+                      f"pure drift signal")
+            last_tstate = s["tstate"]
 
         if s["tempC"] == s["tempC"] and s["tempC"] >= opts.max_temp:
             raise Aborted(f"ESC over-temperature {s['tempC']:.0f}C >= {opts.max_temp:.0f}C")
@@ -324,6 +352,7 @@ def main():
 
     if rows:
         keys = ["t", "trim", "cmd", "dhat", "settled", "vest", "vbatt", "load", "valid",
+                "why", "loadok", "vbok", "tlim", "tstate",
                 "tele_rpm", "enc_rpm", "tempC", "stress"]
         with open(out, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")

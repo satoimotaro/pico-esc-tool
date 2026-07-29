@@ -209,7 +209,7 @@ public:
 		enc_.poll();                                            // high-rate AS5600 sampling (self-gated)
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
-			for (uint8_t i = 0; i < n_; i++) th_[i]->poll();   // RPM submode closes the loop
+			for (uint8_t i = 0; i < n_; i++) { th_[i]->poll(); thermalNotice(i); }   // RPM submode closes the loop
 			escs::spinPoll();                                          // keep DShot frames flowing
 		}
 		if (wifiUp_) server_.handleClient();
@@ -219,6 +219,52 @@ public:
 	void pollCore1() { escs::core1Poll(); }
 
 private:
+	// [B.7] One-shot serial notice whenever the thermal limiter CHANGES state. The two states worth
+	// waking an operator for are DERATE (the firmware is now withholding command — a `rpm` that no longer
+	// tracks is protection, not a fault) and STALE (temperature was being observed and is not any more,
+	// so the limiter has FAILED OPEN — deliberately, but it must never be silent). Printed once per
+	// transition rather than per tick: this runs at the core0 loop rate.
+	void thermalNotice(uint8_t i) {
+		if (i >= escs::COUNT) return;
+		vel::TempState s = th_[i]->vc.tempState();
+		// NONE is the one failure mode with no transition to announce, and the most likely one in
+		// practice: EDT is only enabled post-arm (esc_session.h sends DShot 13 a few times after the arm
+		// window), so if that never takes, the whole session runs with zero thermal protection and the
+		// only evidence is the ABSENCE of a line nobody was waiting for. "Fails open but never silently"
+		// has to cover this case too, so time it out and say so once.
+		if (s == vel::TempState::NONE && th_[i]->submode() == Thruster::RPM && th_[i]->armed()) {
+			if (!tempNoneSince_[i]) tempNoneSince_[i] = millis();
+			else if (!tempNoneSaid_[i] && millis() - tempNoneSince_[i] > THERMAL_NONE_WARN_MS) {
+				tempNoneSaid_[i] = true;
+				Serial.printf("# ESC %u no EDT temperature after %lus of closed-loop drive — NO thermal "
+				              "protection (limiter idle). Re-arm to retry EDT enable.\n",
+				              i, (unsigned long)(THERMAL_NONE_WARN_MS / 1000));
+			}
+		} else {
+			tempNoneSince_[i] = 0;
+			if (s != vel::TempState::NONE) tempNoneSaid_[i] = false;   // re-arm the warning for next time
+		}
+		if ((uint8_t)s == tempSeen_[i]) return;
+		tempSeen_[i] = (uint8_t)s;
+		if (s == vel::TempState::DERATE)
+			Serial.printf("# ESC %u thermal DERATE: ESC MCU %.0fC (warn %.0f, abort %.0f) — command ceiling %.0f%%\n",
+			              i, th_[i]->vc.temp(), th_[i]->vc.warn_temp, th_[i]->vc.max_temp,
+			              th_[i]->vc.tempLimit() * 100.0f);
+		else if (s == vel::TempState::STALE)
+			Serial.printf("# ESC %u thermal telemetry LOST (last %.0fC) — limiter released, NO thermal protection\n",
+			              i, th_[i]->vc.temp());
+		else if (s == vel::TempState::OK)
+			Serial.printf("# ESC %u thermal ok: ESC MCU %.0fC, full command authority\n", i, th_[i]->vc.temp());
+	}
+	uint8_t  tempSeen_[escs::COUNT] = {0};       // last ANNOUNCED TempState per ESC (0 == TempState::NONE)
+	uint32_t tempNoneSince_[escs::COUNT] = {0};  // millis() this ESC started driving with no temperature
+	bool     tempNoneSaid_[escs::COUNT] = {false};
+	// How long a thruster may run the closed loop with NO temperature before we call it out. EDT enable
+	// is 10 DShot-13 frames sent right after the arm window, so a working ESC reports within well under a
+	// second; 5 s is generous enough that a slow first frame is not mistaken for a dead channel, and short
+	// enough that the operator hears about it near the start of a run rather than after it.
+	static const uint32_t THERMAL_NONE_WARN_MS = 5000;
+
 	// ---- members (were esc_tool.cpp file-scope globals) ----
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
 	uint8_t         n_;          // how many
@@ -532,7 +578,11 @@ private:
 					else if(!strcmp(g,"trim")) th_[i]->vc.trim_max=fv; else if(!strcmp(g,"slew")) th_[i]->vc.slew_rpm_s=fv;
 					else if(!strcmp(g,"dob")) th_[i]->vc.dob=fv; else if(!strcmp(g,"dobtau")) th_[i]->vc.dob_tau=fv;
 					else if(!strcmp(g,"dobmax")) th_[i]->vc.dob_max=fv; else if(!strcmp(g,"dobsettle")) th_[i]->vc.dob_settle_secs=fv;
-					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle)"); continue; }
+					// [B.7] thermal thresholds, in C. warntemp 0 disables the derate, maxtemp 0 disables
+					// the temp check entirely. NOT persisted by `cfg save` on purpose (src/main.cpp): a
+					// power cycle always restores the conservative compile-time band.
+					else if(!strcmp(g,"warntemp")) th_[i]->vc.warn_temp=fv; else if(!strcmp(g,"maxtemp")) th_[i]->vc.max_temp=fv;
+					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle|warntemp|maxtemp)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"motor")) { int i=argi(); char* kv=strtok(nullptr," "); char* pp=strtok(nullptr," "); char* vv=strtok(nullptr," ");   // motor <i> <kv> <pp> <v>: regenerate the FF curve parametrically (MotorModel)
 				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence
@@ -564,12 +614,18 @@ private:
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
 				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero|vcal <V>])");
-					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseValid()) Serial.println("err sense-zero: not BEMF-live (spin steady into 6-step first)"); else { th_[i]->senseZero(); Serial.printf("sense|%d|zeroed vref=%.2f\n", i, th_[i]->senseVref()); Serial.println("ok"); } }
+					// [B.6] the refusal now NAMES the blocking condition (why=): the gate is stricter than
+					// the old rpm-only test, so "not BEMF-live" alone would send an operator hunting the
+					// wrong thing. The captured COMMAND is echoed because `load` is only comparable within
+					// a band around it — the caller has to know where the baseline was taken.
+					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseZero()) Serial.printf("err sense-zero: soft-sensor not valid here (why=%s, need |cmd|>=%.0f) — spin steady into 6-step first\n", th_[i]->senseWhy(), th_[i]->senseCmdFloor()); else { Serial.printf("sense|%d|zeroed vref=%.2f|zerocmd=%.0f\n", i, th_[i]->senseVref(), th_[i]->senseZeroCmd()); Serial.println("ok"); } }
 					else if(sub && !strcmp(sub,"vcal")) { char* v=strtok(nullptr," "); float kv=v?atof(v):0.0f;   // [vbatt] calibration to a known battery voltage (per power cycle unless `cfg save`d)
 						if(kv<=0.0f) Serial.println("err sense-vcal: need a known battery voltage (sense <i> vcal 11.2)");
 						// [#7] parity with `sense zero`: refuse instead of silently no-op'ing when there is no
 						// rolling-max estimate yet to calibrate against (the CLI used to print ok + vbatt=0.00).
-						else if(!th_[i]->senseVcal(kv)) Serial.println("err sense-vcal: no vbatt estimate yet (spin steady above the 6-step floor first)");
+						// [B.6] the rolling max only advances inside the gate's LIGHT-LOAD tier (vbok), so
+						// "no estimate yet" now specifically means that tier never opened — say which one.
+						else if(!th_[i]->senseVcal(kv)) Serial.printf("err sense-vcal: no vbatt estimate yet — the light-load tier (vbok) has never opened (vbok=%d why=%s); spin steady, lightly loaded, above the 6-step floor first\n", th_[i]->senseVbattOk()?1:0, th_[i]->senseWhy());
 						else { Serial.printf("sense|%d|vcal to %.2f V -> vbatt=%.2f (persist with: cfg save)\n", i, kv, th_[i]->senseVbatt()); Serial.println("ok"); } }
 				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad(), vb=th_[i]->senseVbatt();
 					// dhat = the DOB's load estimate in rpm (0 when the observer is off or gated). Exposed
@@ -579,10 +635,26 @@ private:
 					// loop hides it), the effort is not: at a fixed setpoint, a drifting R/KV shows up as
 					// trim walking away from its cold value long before rpm moves. cmd = ff(setpoint)+trim
 					// is logged too so a drift trace is self-contained (no need to re-evaluate the FF).
-					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d\n",
+					// [B.6/B.7] New fields are APPENDED, never inserted: the prefix and the existing key
+					// ORDER are a contract with host/driftsoak.py, loadtest.py and vbatt.py (all three
+					// parse key=value, but two of them slice by position first).
+					//   why      = which condition is closing the gate (ok|notlive|cmdlow|dutyhigh|rpmlow|
+					//              settling). Mandatory: the gate is stricter than the old one, so a
+					//              legitimate valid=0 must not look like a regression.
+					//   cmdfloor = the |command| needed to OPEN the gate (derived from the seam, not typed)
+					//   loadok   = `load` is comparable to the zero point; vbok = light-load (vcal) tier
+					//   temp/tpeak/tlim/tstate = the thermal limiter: last ESC MCU temperature (NOT the
+					//              winding), its high-water mark, the command-ceiling scale it is applying
+					//              (1.00 = none) and its state (none=never seen, ok, derate, stale=lost it).
+					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d"
+					              "|why=%s|cmdfloor=%.0f|loadok=%d|vbok=%d|temp=%.0f|tpeak=%.0f|tlim=%.2f|tstate=%s\n",
 						i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor(),
 						th_[i]->vc.dhat(), th_[i]->vc.settled(),
-						th_[i]->vc.trim(), th_[i]->vc.command()); Serial.println("ok"); } }
+						th_[i]->vc.trim(), th_[i]->vc.command(),
+						th_[i]->senseWhy(), th_[i]->senseCmdFloor(),
+						th_[i]->senseLoadOk()?1:0, th_[i]->senseVbattOk()?1:0,
+						th_[i]->vc.temp(), th_[i]->vc.peakTemp(), th_[i]->vc.tempLimit(),
+						vel::tempStateName(th_[i]->vc.tempState())); Serial.println("ok"); } }
 			// curve: upload a MEASURED feed-forward curve (velcal/sysid -> host/curvepush.py), replacing
 			// the parametric `motor` prediction. Sent ONE POINT PER LINE on purpose: the input buffer is
 			// 600 B and silently truncates past it, so a whole table on one line would be a data-loss
@@ -636,11 +708,14 @@ private:
 			// refused while any ESC is armed.
 			else if (!strcmp(cmd,"cfg")) { char* sub=strtok(nullptr," ");
 				if(!sub || !strcmp(sub,"show")) {
-					for(uint8_t i=0;i<n_;i++) Serial.printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f|cross_up=%.0f\n",
+					// [B.7] warntemp/maxtemp are APPENDED (host `cfg` parsers are key=value) and are
+					// deliberately NOT part of the persisted Record — see the note in src/main.cpp.
+					for(uint8_t i=0;i<n_;i++) Serial.printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f|cross_up=%.0f|warntemp=%.0f|maxtemp=%.0f\n",
 						i, th_[i]->motorConfigured()?1:0, th_[i]->motorKv(), th_[i]->motorPolePairs(), th_[i]->motorVolts(),
 						th_[i]->vc.kp, th_[i]->vc.ki, th_[i]->vc.kd, th_[i]->vc.trim_max, th_[i]->vc.slew_rpm_s,
 						th_[i]->vc.dob, th_[i]->vc.dob_tau, th_[i]->vc.dob_max, th_[i]->vc.dob_settle_secs,
-						th_[i]->vbattScale(), th_[i]->motorCrossUp());
+						th_[i]->vbattScale(), th_[i]->motorCrossUp(),
+						th_[i]->vc.warn_temp, th_[i]->vc.max_temp);
 					Serial.printf("cfg|stored=%d\n", settings::exists()?1:0); Serial.println("ok"); }
 				else if(!strcmp(sub,"save")) { if(settings::save(th_,n_)) { Serial.printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); Serial.println("ok"); }
 					else Serial.println("err cfg-save: filesystem write failed"); }
