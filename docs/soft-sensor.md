@@ -68,8 +68,17 @@ Because `V_eff ≤ V_supply`, the **maximum** (or a high percentile) of `V_eff` 
 samples approaches the true supply — the lightest-load / highest-duty moment. Higher rpm/duty shrinks
 the `I·R/duty` droop, so high-command samples are closest.
 
-**Calibration is one-time, per motor+config — NOT per startup, NOT per battery.** The bias is a linear
-scale; one known-voltage point fixes it forever:
+**Calibration is per motor+config — NOT per battery, and NOT per run *provided you persist it*.** The
+bias is a linear scale, so one known-voltage point fixes it; on the firmware that scale lives in RAM
+until you write it to the Pico's flash:
+
+```
+sense 1 vcal 11.2      # set the scale from a known battery voltage (needs a live vbatt estimate)
+cfg save               # persist it (with the motor identity, gains and DOB tunables) — otherwise the
+                       # calibration is lost on the next reset and `vbatt` silently reads uncalibrated
+```
+
+The host prototype stores its own scale in a file instead:
 
 ```
 python host/vbatt.py calibrate --known-v 11.2     # spins, captures gated high-percentile V_eff,
@@ -94,7 +103,7 @@ flag. Useful to characterise a motor offline; the firmware `sense` is the live v
 
 - **Only while spinning in live 6-step.** Stopped / forced-sine / near-crossover → `valid=0`. In an
   ROV, sample opportunistically whenever a thruster is running.
-- **Absolute voltage needs the one-time calibration**; raw `vest` is biased (~18 % low on the bench
+- **Absolute voltage needs the calibration** (and `cfg save` to survive a reset); raw `vest` is biased (~18 % low on the bench
   350KV). Relative trends (load, battery draining) work even uncalibrated.
 - **Can't separate V from load at a single point** — that's why voltage uses *max-over-time* (lightest
   load) and load uses *deviation from a learned no-load baseline*. Time-multiplex if you need both.

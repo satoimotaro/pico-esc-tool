@@ -25,6 +25,7 @@
 #include "as5600.h"
 #include "esc_flash.h"
 #include "thruster.h"
+#include "settings.h"
 
 // ---- small helpers (unchanged from esc_tool.cpp) ----
 static void printHex(const uint8_t* p, uint16_t n) {
@@ -160,6 +161,12 @@ public:
 		if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }   // firmware library store
 		enc_.begin();                                                    // AS5600 encoder (I2C0, GP16/17)
 		LittleFS.mkdir("/fw");
+		// Restore the saved runtime config (motor identity, gains, DOB, vbatt scale) — so `sense vcal`
+		// and `motor` are no longer per-power-cycle. main.cpp has already applied the compile-time
+		// defaults, so a stored config deliberately wins over them; an absent/corrupt one changes nothing.
+		LittleFS.mkdir(settings::CFG_DIR);
+		int restored = settings::load(th_, n_);
+		if (restored > 0) Serial.printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
 
 		// Wi-Fi routes: lambdas capturing `this` bind each HTTP path to a member handler.
 		server_.on("/", [this]{ hIndex(); });
@@ -504,7 +511,9 @@ private:
 					if(!strcmp(g,"kp")) th_[i]->vc.kp=fv; else if(!strcmp(g,"ki")) th_[i]->vc.ki=fv;
 					else if(!strcmp(g,"kd")) th_[i]->vc.kd=fv; else if(!strcmp(g,"dtau")) th_[i]->vc.d_tau=fv;
 					else if(!strcmp(g,"trim")) th_[i]->vc.trim_max=fv; else if(!strcmp(g,"slew")) th_[i]->vc.slew_rpm_s=fv;
-					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew)"); continue; }
+					else if(!strcmp(g,"dob")) th_[i]->vc.dob=fv; else if(!strcmp(g,"dobtau")) th_[i]->vc.dob_tau=fv;
+					else if(!strcmp(g,"dobmax")) th_[i]->vc.dob_max=fv; else if(!strcmp(g,"dobsettle")) th_[i]->vc.dob_settle_secs=fv;
+					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"motor")) { int i=argi(); char* kv=strtok(nullptr," "); char* pp=strtok(nullptr," "); char* vv=strtok(nullptr," ");   // motor <i> <kv> <pp> <v>: regenerate the FF curve parametrically (MotorModel)
 				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence
@@ -513,10 +522,35 @@ private:
 				else { th_[i]->setMotor(kvf, ppi, vvf);
 					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s\n", i, kv, pp, vv); Serial.println("ok"); } }
 			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
-				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero])");
+				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero|vcal <V>])");
 					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseValid()) Serial.println("err sense-zero: not BEMF-live (spin steady into 6-step first)"); else { th_[i]->senseZero(); Serial.printf("sense|%d|zeroed vref=%.2f\n", i, th_[i]->senseVref()); Serial.println("ok"); } }
-				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad();
-					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|valid=%d\n", i, ve, vr, ld, th_[i]->senseValid()?1:0); Serial.println("ok"); } }
+					else if(sub && !strcmp(sub,"vcal")) { char* v=strtok(nullptr," "); float kv=v?atof(v):0.0f;   // [vbatt] calibration to a known battery voltage (per power cycle unless `cfg save`d)
+						if(kv<=0.0f) Serial.println("err sense-vcal: need a known battery voltage (sense <i> vcal 11.2)");
+						// [#7] parity with `sense zero`: refuse instead of silently no-op'ing when there is no
+						// rolling-max estimate yet to calibrate against (the CLI used to print ok + vbatt=0.00).
+						else if(!th_[i]->senseVcal(kv)) Serial.println("err sense-vcal: no vbatt estimate yet (spin steady above the 6-step floor first)");
+						else { Serial.printf("sense|%d|vcal to %.2f V -> vbatt=%.2f (persist with: cfg save)\n", i, kv, th_[i]->senseVbatt()); Serial.println("ok"); } }
+				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad(), vb=th_[i]->senseVbatt();
+					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f\n", i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor()); Serial.println("ok"); } }
+			// cfg: persist / restore the RUNTIME config (motor identity, gains, DOB, vbatt scale) on the
+			// Pico's LittleFS. Whole-config, EXPLICIT — there is no autosave (flash wear) and no per-ESC
+			// slice (one blob keeps the CRC meaningful). `cfg load` replaces the live FF curve, so it is
+			// refused while any ESC is armed.
+			else if (!strcmp(cmd,"cfg")) { char* sub=strtok(nullptr," ");
+				if(!sub || !strcmp(sub,"show")) {
+					for(uint8_t i=0;i<n_;i++) Serial.printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f\n",
+						i, th_[i]->motorConfigured()?1:0, th_[i]->motorKv(), th_[i]->motorPolePairs(), th_[i]->motorVolts(),
+						th_[i]->vc.kp, th_[i]->vc.ki, th_[i]->vc.kd, th_[i]->vc.trim_max, th_[i]->vc.slew_rpm_s,
+						th_[i]->vc.dob, th_[i]->vc.dob_tau, th_[i]->vc.dob_max, th_[i]->vc.dob_settle_secs, th_[i]->vbattScale());
+					Serial.printf("cfg|stored=%d\n", settings::exists()?1:0); Serial.println("ok"); }
+				else if(!strcmp(sub,"save")) { if(settings::save(th_,n_)) { Serial.printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); Serial.println("ok"); }
+					else Serial.println("err cfg-save: filesystem write failed"); }
+				else if(!strcmp(sub,"load")) { bool anyArmed=false; for(uint8_t i=0;i<n_;i++) if(th_[i]->armed()) anyArmed=true;
+					if(anyArmed) Serial.println("err cfg-load: disarm first (replaces the FF curve)");
+					else { int k=settings::load(th_,n_); if(k>0) { Serial.printf("cfg|restored %d ESC(s)\n", k); Serial.println("ok"); }
+						else Serial.println("err cfg-load: no valid stored config (magic/version/size/CRC)"); } }
+				else if(!strcmp(sub,"clear")) { if(settings::clear()) Serial.println("ok"); else Serial.println("err cfg-clear: nothing stored"); }
+				else Serial.println("err bad-args (cfg [show|save|load|clear])"); }
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
 				if(i<0||i>=n_||!v) Serial.println("err bad-args");

@@ -58,9 +58,10 @@ arm <i> [normal|bidir]      # arm ESC i (AUTO: bidir for Bluejay/JESC, else norm
 throttle <i> <0..2000>      # RAW one-way throttle          (armed)
 thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop
 rpm     <i> <mech-rpm>      # CLOSED-LOOP velocity target (signed); 0 = clean stop; needs a profile
-gain    <i> kp|ki|kd|dtau|trim|slew <v>   # tune the closed loop live
+gain    <i> kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle <v>   # tune the closed loop live
 tele    <i>                 # rpm | volts | amps | tempC | stress   (bidir firmware only)
 disarm  <i>                 # stop + release
+cfg     [show|save|load|clear]   # persist/restore motor + gains + DOB + vbatt cal on the Pico's flash
 ```
 
 Arming streams zero throttle ~3 s (BLHeli-S won't spin until armed); a **deadman** re-zeros if no
@@ -140,9 +141,11 @@ I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
 
 ```
 motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
-sense 1                                   # -> sense|1|vest=..|vref=..|load=..|valid=..
+sense 1                                   # -> sense|1|vest=..|vref=..|load=..|vbatt=..|valid=..|floor=..
 sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
-python host/vbatt.py calibrate --known-v 11.2   # one-time (per motor+config); host/vbatt.py monitor -> V_batt
+sense 1 vcal 11.2                         # calibrate vbatt to a known battery voltage (per motor+config)
+cfg save                                  # persist motor/gains/DOB/vcal to the Pico's flash (else RAM-only)
+python host/vbatt.py calibrate --known-v 11.2   # host-side equivalent; host/vbatt.py monitor -> V_batt
 ```
 
 Rough battery gauge (max-over-time ≈ supply, ~1 % after one calibration) + fouled-prop / entanglement

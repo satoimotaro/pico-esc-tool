@@ -55,6 +55,7 @@ public:
 		float ve = estimateV(cmd, rpm);
 		return ve > 0.0f ? (v_ - ve) : 0.0f;
 	}
+	float kv() const         { return kv_; }
 	float voltage() const    { return v_; }
 	float eff() const        { return eff_; }
 	int   polePairs() const  { return pp_; }
@@ -109,24 +110,33 @@ public:
 	// ---- fill a caller-owned CurvePoint[] with the predicted curve (monotone). Returns the count. ----
 	// nSine sine points below the handoff cmd, then (cap - nSine) 6-step points from the landing up to
 	// cmdHi. Strictly increasing thrust + non-decreasing rpm (as SpeedProfile requires).
-	int fillProfile(CurvePoint* buf, int cap, float cmdHi = 700.0f, int nSine = 4) const {
+	// regimesOut (optional, same capacity) is tagged SINE/LINE per point — the generator knows which side
+	// of the seam each point came from, and SpeedProfile::lineFloor() needs those tags to report the real
+	// 6-step landing (~sixstepFloorRpm) instead of falling back to the seam eRPM. Pass it whenever the
+	// profile will be asked where genuine 6-step starts.
+	int fillProfile(CurvePoint* buf, int cap, float cmdHi = 700.0f, int nSine = 4,
+	                Regime* regimesOut = nullptr) const {
 		if (cap < 2) return 0;
 		int n6 = cap - nSine;
 		if (n6 < 2) { n6 = cap - 1; nSine = 1; }
 		float sineHiCmd = cmdForSine(handoffMech());
 		float floor = handoffCmd();
 		int k = 0; int lastC = -1; float lastR = -1.0f;
-		auto push = [&](float c, float r) {
+		auto push = [&](float c, float r, Regime reg) {
 			int ci = (int)(c + 0.5f);
-			if (ci > lastC && r > lastR + 0.1f && k < cap) { buf[k].thrust = (float)ci; buf[k].rpm = r; lastC = ci; lastR = r; k++; }
+			if (ci > lastC && r > lastR + 0.1f && k < cap) {
+				buf[k].thrust = (float)ci; buf[k].rpm = r; lastC = ci; lastR = r;
+				if (regimesOut) regimesOut[k] = reg;
+				k++;
+			}
 		};
 		for (int i = 0; i < nSine; i++) {
 			float c = 60.0f + (sineHiCmd - 60.0f) * (float)i / (float)(nSine - 1 > 0 ? nSine - 1 : 1);
-			push(c, rpmSine(c));
+			push(c, rpmSine(c), Regime::SINE);
 		}
 		for (int i = 0; i < n6; i++) {
 			float c = floor + (cmdHi - floor) * (float)i / (float)(n6 - 1 > 0 ? n6 - 1 : 1);
-			push(c, rpm6step(c));
+			push(c, rpm6step(c), Regime::LINE);
 		}
 		return k;
 	}
