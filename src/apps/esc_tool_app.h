@@ -538,8 +538,30 @@ private:
 				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence
 					if(i<0||i>=n_||kvf<=0.0f||ppi<1||vvf<=0.0f) Serial.println("err bad-args (motor <i> <kv> <pp> <v>): need kv>0 pp>=1 v>0");   // kv/pp/v=0 -> div-by-zero -> NaN into the live FF curve
 					else if(th_[i]->armed()) Serial.println("err motor: disarm first (replaces the FF curve)");
-				else { th_[i]->setMotor(kvf, ppi, vvf);
-					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s\n", i, kv, pp, vv); Serial.println("ok"); } }
+				// Optional 4th arg = the ESC's `sine_cross_up`. The shape constants were fitted at 34, and
+				// Cross_Up shifts the 6-step duty by a constant, so leaving it wrong silently biases the FF
+				// (up to +44% at low cmd, measured) AND the soft-sensor that inverts the same map. Omitted
+				// => keep the current value, so an existing `motor kv pp v` behaves exactly as before.
+				else { char* cu=strtok(nullptr," "); float cuf=cu?atof(cu):0.0f;
+					if(cu && (cuf < 1.0f || cuf > 255.0f)) { Serial.println("err motor: cross_up out of range (1..255)"); continue; }
+					th_[i]->setMotor(kvf, ppi, vvf, cuf);
+					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s|cross_up=%.0f\n", i, kv, pp, vv,
+						th_[i]->motorCrossUp()); Serial.println("ok"); } }
+			// crossup <i> <v>: the ESC's sine_cross_up, WITHOUT replacing the feed-forward curve.
+			// It shifts the parametric 6-step duty map, which the soft-sensor inverts — so it matters
+			// even when a MEASURED curve is driving the FF, and `motor` (which discards that curve) is
+			// the wrong place to set it. Refused while armed: it can regenerate the parametric curve.
+			else if (!strcmp(cmd,"crossup")) { int i=argi(); char* v=strtok(nullptr," ");
+				if(i<0||i>=n_||!v) Serial.println("err bad-args (crossup <i> <sine_cross_up>)");
+				else if(th_[i]->armed()) Serial.println("err crossup: disarm first");
+				else if(!th_[i]->setCrossUp(atof(v))) Serial.println("err crossup: out of range (1..255)");
+				else { Serial.printf("crossup|%d|cross_up=%.0f|curve=%s (persist with: cfg save)\n", i,
+					th_[i]->motorCrossUp(), th_[i]->curveMeasured()?"measured (kept)":"parametric (regenerated)");
+					// The duty map moved by ~0.042/unit, and `sense vcal` is a MULTIPLICATIVE scale on the
+					// estimate that inverts it — so a stored vbattScale calibrated at the old cross_up is
+					// now wrong by the same shift. Say so; it is not recoverable by inspection.
+					Serial.println("# note: soft-sensor duty map moved — re-run `sense <i> vcal <V>`");
+					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
 				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero|vcal <V>])");
 					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseValid()) Serial.println("err sense-zero: not BEMF-live (spin steady into 6-step first)"); else { th_[i]->senseZero(); Serial.printf("sense|%d|zeroed vref=%.2f\n", i, th_[i]->senseVref()); Serial.println("ok"); } }
@@ -553,9 +575,14 @@ private:
 					// dhat = the DOB's load estimate in rpm (0 when the observer is off or gated). Exposed
 					// alongside `load` because it is the same physical quantity in different units, and it
 					// is what an upper layer (attitude / allocation) actually wants per thruster.
-					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f\n",
+					// trim/cmd = the CONTROL EFFORT. rpm tracking is blind to plant drift by design (the
+					// loop hides it), the effort is not: at a fixed setpoint, a drifting R/KV shows up as
+					// trim walking away from its cold value long before rpm moves. cmd = ff(setpoint)+trim
+					// is logged too so a drift trace is self-contained (no need to re-evaluate the FF).
+					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d\n",
 						i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor(),
-						th_[i]->vc.dhat(), th_[i]->vc.settled()); Serial.println("ok"); } }
+						th_[i]->vc.dhat(), th_[i]->vc.settled(),
+						th_[i]->vc.trim(), th_[i]->vc.command()); Serial.println("ok"); } }
 			// curve: upload a MEASURED feed-forward curve (velcal/sysid -> host/curvepush.py), replacing
 			// the parametric `motor` prediction. Sent ONE POINT PER LINE on purpose: the input buffer is
 			// 600 B and silently truncates past it, so a whole table on one line would be a data-loss
@@ -609,10 +636,11 @@ private:
 			// refused while any ESC is armed.
 			else if (!strcmp(cmd,"cfg")) { char* sub=strtok(nullptr," ");
 				if(!sub || !strcmp(sub,"show")) {
-					for(uint8_t i=0;i<n_;i++) Serial.printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f\n",
+					for(uint8_t i=0;i<n_;i++) Serial.printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f|cross_up=%.0f\n",
 						i, th_[i]->motorConfigured()?1:0, th_[i]->motorKv(), th_[i]->motorPolePairs(), th_[i]->motorVolts(),
 						th_[i]->vc.kp, th_[i]->vc.ki, th_[i]->vc.kd, th_[i]->vc.trim_max, th_[i]->vc.slew_rpm_s,
-						th_[i]->vc.dob, th_[i]->vc.dob_tau, th_[i]->vc.dob_max, th_[i]->vc.dob_settle_secs, th_[i]->vbattScale());
+						th_[i]->vc.dob, th_[i]->vc.dob_tau, th_[i]->vc.dob_max, th_[i]->vc.dob_settle_secs,
+						th_[i]->vbattScale(), th_[i]->motorCrossUp());
 					Serial.printf("cfg|stored=%d\n", settings::exists()?1:0); Serial.println("ok"); }
 				else if(!strcmp(sub,"save")) { if(settings::save(th_,n_)) { Serial.printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); Serial.println("ok"); }
 					else Serial.println("err cfg-save: filesystem write failed"); }

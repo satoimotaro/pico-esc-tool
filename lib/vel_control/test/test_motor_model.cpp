@@ -66,7 +66,7 @@ int main() {
 	NEAR(prof.thrustFor(1500), a.thrustFor(1500), 5.0f, "profile matches model");
 
 	// ESC config recipe is the KV-independent working one
-	CHECK(a.crossUpByte() == 34 && a.crossDnByte() == 255, "esc config bytes");
+	CHECK(a.recommendedCrossUpByte() == 34 && a.crossDnByte() == 255, "esc config bytes");
 
 	// soft-sensor: estimateV inverts rpm6step back to the supply voltage (a=350/7/11.1, eff=1)
 	float cmdE = 600.0f, rpmE = a.rpm6step(cmdE);
@@ -74,6 +74,40 @@ int main() {
 	NEAR(a.estimateLoad(cmdE, rpmE), 0.0f, 0.1f, "estimateLoad ~0 at model rpm");
 	CHECK(a.estimateLoad(cmdE, rpmE * 0.9f) > 0.5f, "estimateLoad > 0 under droop");   // slower than model => load
 	CHECK(a.estimateV(0.0f, 0.0f) == 0.0f, "estimateV 0 outside live 6-step");         // no BEMF -> invalid
+
+	// ---- sine_cross_up term (bench 2026-07-29, host/duty_sweep.py, F2838 350KV @ 11.2 V) ----
+	// Default == DUTY6_CROSSUP_REF, so an operator who never calls setCrossUp keeps the old behaviour.
+	MotorModel c34(350, 7, 11.2f);
+	CHECK(c34.crossUp() == DUTY6_CROSSUP_REF, "cross_up defaults to the fit reference");
+	NEAR(c34.duty6(650), DUTY6_A * 650 + DUTY6_B, 1e-6f, "at the reference the term vanishes");
+
+	// Raising Cross_Up LOWERS the duty by K per unit (cross_rescale_duty shifts the affine's intercept).
+	MotorModel c36(350, 7, 11.2f); c36.setCrossUp(36);
+	NEAR(c34.duty6(650) - c36.duty6(650), 2 * DUTY6_CROSSUP_K, 1e-6f, "cross_up shifts duty by K/unit");
+	NEAR(c34.duty6(780) - c36.duty6(780), c34.duty6(570) - c36.duty6(570), 1e-6f,
+	     "the shift is a pure OFFSET — cmd-independent, no slope change");
+
+	// The point of the whole exercise: the measured no-load duty at Cross_Up=36.
+	// NOTE these are the RAW rpm/(KV*V_supply) values, NOT the PSU-current-corrected ones. duty6() is
+	// the model's EFFECTIVE duty and V_supply is its reference, so it is definitionally the raw
+	// quantity; the current-corrected duty (0.7550/0.5205/0.3627/0.2057 for these cmds) is the true
+	// ELECTRICAL duty and sits ~1-6 % higher. Comparing against those would be an apples-to-oranges
+	// test — and the gap between them IS the no-load I*R the model silently absorbs.
+	{
+		const float cmds[] = {780, 690, 630, 570};
+		const float meas[] = {0.7455f, 0.5101f, 0.3515f, 0.1922f};
+		for (int i = 0; i < 4; i++) {
+			CHECK(fabsf(c36.duty6(cmds[i]) / meas[i] - 1.0f) < 0.01f, "cross_up=36 duty within 1% of bench");
+			// ...and that the UNcorrected model would have missed by a lot at the low end
+			if (cmds[i] == 570) CHECK(fabsf(c34.duty6(570) / meas[3] - 1.0f) > 0.30f,
+			                          "uncorrected model is >30% off at cmd 570 (the bug being fixed)");
+		}
+	}
+	// The inverse must undo the forward map WITH the term applied, or thrustFor() would fight rpm6step().
+	NEAR(c36.cmdForDuty6(c36.duty6(712)), 712.0f, 1e-2f, "cmdForDuty6 inverts duty6 at cross_up=36");
+	NEAR(c36.cmd6stepFor(c36.rpm6step(712)), 712.0f, 1e-2f, "cmd6stepFor inverts rpm6step at cross_up=36");
+	// Same rpm needs a HIGHER command once Cross_Up rises (less duty per command).
+	CHECK(c36.cmd6stepFor(1600) > c34.cmd6stepFor(1600), "higher cross_up costs more command for 1600 rpm");
 
 	printf(fails ? "\n%d CHECK(s) FAILED\n" : "\nall motor_model checks passed\n", fails);
 	return fails ? 1 : 0;

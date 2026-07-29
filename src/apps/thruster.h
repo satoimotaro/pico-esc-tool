@@ -109,8 +109,12 @@ public:
 	// parametric vel::MotorModel) and switch the controller onto it — the runtime `motor <i> <kv> <pp>
 	// <v>` path. No recompile, no bench sweep: KV+PP+V predict the curve (RMSE ~12 rpm), and an eRPM
 	// self-cal can refine it later. The owned ffprof_/ffbuf_ outlive vc, so setProfile is safe.
-	void setMotor(float kv, int polePairs, float vSupply) {
+	// crossUp = the ESC's `sine_cross_up`. It shifts the 6-step duty by a constant (cross_rescale_duty
+	// maps the demand relative to Cross_Up), so the parametric curve is only right at the Cross_Up its
+	// shape constants were fitted at. 0 keeps whatever is already set (default = the fit reference).
+	void setMotor(float kv, int polePairs, float vSupply, float crossUp = 0.0f) {
 		mm_.set(kv, polePairs, vSupply);
+		mm_.setCrossUp(crossUp > 0.0f ? crossUp : mm_.crossUp());   // set() must not clear it
 		// [#8] tag each generated point's regime so the profile's lineFloor() reports the real 6-step
 		// LANDING (~sixstepFloorRpm) rather than the seam — the soft-sensor gates below key off it.
 		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])), 700.0f, 4, ffreg_);
@@ -148,6 +152,20 @@ public:
 	float motorKv()         const { return mm_.kv(); }
 	int   motorPolePairs()  const { return mm_.polePairs(); }
 	float motorVolts()      const { return mm_.voltage(); }
+	float motorCrossUp()    const { return mm_.crossUp(); }
+
+	// Set the ESC's `sine_cross_up` WITHOUT touching the feed-forward source. Needed because it stays
+	// relevant while a MEASURED curve is installed: the curve supplies rpmFor/thrustFor, but the
+	// soft-sensor (estimateV/estimateLoad) still inverts the parametric duty map, so a wrong cross_up
+	// keeps biasing `vest`/`load` even when the FF itself is measured. Routing this through `motor`
+	// would have forced the operator to destroy the measured curve just to correct a soft-sensor input.
+	// When the PARAMETRIC curve is the live one, regenerate it — there cross_up does move the FF.
+	bool setCrossUp(float crossUp) {
+		if (crossUp < 1.0f || crossUp > 255.0f) return false;
+		mm_.setCrossUp(crossUp);
+		if (motorSet_ && !curveMeasured_) setMotor(mm_.kv(), mm_.polePairs(), mm_.voltage(), crossUp);
+		return true;
+	}
 	float vbattScale()      const { return vbattScale_; }
 	void  setVbattScale(float s)  { if (s > 0.0f) vbattScale_ = s; }
 	// The live feed-forward curve, for `curve <i>` readback and `cfg save`. curveMeasured() is false
