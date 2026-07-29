@@ -115,15 +115,31 @@ public:
 		// LANDING (~sixstepFloorRpm) rather than the seam — the soft-sensor gates below key off it.
 		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])), 700.0f, 4, ffreg_);
 		if (n < 2) return;
-		// [#6.1] keep the engine's pole count in sync with the new curve — tele mech-rpm is eRPM/pp,
-		// so a differing pp (the whole point of `motor`) would otherwise scale the feedback wrong.
-		poles_ = (uint8_t)(polePairs * 2);
-		escs::setPoles(index_, poles_);
-		// [#6.3] reconstruct WITH the crossover metadata (&ffcx_) so hasCrossover()/lineFloor() stay
-		// live — otherwise the "commanded 6-step but tele never went live" ABORT_STALL goes inert.
-		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs, &ffcx_, ffreg_);
-		vc.setProfile(ffprof_);
+		ffcx_ = vel::Crossover{vel::HANDOFF_ERPM, vel::HANDOFF_ERPM};
+		installCurve_(n, polePairs);
 		motorSet_ = true;
+		curveMeasured_ = false;   // the parametric prediction REPLACES any uploaded curve
+	}
+
+	// Install a MEASURED feed-forward curve (host/curvepush.py -> the `curve` command), replacing the
+	// parametric prediction. This is what unlocks the DOB: the observer inverts the forward map, so with
+	// the parametric curve — which over-predicts — it reads model error as load and has to be clamped.
+	// A velcal/sysid curve makes the deficit genuine load. Points must be monotone (thrust strictly
+	// increasing, rpm non-decreasing) exactly as SpeedProfile requires; on any violation the CURRENT
+	// curve is kept and false is returned, so a bad upload can never leave a half-written table live.
+	// regimes may be null -> derived from the crossover (a measured curve has no points inside the gap,
+	// so the first point above the seam IS the 6-step landing, which is what lineFloor() wants).
+	bool setCurve(const vel::CurvePoint* pts, int n, int polePairs, float upErpm, float dnErpm,
+	              const vel::Regime* regimes = nullptr) {
+		const int cap = (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0]));
+		if (n > cap || polePairs < 1 || upErpm <= 0.0f) return false;
+		if (!vel::validateCurve(pts, n)) return false;
+		for (int i = 0; i < n; i++) ffbuf_[i] = pts[i];
+		vel::tagRegimes(pts, n, polePairs, upErpm, regimes, ffreg_);
+		ffcx_ = vel::Crossover{upErpm, dnErpm};
+		installCurve_(n, polePairs);
+		curveMeasured_ = true;
+		return true;
 	}
 
 	// Motor identity as last configured by `motor` — what `cfg save` persists (nothing to persist until
@@ -134,6 +150,29 @@ public:
 	float motorVolts()      const { return mm_.voltage(); }
 	float vbattScale()      const { return vbattScale_; }
 	void  setVbattScale(float s)  { if (s > 0.0f) vbattScale_ = s; }
+	// The live feed-forward curve, for `curve <i>` readback and `cfg save`. curveMeasured() is false
+	// while the curve is the parametric prediction (which is regenerable from kv/pp/v, so it is NOT
+	// persisted point-by-point).
+	bool  curveMeasured() const { return curveMeasured_; }
+	int   curveCount()    const { return curveMeasured_ ? ffn_ : 0; }
+	// [#11-1] The pole count the LIVE CURVE was installed with — NOT mm_'s. `curve commit <pp>` sets the
+	// profile's pp without touching the parametric model, so the two can differ; persisting or reporting
+	// mm_'s would restore the curve under the wrong pp after a reset, mis-scaling both the tele mech-rpm
+	// (poles_) and the regime test (rpm*pp >= up_erpm) that lineFloor() — hence the soft-sensor gate —
+	// depends on. Read it from the profile, which is the single source of truth for the installed curve.
+	int   curvePolePairs() const { return vc.profile().polePairs(); }
+	// Bounds-clamped: these are public and the natural loop bound (curveCount()) is a separate call,
+	// so an off-by-one at a call site should not read past the buffer.
+	const vel::CurvePoint& curvePoint(int i) const {
+		return ffbuf_[i < 0 ? 0 : (i >= (int)(sizeof(ffbuf_)/sizeof(ffbuf_[0]))
+		                           ? (int)(sizeof(ffbuf_)/sizeof(ffbuf_[0])) - 1 : i)];
+	}
+	vel::Regime curveRegime(int i) const {
+		return ffreg_[i < 0 ? 0 : (i >= (int)(sizeof(ffreg_)/sizeof(ffreg_[0]))
+		                           ? (int)(sizeof(ffreg_)/sizeof(ffreg_[0])) - 1 : i)];
+	}
+	float crossUpErpm()   const { return ffcx_.up_erpm; }
+	float crossDnErpm()   const { return ffcx_.dn_erpm; }
 
 	// ESC perception (soft-sensor): infer effective supply voltage + a relative load signal from the
 	// LIVE command + measured 6-step tele rpm — no voltage/current/force sensor. senseVoltage ~= battery
@@ -245,6 +284,19 @@ public:
 	vel::VelocityController  vc;   // PUBLIC so the declaring side sets gains: th.vc.kp = 0.03f;
 
 private:
+	// Shared tail of setMotor()/setCurve(): ffbuf_/ffreg_/ffcx_ are already populated; publish them.
+	void installCurve_(int n, int polePairs) {
+		// [#6.1] keep the engine's pole count in sync with the new curve — tele mech-rpm is eRPM/pp,
+		// so a differing pp (the whole point of `motor`) would otherwise scale the feedback wrong.
+		poles_ = (uint8_t)(polePairs * 2);
+		escs::setPoles(index_, poles_);
+		// [#6.3] reconstruct WITH the crossover metadata (&ffcx_) so hasCrossover()/lineFloor() stay
+		// live — otherwise the "commanded 6-step but tele never went live" ABORT_STALL goes inert.
+		ffprof_ = vel::SpeedProfile(ffbuf_, n, polePairs, &ffcx_, ffreg_);
+		vc.setProfile(ffprof_);
+		ffn_ = n;
+	}
+
 	// The active profile's 6-step landing, or 0 when it carries no regime tags to trust. Requires the
 	// TAGS, not merely a crossover: untagged, lineFloor() degrades to the seam eRPM = the BOTTOM of the
 	// no-steady-state gap, which is the unsafe direction for a soft-sensor validity gate.
@@ -271,7 +323,9 @@ private:
 	vel::Regime       ffreg_[24] = {vel::Regime::SINE, vel::Regime::SINE};
 	vel::SpeedProfile ffprof_{ffbuf_, 2, 7, &ffcx_, ffreg_};
 	vel::MotorModel   mm_{350.0f, 7, 11.1f};   // parametric model (KV/PP/V) for FF + the soft-sensor
+	int               ffn_ = 0;                // live point count in ffbuf_ (0 = still the compile-time profile)
 	bool              motorSet_ = false;       // has `motor`/setMotor run? (else mm_ holds only defaults)
+	bool              curveMeasured_ = false;  // is ffbuf_ a MEASURED curve (`curve`) rather than parametric?
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
 	bool              senseValid_ = false;     // true only while BEMF-live (6-step) -> estimate valid
 	float             senseVref_ = 0.0f;       // [#7.1] no-load V_eff reference (0 = not baselined; set via `sense zero`)

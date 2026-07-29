@@ -62,6 +62,7 @@ gain    <i> kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle <v>   # tune the
 tele    <i>                 # rpm | volts | amps | tempC | stress   (bidir firmware only)
 disarm  <i>                 # stop + release
 cfg     [show|save|load|clear]   # persist/restore motor + gains + DOB + vbatt cal on the Pico's flash
+curve   <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>]   # upload a measured FF curve
 ```
 
 Arming streams zero throttle ~3 s (BLHeli-S won't spin until armed); a **deadman** re-zeros if no
@@ -99,6 +100,24 @@ python host/gen_profile_header.py            # host/profiles/vel_*.yaml -> src/a
 ```
 
 Each `vel_<name>.yaml` becomes `profiles::M_<NAME>` + `M_<NAME>_GAINS` for a `Thruster` to use.
+
+A measured curve can also be pushed **at runtime**, with no recompile — the fastest path from a velcal
+to a working loop, and what the disturbance observer needs (it inverts the forward map, so a curve that
+is off reads model error as load):
+
+```
+python host/curvepush.py 1 host/profiles/<name>.yaml --motor 350,7,11.2 --gains --save
+```
+
+> **A measured curve is only valid at the `sine_cross_up` it was measured at.** BlueGill's
+> `cross_rescale_duty` maps the 6-step demand to an affine function of throttle *relative to* Cross_Up,
+> so moving that threshold shifts the whole command→speed mapping. Bench-measured on the 350KV with
+> pure feed-forward: the same profile is **+0.3 %** at its own `cross_up=36` and **+27…+46 %** at
+> `cross_up=34`, while the parametric model is the exact mirror image (−0.6 % at 34, −16…−28 % at 36).
+> `curvepush` reads the ESC and refuses on a mismatch; `--apply-crossover` writes the profile's bytes.
+
+`cfg save` persists the curve (and the motor identity, gains and `vcal` scale) to the Pico's flash;
+without it they are lost on the next reset.
 
 ## Host CLI reference
 
@@ -141,7 +160,7 @@ I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
 
 ```
 motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
-sense 1                                   # -> sense|1|vest=..|vref=..|load=..|vbatt=..|valid=..|floor=..
+sense 1                                   # -> sense|1|vest|vref|load|vbatt|valid|floor|dhat|settled
 sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
 sense 1 vcal 11.2                         # calibrate vbatt to a known battery voltage (per motor+config)
 cfg save                                  # persist motor/gains/DOB/vcal to the Pico's flash (else RAM-only)

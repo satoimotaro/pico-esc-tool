@@ -56,6 +56,9 @@ static const int NFIELD = sizeof(FIELDS) / sizeof(FIELDS[0]);
 // on-device firmware library location (LittleFS)
 static const char* FW_DIR = "/fw";
 
+// `curve` upload staging capacity — must match Thruster's owned FF buffer (and settings::CFG_MAX_CURVE).
+static const int CURVE_STAGE_CAP = settings::CFG_MAX_CURVE;
+
 // ================= Web UI (SETUP mode) =================
 // Verbatim from esc_tool.cpp except for the ADDED per-ESC "Set RPM" control in the spin-test panel
 // (rpm number input + button -> POST /api/rpm) and its setRpm() helper.
@@ -165,8 +168,14 @@ public:
 		// and `motor` are no longer per-power-cycle. main.cpp has already applied the compile-time
 		// defaults, so a stored config deliberately wins over them; an absent/corrupt one changes nothing.
 		LittleFS.mkdir(settings::CFG_DIR);
-		int restored = settings::load(th_, n_);
-		if (restored > 0) Serial.printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
+		uint16_t storedVer = 0;
+		int restored = settings::load(th_, n_, &storedVer);
+		if (restored > 0)
+			Serial.printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
+		else if (storedVer && storedVer != settings::CFG_VERSION)
+			Serial.printf("# cfg: IGNORED a stored config written as v%u (this build wants v%u) — "
+			              "gains/vcal are at compile-time defaults; re-save with `cfg save`\n",
+			              storedVer, settings::CFG_VERSION);
 
 		// Wi-Fi routes: lambdas capturing `this` bind each HTTP path to a member handler.
 		server_.on("/", [this]{ hIndex(); });
@@ -217,6 +226,16 @@ private:
 	Mode            mode_   = SETUP;
 	bool            wifiUp_ = false;
 	WebServer       server_{80};
+
+	// `curve` upload staging — ONE table at a time (a curve is uploaded interactively by one host tool),
+	// so this lives here rather than costing every Thruster a second buffer. Nothing reaches the live
+	// controller until `commit` validates the whole set.
+	vel::CurvePoint stage_[CURVE_STAGE_CAP];
+	vel::Regime     stageReg_[CURVE_STAGE_CAP];
+	int             stageIdx_    = -1;      // which ESC the staged table is for (-1 = nothing staged)
+	int             stageWant_   = 0;       // points declared by `begin`
+	int             stageN_      = 0;       // points received so far
+	bool            stageTagged_ = true;    // every point carried an explicit regime tag
 
 	// firmware-flash state machine (verbatim from esc_tool.cpp, now members)
 	char   hexBuf_[32768];
@@ -531,7 +550,59 @@ private:
 						else if(!th_[i]->senseVcal(kv)) Serial.println("err sense-vcal: no vbatt estimate yet (spin steady above the 6-step floor first)");
 						else { Serial.printf("sense|%d|vcal to %.2f V -> vbatt=%.2f (persist with: cfg save)\n", i, kv, th_[i]->senseVbatt()); Serial.println("ok"); } }
 				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad(), vb=th_[i]->senseVbatt();
-					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f\n", i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor()); Serial.println("ok"); } }
+					// dhat = the DOB's load estimate in rpm (0 when the observer is off or gated). Exposed
+					// alongside `load` because it is the same physical quantity in different units, and it
+					// is what an upper layer (attitude / allocation) actually wants per thruster.
+					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f\n",
+						i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor(),
+						th_[i]->vc.dhat(), th_[i]->vc.settled()); Serial.println("ok"); } }
+			// curve: upload a MEASURED feed-forward curve (velcal/sysid -> host/curvepush.py), replacing
+			// the parametric `motor` prediction. Sent ONE POINT PER LINE on purpose: the input buffer is
+			// 600 B and silently truncates past it, so a whole table on one line would be a data-loss
+			// trap. Staged then committed atomically, so a partial upload never goes live.
+			//   curve <i> begin <n> | curve <i> add <thrust> <rpm> [s|l] | curve <i> commit <pp> <up> <dn>
+			//   curve <i>            -> dump the live curve for readback
+			else if (!strcmp(cmd,"curve")) { int i=argi(); char* sub=strtok(nullptr," ");
+				if(i<0||i>=n_) Serial.println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])");
+				// [#11-1] report the pp the LIVE CURVE carries, not the parametric model's — otherwise a
+				// commit/model mismatch is invisible to the host's read-back check, which is the one
+				// place it could have been caught.
+				else if(!sub) { Serial.printf("curve|%d|n=%d|measured=%d|pp=%d|up=%.0f|dn=%.0f\n", i, th_[i]->curveCount(),
+						th_[i]->curveMeasured()?1:0, th_[i]->curvePolePairs(), th_[i]->crossUpErpm(), th_[i]->crossDnErpm());
+					for(int k=0;k<th_[i]->curveCount();k++) Serial.printf("pt|%d|%.1f|%.1f|%c\n", k,
+						th_[i]->curvePoint(k).thrust, th_[i]->curvePoint(k).rpm,
+						th_[i]->curveRegime(k)==vel::Regime::LINE?'l':'s');
+					Serial.println("ok"); }
+				else if(!strcmp(sub,"begin")) { char* v=strtok(nullptr," "); int want=v?atoi(v):0;
+					if(want<2||want>CURVE_STAGE_CAP) Serial.printf("err curve-begin: need 2..%d points\n", CURVE_STAGE_CAP);
+					else { stageIdx_=i; stageWant_=want; stageN_=0; stageTagged_=true;
+						Serial.printf("curve|%d|staging %d point(s)\n", i, want); Serial.println("ok"); } }
+				else if(!strcmp(sub,"add")) { char* t=strtok(nullptr," "); char* r=strtok(nullptr," "); char* g=strtok(nullptr," ");
+					if(stageIdx_!=i||stageWant_<=0) Serial.println("err curve-add: run `curve <i> begin <n>` first");
+					else if(stageN_>=stageWant_) Serial.println("err curve-add: more points than begin declared");
+					else if(!t||!r) Serial.println("err curve-add: need <thrust> <rpm>");
+					else { stage_[stageN_].thrust=atof(t); stage_[stageN_].rpm=atof(r);
+						// regime tag optional: 'l'/'s' from the profile YAML, else derived at commit
+						stageReg_[stageN_] = (g && (*g=='l'||*g=='L')) ? vel::Regime::LINE : vel::Regime::SINE;
+						if(!g) stageTagged_=false;
+						stageN_++; Serial.println("ok"); } }
+				else if(!strcmp(sub,"commit")) { char* pp=strtok(nullptr," "); char* up=strtok(nullptr," "); char* dn=strtok(nullptr," ");
+					int ppi=pp?atoi(pp):0; float upf=up?atof(up):0.0f, dnf=dn?atof(dn):0.0f;
+					if(stageIdx_!=i||stageWant_<=0) Serial.println("err curve-commit: nothing staged");
+					else if(stageN_!=stageWant_) Serial.printf("err curve-commit: staged %d of %d points\n", stageN_, stageWant_);
+					else if(ppi<1||upf<=0.0f) Serial.println("err curve-commit: need <pole_pairs> <up_erpm> <dn_erpm>");
+					else if(th_[i]->armed()) Serial.println("err curve-commit: disarm first (replaces the FF curve)");
+					else if(!th_[i]->setCurve(stage_, stageN_, ppi, upf, dnf, stageTagged_?stageReg_:nullptr))
+						Serial.println("err curve-commit: rejected (need >=2 points, thrust strictly increasing, rpm non-decreasing)");
+					else { Serial.printf("curve|%d|installed %d point(s) pp=%d up=%.0f dn=%.0f\n", i, stageN_, ppi, upf, dnf);
+						// [#11-1] A motor has ONE pole count, so a curve committed at a different pp than
+						// `motor` configured is an operator error (usually curvepush without --motor).
+						// The curve's pp wins from here on; say so rather than letting it diverge quietly.
+						if(th_[i]->motorConfigured() && th_[i]->motorPolePairs()!=ppi)
+							Serial.printf("# warn: curve pp=%d differs from `motor` pp=%d — the curve's wins\n",
+							              ppi, th_[i]->motorPolePairs());
+						stageWant_=0; stageN_=0; stageIdx_=-1; stageTagged_=true; Serial.println("ok"); } }
+				else Serial.println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])"); }
 			// cfg: persist / restore the RUNTIME config (motor identity, gains, DOB, vbatt scale) on the
 			// Pico's LittleFS. Whole-config, EXPLICIT — there is no autosave (flash wear) and no per-ESC
 			// slice (one blob keeps the CRC meaningful). `cfg load` replaces the live FF curve, so it is
@@ -547,11 +618,20 @@ private:
 					else Serial.println("err cfg-save: filesystem write failed"); }
 				else if(!strcmp(sub,"load")) { bool anyArmed=false; for(uint8_t i=0;i<n_;i++) if(th_[i]->armed()) anyArmed=true;
 					if(anyArmed) Serial.println("err cfg-load: disarm first (replaces the FF curve)");
-					else { int k=settings::load(th_,n_); if(k>0) { Serial.printf("cfg|restored %d ESC(s)\n", k); Serial.println("ok"); }
-						else Serial.println("err cfg-load: no valid stored config (magic/version/size/CRC)"); } }
+					else { uint16_t sv=0; int k=settings::load(th_,n_,&sv); if(k>0) { Serial.printf("cfg|restored %d ESC(s)\n", k); Serial.println("ok"); }
+						else if(sv && sv!=settings::CFG_VERSION) Serial.printf("err cfg-load: stored config is v%u, this build wants v%u — re-save\n", sv, settings::CFG_VERSION);
+						else Serial.println("err cfg-load: no valid stored config (magic/size/CRC)"); } }
 				else if(!strcmp(sub,"clear")) { if(settings::clear()) Serial.println("ok"); else Serial.println("err cfg-clear: nothing stored"); }
 				else Serial.println("err bad-args (cfg [show|save|load|clear])"); }
-			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) escs::spinStopAll(); else if(i<n_) th_[i]->stop(); Serial.println("ok"); }
+			// Stop-all goes through each Thruster rather than escs::spinStopAll() alone: the engine call
+			// silences the DShot frames but leaves the objects' submode / soft-sensor validity untouched,
+			// so a bare `disarm` used to leave `sense` reporting a stale estimate as valid. The trailing
+			// spinStopAll() is then redundant for the bound Thrusters and DELIBERATELY kept: it also
+			// covers any escs:: index with no Thruster attached, and a stop path is worth belt-and-braces.
+			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi();
+				if(i<0) { for(uint8_t k=0;k<n_;k++) th_[k]->stop(); escs::spinStopAll(); }
+				else if(i<n_) th_[i]->stop();
+				Serial.println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
 				if(i<0||i>=n_||!v) Serial.println("err bad-args");
 				else if(!strcmp(v,"stop")){ analogWrite(Esc::pin(i),0); pinMode(Esc::pin(i),INPUT); Serial.println("ok pwm-stop (reboot to use DShot again)"); }

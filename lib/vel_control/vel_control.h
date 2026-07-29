@@ -186,6 +186,38 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------------
+// Curve helpers — the SEMANTICS of an uploaded measured curve, kept here rather than in the Thruster
+// so they are hardware-free and can be tested natively (the firmware wrapper is Arduino-bound).
+// ---------------------------------------------------------------------------------------------------
+
+// A curve is usable iff it is a strictly increasing, non-decreasing, non-negative table of >= 2 points
+// — exactly what SpeedProfile's interpolation and its inverse assume.
+inline bool validateCurve(const CurvePoint* pts, int n) {
+	if (!pts || n < 2) return false;
+	for (int i = 0; i < n; i++) {
+		if (pts[i].thrust < 0.0f || pts[i].rpm < 0.0f) return false;
+		if (i && (pts[i].thrust <= pts[i - 1].thrust || pts[i].rpm < pts[i - 1].rpm)) return false;
+	}
+	return true;
+}
+
+// Decide each point's regime for an uploaded curve.
+//   in == null  -> derive purely from the seam.
+//   in != null  -> honour the tags, EXCEPT that a SINE tag at or above the seam is PROMOTED to LINE.
+// The promotion exists because rpm*pp >= up_erpm is the same test SpeedProfile::regime() applies
+// everywhere else, so a contradicting tag would leave lineFloor() (and the soft-sensor gate built on
+// it) disagreeing with the rest of the library. velcal mislabels the handoff point in practice. An
+// explicit LINE tag below the seam is never demoted: a measurement taken in the hysteresis band coming
+// down is real information the seam test cannot represent.
+inline void tagRegimes(const CurvePoint* pts, int n, int polePairs, float upErpm,
+                       const Regime* in, Regime* out) {
+	for (int i = 0; i < n; i++) {
+		bool aboveSeam = pts[i].rpm * (float)polePairs >= upErpm;
+		out[i] = (!in || aboveSeam) ? (aboveSeam ? Regime::LINE : Regime::SINE) : in[i];
+	}
+}
+
+// ---------------------------------------------------------------------------------------------------
 // EscIo — the hardware backend the controller drives. Implement it once per ESC (an adapter over your
 // DShot engine); inject it into the controller. Keeps this library free of hardware headers.
 // ---------------------------------------------------------------------------------------------------

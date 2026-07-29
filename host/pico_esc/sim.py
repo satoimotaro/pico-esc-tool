@@ -40,6 +40,9 @@ class SimEscHost:
             "comm_timing": 3, "demag_compensation": 1,
         }
         self._off = {v: k for k, v in FIELD_OFF.items()}
+        # `curve` upload state: one staging table at a time, plus the installed curve per ESC index
+        self._curve_stage = {"idx": -1, "want": 0, "pts": [], "tagged": True}
+        self._curve_live = {}
 
     # --- model tuning constants ---
     START_BASE = 95.0          # cold-start throttle at nominal startup_power_max
@@ -106,6 +109,8 @@ class SimEscHost:
             self.armed = self.spinning = False
             self.rpm = 0.0
             return []
+        if head == "curve":
+            return self._curve_cmd(arg)
         if head == "editpage":
             self._apply_editpage(arg)
             return ["applied"]
@@ -114,6 +119,75 @@ class SimEscHost:
         if head in ("enter", "read"):
             return []
         return []
+
+    # --- `curve` upload, mirroring the firmware (esc_tool_app.h) so --dry-run really tests the
+    #     transfer: staged by `begin`/`add`, validated and installed atomically by `commit`, and
+    #     read back point-by-point. Same rejections (count mismatch, non-monotone) and the same
+    #     regime derivation from up_erpm when a point carries no explicit tag. ---
+    FW_MAX_POINTS = 24
+
+    def _curve_cmd(self, arg):
+        f = arg.split()
+        if not f:
+            raise RuntimeError("device: err bad-args (curve)")
+        idx, sub = int(f[0]), (f[1] if len(f) > 1 else None)
+        need = {"begin": 3, "add": 4, "commit": 5}.get(sub)
+        if need and len(f) < need:      # firmware: missing args -> err, not a crash
+            raise RuntimeError("device: err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|"
+                               "commit <pp> <up> <dn>])")
+        st = self._curve_stage
+        if sub is None:
+            live = self._curve_live.get(idx)
+            if not live:
+                return [f"curve|{idx}|n=0|measured=0|pp=0|up=0|dn=0"]
+            out = [f"curve|{idx}|n={len(live['pts'])}|measured=1|pp={live['pp']}"
+                   f"|up={live['up']:.0f}|dn={live['dn']:.0f}"]
+            for k, (t, r, g) in enumerate(live["pts"]):
+                out.append(f"pt|{k}|{t:.1f}|{r:.1f}|{g}")
+            return out
+        if sub == "begin":
+            want = int(f[2])
+            if not (2 <= want <= self.FW_MAX_POINTS):
+                raise RuntimeError(f"device: err curve-begin: need 2..{self.FW_MAX_POINTS} points")
+            st.update(idx=idx, want=want, pts=[], tagged=True)
+            return [f"curve|{idx}|staging {want} point(s)"]
+        if sub == "add":
+            if st["idx"] != idx or not st["want"]:
+                raise RuntimeError("device: err curve-add: run `curve <i> begin <n>` first")
+            if len(st["pts"]) >= st["want"]:
+                raise RuntimeError("device: err curve-add: more points than begin declared")
+            tag = f[4] if len(f) > 4 else None
+            if tag is None:
+                st["tagged"] = False
+            st["pts"].append((float(f[2]), float(f[3]), "l" if (tag or "s").startswith("l") else "s"))
+            return []
+        if sub == "commit":
+            pp, up, dn = int(f[2]), float(f[3]), float(f[4])
+            if st["idx"] != idx or not st["want"]:
+                raise RuntimeError("device: err curve-commit: nothing staged")
+            if len(st["pts"]) != st["want"]:
+                raise RuntimeError(f"device: err curve-commit: staged {len(st['pts'])} of {st['want']} points")
+            if pp < 1 or up <= 0.0:
+                raise RuntimeError("device: err curve-commit: need <pole_pairs> <up_erpm> <dn_erpm>")
+            if self.armed:
+                raise RuntimeError("device: err curve-commit: disarm first (replaces the FF curve)")
+            pts = st["pts"]
+            for i, (t, r, _) in enumerate(pts):
+                if t < 0.0 or r < 0.0:
+                    raise RuntimeError("device: err curve-commit: rejected (need >=2 points, thrust "
+                                       "strictly increasing, rpm non-decreasing)")
+                if i and (t <= pts[i - 1][0] or r < pts[i - 1][1]):
+                    raise RuntimeError("device: err curve-commit: rejected (need >=2 points, thrust "
+                                       "strictly increasing, rpm non-decreasing)")
+            # Regimes: derived from the seam when untagged, and an explicit SINE tag that contradicts
+            # the seam is PROMOTED to line — mirroring Thruster::setCurve (velcal mislabels the handoff
+            # point, and lineFloor() must agree with SpeedProfile::regime()).
+            pts = [(t, r, "l" if (r * pp >= up or (st["tagged"] and g == "l")) else "s")
+                   for t, r, g in pts]
+            self._curve_live[idx] = {"pts": pts, "pp": pp, "up": up, "dn": dn}
+            st.update(idx=-1, want=0, pts=[], tagged=True)
+            return [f"curve|{idx}|installed {len(pts)} point(s) pp={pp} up={up:.0f} dn={dn:.0f}"]
+        raise RuntimeError("device: err bad-args (curve)")
 
     def close(self):
         pass
