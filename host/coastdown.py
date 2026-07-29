@@ -18,13 +18,35 @@ CAVEAT worth stating: tau_drag was measured while DRIVEN. Coasting has no commut
 winding current, so its drag can be slightly lower than the driven torque — that biases J LOW. Treat
 the result as a good first number, not a calibration.
 
+THE ROTOR DOES NOT ACTUALLY COAST — measured 2026-07-30, bare shaft, no propeller. The ESC applies
+ACTIVE BRAKING whenever the commanded throttle is zero, and it dominates the decay:
+
+  * bare-shaft, no prop: 3100 rpm -> dead stop in 0.19-0.54 s. Aerodynamic drag on a propeller-less
+    shaft cannot do that, so the braking torque is not aerodynamic.
+  * the deceleration RISES ~10x as the rotor SLOWS (-5000 -> -72000 rpm/s). No passive law permits
+    that: aero drag goes as w^2, viscous as w, Coulomb is constant — all flat or falling. Only an
+    actively-driven torque can grow while the speed collapses.
+  * identical with `disarm`, with the 500 ms deadman simply expiring, and while ARMED holding zero
+    throttle (fastest of the three, 0.19 s). So it is tied to ZERO COMMANDED THROTTLE, not to the
+    disarm path. `brake_on_stop=0` does NOT disable it.
+
+That resolves the long-standing "below ~1500 rpm the rotor decelerates ~4x faster than the drag table
+predicts" anomaly: it was never a drag-table error, it is the ESC braking.
+
+CONSEQUENCE FOR J. Only the brief window between the cut and the brake biting is a real drag
+measurement, so `brake_onset()` finds it per run instead of trusting a fixed rpm band — the brake
+bites at whatever speed the ESC decides, which moves with the rotor and the bench. The prop-on
+J = 8.8e-6 survives because its 1550-2900 rpm fit window happened to sit inside that pre-brake phase,
+but that was luck, not a law: do not reuse those rpm limits on another rotor.
+
 ENCODER ONLY. Cutting the drive stops commutation, so telemetry dies with it — this measurement
 cannot be done once the AS5600 comes off the bench. Position (`accum`) is differentiated rather than
 trusting the device's windowed `rpm` field, which lags exactly when the signal is changing fastest.
 
-The decay is FAST (~0.3-0.6 s from 2000 rpm), so the poll loop reads `encv` and nothing else.
+The decay is FAST (~0.2-0.6 s), so the poll loop reads `encv` and nothing else.
 
   python3 host/coastdown.py 1 --rpm 2200 --repeats 3
+  python3 host/coastdown.py 1 --thrust 800 --cut zero     # bare shaft: open-loop up, brake-mode study
 """
 from __future__ import annotations
 
@@ -74,8 +96,38 @@ def _encv(dev):
 
 
 def spin_up(dev, idx, rpm, opts):
+    """Closed-loop spin-up to `rpm`, or open-loop to a raw command with --thrust.
+
+    WHY OPEN-LOOP EXISTS. The velocity controller cannot always traverse the crossover gap: with no
+    propeller the shipped gains stall the rotor at ~450 rpm and `vc` correctly returns ABORT_STALL and
+    stops, so a closed-loop spin-up simply never arrives. Raw `thrust` sails through the same region
+    (measured: cmd 550 hands off, cmd 900 -> 4060 rpm bare-shaft). The coast itself is identical —
+    `disarm` is still the cut — so the drag measurement does not care which way the rotor got there,
+    and open-loop is the only way to get a bare-shaft baseline at all.
+    """
     dev.cmd(f"arm {idx} bidir", timeout=8)
     time.sleep(3.0)
+    if opts.thrust is not None:
+        # Raw thrust is deadman-protected (500 ms), so it must be re-sent throughout the ramp AND the
+        # settle — one write then sleep() would just let the ESC time out mid-measurement.
+        t_end = time.time() + opts.settle
+        last = None
+        while time.time() < t_end:
+            dev.cmd(f"thrust {idx} {opts.thrust:d}", timeout=4)
+            time.sleep(0.15)
+            _, r = _encv(dev)
+            if r is None:
+                continue
+            # Plateau, not a target: open-loop has no setpoint to compare against, so settle on the
+            # speed no longer changing by more than --plateau over a keep-alive tick.
+            if last is not None and abs(r) > opts.stop_rpm and abs(abs(r) - abs(last)) < opts.plateau:
+                t_hold = time.time() + 1.5
+                while time.time() < t_hold:              # hold the command while it truly settles
+                    dev.cmd(f"thrust {idx} {opts.thrust:d}", timeout=4)
+                    time.sleep(0.15)
+                return True
+            last = r
+        return False
     dev.cmd(f"rpm {idx} {rpm:g}", timeout=6)
     t_end = time.time() + opts.settle
     while time.time() < t_end:
@@ -88,11 +140,26 @@ def spin_up(dev, idx, rpm, opts):
 
 
 def coast(dev, idx, opts):
-    """Cut the drive and poll position as fast as the link allows."""
-    dev.cmd(f"disarm {idx}", timeout=4)
+    """Cut the drive and poll position as fast as the link allows.
+
+    --cut selects HOW the drive is removed. All three brake (see the module docstring); the option
+    exists because comparing them is what proved the brake belongs to zero throttle rather than to
+    `disarm`, and re-running that comparison is the way to check any future ESC/config.
+    """
+    keepalive = False
+    if opts.cut == "disarm":
+        dev.cmd(f"disarm {idx}", timeout=4)
+    elif opts.cut == "zero":
+        keepalive = True                 # stay armed and keep commanding exactly zero
+    # "deadman": send nothing at all and let the 500 ms deadman zero the command itself.
     t0 = time.time()
     rows = []
     while time.time() - t0 < opts.window:
+        if keepalive:
+            try:
+                dev.cmd(f"thrust {idx} 0", timeout=3)
+            except Exception:
+                pass
         a, r = _encv(dev)
         if a is None:
             continue
@@ -175,12 +242,41 @@ def coast_start(res, frac=0.97):
     return len(res)
 
 
+def brake_onset(res, start, factor=2.0, probe=6):
+    """Index where the ESC's zero-throttle brake bites — the end of the usable drag window.
+
+    Everything after this point is the ESC braking, not drag, so feeding it to `J = tau/(-dw/dt)`
+    understates J by up to ~10x. Detected as the first window whose |d|w|/dt| exceeds `factor` x the
+    median of the first `probe` windows after the cut, rather than a fixed rpm threshold: the brake
+    bites wherever the ESC decides, which moves with the rotor, the config and the bench.
+
+    Returns len(res) when it never trips (a genuinely free coast — good, use all of it).
+    """
+    seg = res[start:start + probe]
+    if len(seg) < 3:
+        return len(res)
+    base = sorted(abs((r[1] * r[2]) / abs(r[1])) for r in seg if abs(r[1]) > 1)
+    if not base:
+        return len(res)
+    thresh = base[len(base) // 2] * factor
+    for i in range(start + len(seg), len(res)):
+        rpm, dwdt = res[i][1], res[i][2]
+        if abs(rpm) > 1 and abs((rpm * dwdt) / abs(rpm)) > thresh:
+            return i
+    return len(res)
+
+
 def report(all_runs, opts):
     print("\n=== J from the measured drag: J = tau_drag(w) / (-dw/dt) ===")
     print(f"{'run':>4}{'rpm':>9}{'dw/dt[rpm/s]':>14}{'tau[mN*m]':>11}{'J[kg*m^2]':>12}")
     js = []
     for k, res in enumerate(all_runs, 1):
-        res = res[coast_start(res):]          # drop the still-driven plateau before the real coast
+        s = coast_start(res)                  # drop the still-driven plateau before the real coast
+        e = len(res) if opts.no_brake_gate else brake_onset(res, s, opts.brake_factor)
+        if e < len(res):
+            print(f"#  run {k}: brake bites at t={res[e][0]:.3f}s / {abs(res[e][1]):.0f} rpm — "
+                  f"{e - s} of {len(res) - s} post-cut windows are drag, the rest is the ESC")
+        res = res[s:e]
         for t, rpm, dwdt in res:
             a = abs(rpm)
             # DECELERATING means |w| is falling, i.e. dw/dt OPPOSES w — not "dw/dt < 0". The AS5600
@@ -215,14 +311,25 @@ def main():
     ap.add_argument("--window", type=float, default=6.0, help="s to log after the cut")
     ap.add_argument("--settle", type=float, default=25.0, help="s to reach the target")
     ap.add_argument("--stop-rpm", type=float, default=40.0, help="treat as stopped below this")
-    # Below ~1500 rpm the measured deceleration is ~4x what the drag table predicts (consistent across
-    # runs), i.e. something brakes the rotor there that the DRIVEN torque measurement does not see —
-    # the ESC's zero-throttle state is the prime suspect. Only the high-speed window is usable for J.
+    # These two used to be the ONLY guard against the ESC's brake, hand-picked for the prop-on 350KV
+    # rotor back when the excess deceleration was still unexplained. They are now a secondary trim on
+    # top of the automatic brake gate — keep them wide unless a specific rpm band is wanted.
     ap.add_argument("--fit-lo", type=float, default=1550.0, help="only use samples above this rpm")
     ap.add_argument("--fit-hi", type=float, default=2900.0, help="...and below this")
+    ap.add_argument("--brake-factor", type=float, default=2.0,
+                    help="brake gate: |dw/dt| above this x the post-cut baseline ends the drag window")
+    ap.add_argument("--no-brake-gate", action="store_true",
+                    help="disable the automatic brake gate and fit the whole post-cut decay")
+    ap.add_argument("--cut", choices=("disarm", "deadman", "zero"), default="disarm",
+                    help="how to remove drive: disarm | let the 500ms deadman expire | hold zero armed")
     ap.add_argument("--kv", type=float, default=350.0)
     ap.add_argument("--r", type=float, default=0.7)
     ap.add_argument("--win", type=float, default=0.06, help="quadratic-fit window, s (default 0.06)")
+    ap.add_argument("--thrust", type=int, default=None,
+                    help="spin up OPEN-LOOP to this raw command instead of closed-loop --rpm "
+                         "(the only way to reach 6-step bare-shaft: the vc stalls in the gap)")
+    ap.add_argument("--plateau", type=float, default=25.0,
+                    help="open-loop settle: rpm change below this between keep-alives = arrived")
     ap.add_argument("--analyze", default=None, help="re-fit an existing CSV; no motor run")
     ap.add_argument("--out", default=None)
     ap.add_argument("--port", default=None)
@@ -241,7 +348,11 @@ def main():
         return 0
 
     if opts.dry_run:
-        print(f"# DRY RUN — {opts.repeats}x: spin ESC {opts.index} to {opts.rpm:g} rpm, disarm, "
+        how = (f"OPEN-LOOP to raw command {opts.thrust}" if opts.thrust is not None
+               else f"closed-loop to {opts.rpm:g} rpm")
+        cut = {"disarm": "disarm", "deadman": "let the 500ms deadman expire",
+               "zero": "hold zero throttle while ARMED"}[opts.cut]
+        print(f"# DRY RUN — {opts.repeats}x: spin ESC {opts.index} {how}, {cut}, "
               f"log encv for {opts.window:g}s")
         print("#   drive is CUT, so telemetry dies — the encoder is the only instrument. Always disarms.")
         return 0
@@ -259,8 +370,15 @@ def main():
             print(f"\n=== run {k + 1}/{opts.repeats}: spinning to {opts.rpm:g} rpm ===")
             if not spin_up(dev, opts.index, opts.rpm, opts):
                 print("  !! never reached the target — skipping this run")
-                dev.cmd(f"rpm {opts.index} 0", timeout=6)
-                dev.cmd(f"disarm {opts.index}", timeout=6)
+                # Guarded like the finally-block below: a stalled spin-up leaves the vc already
+                # ABORT_STALL'd and disarmed, so `rpm 0` answers "err not-armed" and an unguarded call
+                # here raised straight out of main() — discarding the CSV of every earlier repeat, the
+                # exact failure the no-samples path further down was already hardened against.
+                for step in (f"rpm {opts.index} 0", f"disarm {opts.index}"):
+                    try:
+                        dev.cmd(step, timeout=6)
+                    except Exception as e:
+                        print(f"#   ('{step}' failed: {e})")
                 continue
             rows = coast(dev, opts.index, opts)
             if not rows:
