@@ -27,7 +27,7 @@ namespace settings {
 static const char*    CFG_DIR     = "/cfg";
 static const char*    CFG_PATH    = "/cfg/settings.bin";
 static const uint32_t CFG_MAGIC   = 0x54534550;   // 'PEST'
-static const uint16_t CFG_VERSION = 1;
+static const uint16_t CFG_VERSION = 2;   // v2 added the measured-curve points + their regime tags
 static const int      CFG_MAX_CURVE = 24;         // == Thruster::ffbuf_ capacity
 
 // One ESC's persisted state. Plain floats, no padding surprises worth worrying about: the CRC + the
@@ -43,6 +43,7 @@ struct Record {
 	float    crossUpErpm, crossDnErpm;
 	float    curveThrust[CFG_MAX_CURVE];
 	float    curveRpm[CFG_MAX_CURVE];
+	uint8_t  curveRegime[CFG_MAX_CURVE];   // 1 = LINE (6-step), 0 = SINE
 };
 
 struct Header {
@@ -75,7 +76,19 @@ inline void capture(const Thruster& t, Record& r) {
 	r.dob = t.vc.dob; r.dobTau = t.vc.dob_tau; r.dobMax = t.vc.dob_max;
 	r.dobSettleSecs = t.vc.dob_settle_secs;
 	r.vbattScale = t.vbattScale();
-	// curveN stays 0 here: the measured-curve upload owns that slot.
+	// A MEASURED curve is stored point-by-point; the parametric one is not — it is regenerable from
+	// kv/pp/v, so persisting it would just be a second, staler copy of the same three numbers.
+	if (t.curveMeasured()) {
+		int n = t.curveCount(); if (n > CFG_MAX_CURVE) n = CFG_MAX_CURVE;
+		for (int i = 0; i < n; i++) {
+			r.curveThrust[i] = t.curvePoint(i).thrust;
+			r.curveRpm[i]    = t.curvePoint(i).rpm;
+			r.curveRegime[i] = (t.curveRegime(i) == vel::Regime::LINE) ? 1 : 0;
+		}
+		r.curveN      = (uint8_t)n;
+		r.crossUpErpm = t.crossUpErpm();
+		r.crossDnErpm = t.crossDnErpm();
+	}
 }
 
 // Apply a Record to a Thruster. Motor identity FIRST (it rebuilds the feed-forward curve), then the
@@ -84,6 +97,18 @@ inline void capture(const Thruster& t, Record& r) {
 inline void apply(Thruster& t, const Record& r) {
 	if (r.hasMotor && r.kv > 0.0f && r.polePairs >= 1 && r.volts > 0.0f)
 		t.setMotor(r.kv, (int)r.polePairs, r.volts);
+	// A stored MEASURED curve wins over the parametric one — that is the whole point of having uploaded
+	// it. setCurve() re-validates, so a plausible-but-corrupt table is rejected rather than installed.
+	if (r.curveN >= 2 && r.curveN <= CFG_MAX_CURVE && r.polePairs >= 1 && r.crossUpErpm > 0.0f) {
+		static vel::CurvePoint pts[CFG_MAX_CURVE];
+		static vel::Regime     regs[CFG_MAX_CURVE];
+		for (int i = 0; i < r.curveN; i++) {
+			pts[i].thrust = r.curveThrust[i];
+			pts[i].rpm    = r.curveRpm[i];
+			regs[i]       = r.curveRegime[i] ? vel::Regime::LINE : vel::Regime::SINE;
+		}
+		t.setCurve(pts, r.curveN, (int)r.polePairs, r.crossUpErpm, r.crossDnErpm, regs);
+	}
 	t.vc.kp = r.kp; t.vc.ki = r.ki; t.vc.kd = r.kd; t.vc.d_tau = r.dTau;
 	t.vc.trim_max = r.trimMax; t.vc.blend_secs = r.blendSecs;
 	t.vc.slew_rpm_s = r.slewRpmS; t.vc.stop_below_rpm = r.stopBelowRpm;
