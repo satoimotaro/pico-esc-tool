@@ -13,6 +13,10 @@ Two parts:
 - **`esctool`** (`host/esctool.py`) — a BLHeli-Configurator-like **CLI** on the PC: list ESCs, read /
   write settings (YAML profiles), and flash firmware, with a layout/MCU **compatibility guard**.
 
+> **Before you touch the bench or the vehicle, read [`docs/README.md`](docs/README.md).** It carries the
+> six behaviours that will bite you (telemetry lies below the crossover seam; zero throttle is a brake),
+> which numbers are measured versus fitted, and the current hardware state.
+
 ## Quick start
 
 ```
@@ -154,43 +158,39 @@ The encoder is a **calibration/position instrument** — the RPM closed loop abo
 
 ## ESC soft-sensor (voltage + load, no extra sensors)
 
-Infer **effective supply voltage** and a **relative load/thrust** signal from just the DShot telemetry
-RPM + the motor model — no voltage, current, or force sensor. `V_eff = rpm/(KV·duty) = V_supply −
-I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
+Infer **effective supply voltage** and a **relative load/thrust** signal from the DShot telemetry RPM plus
+the motor model — no voltage, current or force sensor. `V_eff = rpm/(KV·duty) = V_supply − I·R/duty`, so
+`V_eff ≈ V_supply` at light load and droops under load.
 
 ```
-motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
-sense 1                                   # -> sense|1|vest|vref|load|vbatt|valid|floor|dhat|settled|trim|cmd
-                                          #    |why|cmdfloor|loadok|vbok|temp|tpeak|tlim|tstate
-sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
-sense 1 vcal 11.2                         # calibrate vbatt to a known battery voltage (per motor+config)
-cfg save                                  # persist motor/gains/DOB/vcal to the Pico's flash (else RAM-only)
-python host/vbatt.py calibrate --known-v 11.2   # host-side equivalent; host/vbatt.py monitor -> V_batt
+motor 1 350 7 11.1        # set the motor model (kv pp v), then spin into 6-step with `rpm ...`
+sense 1                   # vest|vref|load|vbatt|valid|why|... (see docs for the full field list)
+sense 1 zero              # baseline the no-load reference (load = vref - vest thereafter)
+sense 1 vcal 11.2         # calibrate vbatt to a known battery voltage
+cfg save                  # persist motor/gains/DOB/vcal to flash (otherwise RAM-only)
 ```
 
-Rough battery gauge (max-over-time ≈ supply, ~1 % after one calibration) + fouled-prop / entanglement
-load detection. Only valid inside a deliberately narrow **validity window** (command above the derived
-6-step handoff, duty below saturation, held for 0.3 s) — outside it `valid=0` and `why=` names the
-condition, because a number you cannot tell apart from a good one is worse than no number.
-**Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).** `softsensor.duty()`/`estimate()` and
-the `obschar` / `duty_sweep` / `sim_obs` CLIs all **require** `--cross-up` — there is no safe default,
-and the wrong one is a silent 13–45 % error.
+Good for a rough battery gauge and for fouled-prop / entanglement detection. Valid only inside a
+deliberately narrow window (command above the derived handoff, duty below saturation, held 0.3 s);
+outside it `valid=0` and `why=` names the blocking condition, because a number you cannot tell apart from
+a good one is worse than no number. **`--cross-up` is required** on `softsensor`/`obschar`/`duty_sweep`/
+`sim_obs` — there is no safe default and the wrong one is a silent 13–45 % error.
+→ [`docs/soft-sensor.md`](docs/soft-sensor.md)
 
 ### The measured plant
 
-`host/pico_esc/plant.py` + `host/pico_esc/measured.py` are the plant model: structure fixed by physics,
-numbers in a provenance-tagged inventory keyed by **mechanical configuration** (propeller on vs bare
-shaft — never mix them). `python3 host/plantid.py validate --all` replays the committed bench fixtures
-in `host/tests/data/` offline and prints the out-of-sample table; `python3 host/plantid.py provenance`
-prints where every number came from, including which parameters each preset **borrows** from the other
-mechanical configuration and why. `validate --pair` prints the controlled bare-shaft-vs-propeller
-comparison: the propeller changes inertia (+29 %) and the free coast (-23 %) and, measurably, nothing
-else — the seam, the 182 rpm telemetry floor, the forced-sine spread and the closed-loop startup
-overshoot are identical. Moving this plant to water changes exactly one callable
-(`PlantParams.drag`); `PlantParams` is frozen so that is a property of the type, not a convention.
-Note `duty6` is a **loaded** curve — it was fitted to measured rpm, so drag is already inside it and a
-torque balance must add the calibration drag back rather than subtracting it twice.
-**Full details: [`docs/measured-plant.md`](docs/measured-plant.md).**
+`host/pico_esc/plant.py` + `measured.py` are the plant model: structure fixed by physics, numbers in a
+provenance-tagged inventory keyed by mechanical configuration (propeller on vs bare shaft — never mix
+them). Moving to water changes exactly one callable (`PlantParams.drag`), and `PlantParams` is frozen so
+that is a property of the type rather than a convention.
+
+```
+python3 host/plantid.py provenance      # where every number came from, and what each preset borrows
+python3 host/plantid.py validate --all  # replay the committed fixtures offline, print the out-of-sample table
+python3 host/plantid.py validate --pair # the controlled bare-shaft vs propeller comparison
+```
+
+→ [`docs/measured-plant.md`](docs/measured-plant.md)
 
 ## Requirements
 
@@ -220,7 +220,8 @@ host/pico_esc/measured.py    the measured plant inventory (one provenance record
 host/pico_esc/plant.py       the plant model (firmware / rotor / load, in three separable layers)
 host/plantid.py              offline fit + out-of-sample validation of the plant (no hardware)
 host/tests/data/             committed bench fixtures + plant_fixtures.json (the manifest)
-docs/                    design notes (measured-plant.md, velctl-generalization.md, etc.)
+docs/README.md           START HERE — operational facts, confidence tiering, doc map
+docs/                    measured-plant.md, soft-sensor.md, velocity-control.md, protocol-notes.md
 ```
 
 Legacy standalone bring-up apps (`dshot_demo`, `spike_*`, `encoder_test`) live on branch

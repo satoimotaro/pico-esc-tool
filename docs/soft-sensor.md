@@ -260,37 +260,17 @@ Read the byte with `python3 host/esctool.py dump`; never assume it, and re-read 
 
 ## The rotor NEVER coasts — zero throttle is a BRAKE
 
-This is not a soft-sensor property, but it governs every "sample opportunistically while it spins"
-assumption below, so it belongs with them. Measured on the bare shaft (no propeller), commit `5c205b2`:
+Not a soft-sensor property, but it governs every "sample opportunistically while it spins" assumption
+here, so it belongs in this document as a constraint. **Full treatment and the numbers:**
+[`measured-plant.md`](measured-plant.md).
 
-- **3100 rpm → dead stop in 0.19–0.54 s.** A free rotor of this inertia would take many seconds.
-- The deceleration **PEAKS PART-WAY DOWN and then falls away again**: ~3500–5000 rpm/s above 2500 rpm,
-  peaking at ~48 000 rpm/s at **1455–1596 rpm** (3/3, ±5 %), back to ~4000 rpm/s below 500 rpm. The
-  *rise* alone already rules out passive drag — aerodynamic (∝ω²), viscous (∝ω) and Coulomb (constant)
-  are all flat or falling and none can grow 10× while the speed collapses. The *roll-off* on the far
-  side additionally rules out a constant brake: a peak with fall-off on both sides is the signature of
-  a **slip-dependent** torque (short-circuit / asynchronous braking, which peaks near ω_e = R/L).
-  **RESOLVED 2026-07-30** (`docs/measured-plant.md`): the peak location never moved. The brake
-  ENGAGES on a fixed delay — the ESC keeps driving for 0.17 s (`disarm`), the rotor then coasts on drag
-  alone for a further 0.13 s, and only then does the brake bite. Bare-shaft the rotor is at ~2390 rpm by
-  then and prop-on at ~1540 rpm, which is exactly the ratio the "moving peak" (1455–1596 vs 865–973)
-  showed. Both delays were measured in **both** configurations and agree within 5 %, so they are ESC
-  state-machine timings. **Re-confirmed a third time on 2026-07-30 evening**, propeller refitted and the
-  whole set re-taken with the same `--thrust 800` spin-up: engagement moves to 2531–2741 rpm, i.e.
-  *higher* than bare-shaft, because the free coast is slower. Engagement tracks the STARTING speed, not
-  the load — and the old 865–973 rpm prop-on figure came from a lower-starting closed-loop spin-up, not
-  from the propeller. The brake **torque** transfers well on that protocol-matched pair (brake-phase
-  duration −5.9…+3.3 % across a +29 % inertia change, nothing refitted), but `L` stays tagged OPEN: one
-  inertia change on the same motor is not a different machine and is not water.
-- **Identical via all three routes**: `disarm`, letting the 500 ms deadman expire, and holding a zero
-  target while armed. There is no "coast" path among them.
-- **`brake_on_stop = 0` does not disable it.** The braking is not that setting.
+The ESC brakes whenever the commanded throttle is zero, on a fixed ~0.30 s delay — identically via
+`disarm`, via letting the 500 ms deadman expire, and while armed holding zero. `brake_on_stop = 0` does
+not disable it.
 
-Operational consequence: **cutting thrust brakes a thruster, it does not windmill.** For an ROV that
-means no free-spinning drag term to plan around when a thruster is idled — and, for this document, that
-the "spinning" window from which the soft-sensor can sample ends abruptly rather than tapering, so
-there is no slow-coast tail to sample during. It also means the last `sense` reading before a stop is
-the last one you get; there is no post-command coast-down to observe.
+What that means for sampling: the spinning window ends **abruptly rather than tapering**, so there is no
+slow-coast tail to sample during, and the last `sense` reading before a stop is the last one you get.
+There is no post-command coast-down to observe.
 
 ## Limitations & notes
 

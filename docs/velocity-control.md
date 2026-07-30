@@ -228,12 +228,25 @@ deliberately (smallest change, and the derate makes reaching the abort much less
 these thresholds is bench-validated — nothing correlates 60/80 °C EDT integers to real junction
 temperature on this board revision yet.
 
-## S3 firmware is BENCH-UNTESTED — warning
+## Default profile hazard — the shipped default is SIM-DERIVED, and for the wrong motor
 
-All development and verification here is against the **simulator** (`SimEncEscHost`), which is
-a **MODEL, not hardware truth**. The S3 sine↔BEMF crossover firmware has **never been run on
-the bench**. Green sim tests do **not** validate the S3 firmware. The first real
-`velcal --crossover` run will be the firmware's **first hardware crossover test** — supervise
-it, start with a conservative split, and watch the telemetry temperature. The shipped default
-profile `host/profiles/vel_930kv_12n14p_sim.yaml` is **sim-derived** and marked as such;
-replace it with a bench `velcal` run before trusting it on hardware.
+`host/velctl.py`'s `DEFAULT_PROFILE` is `host/profiles/vel_930kv_12n14p_sim.yaml`: a **930 KV** profile
+derived from the **simulator** (`SimEncEscHost`), not from hardware. The bench now runs a **350 KV**
+motor. Running velctl without an explicit `--profile` therefore feeds the controller a feed-forward curve
+for a different motor, produced by a model. Always pass `--profile`; for the current bench that is
+`host/profiles/f2838_350kv_bench_20260726.yaml`.
+
+(The 29 files in `host/profiles/` are largely historical calibration runs. Only the `f2838_350kv_*` ones
+describe the current bench.)
+
+What has and has not been bench-verified, as of 2026-07-30:
+
+- **The sine↔6-step crossover HAS now been run on hardware, extensively**, on the 350 KV bench. It hands
+  off between cmd 525 and 530 on both legs with no resolvable hysteresis, and a step down through the
+  seam does not stall (3/3 in both mechanical configurations). See [`measured-plant.md`](measured-plant.md).
+- **The thermal limiter in this document has NEVER executed on hardware.** It is committed but unflashed —
+  the running firmware still answers the old 11-field `sense` line and rejects `gain warntemp`. Green
+  unit tests do not validate it. Its 60/80 °C thresholds are argued from the ESC's own assembly, not from
+  any measurement tying EDT integer °C to a real winding or junction temperature.
+- **RAW drive (`thrust`/`throttle`) gets no thermal limiting at all**, because only the RPM submode runs
+  `vc.step()`. That includes every measurement tool (`sinesweep`, `steptrace`, `coastdown`).
