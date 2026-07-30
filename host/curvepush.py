@@ -267,7 +267,7 @@ def main(argv=None):
                 bad += 1
         # [#11-6] Verify the REGIME TAGS and the metadata too, not just the points. Mis-handled tags are
         # the failure this whole change exists to prevent (they move lineFloor(), hence the soft-sensor
-        # gate), and a pp that disagrees with the commit is exactly what slipped past the first version.
+        # gate), and a pp that disagrees with the commit is the failure this check exists to catch.
         got_tags = [g for *_, g in got]
         if len(got) == len(expect) and got_tags != expect:
             print(f"MISMATCH: regimes expected {''.join(expect)} got {''.join(got_tags)}")

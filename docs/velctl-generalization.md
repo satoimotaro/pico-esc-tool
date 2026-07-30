@@ -2,7 +2,7 @@
 
 >  **STATUS: HISTORICAL (frozen 2026-07-17).** This is the design spec that shaped the architecture, kept
 >  for the *why*. It is **not** a description of current behaviour and its numbers are not current — for
->  that read [`README.md`](README.md), [`measured-plant.md`](measured-plant.md) and
+>  that read [`README.md`](README.md), the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one) and
 >  [`velocity-control.md`](velocity-control.md). Its principles held up; its open questions are answered
 >  at the foot of this file.
 

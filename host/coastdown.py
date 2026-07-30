@@ -84,8 +84,21 @@ COUNTS_PER_REV = 4096.0
 # It lives in pico_esc.measured now, with its provenance record and the honest note that it FALLS with
 # speed (which no drag law permits, so it is bearing/iron loss plus a K_T*I_dc bias, not prop drag).
 # Re-exported here under the old names so every existing caller and test is untouched.
-from pico_esc.measured import DRAG_TABLE_PROP as DRAG_TABLE     # noqa: E402,F401
-from pico_esc.measured import drag_at                            # noqa: E402,F401
+# The drag table is a PER-INSTALLATION measurement (rotor + propeller + bearings), so it is not shipped.
+# Without one this tool still does the part that needs no calibration: the deceleration trace and the
+# brake window. J = tau_drag/(-dw/dt) needs YOUR table -- measure it with duty_sweep.py plus a PSU
+# current reading and pass it with --drag-table.
+try:
+    from pico_esc.measured import DRAG_TABLE_PROP as DRAG_TABLE   # noqa: E402,F401
+    from pico_esc.measured import drag_at                          # noqa: E402,F401
+except ImportError:
+    DRAG_TABLE = None
+
+    def drag_at(rpm):
+        raise RuntimeError(
+            "no drag table: J cannot be computed without one. Measure tau_drag(rpm) for YOUR rotor "
+            "(host/duty_sweep.py + a PSU current reading, tau = K_T*I_dc) and pass --drag-table, or "
+            "read the deceleration and brake-window output, which needs no calibration.")
 
 
 def _encv(dev):
@@ -272,8 +285,15 @@ def brake_onset(res, start, factor=2.0, probe=6):
 
 
 def report(all_runs, opts):
-    print("\n=== J from the measured drag: J = tau_drag(w) / (-dw/dt) ===")
-    print(f"{'run':>4}{'rpm':>9}{'dw/dt[rpm/s]':>14}{'tau[mN*m]':>11}{'J[kg*m^2]':>12}")
+    # Without a drag table the deceleration trace and the brake window are still exactly as measured —
+    # they need no calibration. Only J does, so only J is withheld.
+    have_drag = DRAG_TABLE is not None
+    if have_drag:
+        print("\n=== J from the measured drag: J = tau_drag(w) / (-dw/dt) ===")
+        print(f"{'run':>4}{'rpm':>9}{'dw/dt[rpm/s]':>14}{'tau[mN*m]':>11}{'J[kg*m^2]':>12}")
+    else:
+        print("\n=== deceleration and brake window (no drag table: J needs one, see --drag-table) ===")
+        print(f"{'run':>4}{'rpm':>9}{'dw/dt[rpm/s]':>14}")
     js = []
     for k, res in enumerate(all_runs, 1):
         s = coast_start(res)                  # drop the still-driven plateau before the real coast
@@ -290,12 +310,21 @@ def report(all_runs, opts):
             slowing = (rpm * dwdt) / a           # d|w|/dt = sign(w)*dw/dt; negative while coasting down
             if a < opts.fit_lo or a > opts.fit_hi or slowing >= 0:
                 continue
+            if not have_drag:
+                if len(js) < 40:
+                    print(f"{k:>4}{a:>9.0f}{slowing:>14.0f}")
+                js.append(None)
+                continue
             tau = drag_at(a)
             j = tau / (abs(slowing) * 2 * 3.141592653589793 / 60.0)
             dwdt = slowing
             js.append(j)
             if len(js) <= 40:
                 print(f"{k:>4}{a:>9.0f}{dwdt:>14.0f}{tau * 1e3:>11.2f}{j:>12.3e}")
+    if js and js[0] is None:
+        print(f"\n  n={len(js)} deceleration samples. Supply a measured tau_drag(rpm) for YOUR rotor "
+              f"to get J.")
+        return
     if not js:
         print("  (no usable samples — try a higher --rpm or a wider --fit-lo/--fit-hi)")
         return

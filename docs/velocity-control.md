@@ -243,7 +243,7 @@ What has and has not been bench-verified, as of 2026-07-30:
 
 - **The sine↔6-step crossover HAS now been run on hardware, extensively**, on the 350 KV bench. It hands
   off between cmd 525 and 530 on both legs with no resolvable hysteresis, and a step down through the
-  seam does not stall (3/3 in both mechanical configurations). See [`measured-plant.md`](measured-plant.md).
+  seam does not stall (3/3 in both mechanical configurations). See the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one).
 - **The thermal limiter in this document has NEVER executed on hardware.** It is committed but unflashed —
   the running firmware still answers the old 11-field `sense` line and rejects `gain warntemp`. Green
   unit tests do not validate it. Its 60/80 °C thresholds are argued from the ESC's own assembly, not from

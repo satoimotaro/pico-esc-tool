@@ -196,7 +196,7 @@ python3 host/plantid.py validate --all  # replay the committed fixtures offline,
 python3 host/plantid.py validate --pair # the controlled bare-shaft vs propeller comparison
 ```
 
-→ [`docs/measured-plant.md`](docs/measured-plant.md)
+→ the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one)
 
 ## Requirements
 
@@ -227,7 +227,7 @@ host/pico_esc/plant.py       the plant model (firmware / rotor / load, in three 
 host/plantid.py              offline fit + out-of-sample validation of the plant (no hardware)
 host/tests/data/             committed bench fixtures + plant_fixtures.json (the manifest)
 docs/README.md           START HERE — operational facts, confidence tiering, doc map
-docs/                    measured-plant.md, soft-sensor.md, velocity-control.md, protocol-notes.md
+docs/                    the plant inventory (kept per-installation), soft-sensor.md, velocity-control.md, protocol-notes.md
 ```
 
 Legacy standalone bring-up apps (`dshot_demo`, `spike_*`, `encoder_test`) live on branch

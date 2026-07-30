@@ -262,7 +262,7 @@ Read the byte with `python3 host/esctool.py dump`; never assume it, and re-read 
 
 Not a soft-sensor property, but it governs every "sample opportunistically while it spins" assumption
 here, so it belongs in this document as a constraint. **Full treatment and the numbers:**
-[`measured-plant.md`](measured-plant.md).
+the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one).
 
 The ESC brakes whenever the commanded throttle is zero, on a fixed ~0.30 s delay — identically via
 `disarm`, via letting the 500 ms deadman expire, and while armed holding zero. `brake_on_stop = 0` does

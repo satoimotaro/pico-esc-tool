@@ -10,7 +10,15 @@ old hand-picked `--fit-lo 1550` was silently papering over on one specific rotor
 `brake_onset` has to find the end of the real drag window from the SHAPE of the decay, with no rpm
 constants, because the brake bites at whatever speed the ESC decides.
 """
+import pytest
+
 import coastdown
+
+# The drag table is a per-installation measurement and is not distributed; the tests that need it skip
+# rather than fail, so the shipped suite is green without it while the local one still covers it.
+_HAVE_INVENTORY = coastdown.DRAG_TABLE is not None
+_needs_inventory = pytest.mark.skipif(not _HAVE_INVENTORY,
+                                      reason="no measured drag table in this distribution")
 
 
 def _res(pairs, t0=0.0, dt=0.02):
@@ -61,6 +69,7 @@ def test_brake_onset_gives_up_gracefully_on_a_short_run():
     assert coastdown.brake_onset(res, 0) == len(res)
 
 
+@_needs_inventory
 def test_drag_table_is_clamped_outside_its_measured_range():
     """`drag_at` extrapolating would invent torque for speeds nobody measured."""
     lo_rpm, lo_tau = coastdown.DRAG_TABLE[0]
@@ -102,6 +111,7 @@ def test_analyze_accepts_the_mode_column_as_well_as_run(tmp_path, capsys):
             assert str(k) in out
 
 
+@_needs_inventory
 def test_the_drag_table_is_re_exported_from_measured():
     """The table moved into pico_esc.measured (with its provenance record and the honest note that it
     FALLS with speed). It is re-exported here under the old names so no caller had to change."""

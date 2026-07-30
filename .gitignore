@@ -41,3 +41,23 @@ host/profiles/simcheck_sysid.yaml
 host/profiles/wrongKV*.yaml
 .vscode/
 host/vbatt_cal.json
+
+# ---- per-installation measured asset: kept local, not distributed ----------------------
+# Every value here describes ONE motor, ONE wiring loom and ONE supply, and the design assumes it is
+# re-measured in situ. The tools to produce it are shipped; the results are not.
+host/pico_esc/measured.py
+host/plantid.py
+host/sim_obs.py
+docs/measured-plant.md
+host/tests/test_measured_plant.py
+host/tests/test_plant_replay.py
+host/tests/data/*.csv
+!host/tests/data/posctl_move_d90_s1234.golden.csv
+host/tests/data/plant_fixtures.json
+# calibrated speed curves are per-installation too; the ESC-config default stays as an example
+# The 350KV/f2838 curves are the CURRENT bench's real calibration -> local only.
+# The vel_*.yaml 930KV set stays: it is the input to gen_profile_header.py, is already baked into the
+# tracked src/apps/profiles_gen.h, and public tests generate from it.
+host/profiles/*.yaml
+!host/profiles/blheli-s-default.yaml
+!host/profiles/vel_*.yaml

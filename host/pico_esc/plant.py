@@ -69,8 +69,21 @@ import math
 from dataclasses import dataclass, field, replace   # noqa: F401  (replace is re-exported)
 from typing import Callable, Optional
 
-from . import measured as M
+try:                                   # the measured inventory is a SEPARATE, per-installation asset.
+    from . import measured as M        # Without it this module still gives you the plant STRUCTURE;
+except ImportError:                    # you supply your own PlantParams. `preset()` is what needs it.
+    M = None
 from .motor_model import MotorModel, duty6
+
+
+def _require_inventory(what):
+    if M is None:
+        raise RuntimeError(
+            f"{what} needs a measured inventory (pico_esc/measured.py), which is not part of this "
+            "distribution because every value in it is specific to one motor, one wiring loom and one "
+            "supply. Build a PlantParams yourself from your own calibration — see the class docstring "
+            "— or run host/coastdown.py, duty_sweep.py and sinesweep.py to measure your own.")
+
 
 RAD = 2.0 * math.pi / 60.0          # rpm -> rad/s
 
@@ -138,6 +151,7 @@ def _measured_drag(rpm):
       * the table itself FALLS with speed, which no drag law permits — it is a lumped bearing/iron loss
         plus a K_T*I_dc bias, and those are propeller-independent.
     """
+    _require_inventory("the default air drag law")
     return M.drag_at(rpm)
 
 
@@ -147,6 +161,7 @@ def preset(mech_config: str) -> PlantParams:
     Every measured value is pulled through `M.value(name)` so that `measured.recorded_reads()` can tell
     the provenance test EXACTLY which parameters this function touched — a hand-maintained parallel list
     let `SINE_COHERENT_CMD_MIN` leak into the PROP preset undeclared."""
+    _require_inventory("preset()")
     v = M.value
     if mech_config not in (M.PROP, M.BARE):
         raise KeyError(f"unknown mechanical configuration {mech_config!r}")
@@ -218,7 +233,7 @@ class MeasuredPlant:
         self.cut_mode = cut_mode
         # Explicit Euler is only stable for dt well inside the electromechanical time constant
         # J*R/K_T^2 (~12 ms here). `step()` substeps internally rather than trusting the caller: the
-        # first version diverged to 28513 rpm on a single step(600, 10.0), and `step(cmd, dt)` is the
+        # explicit Euler diverges badly on a single oversized step, and `step(cmd, dt)` is the
         # public API — a future 20 ms-tick caller must not get a silently wrong answer.
         self._max_sub_dt = 0.05 * params.j * params.r_total / (params.k_t ** 2)
         self.reset()
