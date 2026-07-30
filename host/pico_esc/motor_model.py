@@ -10,8 +10,9 @@ self-cal (using bidir-DShot `tele`, no encoder) fits the residual scale for a sp
 Physics (validated on the F2838 350KV, RMSE 2.8 rpm):
   * no-load rpm  = KV * V * duty(cmd)      -> the 6-step curve SCALES with KV*V; duty(cmd) is universal.
   * sine forced-commutation is PP-governed: mech = (cmd/1000) * SINE_FULLSCALE_ERPM / PP  (KV-independent).
-  * regime split is PP-governed: sine below, 6-step above; handoff fires at the firmware floor
-    (SINE_CROSS_UP_ERPM_MIN eRPM) => mech handoff = that / PP.
+  * regime split is PP-governed: sine below, 6-step above; the handoff fires at the CONFIGURED seam
+    (cross_up * 39.0625 eRPM, floored at the firmware minimum SINE_CROSS_UP_ERPM_MIN) => mech handoff
+    = cross_up_erpm() / PP. Everything seam-derived goes through cross_up_erpm().
 
 So Motor(KV, PP, V) alone predicts: no-load top, the sine + 6-step FF curves, the regime boundaries,
 and the derivable ESC config. What it CANNOT predict is the dynamics (tau ~ inertia/load) and thus the
@@ -39,12 +40,24 @@ DUTY6_CROSSUP_K = 0.0421
 
 
 def duty6(cmd, cross_up=DUTY6_CROSSUP_REF):
-    """Effective 6-step duty = rpm/(KV*V_supply) at command `cmd` on an ESC set to `cross_up`."""
+    """EFFECTIVE 6-step duty = rpm_measured/(KV*V_supply) at command `cmd` on an ESC set to `cross_up`.
+
+    NOTE THIS IS A LOADED CURVE. DUTY6_A/B were fitted to measured rpm on a real bench, so the drag of
+    that rotor is already inside them: this is the duty implied by the speed the rotor SETTLED at, not
+    the electrical duty the winding sees. Anything that puts this into a torque balance must add the
+    calibration drag's duty cost back first — see pico_esc.plant.duty_ref_offset, and the drag
+    double-count it exists to prevent.
+
+    The `cross_up` DEFAULT survives here (and in cmd_for_duty6) so that MotorModel and every existing
+    caller stay numerically identical to before the term existed. Every call site in host/ passes it
+    explicitly, which `test_measured_plant.test_no_call_site_relies_on_a_duty_default` enforces by AST
+    scan — but that scan covers `host/` and `host/pico_esc/` only, so a NEW module elsewhere could still
+    reach the default. Prefer `MotorModel.duty6`/`MeasuredPlant.duty_6step`, which cannot."""
     return DUTY6_A * abs(cmd) + DUTY6_B - DUTY6_CROSSUP_K * (cross_up - DUTY6_CROSSUP_REF)
 
 
 def cmd_for_duty6(duty, cross_up=DUTY6_CROSSUP_REF):
-    """Exact inverse of duty6()."""
+    """Exact inverse of duty6(). Same default caveat as duty6()."""
     return (duty - DUTY6_B + DUTY6_CROSSUP_K * (cross_up - DUTY6_CROSSUP_REF)) / DUTY6_A
 # sine: mech RPM = (cmd/1000) * SINE_FULLSCALE_MECH, SINE_FULLSCALE_MECH = SINE_FULLSCALE_ERPM / PP.
 SINE_FULLSCALE_ERPM = 2499.0      # firmware S1 full-scale eRPM at cmd 1000 (SINE_RCP_SHIFT=3 etc.)
@@ -75,9 +88,27 @@ class MotorModel:
         """Forced-sine full-scale mech RPM (cmd 1000) = SINE_FULLSCALE_ERPM / PP. KV-INDEPENDENT."""
         return SINE_FULLSCALE_ERPM / self.pp
 
+    def cross_up_erpm(self) -> float:
+        """The SEAM the configured `sine_cross_up` puts the handoff at, in eRPM — floored at the
+        firmware's own minimum, because the ESC cannot hand off below it however low the byte is.
+
+        cross_up does TWO independent things and only one of them used to be modelled: it shifts the
+        6-step duty (DUTY6_CROSSUP_K) AND IT MOVES THE SEAM. Anything that derives a handoff speed or
+        command must come through here, or it silently keeps using the firmware minimum while the
+        operator has configured something else (at cross_up 50 that is a ~220-count band of pure
+        forced sine reported as valid 6-step).
+
+        Mirrors vel::MotorModel::crossUpErpm() in lib/vel_control/motor_model.h. The C++ side floors
+        at the literal 1333.0f while this floors at SINE_CROSS_UP_ERPM_MIN = 4*10000/30 = 1333.333...,
+        so the two agree to 0.34 eRPM (0.03 %) — inside the 0.5 eRPM parity band the tests assert, and
+        far inside one cross_up unit (39.0625 eRPM). cross_up 34 -> 1328.1 eRPM is just UNDER the
+        floor, which is why 34 reads as ~the firmware minimum.
+        """
+        return max(self.cross_up * SINE_CROSS_UP_ERPM_PER_UNIT, SINE_CROSS_UP_ERPM_MIN)
+
     def handoff_mech(self) -> float:
-        """Mech RPM at which the sine->6step handoff fires (firmware floor / PP)."""
-        return HANDOFF_ERPM / self.pp
+        """Mech RPM at which the sine->6step handoff fires (the configured seam / PP)."""
+        return self.cross_up_erpm() / self.pp
 
     def handoff_cmd(self) -> float:
         """cmd at which forced sine reaches the handoff speed (where the up-crossover fires)."""

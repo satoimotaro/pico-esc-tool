@@ -109,6 +109,34 @@ int main() {
 	// Same rpm needs a HIGHER command once Cross_Up rises (less duty per command).
 	CHECK(c36.cmd6stepFor(1600) > c34.cmd6stepFor(1600), "higher cross_up costs more command for 1600 rpm");
 
+	// ---- the SEAM must track cross_up too, not just the duty (E.9) ----
+	// crossUpErpm() existed before this but handoffMech()/handoffCmd()/sixstepFloorRpm() went straight
+	// to HANDOFF_ERPM, so the seam LOCATION stayed pinned to the firmware minimum at every cross_up.
+	// Table pinned against host/pico_esc/motor_model.py:MotorModel.cross_up_erpm() and
+	// lib/vel_control/test/test_sense_gate.cpp (same three bytes, 0.5 eRPM parity band). 34 floors at
+	// the firmware minimum because 34*39.0625 = 1328.1 < 1333.
+	{
+		MotorModel s34(350, 7, 11.2f), s36(350, 7, 11.2f), s50(350, 7, 11.2f);
+		s36.setCrossUp(36); s50.setCrossUp(50);
+		NEAR(s34.crossUpErpm(), HANDOFF_ERPM, 0.5f, "cross_up 34 -> the firmware floor");
+		NEAR(s36.crossUpErpm(), 1406.25f, 0.01f, "cross_up 36 -> 1406.25 eRPM");
+		NEAR(s50.crossUpErpm(), 1953.125f, 0.01f, "cross_up 50 -> 1953.125 eRPM");
+		// handoffMech = seam/PP, and every seam-derived quantity moves with it
+		NEAR(s36.handoffMech(), 1406.25f / 7.0f, 0.01f, "handoffMech follows the configured seam");
+		NEAR(s50.handoffCmd(), 1953.125f / SINE_FULLSCALE_ERPM * 1000.0f, 0.05f,
+		     "handoffCmd follows the configured seam (cross_up 50 -> cmd 781, not 533)");
+		CHECK(s50.handoffCmd() > s36.handoffCmd() && s36.handoffCmd() > s34.handoffCmd(),
+		      "raising cross_up raises the handoff command");
+		// The LANDING falls as cross_up rises even though the handoff command rises: the extra command
+		// buys less duty (DUTY6_CROSSUP_K), and that costs more than the higher seam gains. So the gap
+		// narrows from BOTH ends — 34: 190..707 rpm, 36: 201..685, 50: 279..640.
+		CHECK(s50.sixstepFloorRpm() < s36.sixstepFloorRpm()
+		      && s36.sixstepFloorRpm() < s34.sixstepFloorRpm(),
+		      "raising cross_up LOWERS the 6-step landing (less duty per command)");
+		CHECK(s34.inGap(250.0f) && !s50.inGap(250.0f), "the gap's lower edge rises with cross_up");
+		CHECK(s34.inGap(670.0f) && !s50.inGap(670.0f), "the gap's upper edge falls with cross_up");
+	}
+
 	printf(fails ? "\n%d CHECK(s) FAILED\n" : "\nall motor_model checks passed\n", fails);
 	return fails ? 1 : 0;
 }

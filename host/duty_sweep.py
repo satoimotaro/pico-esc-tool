@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from esctool import EscHost, find_pico            # noqa: E402
 
 # The firmware's model — imported, not re-declared, so this tool can never drift from what it validates.
-from pico_esc.motor_model import DUTY6_A, DUTY6_B, DUTY6_CROSSUP_REF, duty6   # noqa: E402
+from pico_esc.motor_model import DUTY6_A, DUTY6_B, duty6   # noqa: E402
 KEEPALIVE_S = 0.2                                  # < the 500 ms raw-throttle deadman
 
 
@@ -53,10 +53,14 @@ class Aborted(RuntimeError):
     pass
 
 
-def duty_model(cmd, cross_up=None):
+def duty_model(cmd, cross_up):
     """The model's prediction INCLUDING its cross_up term, so the printed ratio is what the firmware
-    would actually now compute — not what it computed before the term existed."""
-    return duty6(cmd, DUTY6_CROSSUP_REF if cross_up is None else cross_up)
+    would actually now compute — not what it computed before the term existed.
+
+    `cross_up` is REQUIRED. It used to fall back to DUTY6_CROSSUP_REF, which in a tool whose entire
+    purpose is to MEASURE the cross_up term meant the reference row silently compared the bench against
+    a different ESC config than the one it was running."""
+    return duty6(cmd, cross_up)
 
 
 def duty_measured(rpm, kv, v_supply, i_dc=None, r=None):
@@ -191,7 +195,7 @@ def analyze(rows, opts):
               "extra/missing treated as unknown")
     print("\n=== duty_eff(cmd): measured vs the firmware's fixed affine ===")
     print(f"# KV={opts.kv:g}  V_supply={opts.v:g}  R={opts.r:g}  "
-          f"idle={opts.idle:g}A  cross_up={opts.cross_up if opts.cross_up else '?'}")
+          f"idle={opts.idle:g}A  cross_up={opts.cross_up}")
     if not cur:
         print("# NO currents given -> I*R ignored (duty = rpm/(KV*V)); "
               "the result is biased LOW, worst at high rpm")
@@ -252,7 +256,11 @@ def main():
                     help="ESC+logic idle current to subtract from each PSU reading (default 0.0055)")
     ap.add_argument("--currents", default=None,
                     help="comma-separated PSU readings, in the swept (descending) order")
-    ap.add_argument("--cross-up", type=int, default=None, help="record the sine_cross_up in use")
+    ap.add_argument("--cross-up", type=int, required=True,
+                    help="the sine_cross_up the ESC is actually set to (read it with `esctool.py "
+                         "dump`). REQUIRED: it is stamped into the CSV header and it is what the "
+                         "model column is computed at — two bare CSVs taken at different cross_up "
+                         "are indistinguishable afterwards")
     ap.add_argument("--rpm-ceiling", type=float, default=3000.0)
     ap.add_argument("--lock-tol", type=float, default=0.05, help="|tele/enc - 1| for a 6-step lock")
     ap.add_argument("--lock-timeout", type=float, default=25.0)

@@ -68,3 +68,43 @@ def test_drag_table_is_clamped_outside_its_measured_range():
     assert coastdown.drag_at(lo_rpm - 500) == lo_tau
     assert coastdown.drag_at(hi_rpm + 500) == hi_tau
     assert coastdown.drag_at(-2000) == coastdown.drag_at(2000)      # magnitude only
+
+
+def test_analyze_accepts_the_mode_column_as_well_as_run(tmp_path, capsys):
+    """`--cut`-comparison CSVs are keyed by `mode`, plain repeat CSVs by `run`.
+
+    Only `run` used to be accepted, so `cutmode_noprop_*.csv` — the file that PROVED the brake belongs
+    to zero commanded throttle rather than to `disarm` — raised KeyError inside its own tool. Both
+    schemas must read, and the report must say which key it used so a mis-keyed file is visible.
+    """
+    import csv
+
+    def _write(path, key, keys):
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow([key, "t", "accum", "encv_rpm"])
+            for k in keys:
+                for i in range(40):
+                    t = i * 0.004
+                    # 3000 rpm falling linearly: accum in counts, 4096/rev
+                    rpm = 3000.0 - 2000.0 * t
+                    accum = int(-(3000.0 * t - 1000.0 * t * t) / 60.0 * 4096.0)
+                    w.writerow([k, f"{t:.4f}", accum, f"{-rpm:.1f}"])
+
+    for key, keys in (("mode", ["disarm", "deadman", "zero_held"]), ("run", ["1", "2"])):
+        p = tmp_path / f"{key}.csv"
+        _write(p, key, keys)
+        assert coastdown.main(["--analyze", str(p), "--no-brake-gate",
+                              "--fit-lo", "0", "--fit-hi", "9000"]) == 0
+        out = capsys.readouterr().out
+        assert f"{key}(s)" in out, out.splitlines()[0]
+        for k in keys:
+            assert str(k) in out
+
+
+def test_the_drag_table_is_re_exported_from_measured():
+    """The table moved into pico_esc.measured (with its provenance record and the honest note that it
+    FALLS with speed). It is re-exported here under the old names so no caller had to change."""
+    from pico_esc import measured
+    assert coastdown.DRAG_TABLE is measured.DRAG_TABLE_PROP
+    assert coastdown.drag_at is measured.drag_at

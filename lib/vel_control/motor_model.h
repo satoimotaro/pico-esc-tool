@@ -109,7 +109,11 @@ public:
 	// ---- scalar predictions ----
 	float noLoadTop()         const { return kv_ * v_ * eff_; }
 	float sineFullscaleMech() const { return SINE_FULLSCALE_ERPM / (float)pp_; }   // PP-governed
-	float handoffMech()       const { return HANDOFF_ERPM / (float)pp_; }
+	// The CONFIGURED seam, not the firmware floor. This used to read HANDOFF_ERPM directly, so
+	// crossUpErpm() existed but nothing downstream used it: at cross_up 36 the handoff command came
+	// out 533 instead of 563 and at 50 it was 533 instead of 781. Mirrors
+	// host/pico_esc/motor_model.py:MotorModel.handoff_mech().
+	float handoffMech()       const { return crossUpErpm() / (float)pp_; }
 	float handoffCmd()        const { return cmdForSine(handoffMech()); }
 	float sixstepFloorRpm()   const { return rpm6step(handoffCmd()); }             // the 6-step "landing"
 

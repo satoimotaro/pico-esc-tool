@@ -30,10 +30,15 @@ ACTIVE BRAKING whenever the commanded throttle is zero, and it dominates the dec
     the far side rules out a constant brake too: a peak with fall-off on both sides is the signature
     of a SLIP-dependent torque (short-circuit / asynchronous braking, which peaks near w_e = R/L),
     not an ever-growing one. That shape is what makes the mechanism identifiable at all.
-    CAUTION, unresolved: the peak sits at a DIFFERENT rotor speed with the propeller fitted
-    (865-973 rpm, 3/3) than bare-shaft (1455-1596). A purely electrical slip law should peak at the
-    same speed regardless of load, so either the peak location is not purely electrical, or the
-    prop-on peak is biased by that run only reaching 2200 rpm. Do not assume load-independence.
+    THE "PEAK MOVES WITH LOAD" QUESTION IS SETTLED (2026-07-30, docs/measured-plant.md): it does not.
+    The brake ENGAGES ON A FIXED DELAY — the ESC keeps driving for CUT_RELEASE_S (0.17 s on `disarm`),
+    the rotor then coasts on drag alone for a further BRAKE_ENGAGE_S (~0.13 s), and only then does the
+    brake bite. Bare-shaft the rotor is at ~2390 rpm by then and prop-on at ~1540 rpm, which is exactly
+    the ratio the apparent peak shift (1455-1596 vs 865-973 rpm) showed. Both delays were measured in
+    BOTH configurations and agree within 5 %, so they are ESC state-machine timings, not rotor
+    properties. The brake TORQUE's load-independence is still open.
+    NOT explained by one slip law: `zero_held` brakes ~3x harder than `disarm` from the same speed
+    (32 ms vs 107 ms to a stop) and drives the rotor THROUGH zero, springing back to 105-148 rpm.
   * identical with `disarm`, with the 500 ms deadman simply expiring, and while ARMED holding zero
     throttle (fastest of the three, 0.19 s). So it is tied to ZERO COMMANDED THROTTLE, not to the
     disarm path. `brake_on_stop=0` does NOT disable it.
@@ -70,25 +75,11 @@ from esctool import EscHost, find_pico            # noqa: E402
 COUNTS_PER_REV = 4096.0
 
 # tau_drag(rpm) measured 2026-07-29 (duty_sweep + PSU current, K_T = 9.5493/350) for THIS rotor+prop.
-# Hard-coded on purpose — it is a measurement, not a tunable — but that makes the J it yields valid for
-# this bench ONLY. On any other rotor, re-measure with duty_sweep + a PSU current reading and replace it.
-DRAG_TABLE = [(753, 5.90e-3), (1073, 5.21e-3), (1378, 4.89e-3), (1685, 4.68e-3),
-              (2000, 4.51e-3), (2310, 4.35e-3), (2616, 4.23e-3), (2922, 4.16e-3)]
-
-
-def drag_at(rpm):
-    """Linear interpolation on the measured drag table; clamped outside it."""
-    a = abs(rpm)
-    if a <= DRAG_TABLE[0][0]:
-        return DRAG_TABLE[0][1]
-    if a >= DRAG_TABLE[-1][0]:
-        return DRAG_TABLE[-1][1]
-    for i in range(1, len(DRAG_TABLE)):
-        x0, y0 = DRAG_TABLE[i - 1]
-        x1, y1 = DRAG_TABLE[i]
-        if a <= x1:
-            return y0 + (y1 - y0) * (a - x0) / (x1 - x0)
-    return DRAG_TABLE[-1][1]
+# It lives in pico_esc.measured now, with its provenance record and the honest note that it FALLS with
+# speed (which no drag law permits, so it is bearing/iron loss plus a K_T*I_dc bias, not prop drag).
+# Re-exported here under the old names so every existing caller and test is untouched.
+from pico_esc.measured import DRAG_TABLE_PROP as DRAG_TABLE     # noqa: E402,F401
+from pico_esc.measured import drag_at                            # noqa: E402,F401
 
 
 def _encv(dev):
@@ -311,7 +302,7 @@ def report(all_runs, opts):
           f"(vs the ~37 ms the loop actually sees => still firmware-dominated if much smaller)")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="coast-down: drag-based inertia + b(w) baseline")
     ap.add_argument("index", type=int, nargs="?", default=1)
     ap.add_argument("--rpm", type=float, default=2200.0, help="spin-up target before the cut")
@@ -342,16 +333,22 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--port", default=None)
     ap.add_argument("--dry-run", action="store_true")
-    opts = ap.parse_args()
+    opts = ap.parse_args(argv)
 
     if opts.analyze:
         by_run = {}
         with open(opts.analyze) as f:
-            for r in csv.DictReader(f):
-                by_run.setdefault(int(r["run"]), []).append(
+            rd = csv.DictReader(f)
+            # `--cut`-comparison CSVs are keyed by `mode` (disarm/deadman/zero_held), plain repeat
+            # CSVs by `run`. Only `run` was accepted, so the cutmode file — the one that PROVED the
+            # brake belongs to zero throttle rather than to disarm — was unreadable by its own tool.
+            key = "mode" if (rd.fieldnames and "mode" in rd.fieldnames) else "run"
+            for r in rd:
+                by_run.setdefault(r[key], []).append(
                     (float(r["t"]), int(r["accum"]), float(r["encv_rpm"])))
         runs = [derive(rows, opts.win) for rows in by_run.values()]
-        print(f"# re-fit {sum(len(v) for v in by_run.values())} samples from {len(by_run)} run(s)")
+        print(f"# re-fit {sum(len(v) for v in by_run.values())} samples from {len(by_run)} "
+              f"{key}(s): {', '.join(str(k) for k in by_run)}")
         report(runs, opts)
         return 0
 

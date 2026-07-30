@@ -1,0 +1,106 @@
+{
+  "_about": [
+    "Manifest for the measured-plant fixtures. Every number in host/pico_esc/measured.py traces to a",
+    "file listed here, and every file records which MECHANICAL CONFIGURATION and which ESC cross_up it",
+    "was recorded at — the two things that were previously implicit and got mixed."
+  ],
+  "_cross_up_provenance": {
+    "claim": "prop_350kv_20260726 datasets are cross_up=34; bare_shaft_350kv_20260730 are cross_up=36",
+    "why_it_needed_evidence": [
+      "No fixture CSV carries a cross_up column (only duty_sweep.py stamps one, into its own output).",
+      "Git history looked like it said 36 for BOTH: the bench was recalibrated at cross_up=36 on",
+      "2026-07-26 17:46 (commit 011acf8), the prop-on dynamics dataset was committed 2026-07-27 00:17",
+      "(235eb56) with no reflash commit in between, the 2026-07-29 session note records cross_up=36 and",
+      "host/loadtest.py:221 comments 'the bench runs 36'."
+    ],
+    "evidence": [
+      "Two no-load duty sweeps recorded minutes apart at the two values: reports/duty_sweep_20260729_220535.csv",
+      "(A) and reports/duty_sweep_20260729_223122.csv (B). They are offset by EXACTLY 30 command counts at",
+      "every point (A: 780->2922.2, 570->753.2; B: 750->2932.2, 540->768.9) — a pure intercept shift, which",
+      "is what cross_rescale_duty does, and independent confirmation that cross_up moves the intercept and",
+      "not the slope.",
+      "Which sweep is which, pinned against a KNOWN cross_up rather than by assuming the sign: the ESC was",
+      "read directly and reports sine_cross_up: 36; at cmd 600 the encoder measured 1064.3 and 1069.3 rpm on",
+      "two independent runs. Sweep A interpolates to 1072.8 there (0.4-0.8 % away), sweep B to 1391.7 (30 %",
+      "away, far beyond any load effect - today is bare shaft and sweep A was prop-on). So A = 36, B = 34.",
+      "Interpolating both sweeps to the postfix sysid's three 6-step commands: measured 794.4 / 1510.4 /",
+      "2212.7 rpm at cmd 543 / 612 / 680; sweep B (34) gives 800.1 / 1514.6 / 2213.6 (+0.7 / +0.3 / +0.0 %),",
+      "sweep A (36) gives 465.7 / 1194.8 / 1894.6 (-41.4 / -20.9 / -14.4 %). A three-point match to 0.0 % at",
+      "cmd 680 against a directly-measured sweep whose own cross_up is pinned by a known-configuration",
+      "measurement."
+    ],
+    "reconciliation_with_git": [
+      "esctool.py flash WIPES the ESC config to firmware defaults and must be followed by re-applying the",
+      "whole config (a documented, recurring gotcha in this project). A flash between the 17:46 velcal and",
+      "the 00:17 sysid leaves NO commit trace, which is exactly why no reflash is visible in history. The",
+      "velcal commit message describes the config velcal ran under; the sysid that followed sat at the",
+      "post-flash value."
+    ],
+    "also_derived": [
+      "The 30-count offset over 2 cross_up units gives K = 0.00265*30/2 = 0.0398 duty/unit, between the",
+      "code's DUTY6_CROSSUP_K = 0.0421 and the theoretical 0.0391 — so the sign AND magnitude of the",
+      "existing term are sound. Sign convention (host/pico_esc/motor_model.py:duty6): a HIGHER cross_up",
+      "gives LOWER duty for the same command, so it needs MORE command for a given rpm. The 36 sweep needs",
+      "30 more counts, which matches."
+    ]
+  },
+  "_open_loop_commands": {
+    "note": "Inferred from each tool's default/documented invocation, NOT recorded in the CSVs. Flagged.",
+    "steptrace_down": "thrust 600 -> 480 (open loop, --mode thrust)",
+    "steptrace_startup": "rpm 1200 from rest (closed loop, --mode rpm --startup)",
+    "steptrace_startup2400": "rpm 2400 from rest (closed loop, --mode rpm --startup); ABORT_STALLs"
+  },
+  "fixtures": {
+    "sinesweep_noprop_20260730_033014.csv": {
+      "tool": "sinesweep", "role": "sine", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "leg", "runs": ["up", "down"], "rows": 38,
+      "trim": "none (full file)",
+      "note": "cmd 60..600 step 30, both legs. Source of TELE_FLOOR_MECH, SINE_SPREAD_TABLE_BARE, SINE_REVERSALS_BARE and the bare-shaft static points at cmd 570/600."
+    },
+    "sinesweep_fold_noprop_20260730_033417.csv": {
+      "tool": "sinesweep", "role": "sine", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "leg", "runs": ["up", "down"], "rows": 22,
+      "trim": "none (full file)",
+      "note": "fine sweep cmd 495..555 through the seam. Departure bracket 515..520 on BOTH legs — no hysteresis resolved. Source of the cmd 555 static point."
+    },
+    "coastdown_noprop_20260730_032130.csv": {
+      "tool": "coastdown", "role": "bare", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "run", "runs": ["1", "2", "3"], "rows": 897,
+      "cut": "disarm", "spin_up": "thrust 800 open loop (~3130 rpm)", "trim": "none (full file)",
+      "note": "3 repeats of the zero-throttle brake. Source of L_PHASE_FITTED, J_BARE_FITTED and FREE_DECEL_BARE_RPM_S."
+    },
+    "cutmode_noprop_20260730_032448.csv": {
+      "tool": "coastdown", "role": "bare", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "mode", "runs": ["disarm", "deadman", "zero_held"], "rows": 690,
+      "cut": null, "spin_up": "thrust 800 open loop", "trim": "none (full file)",
+      "note": "NO `run` column — the key column is `mode`, which is why coastdown.py --analyze had to learn both. Source of CUT_RELEASE_S and BRAKE_ENGAGE_S. brake_on_stop=0 does not disable any of the three."
+    },
+    "coastdown_20260730_011123.csv": {
+      "tool": "coastdown", "role": "prop", "mech_config": "prop_350kv_20260726",
+      "cross_up": 34, "run_key": "run", "runs": ["1", "2", "3"], "rows": 884,
+      "cut": "disarm", "spin_up": "rpm 2200 closed loop", "trim": "none (full file)",
+      "note": "PROPELLER FITTED. Held out of the brake fit, so replaying it with the bare-shaft-fitted L and the prop-on J/drag is the genuine out-of-sample check. Also the source of J_PROP."
+    },
+    "steptrace_down_noprop_20260730_033706.csv": {
+      "tool": "steptrace", "role": "down", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "run", "runs": ["1", "2", "3"], "rows": 1410,
+      "command": "thrust 600 -> 480 (open loop)",
+      "trim": "TIME-trimmed to the first 2.0 s per run; NOT decimated",
+      "note": "The half-time is 22-26 ms, i.e. ~5 samples, so decimating this file would destroy the one number it exists to measure. Source of SINE_PULLOUT_NM."
+    },
+    "steptrace_startup_noprop_20260730_033906.csv": {
+      "tool": "steptrace", "role": "startup", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "run", "runs": ["1", "2", "3"], "rows": 1164,
+      "command": "rpm 1200 from rest (closed loop, --startup)",
+      "trim": "time-trimmed to 4.0 s per run, then decimated 2x",
+      "note": "Overshoot 53/53/54 %, t_peak 1.19/1.18/1.21 s, settles ~1206 rpm. tele reads exactly 0 for the first ~0.11 s and then 182 — the source of TELE_LIVE_S."
+    },
+    "steptrace_startup2400_noprop_20260730_034108.csv": {
+      "tool": "steptrace", "role": "startup", "mech_config": "bare_shaft_350kv_20260730",
+      "cross_up": 36, "run_key": "run", "runs": ["1", "2"], "rows": 1396,
+      "command": "rpm 2400 from rest (closed loop, --startup)",
+      "trim": "time-trimmed to 4.0 s per run, then decimated 2x",
+      "note": "Only 2 runs (not 3). Both ABORT_STALL: peak 657/742 rpm then zero. Source of STARTUP_ABORT_TARGET_RPM. The abort is gated on traversing the crossover gap, so it is strongly load-dependent."
+    }
+  }
+}

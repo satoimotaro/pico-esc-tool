@@ -241,6 +241,23 @@ Fit `V_eff` and a load-droop trend from a `(cmd, rpm)` sweep (e.g. a `sysid` cur
 run): `v_eff` (least-squares supply), per-point V, an `rpm²` load coefficient, and a `load_present`
 flag. Useful to characterise a motor offline; the firmware `sense` is the live version.
 
+### `--cross-up` is REQUIRED (2026-07-30)
+
+`softsensor.duty(cmd, cross_up)` and `softsensor.estimate(kv, pp, samples, cross_up)` have **no
+default** for `cross_up`, and calling them without it raises `TypeError`. `host/obschar.py`,
+`host/duty_sweep.py`, `host/softsensor.py` and `host/sim_obs.py` all take `--cross-up` on the CLI.
+
+The default used to be 34 (the value `DUTY6_A/B` were fitted at) while the bench ran 36. That is a
+fixed **duty** offset of `0.0421 × 2`, so it is a ~0.6 % error in `V_eff` at cmd 780 and a ~44 % error
+at cmd 570 — and because `estimate()` charges every unexplained deficit to *load*, the droop and
+`k_load` numbers silently absorbed it as if it were physics. `host/sim_obs.py` imported `duty` bare and
+so validated a model of a **different ESC** than the hardware it was compared against. A wrong
+`cross_up` costs 13.7–45.0 % on the static curve (`python3 host/plantid.py validate --static`), so the
+argument is required rather than defaulted: a `TypeError` is a better answer than a plausible number.
+
+Read the byte with `python3 host/esctool.py dump`; never assume it, and re-read it after every flash
+(`esctool.py flash` wipes the config to firmware defaults).
+
 ## The rotor NEVER coasts — zero throttle is a BRAKE
 
 This is not a soft-sensor property, but it governs every "sample opportunistically while it spins"
@@ -253,9 +270,14 @@ assumption below, so it belongs with them. Measured on the bare shaft (no propel
   are all flat or falling and none can grow 10× while the speed collapses. The *roll-off* on the far
   side additionally rules out a constant brake: a peak with fall-off on both sides is the signature of
   a **slip-dependent** torque (short-circuit / asynchronous braking, which peaks near ω_e = R/L).
-  Unresolved: with the propeller fitted the peak moves to **865–973 rpm** (3/3), which a purely
-  electrical slip law should not do — so either the peak location is not purely electrical, or the
-  prop-on figure is biased by that run only reaching 2200 rpm. Do not assume load-independence.
+  **RESOLVED 2026-07-30** (`docs/measured-plant.md`): the peak location never moved. The brake
+  ENGAGES on a fixed delay — the ESC keeps driving for 0.17 s (`disarm`), the rotor then coasts on drag
+  alone for a further 0.13 s, and only then does the brake bite. Bare-shaft the rotor is at ~2390 rpm by
+  then and prop-on at ~1540 rpm, which is exactly the ratio the "moving peak" (1455–1596 vs 865–973)
+  showed. Both delays were measured in **both** configurations and agree within 5 %, so they are ESC
+  state-machine timings. The brake **torque**'s load-independence is still OPEN: replaying the prop-on
+  decays with the bare-shaft-fitted `L` reproduces the stop time within 11 % but misses the
+  deceleration-peak rpm by 37–41 %.
 - **Identical via all three routes**: `disarm`, letting the 500 ms deadman expire, and holding a zero
   target while armed. There is no "coast" path among them.
 - **`brake_on_stop = 0` does not disable it.** The braking is not that setting.

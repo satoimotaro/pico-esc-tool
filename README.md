@@ -172,7 +172,22 @@ Rough battery gauge (max-over-time ≈ supply, ~1 % after one calibration) + fou
 load detection. Only valid inside a deliberately narrow **validity window** (command above the derived
 6-step handoff, duty below saturation, held for 0.3 s) — outside it `valid=0` and `why=` names the
 condition, because a number you cannot tell apart from a good one is worse than no number.
-**Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).**
+**Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).** `softsensor.duty()`/`estimate()` and
+the `obschar` / `duty_sweep` / `sim_obs` CLIs all **require** `--cross-up` — there is no safe default,
+and the wrong one is a silent 13–45 % error.
+
+### The measured plant
+
+`host/pico_esc/plant.py` + `host/pico_esc/measured.py` are the plant model: structure fixed by physics,
+numbers in a provenance-tagged inventory keyed by **mechanical configuration** (propeller on vs bare
+shaft — never mix them). `python3 host/plantid.py validate --all` replays the committed bench fixtures
+in `host/tests/data/` offline and prints the out-of-sample table; `python3 host/plantid.py provenance`
+prints where every number came from, including which parameters each preset **borrows** from the other
+mechanical configuration and why. Moving this plant to water changes exactly one callable
+(`PlantParams.drag`); `PlantParams` is frozen so that is a property of the type, not a convention.
+Note `duty6` is a **loaded** curve — it was fitted to measured rpm, so drag is already inside it and a
+torque balance must add the calibration drag back rather than subtracting it twice.
+**Full details: [`docs/measured-plant.md`](docs/measured-plant.md).**
 
 ## Requirements
 
@@ -198,7 +213,11 @@ host/esctool.py          the PC CLI                host/posctl.py   position con
 host/rpm_sweep.py        velocity-loop sweep + HTML evaluation report (rpm_sweep_report.py)
 host/gen_profile_header.py   YAML profile -> C++ header codegen
 host/profiles/           calibrated YAML profiles (source of truth for firmware curves)
-docs/                    design notes (velctl-generalization.md, etc.)
+host/pico_esc/measured.py    the measured plant inventory (one provenance record per number)
+host/pico_esc/plant.py       the plant model (firmware / rotor / load, in three separable layers)
+host/plantid.py              offline fit + out-of-sample validation of the plant (no hardware)
+host/tests/data/             committed bench fixtures + plant_fixtures.json (the manifest)
+docs/                    design notes (measured-plant.md, velctl-generalization.md, etc.)
 ```
 
 Legacy standalone bring-up apps (`dshot_demo`, `spike_*`, `encoder_test`) live on branch

@@ -85,3 +85,58 @@ def test_silent_telemetry_is_called_out(capsys):
 def test_too_few_samples_bails_out(capsys):
     out = _report(_rows([100, 200]), capsys)
     assert "too few samples" in out
+
+
+def test_analyze_reads_both_the_old_and_the_new_csv_schema(tmp_path, capsys):
+    """The `cmd` column was APPENDED on 2026-07-30, never inserted, so every pre-existing trace still
+    reads. Without it a replay has to infer what was commanded from the filename — which is exactly why
+    `plant_fixtures.json` has to flag its commands as inferred for the traces recorded before this."""
+    import csv
+
+    def _write(path, header, with_cmd):
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(header)
+            for i in range(40):
+                row = [1, f"{i * 0.01:.4f}", f"{1000 - 20 * i:.1f}", "182.0"]
+                if with_cmd:
+                    row.append("480")
+                w.writerow(row)
+
+    class O:
+        mode = "thrust"
+        start = None
+        to = None
+        tail_frac = 0.25
+        settle_band = 0.05
+        stall_rpm = 30.0
+        analyze = None
+        dry_run = False
+        out = None
+        port = None
+        repeats = 1
+        pre = 0.0
+        window = 1.0
+        startup = False
+
+    old = tmp_path / "old.csv"
+    new = tmp_path / "new.csv"
+    _write(old, ["run", "t", "enc_rpm", "tele_rpm"], False)
+    _write(new, ["run", "t", "enc_rpm", "tele_rpm", "cmd"], True)
+
+    assert steptrace.main(["--analyze", str(old)]) == 0
+    out = capsys.readouterr().out
+    assert "NO cmd column" in out and "commanded:" not in out
+
+    assert steptrace.main(["--analyze", str(new)]) == 0
+    out = capsys.readouterr().out
+    assert "with cmd column" in out and "commanded: 480" in out
+
+
+def test_the_writer_appends_cmd_rather_than_inserting_it():
+    """Appended, so column order for the first four is unchanged and old readers keep working."""
+    import inspect
+    src = inspect.getsource(steptrace.main)
+    i = src.index('w.writerow(["run", "t", "enc_rpm", "tele_rpm"')
+    line = src[i:src.index("\n", i)]
+    assert line.endswith('"cmd"])'), line

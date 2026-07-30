@@ -103,16 +103,17 @@ def trace(dev, idx, opts, rows):
             while time.time() < t_end:
                 r = _encv(dev)
                 if r is not None:
-                    rows.append((time.time() - t0, r, _tele(dev, idx)))
+                    rows.append((time.time() - t0, r, _tele(dev, idx), opts.to))
             return False
         r = _encv(dev)
         if r is None:
             continue
-        rows.append((time.time() - t0, r, _tele(dev, idx)))
+        rows.append((time.time() - t0, r, _tele(dev, idx), opts.to))
     return True
 
 
 def analyse(rows, opts):
+    rows = [r[:3] for r in rows]                     # tolerate rows that carry the trailing cmd
     if len(rows) < 5:
         print("  (too few samples)")
         return
@@ -172,7 +173,7 @@ def analyse(rows, opts):
         print(f"  tele: SILENT for the whole {ts[-1]:.1f}s — the encoder is the only witness")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="step response on the encoder, at full poll rate")
     ap.add_argument("index", type=int, nargs="?", default=1)
     ap.add_argument("--mode", choices=("thrust", "rpm"), default="rpm",
@@ -193,19 +194,30 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--port", default=None)
     ap.add_argument("--dry-run", action="store_true")
-    opts = ap.parse_args()
+    opts = ap.parse_args(argv)
 
     if opts.analyze:
-        by_run = {}
+        by_run, cmds = {}, {}
         with open(opts.analyze) as f:
             rd = csv.DictReader(f)
+            # The `cmd` column was added 2026-07-30 and APPENDED, so pre-2026-07-30 traces (which have
+            # only run,t,enc_rpm,tele_rpm) still read. Without it a replay has to guess what was
+            # commanded from the filename, which is how a fixture manifest ends up with inferred
+            # commands instead of recorded ones.
+            has_cmd = bool(rd.fieldnames) and "cmd" in rd.fieldnames
             for r in rd:
                 by_run.setdefault(int(r["run"]), []).append(
                     (float(r["t"]), float(r["enc_rpm"]), float(r["tele_rpm"])))
+                if has_cmd:
+                    cmds.setdefault(int(r["run"]), set()).add(float(r["cmd"]))
         meta = os.path.basename(opts.analyze)
-        print(f"# re-analyse {sum(len(v) for v in by_run.values())} samples from {meta}")
+        print(f"# re-analyse {sum(len(v) for v in by_run.values())} samples from {meta} "
+              f"({'with' if has_cmd else 'NO'} cmd column)")
         for k, rows in sorted(by_run.items()):
             print(f"\n--- run {k} ---")
+            if has_cmd:
+                print(f"  commanded: {', '.join(f'{c:g}' for c in sorted(cmds[k]))} "
+                      f"({opts.mode} units, as recorded)")
             analyse(rows, opts)
         return 0
 
@@ -261,7 +273,8 @@ def main():
     if all_rows:
         with open(out, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["run", "t", "enc_rpm", "tele_rpm"])
+            # `cmd` is APPENDED, never inserted: --analyze on an older CSV must keep working.
+            w.writerow(["run", "t", "enc_rpm", "tele_rpm", "cmd"])
             w.writerows(all_rows)
         print(f"# {len(all_rows)} samples -> {out}")
     return 0
