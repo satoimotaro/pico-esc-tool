@@ -13,6 +13,12 @@ Two parts:
 - **`esctool`** (`host/esctool.py`) — a BLHeli-Configurator-like **CLI** on the PC: list ESCs, read /
   write settings (YAML profiles), and flash firmware, with a layout/MCU **compatibility guard**.
 
+**"BlueGill"**, where it appears below, is our fork of the [Bluejay](https://github.com/mathiasvr/bluejay)
+ESC firmware, which adds low-speed **forced-commutation sine drive** and a **sine↔BEMF crossover** so a
+low-KV thruster can creep and hold below the speed where sensorless 6-step can lock. It is a separate
+project; this tool works with stock Bluejay and BLHeli-S too, and the BlueGill-only features are the ones
+labelled S1/S2/S3 or `sine_*`.
+
 > **Before you touch the bench or the vehicle, read [`docs/README.md`](docs/README.md).** It carries the
 > six behaviours that will bite you (telemetry lies below the crossover seam; zero throttle is a brake),
 > which numbers are measured versus fitted, and the current hardware state.

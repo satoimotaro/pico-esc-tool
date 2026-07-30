@@ -49,7 +49,12 @@ from pico_esc.velocity import DEFAULT_GAINS, SpeedProfile, VelocityController  #
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT_DIR = os.path.join(HERE, "reports")
-DEFAULT_PROFILE = os.path.join(HERE, "profiles", "vel_930kv_12n14p_sim.yaml")
+# The sim-derived 930KV profile is CORRECT for the simulator and WRONG for any real motor, so it is the
+# default ONLY under --dry-run. It used to be the unconditional default, which meant that running velctl
+# against hardware without --profile fed the controller a model-generated feed-forward curve for a
+# different motor than the one on the bench (930KV vs the 350KV actually fitted). A hard-coded hardware
+# default cannot be right for long -- the bench motor changes -- so on hardware the profile is REQUIRED.
+SIM_PROFILE = os.path.join(HERE, "profiles", "vel_930kv_12n14p_sim.yaml")
 
 
 def open_host(opts):
@@ -89,8 +94,10 @@ def build_parser():
     sp.add_argument("--rpm", type=float, required=True,
                     help="TARGET SPEED (mech RPM; negative = reverse). The ESC command is looked "
                          "up from the calibrated curve — --rpm is a SPEED, not a force.")
-    sp.add_argument("--profile", default=DEFAULT_PROFILE,
-                    help="calibrated ESC-command->speed curve YAML (default: sim-derived 930KV)")
+    sp.add_argument("--profile", default=None,
+                    help="calibrated ESC-command->speed curve YAML. REQUIRED on hardware; under "
+                         "--dry-run it defaults to the sim-derived 930KV profile, which is correct "
+                         "for the simulator and wrong for every real motor.")
     sp.add_argument("--crossover", action="store_true",
                     help="enable the S3 sine<->BEMF crossover (writes the profile's crossover "
                          "bytes; in --dry-run configures the sim only)")
@@ -138,6 +145,16 @@ def _validate(opts):
             sys.exit(f"--{name.replace('_', '-')} must be > 0")
     if opts.max_temp < 0:
         sys.exit("--max-temp must be >= 0")
+    if opts.profile is None:
+        if not opts.dry_run:
+            sys.exit("--profile is required when driving hardware: the feed-forward curve is "
+                     "motor-specific and there is no safe default.\n"
+                     "  current bench (350KV): host/profiles/f2838_350kv_bench_20260726.yaml\n"
+                     "  list what is calibrated: ls host/profiles/\n"
+                     "  (--dry-run alone may omit it; it then uses the sim-derived 930KV profile.)")
+        opts.profile = SIM_PROFILE
+        print(f"# DRY-RUN default profile: {os.path.basename(SIM_PROFILE)} "
+              f"(sim-derived 930KV -- valid for the simulator only)")
     if not os.path.exists(opts.profile):
         sys.exit(f"profile not found: {opts.profile}")
 
