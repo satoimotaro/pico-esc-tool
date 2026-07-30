@@ -37,8 +37,14 @@ ACTIVE BRAKING whenever the commanded throttle is zero, and it dominates the dec
     the ratio the apparent peak shift (1455-1596 vs 865-973 rpm) showed. Both delays were measured in
     BOTH configurations and agree within 5 %, so they are ESC state-machine timings, not rotor
     properties. The brake TORQUE's load-independence is still open.
+    THIRD CONFIRMATION (2026-07-30 evening, propeller refitted and the set re-taken with the SAME
+    `--thrust 800` spin-up): engagement speed tracks the STARTING speed, not the load. From ~3130 rpm the
+    prop-on rotor is at 2531-2741 rpm when the brake bites — HIGHER than the bare shaft's 2349-2409,
+    exactly as a slower free coast requires. Note the earlier prop-on figure of 865-973 rpm came from a
+    closed-loop `--rpm 2200` spin-up, i.e. a lower starting speed: ALWAYS record the spin-up method, and
+    never compare two decays taken with different ones.
     NOT explained by one slip law: `zero_held` brakes ~3x harder than `disarm` from the same speed
-    (32 ms vs 107 ms to a stop) and drives the rotor THROUGH zero, springing back to 105-148 rpm.
+    (33 ms vs 107 ms to a stop) and drives the rotor THROUGH zero, springing back to 105-148 rpm.
   * identical with `disarm`, with the 500 ms deadman simply expiring, and while ARMED holding zero
     throttle (fastest of the three, 0.19 s). So it is tied to ZERO COMMANDED THROTTLE, not to the
     disarm path. `brake_on_stop=0` does NOT disable it.

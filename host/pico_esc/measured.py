@@ -59,16 +59,35 @@ EFF_350KV = 1.0                  # KV*V*eff*duty6 fits both curves to <=2.1 % wi
 R_TOTAL = 1.20                   # ohm, winding 0.79 + connectors/leads 0.41
 R_TOTAL_TOL = 0.26               # ohm, +- band; propagated into L and J by plantid.py
 
-# --- inertia. ONLY the prop-on number was measured; the bare-shaft one is IDENTIFIED. -------
-J_PROP = 8.8e-6                  # kg*m^2, coast-down against the measured drag table
+# --- inertia. Both are now IDENTIFIED the same way, from a CONTROLLED pair. ------------------
+# A CONFOUND IN THE ORIGINAL PAIR, found 2026-07-30 when the operator refitted the propeller. The
+# prop-on decay this inventory originally used (`coastdown_20260730_011123.csv`) was taken with a
+# CLOSED-LOOP `--rpm 2200` spin-up and starts at ~2210 rpm, while the bare-shaft set used OPEN-LOOP
+# `--thrust 800` and starts at ~3130. So the bare-vs-prop pair differed in STARTING SPEED as well as in
+# propeller, and every quantity that depends on where the brake engages was being compared across that.
+# `coastdown_prop_20260730_211609.csv` is the protocol-matched partner and is where these two numbers
+# now come from. The old file stays a fixture: replaying it is what MEASURES the confound.
+#   bare thrust-800: a_free 5283 rpm/s at w_mid 2762 -> J 7.585e-6
+#   prop thrust-800: a_free 4089 rpm/s at w_mid 2836 -> J 9.761e-6   (+29 %) <- the controlled pair
+#   prop rpm-2200  : a_free 4855 rpm/s at w_mid 1876 -> J 9.002e-6   (the old value; 8.8e-6 was stored)
+# CONTROLLED RESULT: the propeller raises J by 29 % and slows the free coast by 22 %. Rows 1 and 3 are
+# the SAME rotor measured at two speeds and differ by 8.4 % — see J_SHAPE_UNCERTAINTY_PCT.
+# Both constants are the mean-alpha-at-measured-w_mid value, i.e. exactly what `plantid.py fit` prints,
+# so the tool and the inventory can never disagree. Taking the median of the three per-run estimates
+# instead gives 7.582e-6 / 9.650e-6 — a 1.2 % difference on the prop row, well inside the shape bound.
+J_PROP = 9.761e-6                # kg*m^2, controlled thrust-800 free coast
 # Identified from the FREE-COAST window — the phase after the drive is removed and before the brake
 # bites — against the same measured drag table: J = tau_drag(w_mid)/alpha_free. NOT from the brake, and
 # NOT from the brake-peak magnitude (an earlier draft claimed that; nothing in the brake fit's cost
 # function constrained the brake torque scale at all, so the claim was false).
-#   bare: tau_drag(2757 rpm) = 4.198 mN*m / (5550 rpm/s) => 7.222e-6
-# Cross-check on the configuration where J WAS measured: the same arithmetic on the prop-on decays
-# (tau_drag(1877 rpm) = 4.576 mN*m / 4860 rpm/s) gives 8.99e-6 against the measured 8.8e-6, +2.2 %.
-J_BARE_FITTED = 7.222e-6         # kg*m^2
+#   bare: tau_drag(2762 rpm) = 4.196 mN*m / (5283 rpm/s) => 7.585e-6
+# `disarm` CUT MODE ONLY, and that matters: the six bare decays span three cut modes and the free-coast
+# deceleration is 5042-5436 rpm/s on the four `disarm` runs but 6074/6113 on `deadman`/`zero_held` — 15 %
+# faster, for a phase that by definition has no ESC torque in it. Those two modes also have the SHORTEST
+# free windows (0.072 / 0.113 s vs 0.129-0.143 s) and the shortest engage delays, so the likeliest
+# reading is that their "free" window is already partly braked. The `disarm` subset is the trustworthy
+# estimate; an earlier constant averaged all six, read 5550 rpm/s, and biased J 5 % low.
+J_BARE_FITTED = 7.585e-6         # kg*m^2
 
 # --- the one genuinely new electrical parameter: phase inductance --------------------------
 # NOT measured. Fitted from where the zero-throttle brake's deceleration PEAKS: a short-circuit
@@ -78,12 +97,12 @@ J_BARE_FITTED = 7.222e-6         # kg*m^2
 # free-coast window. An earlier draft fitted it against time-to-stop measured from t = 0, which is 80 %
 # fixed delay: that metric passed at 2x torque error, so the earlier L (0.682 mH) was not identified by
 # anything. This is a PREDICTION: check it with an LCR meter across two phases (expect ~2L
-# line-to-line, i.e. ~2.7 mH at 1 kHz) before trusting it anywhere else.
+# line-to-line, i.e. ~2.6 mH at 1 kHz) before trusting it anywhere else.
 # CAVEAT: the pointwise deceleration residual (measured decel minus the drag table, per window) puts
 # the brake peak nearer 60 mN*m at ~1900 rpm, where this L puts it at 40 mN*m at 1226 rpm. The
 # trajectory fit uses the integral and is far less noisy than single-window residuals, so it wins — but
 # the two disagree by ~1.5x and that is the honest uncertainty on the brake torque scale.
-L_PHASE_FITTED = 1.335e-3        # H
+L_PHASE_FITTED = 1.296e-3        # H
 
 # --- drag ---------------------------------------------------------------------------------
 # tau_drag(rpm) measured 2026-07-29 (duty_sweep + PSU current, tau = K_T*I_dc) WITH the propeller.
@@ -100,8 +119,15 @@ DRAG_TABLE_PROP = [(753, 5.90e-3), (1073, 5.21e-3), (1378, 4.89e-3), (1685, 4.68
 
 # Free-coast deceleration in the window between the drive being removed and the ESC's brake biting —
 # a two-segment (flat, then linear) least-squares fit of encoder position per decay.
-FREE_DECEL_BARE_RPM_S = 5550.0   # mean of 6 bare decays (5042..6113)
-FREE_DECEL_PROP_RPM_S = 4860.0   # mean of 3 prop-on decays (4592..5046)
+# `disarm` cut mode only, and the SAME open-loop `--thrust 800` spin-up in both configurations.
+FREE_DECEL_BARE_RPM_S = 5283.0   # mean of the 4 bare `disarm` decays (5042..5436), w_mid ~2762 rpm
+FREE_DECEL_PROP_RPM_S = 4089.0   # mean of the 3 prop-on thrust-800 decays (3910..4222), w_mid ~2836
+# The same prop-on ROTOR measured at two speeds gives J = 9.002e-6 at w_mid 1876 and 9.761e-6 at
+# w_mid 2836 — 8.4 % apart for a quantity that cannot depend on speed. Since J is inferred as
+# `drag_at(w_mid)/alpha`, that gap is a MEASURED bound on the error in DRAG_TABLE_PROP's speed
+# DEPENDENCE — the very shape this file already argues is bearing/iron loss plus a K_T*I_dc bias rather
+# than prop drag. It is the honest uncertainty on both inertias, and it is now a measurement.
+J_SHAPE_UNCERTAINTY_PCT = 8.4
 # Bare-shaft drag as a VISCOUS coefficient: B = J_BARE*(FREE_DECEL@2700rpm)/w. Viscous rather than
 # Coulomb because the forced-sine regime holds the rotor at 96..214 rpm on a tiny sine amplitude,
 # which a 4.3 mN*m Coulomb torque could not permit. Derived, not independently measured.
@@ -134,7 +160,7 @@ BRAKE_PHASE_REV = {"disarm": 1.18, "deadman": 0.51, "zero_held": 0.62}
 # The short-circuit law's own low-speed branch falls only as w and would still be ~36 krpm/s at
 # 450 rpm, 7x too much. A short circuit the ESC has stopped COMMUTATING is stationary in the rotor
 # frame, so its torque averages out over a revolution; that is a cut-out, not a decay.
-BRAKE_CUTOUT_RPM = 705.0
+BRAKE_CUTOUT_RPM = 670.0
 
 # --- forced sine (the regime telemetry cannot see) -----------------------------------------
 # Peak torque the forced-sine drive can pull with before the rotor falls out of step. Fitted from the
@@ -144,10 +170,10 @@ BRAKE_CUTOUT_RPM = 705.0
 #   * it must exceed the drag it has to hold against, max 5.90 mN*m over the coherent band cmd 240..510
 #     — otherwise the measured synchronous lock could not exist at all;
 #   * it must sit below the sine STALL torque K_T*V*(sine_amp_max/255)/R ~= 44.9 mN*m.
-# It lands at 7.6, i.e. 1.3x the drag and 17 % of the stall bound. NOTE it was 16.0 mN*m before the
+# It lands at 8.2, i.e. 1.4x the drag and 18 % of the stall bound. NOTE it was 16.0 mN*m before the
 # 2026-07-30 drag double-count fix: with drag counted twice the sine branch needed twice the torque to
 # produce the same trace, which is a good illustration of how a downstream fit absorbs an upstream bug.
-SINE_PULLOUT_NM = 7.577e-3      # N*m
+SINE_PULLOUT_NM = 8.244e-3      # N*m
 # Below this command the rotor does not rotate coherently — it cogs, stalls and REVERSES, so a mean
 # speed is not a speed. The plant declines to be a speed source there rather than lying.
 SINE_COHERENT_CMD_MIN = 210
@@ -180,8 +206,8 @@ SINE_REVERSALS_BARE = {60: 3, 90: 7, 120: 6, 150: 2, 180: 3, 210: 2, 240: 0, 270
 # NEITHER IS LOAD-INDEPENDENT. The clamp was obtained by inverting the prop drag table at the measured
 # 390 rpm plateau, and the slew is `electrical_duty(680)/0.40 s`, which also goes through that table.
 # Both are therefore functions of the inventory's least trustworthy entry and are tagged OPEN.
-DUTY_SLEW_UP_PER_S = 1.6085      # duty/s (ELECTRICAL duty)
-DUTY_CROSSOVER_CLAMP = 0.1244    # ELECTRICAL duty (dimensionless)
+DUTY_SLEW_UP_PER_S = 1.6002      # duty/s (ELECTRICAL duty)
+DUTY_CROSSOVER_CLAMP = 0.1243    # ELECTRICAL duty (dimensionless)
 
 # --- telemetry: the sensor lies, identically in both configurations ------------------------
 # `tele` never reports below 182 mech rpm (= 1274 eRPM at PP=7). Present at EVERY command 60..450 in
@@ -240,7 +266,12 @@ _SINESWEEP = "tests/data/sinesweep_noprop_20260730_033014.csv"
 _FOLD = "tests/data/sinesweep_fold_noprop_20260730_033417.csv"
 _COAST_BARE = "tests/data/coastdown_noprop_20260730_032130.csv"
 _CUTMODE = "tests/data/cutmode_noprop_20260730_032448.csv"
-_COAST_PROP = "tests/data/coastdown_20260730_011123.csv"
+_COAST_PROP_OLD = "tests/data/coastdown_20260730_011123.csv"      # rpm-2200 spin-up (confounded)
+_COAST_PROP = "tests/data/coastdown_prop_20260730_211609.csv"     # thrust-800: the controlled one
+_SINE_PROP = "tests/data/sinesweep_prop_20260730_211856.csv"
+_FOLD_PROP = "tests/data/sinesweep_fold_prop_20260730_212120.csv"
+_STARTUP_PROP = "tests/data/steptrace_startup_prop_20260730_212401.csv"
+_STARTUP2400_PROP = "tests/data/steptrace_startup2400_prop_20260730_212401.csv"
 _DOWN = "tests/data/steptrace_down_noprop_20260730_033706.csv"
 _STARTUP = "tests/data/steptrace_startup_noprop_20260730_033906.csv"
 _STARTUP2400 = "tests/data/steptrace_startup2400_noprop_20260730_034108.csv"
@@ -275,9 +306,12 @@ PROVENANCE = {
                   "34 % of it is per-installation wiring and it corrodes"),
     "R_TOTAL_TOL": _p("ohm", "multimeter repeats", "-", PROP, "2026-07-30", "measured", True,
                       "+-band; L scales with R and J scales with 1/R, both propagated by plantid"),
-    "J_PROP": _p("kg*m^2", "coastdown.py (J = tau_drag/(-dw/dt))", _COAST_PROP, PROP,
+    "J_PROP": _p("kg*m^2", "plantid.py fit (free-coast window vs the drag table)", _COAST_PROP, PROP,
                  "2026-07-30", "measured", False,
-                 "the ONLY measured inertia. Biased low: tau_drag was measured while DRIVEN"),
+                 "from the PROTOCOL-MATCHED thrust-800 decay, so it pairs with J_BARE_FITTED. The "
+                 "earlier 8.8e-6 came from a rpm-2200 spin-up (which re-derives to 9.002e-6 by this "
+                 "route) and was confounded with starting speed; the 8.8 % gap between the two "
+                 "estimates is J_SHAPE_UNCERTAINTY_PCT, not a rotor difference"),
     "J_BARE_FITTED": _p("kg*m^2", "plantid.py fit (free-coast window vs the drag table)", _COAST_BARE,
                         BARE, "2026-07-30", "fitted", False,
                         "NOT measured. Identified from the FREE-COAST window (the only phase with no "
@@ -297,11 +331,20 @@ PROVENANCE = {
                           "drag law: it fits BOTH free-coast decelerations to <=2.2 %"),
     "FREE_DECEL_BARE_RPM_S": _p("rpm/s", "plantid.py two-segment fit", _COAST_BARE, BARE,
                                 "2026-07-30", "measured", False,
-                                "deceleration between drive removal and the brake biting"),
+                                "deceleration between drive removal and the brake biting. `disarm` cut "
+                                "mode only: `deadman`/`zero_held` read 15 % faster over much shorter "
+                                "windows, which a torque-free phase cannot do"),
     "FREE_DECEL_PROP_RPM_S": _p("rpm/s", "plantid.py two-segment fit", _COAST_PROP, PROP,
                                 "2026-07-30", "measured", False,
-                                "within 15 % of the bare-shaft value => the propeller adds almost "
-                                "no torque in air, so DRAG_TABLE_PROP is not prop drag"),
+                                "the PROTOCOL-MATCHED partner (same thrust-800 spin-up as the bare "
+                                "set). 22 % slower than bare, which together with the +27 % on J is "
+                                "the whole measured effect of fitting the propeller"),
+    "J_SHAPE_UNCERTAINTY_PCT": _p("%", "plantid.py (two prop-on decays at different speeds)",
+                                  _COAST_PROP + " + " + _COAST_PROP_OLD, PROP, "2026-07-30",
+                                  "measured", True,
+                                  "the SAME rotor gives J 8.4 % apart at w_mid 1876 vs 2836, so this is "
+                                  "a measured bound on DRAG_TABLE_PROP's speed-dependence error and "
+                                  "therefore the uncertainty on BOTH inertias"),
     "CUT_RELEASE_S": _p("s", "coastdown.py coast_start()", _CUTMODE + " + " + _COAST_PROP, BARE,
                         "2026-07-30", "measured", True,
                         "per cut mode: how long the ESC keeps driving after the command is gone. The "
@@ -334,14 +377,23 @@ PROVENANCE = {
                           "forced-sine pull-out torque; set by the sine AMPLITUDE, so the torque is "
                           "fixed but the load it must beat is not. Bracketed by the drag it holds "
                           "against (5.90 mN*m) and the sine stall torque (44.9 mN*m)"),
-    "SINE_COHERENT_CMD_MIN": _p("cmd", "sinesweep.py (reversal counts)", _SINESWEEP, BARE,
-                                "2026-07-30", "measured", False,
-                                "below this the rotor reverses inside one dwell; a mean is not a speed"),
-    "SINE_SPREAD_TABLE_BARE": _p("(cmd, rpm)", "sinesweep.py", _SINESWEEP, BARE, "2026-07-30",
-                                 "measured", False,
-                                 "cogging dispersion, worst leg. Shrinks with damping (water)"),
-    "SINE_REVERSALS_BARE": _p("(cmd, count)", "sinesweep.py", _SINESWEEP, BARE, "2026-07-30",
-                              "measured", False, "reversals per 3 s dwell, worst leg"),
+    "SINE_COHERENT_CMD_MIN": _p("cmd", "sinesweep.py (reversal counts)",
+                                _SINESWEEP + " + " + _SINE_PROP, BARE, "2026-07-30", "measured", True,
+                                "below this the rotor reverses inside one dwell; a mean is not a speed. "
+                                "NOW EVIDENCED LOAD-INDEPENDENT: the controlled prop-on sweep reverses "
+                                "over cmd 60..270 (up) / 60..180 (down) against bare 60..330 / 60..210 "
+                                "— no improvement. The propeller's inertia does NOT help the rotor "
+                                "follow the forced field: an explicit expectation, FALSIFIED"),
+    "SINE_SPREAD_TABLE_BARE": _p("(cmd, rpm)", "sinesweep.py", _SINESWEEP + " + " + _SINE_PROP, BARE,
+                                 "2026-07-30", "measured", True,
+                                 "cogging dispersion, worst leg. Expected to shrink with damping; it "
+                                 "does NOT — worst spread 238 rpm prop-on vs 234 bare (up leg), 211 vs "
+                                 "174 (down). Controlled pair, so load-independent for THIS pair; water "
+                                 "is still untested"),
+    "SINE_REVERSALS_BARE": _p("(cmd, count)", "sinesweep.py", _SINESWEEP + " + " + _SINE_PROP, BARE,
+                              "2026-07-30", "measured", True,
+                              "reversals per 3 s dwell, worst leg. Same controlled-pair evidence as "
+                              "the spread table"),
     "DUTY_SLEW_UP_PER_S": _p("duty/s", "plantid.py fit on the sysid 407->680 step", _SYSID, PROP,
                              "2026-07-26", "fitted", None,
                              "firmware crossover ramp rate, up direction only. Pinned by the plateau "
@@ -364,15 +416,26 @@ PROVENANCE = {
     "TORQUE_PER_CMD": _p("N*m/cmd", "loadtest.py", "reports/loadtest_20260730_021330.csv", PROP,
                          "2026-07-30", "measured", False,
                          "REPORTING ONLY. Absolute torque is not modelled: R_TOTAL is 34 % wiring"),
-    "STARTUP_OVERSHOOT_PCT": _p("%", "steptrace.py --mode rpm --startup", _STARTUP, BARE,
-                                "2026-07-30", "measured", False,
-                                "closed loop, so it belongs to the FIRMWARE controller + this rotor"),
-    "STARTUP_T_PEAK_S": _p("s", "steptrace.py --mode rpm --startup", _STARTUP, BARE, "2026-07-30",
-                           "measured", False, "time to the overshoot peak"),
-    "STARTUP_ABORT_TARGET_RPM": _p("rpm", "steptrace.py --mode rpm --startup", _STARTUP2400, BARE,
-                                   "2026-07-30", "measured", False,
-                                   "rpm 1200 starts, rpm 2400 ABORT_STALLs: gated on the plant's "
-                                   "ability to traverse the crossover gap, so strongly load-dependent"),
+    "STARTUP_OVERSHOOT_PCT": _p("%", "steptrace.py --mode rpm --startup",
+                                _STARTUP + " + " + _STARTUP_PROP, BARE, "2026-07-30", "measured", True,
+                                "closed loop, so it belongs to the FIRMWARE controller — and the "
+                                "controlled pair now says it does NOT belong to the rotor: on the "
+                                "committed fixtures (same 4 s span) bare reads 53/53/54 % and prop-on "
+                                "53/53/54 %, peaks 1839-1855 vs 1847-1853 rpm. +29 % of inertia moved "
+                                "it by under 1 pp"),
+    "STARTUP_T_PEAK_S": _p("s", "steptrace.py --mode rpm --startup",
+                           _STARTUP + " + " + _STARTUP_PROP, BARE, "2026-07-30", "measured", True,
+                           "time to the overshoot peak: 1.18-1.21 s bare vs 1.20-1.23 s prop-on, with "
+                           "settling 3.0-3.2 s in both"),
+    "STARTUP_ABORT_TARGET_RPM": _p("rpm", "steptrace.py --mode rpm --startup",
+                                   _STARTUP2400 + " + " + _STARTUP2400_PROP, BARE, "2026-07-30",
+                                   "measured", True,
+                                   "rpm 1200 starts and rpm 2400 ABORT_STALLs — in BOTH configurations, "
+                                   "at the same time and from a barely higher peak. The expectation that "
+                                   "the propeller's inertia would carry the rotor through the crossover "
+                                   "gap is FALSIFIED, so this is a CONTROL / crossover-gap failure and "
+                                   "not an inertia failure. Do not port the threshold to another rotor, "
+                                   "but do not blame inertia for it either"),
 }
 
 # Every exported parameter, in the order the provenance table prints. Adding a number without adding
@@ -434,7 +497,9 @@ def preset_param_names(mech_config):
 
 # Parameters each preset KNOWINGLY takes from the other mechanical configuration, with the reason.
 # Anything a preset reads whose `mech_config` differs and which is not `mech_independent=True` must
-# appear here, or test_no_preset_mixes_mechanical_configurations_undeclared fails.
+# appear here, or test_no_preset_mixes_mechanical_configurations_undeclared fails — and once a parameter
+# IS evidenced independent its entry must GO, so the map cannot accumulate stale excuses. Three sine-
+# region entries were removed on 2026-07-30 when the controlled prop-on pair evidenced them.
 PRESET_BORROWED = {
     PROP: {
         "L_PHASE_FITTED": "there is only one L and it was only ever identified bare-shaft; "
@@ -444,14 +509,6 @@ PRESET_BORROWED = {
                            "is the bare-shaft one. The pull-out TORQUE is set by the sine amplitude "
                            "(electrical) but the load it must beat is not, so any prop-on forced-sine "
                            "prediction from this preset is unvalidated",
-        "SINE_COHERENT_CMD_MIN": "the incoherent-rotation band was only measured bare-shaft, and the "
-                                 "module's own note says it shrinks with damping — so PROP's "
-                                 "`coherent()`/`steady()` below cmd 210 is bare-shaft data. It is "
-                                 "carried so the prop preset refuses to invent a speed there, not "
-                                 "because 210 is the prop-on number",
-        "SINE_SPREAD_TABLE_BARE": "cogging dispersion, bare-shaft only. Reported as data by the prop "
-                                  "preset; a propeller's damping would shrink it",
-        "SINE_REVERSALS_BARE": "reversal counts, bare-shaft only. Same caveat as the spread table",
         "BRAKE_CUTOUT_RPM": "the speed the brake stops braking at was only identified on the "
                             "bare-shaft `disarm` decays. It should be an ESC state transition (loss "
                             "of BEMF zero-crossing detection) and therefore rotor-independent, but "

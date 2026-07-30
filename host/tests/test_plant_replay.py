@@ -141,23 +141,67 @@ def test_brake_phase_fits_the_disarm_decays_in_sample():
 
 
 def test_brake_phase_out_of_sample_on_the_prop_on_decays():
-    """THE out-of-sample brake check, and the only one that exists. The three prop-on decays reuse the
-    bare-shaft-fitted L and cut-out with the prop-on J and drag; nothing was refitted for them.
+    """THE out-of-sample brake check, and the only one that exists.
 
-    The first version of this file claimed this at "within 11 %" using time-to-stop from t = 0, of
-    which ~72 % is fixed delay. On the brake-phase metric the true figures are below."""
+    `coastdown_prop_20260730_211609.csv` uses the SAME open-loop `thrust 800` spin-up as the bare-shaft
+    set, so it is the protocol-matched partner (the older prop-on decay was a closed-loop rpm-2200 run
+    and is tagged `prop_confounded` — see the test below). It reuses the bare-shaft-fitted L and cut-out
+    with the prop-on J, across a +29 % inertia change, and nothing was refitted for it.
+
+    Iteration 1 claimed this at "within 11 %" using time-to-stop from t = 0, of which ~72 % is fixed
+    delay. On the metric that isolates the brake, the real figures are below."""
+    # STRUCTURAL guard first: the fit must never have seen this data. plantid.fit asserts it too.
+    fit_labels = {lbl for lbl, mode, _c, _p in plantid.decay_phases("bare") if mode == "disarm"}
+    oos = plantid.decay_phases("prop")
+    assert oos and not (fit_labels & {lbl for lbl, *_ in oos})
+    assert preset(M.PROP).j > 1.25 * preset(M.BARE).j, "it must be a materially different plant"
     seen = []
-    for lbl, mode, cfg, ph in plantid.decay_phases("prop"):
+    for lbl, mode, cfg, ph in oos:
         d, r = _sim_phase(cfg, mode, ph["w_on"])
         e_d = 100.0 * (d - ph["dur"]) / ph["dur"]
         e_r = 100.0 * (r - ph["rev"]) / ph["rev"]
         seen.append((lbl, e_d, e_r))
-        assert abs(e_d) <= 25.0, f"{lbl}: brake-phase duration {e_d:+.1f}%"
-        assert abs(e_r) <= 20.0, f"{lbl}: brake-phase revolutions {e_r:+.1f}%"
+        assert abs(e_d) <= 8.0, f"{lbl}: brake-phase duration {e_d:+.1f}%"
+        assert abs(e_r) <= 15.0, f"{lbl}: brake-phase revolutions {e_r:+.1f}%"
     assert len(seen) == 3
-    # it must be a REAL transfer, not an accident of a loose bound: the prop-on rotor is 22 % heavier
-    # and starts the brake phase 850 rpm lower, and the model tracks both.
-    assert all(abs(e) >= 3.0 for _l, e, _r in seen), "suspiciously exact — check the fixtures"
+    # ...and no better than the in-sample fit, which would mean something had gone wrong
+    ins = []
+    for lbl, mode, cfg, ph in plantid.decay_phases("bare"):
+        if mode != "disarm":
+            continue
+        d, r = _sim_phase(cfg, mode, ph["w_on"])
+        ins.append(abs(100.0 * (d - ph["dur"]) / ph["dur"]))
+    assert max(abs(e) for _l, e, _r in seen) <= 2.0 * max(ins)
+
+
+def test_the_confounded_prop_on_decay_is_excluded_and_measures_the_confound():
+    """The ORIGINAL prop-on decay used a closed-loop `--rpm 2200` spin-up, so it starts ~920 rpm below
+    the bare-shaft set and its brake engages at 1536-1606 rpm instead of ~2540. Any bare-vs-prop
+    comparison drawn across that pair is confounded by starting speed, which is why it now carries
+    role `prop_confounded` and is excluded from the load-independence claim.
+
+    It is KEPT because replaying it is what measures two things: the drag table's speed-dependence
+    error (`J_SHAPE_UNCERTAINTY_PCT`), and a third independent confirmation of the fixed-delay brake —
+    engagement speed tracks the STARTING speed, not the propeller."""
+    conf = plantid.decay_phases("prop_confounded")
+    ctrl = plantid.decay_phases("prop")
+    bare = [x for x in plantid.decay_phases("bare") if x[1] == "disarm"]
+    assert len(conf) == 3 and len(ctrl) == 3
+    # engagement speed tracks the START speed: same propeller, ~1000 rpm apart
+    w_conf = sum(p["w_on"] for *_x, p in conf) / 3
+    w_ctrl = sum(p["w_on"] for *_x, p in ctrl) / 3
+    w_bare = sum(p["w_on"] for *_x, p in bare) / len(bare)
+    assert w_conf < 1700 and w_ctrl > 2400
+    # and prop-on engages HIGHER than bare from the same start, as a slower free coast requires
+    assert w_ctrl > w_bare, (w_ctrl, w_bare)
+    # the confounded file is materially worse against the model, and that error is the protocol
+    err_conf = [abs(100.0 * (_sim_phase(c, m, p["w_on"])[0] - p["dur"]) / p["dur"])
+                for _l, m, c, p in conf]
+    err_ctrl = [abs(100.0 * (_sim_phase(c, m, p["w_on"])[0] - p["dur"]) / p["dur"])
+                for _l, m, c, p in ctrl]
+    assert min(err_conf) > max(err_ctrl), (err_conf, err_ctrl)
+    # J from the two prop-on files differs by the recorded shape uncertainty, not by a rotor change
+    assert 6.0 <= M.J_SHAPE_UNCERTAINTY_PCT <= 12.0
 
 
 def test_the_mode_dependence_is_in_the_torque_and_is_not_modelled():
@@ -397,3 +441,123 @@ def test_plantid_provenance_and_fit_helpers_run_offline(capsys):
     out = capsys.readouterr().out
     assert "L_PHASE_FITTED" in out and "OPEN" in out
     assert len(plantid.decays("bare")) == 6 and len(plantid.decays("prop")) == 3
+
+
+# ------------------------------------------------------------------ the controlled prop-on pair
+# 2026-07-30: the operator refitted the propeller and re-took the whole set with the SAME tools,
+# protocol and starting speeds. These tests pin the load-(in)dependence findings that carry design
+# weight, measured-vs-measured — no model in the loop, so they cannot be satisfied by tuning.
+def _sine(name):
+    return [(r["leg"], int(r["cmd"]), float(r["field_rpm"]), float(r["enc_mean"]), float(r["enc_min"]),
+             float(r["enc_max"]), float(r["enc_spread"]), int(r["reversals"]), float(r["tele_rpm"]),
+             float(r["slip"]), int(r["n"])) for r in csv.DictReader(open(os.path.join(DATA, name)))]
+
+
+class _SeamOpts:
+    pole_pairs = 7
+    follow_slip = 0.10
+    seam_factor = 1.5
+    seam_min_rpm = 250.0
+
+
+def test_the_seam_is_load_independent():
+    """The seam is set by cross_up, KV, V and duty6 — firmware and electrical — so a propeller should
+    not move it. Now measured in a controlled pair rather than argued: the fine fold sweep brackets the
+    departure in the SAME cmd 525..530 on BOTH legs of BOTH configurations, with no hysteresis resolved
+    either way. This is the single load-independence claim the whole `max(sine, 6-step)` seam model rests
+    on, so it gets a test with no model in it."""
+    import sinesweep
+    brackets = {}
+    for cfg, name in (("bare", "sinesweep_fold_noprop_20260730_033417.csv"),
+                      ("prop", "sinesweep_fold_prop_20260730_212120.csv")):
+        rows = _sine(name)
+        for leg in ("up", "down"):
+            tr = sinesweep.transition([r for r in rows if r[0] == leg], _SeamOpts)
+            assert tr is not None, (cfg, leg)
+            brackets[(cfg, leg)] = tuple(sorted((tr[0][1], tr[1][1])))
+    assert len(set(brackets.values())) == 1, brackets      # all four identical
+    lo, hi = next(iter(brackets.values()))
+    assert (lo, hi) == (525, 530), brackets
+    # ...and the MODEL's seam sits in that bracket for both presets (cross_up 36 in both recordings)
+    for cfg in (M.BARE, M.PROP):
+        seam = MeasuredPlant(with_cross_up(preset(cfg), 36.0)).seam_cmd()
+        assert 510.0 <= seam <= 535.0, (cfg, seam)
+
+
+def test_the_tele_floor_is_load_independent():
+    """182.0 rpm exactly, at every cmd <= 450, in both configurations of the controlled pair. That is
+    what licenses `TELE_FLOOR_MECH`'s mech_independent tag."""
+    seen = {}
+    for cfg, name in (("bare", "sinesweep_noprop_20260730_033014.csv"),
+                      ("prop", "sinesweep_prop_20260730_211856.csv")):
+        seen[cfg] = sorted({r[8] for r in _sine(name) if r[1] <= 450})
+    assert seen["bare"] == seen["prop"] == [M.TELE_FLOOR_MECH], seen
+    assert M.PROVENANCE["TELE_FLOOR_MECH"]["mech_independent"] is True
+
+
+def test_the_propeller_does_not_help_the_rotor_follow_the_forced_field():
+    """A FALSIFIED EXPECTATION, recorded as a test so it cannot quietly come back. +29 % of inertia was
+    expected to tighten the sine-region spread and shrink the reversing band. It does neither."""
+    stats = {}
+    for cfg, name in (("bare", "sinesweep_noprop_20260730_033014.csv"),
+                      ("prop", "sinesweep_prop_20260730_211856.csv")):
+        rows = [r for r in _sine(name) if r[1] <= 510]
+        stats[cfg] = (max(r[6] for r in rows if r[0] == "up"),
+                      max(r[1] for r in rows if r[7] > 0))
+    # worst spread does not improve (238 prop vs 234 bare) and the reversing band does not shrink below
+    # the coherence threshold
+    assert stats["prop"][0] >= 0.95 * stats["bare"][0], stats
+    assert stats["prop"][1] >= M.SINE_COHERENT_CMD_MIN, stats
+    assert M.PROVENANCE["SINE_SPREAD_TABLE_BARE"]["mech_independent"] is True
+    assert "does NOT" in M.PROVENANCE["SINE_SPREAD_TABLE_BARE"]["note"]
+
+
+def test_the_startup_overshoot_is_load_independent():
+    """+29 % of inertia moves the closed-loop startup overshoot by under 1 pp. Compared on the SAME 4 s
+    fixture span so the tail window is identical — the two fixtures were trimmed to match for exactly
+    this reason."""
+    got = {}
+    for cfg, name in (("bare", "steptrace_startup_noprop_20260730_033906.csv"),
+                      ("prop", "steptrace_startup_prop_20260730_212401.csv")):
+        by = {}
+        for r in csv.DictReader(open(os.path.join(DATA, name))):
+            by.setdefault(r["run"], []).append((float(r["t"]), abs(float(r["enc_rpm"]))))
+        rows = []
+        for _k, rr in sorted(by.items()):
+            pk = max(rr, key=lambda x: x[1])
+            tail = [v for t, v in rr if t > 3.0]
+            fin = sum(tail) / len(tail)
+            rows.append((pk[1], pk[0], 100.0 * (pk[1] / fin - 1)))
+        got[cfg] = rows
+        assert len(rows) == 3
+    for k in (0, 1, 2):        # peak rpm, t_peak, overshoot %
+        b = [r[k] for r in got["bare"]]
+        p = [r[k] for r in got["prop"]]
+        tol = {0: 30.0, 1: 0.06, 2: 1.5}[k]
+        assert abs(sum(p) / 3 - sum(b) / 3) <= tol, (k, b, p)
+    assert M.PROVENANCE["STARTUP_OVERSHOOT_PCT"]["mech_independent"] is True
+
+
+def test_the_propeller_does_not_fix_the_rpm_2400_startup_stall():
+    """The other FALSIFIED expectation, and the one with design consequences: `rpm 2400` ABORT_STALLs
+    with the propeller fitted exactly as it does bare-shaft, from a barely higher peak. So the
+    target-dependent startup failure is a CONTROL / crossover-gap problem, not an inertia problem —
+    adding rotor inertia is not a fix and must not be proposed as one."""
+    got = {}
+    for cfg, name in (("bare", "steptrace_startup2400_noprop_20260730_034108.csv"),
+                      ("prop", "steptrace_startup2400_prop_20260730_212401.csv")):
+        by = {}
+        for r in csv.DictReader(open(os.path.join(DATA, name))):
+            by.setdefault(r["run"], []).append((float(r["t"]), abs(float(r["enc_rpm"]))))
+        got[cfg] = [(max(v for _t, v in rr), max(t for t, v in rr if v > 100), rr[-1][1])
+                    for _k, rr in sorted(by.items())]
+    for cfg, rows in got.items():
+        for peak, t_last, final in rows:
+            assert final < 30.0, f"{cfg}: did not stall (final {final:.0f} rpm)"
+            assert peak < 0.4 * M.STARTUP_ABORT_TARGET_RPM, f"{cfg}: peak {peak:.0f}"
+    # the collapse happens at the same time in both, so inertia is not what decides it
+    tb = sum(r[1] for r in got["bare"]) / len(got["bare"])
+    tp = sum(r[1] for r in got["prop"]) / len(got["prop"])
+    assert abs(tp - tb) < 0.25, (tb, tp)
+    assert "FALSIFIED" in M.PROVENANCE["STARTUP_ABORT_TARGET_RPM"]["note"]
+    assert "not an inertia failure" in M.PROVENANCE["STARTUP_ABORT_TARGET_RPM"]["note"]

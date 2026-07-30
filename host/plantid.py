@@ -231,11 +231,16 @@ def j_from_free_coast(cfg):
     `J = tau_drag(w_mid)/alpha_free` with the measured drag table and nothing fitted.
 
     This is what actually identifies J. The brake fit's cost function never constrained the brake
-    torque SCALE, so an earlier claim that J came from the brake-peak magnitude was simply wrong."""
+    torque SCALE, so an earlier claim that J came from the brake-peak magnitude was simply wrong.
+
+    Both configurations now use the SAME open-loop `thrust 800` spin-up and the `disarm` cut, so the
+    two J's are a controlled pair. The `w_mid` values are the measured window midpoints of those
+    fixtures; because `drag_at` is speed-dependent (and unphysically so — see
+    J_SHAPE_UNCERTAINTY_PCT), evaluating at the wrong midpoint is itself an error source."""
     if cfg == M.BARE:
-        alpha, w_mid = M.FREE_DECEL_BARE_RPM_S, 2757.0
+        alpha, w_mid = M.FREE_DECEL_BARE_RPM_S, 2762.0
     else:
-        alpha, w_mid = M.FREE_DECEL_PROP_RPM_S, 1877.0
+        alpha, w_mid = M.FREE_DECEL_PROP_RPM_S, 2836.0
     return M.drag_at(w_mid) / (alpha * RAD), alpha, w_mid
 
 
@@ -250,7 +255,10 @@ def _phase_cost(sets, l_phase, j, cutout):
 def fit(cfg, verbose=True):
     """J from the free coast, then (L, BRAKE_CUTOUT_RPM) from the brake phase. R pinned throughout."""
     j, alpha, w_mid = j_from_free_coast(cfg)
+    # BARE `disarm` ONLY, and asserted. The prop-on brake phase is deliberately held out: it is the only
+    # out-of-sample evidence the brake law has, and fitting to it would destroy that.
     sets = [x for x in decay_phases("bare") if x[1] == "disarm"]
+    assert all(c == M.BARE for _l, _m, c, _p in sets), "the brake fit must never see prop-on data"
     best = None
     for i in range(46):
         l = 3.0e-4 * (1.07 ** i)
@@ -272,9 +280,12 @@ def fit(cfg, verbose=True):
         print("## J — from the FREE-COAST window (no ESC torque in it at all)")
         print(f"   tau_drag({w_mid:.0f} rpm) = {M.drag_at(w_mid) * 1e3:.3f} mN*m  /  "
               f"alpha_free = {alpha:.0f} rpm/s   ->  J = {j:.4e} kg*m^2")
+        print(f"   stored: {(M.J_BARE_FITTED if cfg == M.BARE else M.J_PROP):.4e} "
+              f"({100 * (j / (M.J_BARE_FITTED if cfg == M.BARE else M.J_PROP) - 1):+.2f} %)")
         if cfg == M.PROP:
-            print(f"   cross-check: this is the configuration where J WAS measured (coastdown.py): "
-                  f"{M.J_PROP:.3e}, i.e. {100 * (j / M.J_PROP - 1):+.1f} %")
+            print(f"   the SAME rotor from the older rpm-2200 decay reads 8.867e-6 at w_mid 1876, i.e. "
+                  f"{M.J_SHAPE_UNCERTAINTY_PCT:.1f} % away — that gap is the drag table's shape error, "
+                  f"not a rotor difference")
         print(f"\n## (L, brake cut-out) — from the BRAKE PHASE of the {len(sets)} `disarm` decays")
         print("   metric: revolutions travelled AND duration, both measured FROM ENGAGEMENT")
         print(f"   L = {l * 1e3:.3f} mH   BRAKE_CUTOUT_RPM = {cut:.0f} rpm   cost = {c:.4f}")
@@ -350,7 +361,7 @@ def val_brake():
     print("#  continuity but proves nothing about the brake.")
     print(f"  {'fixture':26s} {'cut mode':10s} {'w_on':>6} {'dur meas/model':>16} {'err':>7} "
           f"{'rev meas/model':>15} {'err':>7} {'t_stop err':>10}")
-    for role in ("bare", "prop"):
+    for role in ("bare", "prop", "prop_confounded"):
         for lbl, mode, cfg, ph in decay_phases(role):
             p = preset(cfg)
             d, r = sim_brake_phase(cfg, mode, ph["w_on"], p.l_phase, p.j, p.brake_cutout_rpm)
@@ -358,13 +369,20 @@ def val_brake():
             sim = _sim_decay(cfg, mode, ph["w_on"], ph["t_stop"] + 0.25, p.l_phase, p.j)
             thin = [(t, v) for i, (t, v) in enumerate(sim) if i % 20 == 0]
             s_stop = time_to_stop(thin) or float("nan")
-            tag = "" if role == "bare" else "  OUT OF SAMPLE"
+            tag = {"bare": "", "prop": "  ** OUT OF SAMPLE **",
+                   "prop_confounded": "  out of sample, CONFOUNDED protocol"}[role]
             if mode != "disarm":
                 tag = "  NOT MODELLED (mode torque)"
             print(f"  {lbl:26s} {mode:10s} {ph['w_on']:6.0f} {ph['dur']:7.3f}/{d:8.3f} "
                   f"{100 * (d - ph['dur']) / ph['dur']:+6.1f}% {ph['rev']:6.2f}/{r:8.2f} "
                   f"{100 * (r - ph['rev']) / ph['rev']:+6.1f}% "
                   f"{100 * (s_stop - ph['t_stop']) / ph['t_stop']:+9.1f}%{tag}")
+    print("\n  THE OUT-OF-SAMPLE ROWS. `coastdown_prop` uses the SAME open-loop thrust-800 spin-up as the")
+    print("  bare set, so it is the protocol-matched partner: the brake law transfers across a +29 %")
+    print("  inertia change with nothing refitted. `coastdown` (the older prop-on file) used a closed-loop")
+    print("  rpm-2200 spin-up and engages ~1000 rpm lower, and its larger error is that CONFOUND, not the")
+    print("  brake — which is why it is tagged `prop_confounded` and excluded from the load-independence")
+    print("  claim while being kept as the measurement of J_SHAPE_UNCERTAINTY_PCT.")
     print("\n  THE MODE DEPENDENCE IS IN THE TORQUE, NOT ONLY THE DELAY. From the same ~2400 rpm the")
     print("  measured brake phase is "
           + " / ".join(f"{v:.3f} s (`{k}`)" for k, v in M.BRAKE_PHASE_S.items())
@@ -493,6 +511,71 @@ def val_sine():
           f"reversals up to {max(pl.p.sine_reversals.values())} per 3 s dwell")
 
 
+def val_pair():
+    """The CONTROLLED bare-vs-prop comparison (2026-07-30): same tools, same protocol, same starting
+    speeds, propeller the only difference. This is what licenses the mech_independent tags."""
+    print("\n## controlled bare-vs-prop pair — what the propeller actually changes")
+    print("#  Same tools, same open-loop `thrust 800` spin-up, same commands. Measured vs measured:")
+    print("#  no model in this section, so nothing here can be satisfied by tuning a parameter.")
+    rows = []
+    for role, lbl in (("bare", "bare shaft"), ("prop", "prop fitted")):
+        ph = [p for _l, m, _c, p in decay_phases(role) if m == "disarm"]
+        alpha = [two_segment(o, brake_onset(o))[2]
+                 for _l, m, _c, o in decays(role) if m == "disarm"]
+        rows.append((lbl, sum(alpha) / len(alpha), sum(p["w_on"] for p in ph) / len(ph),
+                     sum(p["dur"] for p in ph) / len(ph), sum(p["rev"] for p in ph) / len(ph)))
+    print(f"  {'':14s} {'free decel':>11} {'w_on':>7} {'brake dur':>10} {'brake rev':>10} {'J':>11}")
+    for (lbl, a, w, d, r), j in zip(rows, (M.J_BARE_FITTED, M.J_PROP)):
+        print(f"  {lbl:14s} {a:9.0f}   {w:7.0f} {d:10.3f} {r:10.2f} {j:11.3e}")
+    print(f"  -> DIFFERS: J {100 * (M.J_PROP / M.J_BARE_FITTED - 1):+.0f} %, free-coast deceleration "
+          f"{100 * (rows[1][1] / rows[0][1] - 1):+.0f} %. That is the whole measured effect.")
+    print(f"  -> J uncertainty from the drag table's shape: +-{M.J_SHAPE_UNCERTAINTY_PCT:.1f} % "
+          f"(same rotor, two window midpoints)")
+
+    import sinesweep as _ss
+
+    class _O:
+        pole_pairs, follow_slip, seam_factor, seam_min_rpm = 7, 0.10, 1.5, 250.0
+
+    def sine_rows(name):
+        with open(os.path.join(DATA, name)) as fh:
+            return [(r["leg"], int(r["cmd"]), float(r["field_rpm"]), float(r["enc_mean"]),
+                     float(r["enc_min"]), float(r["enc_max"]), float(r["enc_spread"]),
+                     int(r["reversals"]), float(r["tele_rpm"]), float(r["slip"]), int(r["n"]))
+                    for r in csv.DictReader(fh)]
+
+    print("\n  DOES NOT DIFFER (each measured in both configurations):")
+    for lbl, fold, sweep in (("bare", "sinesweep_fold_noprop_20260730_033417.csv",
+                              "sinesweep_noprop_20260730_033014.csv"),
+                             ("prop", "sinesweep_fold_prop_20260730_212120.csv",
+                              "sinesweep_prop_20260730_211856.csv")):
+        fr = sine_rows(fold)
+        br = {leg: _ss.transition([r for r in fr if r[0] == leg], _O) for leg in ("up", "down")}
+        sw = [r for r in sine_rows(sweep) if r[1] <= 510]
+        teles = sorted({r[8] for r in sine_rows(sweep) if r[1] <= 450})
+        rev = [r[1] for r in sw if r[7] > 0]
+        print(f"    {lbl:5s} seam bracket up {sorted((br['up'][0][1], br['up'][1][1]))} "
+              f"down {sorted((br['down'][0][1], br['down'][1][1]))}   "
+              f"tele<=450 {teles}   worst spread {max(r[6] for r in sw):.0f} rpm   "
+              f"reverses to cmd {max(rev) if rev else None}")
+    for lbl, f in (("bare", "steptrace_startup_noprop_20260730_033906.csv"),
+                   ("prop", "steptrace_startup_prop_20260730_212401.csv")):
+        by = _rows(f, "run")
+        out = []
+        for _k, rr in sorted(by.items()):
+            t = [(float(x["t"]), abs(float(x["enc_rpm"]))) for x in rr]
+            pk = max(t, key=lambda z: z[1])
+            tail = [v for tt, v in t if tt > 3.0]
+            out.append((pk[1], pk[0], 100.0 * (pk[1] / (sum(tail) / len(tail)) - 1)))
+        print(f"    {lbl:5s} startup rpm 1200: peak {min(o[0] for o in out):.0f}-"
+              f"{max(o[0] for o in out):.0f} rpm at t={min(o[1] for o in out):.2f}-"
+              f"{max(o[1] for o in out):.2f} s, overshoot {min(o[2] for o in out):.0f}-"
+              f"{max(o[2] for o in out):.0f} %")
+    print("    -> +29 % of inertia moves the startup overshoot by under 1 pp, does NOT tighten the")
+    print("       forced-sine spread, and does NOT stop `rpm 2400` ABORT_STALLing. Two expectations")
+    print("       falsified: the startup failure is a CONTROL/crossover-gap problem, not inertia.")
+
+
 def val_transfer():
     print("\n## transferability — water changes the drag callable and NOTHING else")
     air = preset(M.PROP)
@@ -565,6 +648,8 @@ def cmd_validate(opts):
         val_steps()
     if opts.all or opts.sine:
         val_sine()
+    if opts.all or opts.pair:
+        val_pair()
     if opts.all or opts.transfer:
         val_transfer()
     return 0
@@ -583,7 +668,7 @@ def main(argv=None):
     f.add_argument("--write", action="store_true", help="also write models/350kv_measured_plant.json")
     v = sub.add_parser("validate")
     v.add_argument("--all", action="store_true")
-    for name in ("static", "tele", "brake", "steps", "sine", "transfer"):
+    for name in ("static", "tele", "brake", "steps", "sine", "pair", "transfer"):
         v.add_argument(f"--{name}", action="store_true")
     opts = ap.parse_args(argv)
 
@@ -595,7 +680,7 @@ def main(argv=None):
         print("#   provenance : print the inventory (no file reads)")
         print(f"#   fit        : J from the free-coast window, then (L, brake cut-out) from the BRAKE "
               f"PHASE of the 4 `disarm` decays; R pinned at {M.R_TOTAL} ohm")
-        print("#   validate   : static / tele / brake / steps / sine / transfer replays")
+        print("#   validate   : static / tele / brake / steps / sine / pair / transfer replays")
         return 0
 
     if opts.analyze:

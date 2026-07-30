@@ -183,7 +183,10 @@ numbers in a provenance-tagged inventory keyed by **mechanical configuration** (
 shaft — never mix them). `python3 host/plantid.py validate --all` replays the committed bench fixtures
 in `host/tests/data/` offline and prints the out-of-sample table; `python3 host/plantid.py provenance`
 prints where every number came from, including which parameters each preset **borrows** from the other
-mechanical configuration and why. Moving this plant to water changes exactly one callable
+mechanical configuration and why. `validate --pair` prints the controlled bare-shaft-vs-propeller
+comparison: the propeller changes inertia (+29 %) and the free coast (-23 %) and, measurably, nothing
+else — the seam, the 182 rpm telemetry floor, the forced-sine spread and the closed-loop startup
+overshoot are identical. Moving this plant to water changes exactly one callable
 (`PlantParams.drag`); `PlantParams` is frozen so that is a property of the type, not a convention.
 Note `duty6` is a **loaded** curve — it was fitted to measured rpm, so drag is already inside it and a
 torque balance must add the calibration drag back rather than subtracting it twice.

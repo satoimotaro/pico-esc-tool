@@ -90,9 +90,20 @@ def test_no_preset_mixes_mechanical_configurations_undeclared():
             assert name in M.preset_param_names(cfg), (
                 f"{cfg} declares {name} borrowed but never reads it — the borrow map must describe "
                 f"the code, not the other way round")
-        # the specific hole that was live: PROP reads the bare-shaft coherence band
+        # A borrow entry must be REMOVED once the parameter is evidenced independent, or the map just
+        # accumulates stale excuses.
+        for name in borrowed:
+            assert M.PROVENANCE[name]["mech_independent"] is not True, (
+                f"{cfg} still declares {name} borrowed, but it is now tagged mech_independent=True — "
+                f"delete the entry")
+        # The specific hole that was live in iteration 1: PROP reads the bare-shaft coherence band.
+        # It is now CLOSED BY EVIDENCE rather than by a declaration — the controlled 2026-07-30 prop-on
+        # sweep shows the reversing region does not shrink — so the parameter is tagged independent and
+        # its borrow entry is gone. The behaviour it drives must still be there.
         if cfg == M.PROP:
-            assert "SINE_COHERENT_CMD_MIN" in borrowed
+            assert "SINE_COHERENT_CMD_MIN" not in borrowed
+            assert M.PROVENANCE["SINE_COHERENT_CMD_MIN"]["mech_independent"] is True
+            assert "FALSIFIED" in M.PROVENANCE["SINE_COHERENT_CMD_MIN"]["note"]
             assert P.MeasuredPlant(P.preset(M.PROP)).steady(180)[1] == "incoherent"
 
 
@@ -125,8 +136,22 @@ def test_manifest_describes_every_committed_fixture():
         for key in ("tool", "role", "mech_config", "cross_up", "run_key", "runs", "rows", "note"):
             assert key in meta, (name, key)
         assert meta["mech_config"] in (M.PROP, M.BARE)
-        assert meta["cross_up"] == (34 if meta["mech_config"] == M.PROP else 36)
-    assert total < 300 * 1024, f"fixtures are {total / 1024:.0f} KB, budget is 300 KB"
+        # cross_up and mech_config are INDEPENDENT axes, and neither is derivable from the filename:
+        # coastdown_20260730_011123.csv is dated the 30th but belongs to the 2026-07-26 cross_up-34
+        # calibration campaign. Asserting "prop => 34" would have been wrong the moment the operator
+        # refitted the propeller, and asserting "dated the 30th => 36" is wrong for that one file. So each
+        # fixture names its CAMPAIGN and the campaign carries the cross_up.
+        camp = mf["_campaigns"][meta["campaign"]]
+        assert meta["cross_up"] == camp["cross_up"], name
+        if camp["mech_config"] != "either":
+            assert meta["mech_config"] == camp["mech_config"], name
+        if meta["tool"] == "coastdown":
+            assert "spin_up" in meta, f"{name}: the spin-up method is known to matter — record it"
+    budget = mf["_fixture_budget_bytes"]
+    assert budget == 350 * 1024, "the budget is a deliberate, documented number — not a moving target"
+    assert total < budget, f"fixtures are {total / 1024:.0f} KB, budget is {budget / 1024:.0f} KB"
+    assert len(mf["_fixture_budget_note"]) >= 3, "raising the budget requires the reason to be recorded"
+    assert "_spin_up_matters" in mf
     # the open-loop commands are recorded (and flagged as inferred, because no CSV carried them)
     cmds = mf["_open_loop_commands"]
     assert "600" in cmds["steptrace_down"] and "480" in cmds["steptrace_down"]
@@ -510,8 +535,9 @@ def test_the_regression_pinned_sim_is_untouched():
 def test_mech_time_constant_is_far_smaller_than_the_loop_sees():
     """8.3 ms at R=0.7, 14.2 ms at the measured R=1.20, against the ~37 ms the loop sees. The residual
     is the ESC's command shaping, not inertia — which is why no lag parameter exists."""
-    assert M.mech_time_constant_ms(M.J_PROP, 0.7) == pytest.approx(8.3, abs=0.2)
-    assert M.mech_time_constant_ms(M.J_PROP, M.R_TOTAL) == pytest.approx(14.2, abs=0.2)
+    assert M.mech_time_constant_ms(M.J_PROP, 0.7) == pytest.approx(9.2, abs=0.2)
+    assert M.mech_time_constant_ms(M.J_PROP, M.R_TOTAL) == pytest.approx(15.7, abs=0.2)
+    assert M.mech_time_constant_ms(M.J_BARE_FITTED, M.R_TOTAL) == pytest.approx(12.2, abs=0.2)
     assert M.mech_time_constant_ms(M.J_PROP, M.R_TOTAL) < 37.0 / 2
 
 
@@ -527,8 +553,16 @@ def test_r_total_band_propagates_into_l_but_not_into_j():
     assert M.brake_peak_rpm(lo, l_lo) == pytest.approx(M.brake_peak_rpm(hi, l_hi), rel=1e-9)
     assert M.brake_peak_torque(lo, l_lo) > M.brake_peak_torque(hi, l_hi)
     assert 0.4e-3 < M.L_PHASE_FITTED < 3.0e-3, "a fitted L outside ~0.4-3 mH is not a BLDC phase"
-    # J from the free-coast window, computed independently of anything electrical
-    j = M.drag_at(2757.0) / (M.FREE_DECEL_BARE_RPM_S * P.RAD)
-    assert j == pytest.approx(M.J_BARE_FITTED, rel=0.01)
-    j_prop = M.drag_at(1877.0) / (M.FREE_DECEL_PROP_RPM_S * P.RAD)
-    assert j_prop == pytest.approx(M.J_PROP, rel=0.05), "the same arithmetic must recover measured J"
+    # J from the free-coast window, computed independently of anything electrical. Both configurations
+    # use the SAME route at their OWN measured window midpoint, so the inventory and `plantid fit`
+    # cannot drift apart.
+    assert M.drag_at(2762.0) / (M.FREE_DECEL_BARE_RPM_S * P.RAD) == pytest.approx(M.J_BARE_FITTED,
+                                                                                 rel=0.002)
+    assert M.drag_at(2836.0) / (M.FREE_DECEL_PROP_RPM_S * P.RAD) == pytest.approx(M.J_PROP, rel=0.002)
+    # The SAME prop-on rotor from the confounded rpm-2200 decay, at a much lower window midpoint.
+    # It must differ by J_SHAPE_UNCERTAINTY_PCT — that gap IS the drag table's shape error.
+    j_old = M.drag_at(1876.0) / (4855.0 * P.RAD)
+    assert 100 * (M.J_PROP / j_old - 1) == pytest.approx(M.J_SHAPE_UNCERTAINTY_PCT, abs=0.5)
+    # and the controlled pair: the propeller raises J, materially
+    assert M.J_PROP > M.J_BARE_FITTED
+    assert 25.0 < 100 * (M.J_PROP / M.J_BARE_FITTED - 1) < 32.0

@@ -275,9 +275,13 @@ assumption below, so it belongs with them. Measured on the bare shaft (no propel
   alone for a further 0.13 s, and only then does the brake bite. Bare-shaft the rotor is at ~2390 rpm by
   then and prop-on at ~1540 rpm, which is exactly the ratio the "moving peak" (1455–1596 vs 865–973)
   showed. Both delays were measured in **both** configurations and agree within 5 %, so they are ESC
-  state-machine timings. The brake **torque**'s load-independence is still OPEN: replaying the prop-on
-  decays with the bare-shaft-fitted `L` reproduces the stop time within 11 % but misses the
-  deceleration-peak rpm by 37–41 %.
+  state-machine timings. **Re-confirmed a third time on 2026-07-30 evening**, propeller refitted and the
+  whole set re-taken with the same `--thrust 800` spin-up: engagement moves to 2531–2741 rpm, i.e.
+  *higher* than bare-shaft, because the free coast is slower. Engagement tracks the STARTING speed, not
+  the load — and the old 865–973 rpm prop-on figure came from a lower-starting closed-loop spin-up, not
+  from the propeller. The brake **torque** transfers well on that protocol-matched pair (brake-phase
+  duration −5.9…+3.3 % across a +29 % inertia change, nothing refitted), but `L` stays tagged OPEN: one
+  inertia change on the same motor is not a different machine and is not water.
 - **Identical via all three routes**: `disarm`, letting the 500 ms deadman expire, and holding a zero
   target while armed. There is no "coast" path among them.
 - **`brake_on_stop = 0` does not disable it.** The braking is not that setting.

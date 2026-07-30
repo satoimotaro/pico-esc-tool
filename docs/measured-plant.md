@@ -93,24 +93,25 @@ The saturation VALUE, however, does not survive a second trace: see the `680 -> 
 | `V_SUPPLY_PROP` / `V_SUPPLY_BARE` | 11.25 / 11.2 | V | measured | each | no (a parameter, not a state) |
 | `EFF_350KV` | 1.0 | - | measured | prop | yes (fits both curves to <=2.1 %) |
 | `R_TOTAL` | 1.20 +- 0.26 | ohm | measured | prop | yes, but 34 % is wiring and it corrodes |
-| `J_PROP` | 8.8e-6 | kg*m^2 | **measured** | prop | **no** |
-| `J_BARE_FITTED` | 7.222e-6 | kg*m^2 | **identified** (free coast) | bare 2026-07-30 | **no** |
-| `L_PHASE_FITTED` | 1.335 | mH | **fitted** (brake phase, `disarm` only) | bare | **OPEN** |
-| `BRAKE_CUTOUT_RPM` | 705 | rpm | **fitted** (brake phase, `disarm` only) | bare | **OPEN** |
+| `J_PROP` | 9.761e-6 | kg*m^2 | **identified** (free coast) | prop 2026-07-30 | **no** |
+| `J_BARE_FITTED` | 7.585e-6 | kg*m^2 | **identified** (free coast) | bare 2026-07-30 | **no** |
+| `J_SHAPE_UNCERTAINTY_PCT` | 8.4 | % | **measured** | prop (two speeds) | yes — it is the drag table's error |
+| `L_PHASE_FITTED` | 1.296 | mH | **fitted** (brake phase, `disarm` only) | bare | **OPEN** (but see the out-of-sample transfer below) |
+| `BRAKE_CUTOUT_RPM` | 670 | rpm | **fitted** (brake phase, `disarm` only) | bare | **OPEN** |
 | `DRAG_TABLE_PROP` | 5.90 -> 4.16 | mN*m | measured | prop | **no — and it is not prop drag.** Also the `duty6` reference drag, and the only air drag law |
-| `FREE_DECEL_BARE/PROP_RPM_S` | 5550 / 4860 | rpm/s | measured | each | no |
+| `FREE_DECEL_BARE/PROP_RPM_S` | 5283 / 4089 | rpm/s | measured (`disarm`, thrust-800) | each | no |
 | `CUT_RELEASE_S` | 0.170 / 0.332 / 0.024 | s | measured | both (`disarm` only) | **yes for `disarm`**, assumed for the other two |
 | `BRAKE_ENGAGE_S` | 0.137 / 0.113 / 0.072 | s | measured | both (`disarm` only) | **yes for `disarm`**, assumed for the other two |
 | `BRAKE_PHASE_S` / `_REV` | 0.107/0.062/0.033 s, 1.18/0.51/0.62 rev | - | measured | bare | data only — **not** a model parameter |
-| `SINE_PULLOUT_NM` | 7.58 | mN*m | fitted | bare | no |
-| `SINE_COHERENT_CMD_MIN` | 210 | cmd | measured | bare | no |
-| `SINE_SPREAD_TABLE_BARE` | 92..234 | rpm | measured | bare | no (shrinks with damping) |
-| `DUTY_SLEW_UP_PER_S` / `DUTY_CROSSOVER_CLAMP` | 1.6085 / 0.1244 | duty/s, duty | fitted | prop | **OPEN** — both go through the prop drag table |
+| `SINE_PULLOUT_NM` | 8.24 | mN*m | fitted | bare | no |
+| `SINE_COHERENT_CMD_MIN` | 210 | cmd | measured | both | **yes** (controlled pair) |
+| `SINE_SPREAD_TABLE_BARE` | 92..234 | rpm | measured | both | **yes** (controlled pair; it does NOT shrink) |
+| `DUTY_SLEW_UP_PER_S` / `DUTY_CROSSOVER_CLAMP` | 1.6002 / 0.1243 | duty/s, duty | fitted | prop | **OPEN** — both go through the prop drag table |
 | `TELE_FLOOR_MECH` | 182 | mech rpm | measured | both | **yes** |
 | `TELE_LIVE_S` | 0.109 | s | measured | bare | yes |
 | `TORQUE_PER_CMD` | 0.68 | mN*m/cmd | measured | prop | **reporting only** |
-| `STARTUP_OVERSHOOT_PCT` / `_T_PEAK_S` | 53.5 / 1.19 | %, s | measured | bare | **no** |
-| `STARTUP_ABORT_TARGET_RPM` | 2400 | rpm | measured | bare | **no** |
+| `STARTUP_OVERSHOOT_PCT` / `_T_PEAK_S` | 53.5 / 1.19 | %, s | measured | both | **yes** (controlled pair: under 1 pp) |
+| `STARTUP_ABORT_TARGET_RPM` | 2400 | rpm | measured | both | **yes** — and it is a CONTROL failure, not inertia |
 
 ### How each unmeasured parameter is IDENTIFIED (this was wrong in the first version)
 
@@ -119,9 +120,13 @@ the two fixed cut delays.
 
 - **`J` comes from the FREE-COAST window** — the phase after the drive is removed and before the brake
   bites, the one phase of the decay with no ESC torque in it. `J = tau_drag(w_mid)/alpha_free`, straight
-  off the measured drag table with nothing fitted: `4.198 mN*m / 5550 rpm/s = 7.222e-6` bare. The same
-  arithmetic on the prop-on decays gives **8.99e-6 against the directly measured 8.8e-6 (+2.2 %)**,
-  which is the cross-check that makes the method credible.
+  off the measured drag table with nothing fitted: `4.197 mN*m / 5283 rpm/s = 7.585e-6` bare and
+  `9.761e-6` prop-on, both from `--thrust 800 --cut disarm` runs so they are a controlled pair.
+  `disarm` **only**: the six bare decays span three cut modes and read 5042-5436 rpm/s on the four
+  `disarm` runs but 6074/6113 on `deadman`/`zero_held` — 15 % faster, for a phase that by definition has
+  no ESC torque in it. Those two also have much shorter free windows (0.072 / 0.113 s vs 0.129-0.143 s),
+  so their "free" phase is probably already partly braked. An earlier constant averaged all six, read
+  5550 rpm/s, and biased `J` 5 % low.
   The first version claimed `J_BARE` was "pinned by the brake-peak magnitude". That was **false**:
   nothing in that fit's cost function constrained the brake torque scale at all.
 - **`(L, BRAKE_CUTOUT_RPM)` come from the BRAKE PHASE** — revolutions travelled and duration, both
@@ -141,17 +146,17 @@ Time-to-stop measured from `t = 0` is **~72 % fixed cut delay** (0.307 s of 0.40
 therefore stays inside 13 % while the brake torque is out by 2x, and that is precisely how the first
 version of this model certified a 2x-too-strong brake as "out of sample within 11 %". Demonstrated
 directly in `test_time_to_stop_from_zero_is_delay_dominated_and_says_so`: halving `L` (roughly doubling
-the brake torque at these speeds) moves time-to-stop by **1.1 %** and brake-phase revolutions by
-**26.9 %** — a 24x difference in sensitivity.
+the brake torque at these speeds) moves time-to-stop by ~1 % and brake-phase revolutions by ~27 % —
+a >10x difference in sensitivity, asserted as that ratio.
 
 `plantid.py validate --brake` now prints both, so the gap is visible rather than inferred.
 
-`R_total`'s +-0.26 ohm band propagates into `L` (1.05..1.63 mH) but **not** into `J`: the free-coast
+`R_total`'s +-0.26 ohm band propagates into `L` (1.02..1.58 mH) but **not** into `J`: the free-coast
 window has no electrical term in it. `plantid.py fit` prints the band.
 
 **`L` is a prediction, not a measurement.** Check it with an LCR meter across two phases (expect ~2L
-line-to-line, so ~2.7 mH at 1 kHz) before reusing it anywhere. Note that this L puts the short-circuit
-brake's peak at **39.8 mN*m at 1226 rpm**, while the pointwise deceleration residual (measured decel
+line-to-line, so ~2.6 mH at 1 kHz) before reusing it anywhere. Note that this L puts the short-circuit
+brake's peak at **41.0 mN*m at 1263 rpm**, while the pointwise deceleration residual (measured decel
 minus the drag table, per 20 ms window) puts it nearer **60 mN*m at ~1900 rpm**. The trajectory fit uses
 the integral and is far less noisy than single-window residuals, so it wins — but the two disagree by
 ~1.5x and that is the honest uncertainty on the brake torque scale.
@@ -192,11 +197,84 @@ and the theoretical 0.0391 — so the existing term's sign and magnitude are sou
 
 The full evidence is in `host/tests/data/plant_fixtures.json` under `_cross_up_provenance`.
 
+## The controlled bare-vs-prop pair (2026-07-30 evening)
+
+The operator refitted the propeller and re-took the whole set with the same tools, the same protocol and
+the same starting speeds. `python3 host/plantid.py validate --pair` prints this comparison; it is
+measured-vs-measured with no model in it, so nothing in it can be satisfied by tuning a parameter.
+
+### First: a confound in the original pair
+
+The prop-on decay this inventory originally used (`coastdown_20260730_011123.csv`) was taken with a
+**closed-loop `--rpm 2200`** spin-up and starts at ~2210 rpm, while the bare-shaft set used **open-loop
+`--thrust 800`** and starts at ~3130. Because the brake engages on a fixed DELAY, engagement speed
+tracks the starting speed:
+
+| dataset | spin-up | start rpm | w_on (engagement) | brake rev | brake dur |
+|---|---|---|---|---|---|
+| bare | `thrust 800` | 3121-3128 | 2349-2409 | 1.34 | 0.116 s |
+| prop, OLD | `rpm 2200` | 2205-2214 | 1536-1606 | 0.99 | 0.101 s |
+| prop, NEW | `thrust 800` | 3127-3137 | 2531-2741 | 1.97 | 0.157 s |
+
+So any bare-vs-prop conclusion drawn between the first two rows was confounded by starting speed. Row 3
+is the protocol-matched partner. (Row 3 engaging *higher* than row 1 from the same start is exactly what
+a slower free coast requires — a third independent confirmation of the fixed-delay brake, and one that
+also rules out a fixed *commutation count*, which would predict the opposite ordering.)
+
+**`plant_fixtures.json` now records `spin_up` for every coastdown fixture**, because it is known to
+matter. The old file is kept, tagged `role: prop_confounded`, because replaying it is what measures the
+drag table's shape error (below).
+
+### What the propeller changes: inertia and the free coast, and nothing else found
+
+| | free decel | w_on | brake dur | brake rev | J |
+|---|---|---|---|---|---|
+| bare shaft | 5283 rpm/s | 2386 | 0.116 s | 1.34 | 7.585e-6 |
+| prop fitted | 4089 rpm/s | 2605 | 0.157 s | 1.97 | 9.761e-6 |
+| | **-23 %** | | | | **+29 %** |
+
+### What it does not change — six things, each measured in both configurations
+
+| behaviour | bare | prop | difference |
+|---|---|---|---|
+| seam bracket (fine sweep, both legs) | cmd **525..530** | cmd **525..530** | none resolvable |
+| fold hysteresis | none resolvable | none resolvable | none |
+| `tele` below the seam | **exactly 182.0**, cmd 60..450 | **exactly 182.0**, cmd 60..450 | none |
+| `TELE_LIVE_S` bracket | last 0 at 0.105-0.108 s | last 0 at 0.105-0.108 s | none |
+| worst sine spread (up / down) | 234 / 174 rpm | 238 / 211 rpm | no improvement |
+| reversing region | to cmd 330 / 210 | to cmd 270 / 180 | no improvement |
+| down-step through the seam | 1048 -> 175 rpm, no stall 3/3 | 1054 -> 175 rpm, no stall 3/3 | same |
+| startup overshoot (rpm 1200) | 53/53/54 %, peak t 1.18-1.21 s | 53/53/54 %, peak t 1.20-1.23 s | **under 1 pp** |
+| startup at rpm 2400 | ABORT_STALL, peak 657-780 rpm | ABORT_STALL, peak 700-827 rpm | **same failure** |
+
+### Two expectations falsified, both with design consequences
+
+1. **The propeller's inertia does NOT help the rotor follow the forced field.** More inertia was expected
+   to tighten the sine-region spread and shrink the reversing band. Neither happened (238 vs 234 rpm
+   worst spread). So the sine dispersion and the coherence band are load-INDEPENDENT for this pair, which
+   is why `SINE_COHERENT_CMD_MIN`, `SINE_SPREAD_TABLE_BARE` and `SINE_REVERSALS_BARE` are now tagged
+   `mech_independent=True` and their `borrowed` entries have been deleted. (Water, with real damping, is
+   still untested.)
+2. **The propeller does NOT fix the closed-loop `rpm 2400` startup stall.** It aborts in all three runs
+   from a barely higher peak, at the same time. **So the target-dependent startup failure is a
+   CONTROL / crossover-gap problem, not an inertia problem** — adding rotor inertia is not a fix and must
+   not be proposed as one. Both falsifications are pinned by tests in `test_plant_replay.py` so they
+   cannot quietly come back.
+
+### A measured bound on the drag table's shape error
+
+The same prop-on rotor gives `J = 9.002e-6` at w_mid 1876 (the old rpm-2200 file) and `9.761e-6` at
+w_mid 2836 (the new thrust-800 file) — **8.4 % apart for a quantity that cannot depend on speed.** Since
+`J` is inferred as `drag_at(w_mid)/alpha`, that gap is the error in `DRAG_TABLE_PROP`'s *speed
+dependence* — the very shape this document already argues is bearing/iron loss rather than prop drag.
+It is recorded as `J_SHAPE_UNCERTAINTY_PCT`, and it is the honest uncertainty on **both** inertias. This
+replaces an argument with a measurement.
+
 ## Load dependence of the four known behaviours
 
 | behaviour | law load-dependent? | observed numbers load-dependent? | why |
 |---|---|---|---|
-| 1. active brake at zero throttle | **timing: NO for `disarm` (measured in both). torque: OPEN, and MODE-DEPENDENT.** | YES | The two delays were measured in BOTH configurations for `disarm` and agree within 4 % (`deadman`/`zero_held` were only ever recorded bare-shaft, so for those the tag is an assumption). The torque law is electrical in form, but its scale was fitted bare-shaft on `disarm` only; replaying it prop-on gives brake-phase duration +13..+24 % and revolutions -12..+15 %. That IS a real out-of-sample transfer, but not a tight one, and `deadman`/`zero_held` brake 2-3x harder from the same speed, which no single torque reproduces. |
+| 1. active brake at zero throttle | **timing: NO for `disarm` (measured in both). torque: transfers well, but still tagged OPEN. MODE-DEPENDENT.** | YES | The two delays were measured in BOTH configurations for `disarm` and agree within 4 % (`deadman`/`zero_held` were only ever recorded bare-shaft, so for those the tag is an assumption). The torque scale was fitted bare-shaft on `disarm` only; replaying it on the PROTOCOL-MATCHED prop-on decays gives brake-phase duration **-4.9..+4.9 %** and revolutions **-11.3..+12.9 %** — as good as the in-sample fit, across a +29 % inertia change, with nothing refitted. `L_PHASE_FITTED` and `BRAKE_CUTOUT_RPM` nevertheless stay **OPEN**: one inertia change on the same motor is not a different machine and is not water, and the cut-out is an ESC state transition never observed independently. `deadman`/`zero_held` still brake 2-3x harder from the same speed, which no single torque reproduces. |
 | 2. forced-sine slip / cogging / reversal floor | pull-out torque NO (set by sine amplitude) | **YES, strongly** | The torque is fixed by the sine amplitude; the load torque it must beat is not. The incoherent band and the dispersion will shrink with damping (strongly in water). |
 | 3. seam location + smooth ramp | **mostly NO** | mostly no | Set by `cross_up`, KV, V and `duty6` — firmware/electrical. Load shifts it only via 6-step droop (~1-2 % prop-on in air). One parameter-free rule fits both configurations' departure brackets. |
 | 4. startup overshoot and the target-dependent `ABORT_STALL` | **YES, strongly** | YES | Closed loop, and gated on the plant's ability to traverse the crossover gap. Do not port to any other rotor. |
@@ -216,10 +294,14 @@ by then.** Measured, per decay, by a two-segment fit of encoder position:
 | `cutmode_noprop` disarm | 0.163 s | +0.143 s | 2390 rpm |
 | `cutmode_noprop` deadman | 0.332 s | +0.113 s | 2392 rpm |
 | `cutmode_noprop` zero_held | 0.024 s | +0.072 s | 2451 rpm |
-| `coastdown` (prop) x3 | 0.163-0.167 s | +0.128-0.137 s | 1513-1606 rpm |
+| `coastdown` (prop, rpm-2200 spin-up) x3 | 0.163-0.167 s | +0.128-0.137 s | 1513-1606 rpm |
+| `coastdown_prop` (prop, thrust-800) x3 | 0.157-0.167 s | +0.130-0.140 s | 2531-2741 rpm |
 
-The delay is the same in both configurations; the rotor is at ~2390 rpm bare and ~1540 rpm prop-on when
-the brake arrives, which is exactly the ratio the "moving peak" showed. So the shape is **not** evidence
+The delay is the same in every row; the rotor is simply at a different speed when the brake arrives, and
+that speed tracks the STARTING speed. The last row is the decisive one: with the propeller fitted AND the
+bare-shaft spin-up, engagement moves to 2531-2741 rpm — **higher** than bare-shaft, because the free
+coast is slower. So the 865-973 rpm figure that raised the original question was the closed-loop
+spin-up's lower starting speed, not the propeller. So the shape is **not** evidence
 against an electrical law — but it is not evidence for load-independence either, and the brake torque is
 therefore left tagged **OPEN**.
 
@@ -264,13 +346,18 @@ measurement bias.
 
 **The propeller adds nothing resolvable in air**, on three independent lines:
 
-1. this table, used unchanged for both configurations, predicts the free-coast decelerations as
-   **5552 rpm/s bare (measured 5550)** and **4966 rpm/s prop-on (measured 4860)**;
-2. the bare-shaft static curve at cmd 555/570/600 matches a `duty6` that was **calibrated prop-on** to
-   <= 1 %, which it could not if the two rotors had materially different drag;
-3. the unphysical fall itself — bearing and iron losses are propeller-independent.
+1. the bare-shaft static curve at cmd 555/570/600 matches a `duty6` that was **calibrated prop-on** to
+   <= 1 %, which it could not if the two rotors had materially different drag at those speeds;
+2. the unphysical fall itself — bearing and iron losses are propeller-independent;
+3. the controlled pair's own numbers: the propeller changes the free-coast deceleration by -23 % while
+   changing `J` by +29 %, so `tau_drag = J*alpha` comes out at **4.20 mN*m bare and 4.18 mN*m prop-on**
+   at their respective window midpoints — the drag torque itself is unchanged to 0.5 %.
 
 So there is **one** drag law, `drag_at`, used as both `drag` and `drag_ref` for both presets.
+
+CAVEAT, now quantified: the controlled pair also bounds how wrong that table's SHAPE is — the same rotor
+gives `J` 8.4 % apart at two window midpoints (`J_SHAPE_UNCERTAINTY_PCT`). A table with the correct speed
+dependence would give the same `J` at both.
 
 An earlier version carried a separate viscous bare-shaft coefficient, justified by "a 4.3 mN*m Coulomb
 torque could not permit holding 96..214 rpm on a tiny sine amplitude". That justification was **false**
@@ -297,29 +384,36 @@ to this table would be inventing data.
 | nothing exceeds `KV*V*eff` | (new) | agrees with `MotorModel.rpm_6step` to 1e-9 at cmd 700..2000 |
 | `tele` vs 60 sinesweep rows | max 25, mean 12 rpm | max **33.8**, mean 8.5 rpm |
 | `tele` on startup, t < 0.5 s | 5 rpm | 4.9 / **26.3** / 1.5 rpm (2 of 3 runs) |
-| **brake phase, 4 `disarm` decays (IN SAMPLE)** | — | duration -9.5 .. +6.8 %, revolutions -7.5 .. +11.6 % |
-| **brake phase, 3 prop-on decays (OUT OF SAMPLE)** | — | duration **+13.3 .. +23.6 %**, revolutions **-11.8 .. +15.4 %** |
-| brake phase, `deadman` / `zero_held` | — | **+84 % / +255 %** on duration — NOT modelled, asserted as the factor |
+| **brake phase, 4 `disarm` decays (IN SAMPLE)** | — | duration -8.6 .. +7.7 %, revolutions -8.7 .. +11.4 % |
+| **brake phase, 3 PROTOCOL-MATCHED prop-on decays (OUT OF SAMPLE)** | — | duration **-4.9 .. +4.9 %**, revolutions **-11.3 .. +12.9 %** |
+| brake phase, 3 CONFOUNDED prop-on decays (rpm-2200 spin-up) | — | duration +20.9 .. +31.2 % — the protocol, not the brake |
+| brake phase, `deadman` / `zero_held` | — | **+86 % / +259 %** on duration — NOT modelled, asserted as the factor |
 | time-to-stop from t=0 (delay-dominated, for comparison) | — | -6.2 .. +6.1 % on `disarm`/prop, +64.2 % on `zero_held` |
 | cut delays vs `coastdown.coast_start()` | 30 ms | 0 / 18 / 26 ms |
 | down-step half-time (IN SAMPLE — see below) | 50 % | **+1 %** (25.0 vs 24.9 ms) |
+| down-step, prop-on (verified from `host/reports/`, not committed) | — | 1054 -> 175 rpm, no stall 3/3, undershoot 24-28 % vs bare 30-35 % |
 | down-step trough | 100-200 rpm | 171 rpm, no stall, settles on the field |
-| `407 -> 680` time to 95 % | 25 % | +10.4 % (0.489 vs 0.442 s) |
+| `407 -> 680` time to 95 % | 25 % | +12.1 % (0.496 vs 0.442 s) |
 | `407 -> 680` plateau | 300-500 rpm | 389-390 rpm (measured 360-415) |
-| `680 -> 407` down-crossing | — | **VAF 32.9 %, model ~2x too slow** — documented miss, see below |
+| `680 -> 407` down-crossing | — | **VAF 25.7 %, model ~2x too slow** — documented miss, see below |
 | forced sine, cmd 270..510 | 30 % | 28.4 % (worst: cmd 360 up leg) |
-| VAF, `407 -> 680` | reported | 99.3 % |
+| VAF, `407 -> 680` | reported | 99.2 % |
 | VAF, sine-region steps | `n/a` | `n/a (cogging-dominated)`, by design |
 | transferability | asdict-identical minus `drag` | True, `drag_ref` unmoved, monotone slowdown, brake untouched |
 
 ### What is genuinely out-of-sample, and what is not
 
-- **OUT OF SAMPLE:** the three prop-on decays. They reuse the bare-shaft-fitted `L` and
-  `BRAKE_CUTOUT_RPM` with the prop-on `J` and drag, on a rotor 22 % heavier that starts the brake phase
-  850 rpm lower, and nothing was refitted for them. **This is the only out-of-sample evidence the brake
-  law has.** The first version claimed the same thing at "within 11 %" using time-to-stop from `t = 0`;
-  that claim is **retracted** — on the metric that isolates the brake the true figures are the +13..+24 %
-  / -12..+15 % above.
+- **OUT OF SAMPLE:** the three **protocol-matched** prop-on decays
+  (`coastdown_prop_20260730_211609.csv`). They reuse the bare-shaft-fitted `L` and `BRAKE_CUTOUT_RPM`
+  with the prop-on `J`, across a +29 % inertia change, and nothing was refitted for them —
+  `plantid.fit` asserts it never sees prop-on data, and
+  `test_brake_phase_out_of_sample_on_the_prop_on_decays` asserts the hold-out structurally. **This is the
+  only out-of-sample evidence the brake law has, and it is now a good one:** -4.9..+4.9 % on duration, no
+  worse than the in-sample fit.
+  Iteration 1 claimed this at "within 11 %" using time-to-stop from `t = 0`, of which ~72 % is fixed
+  delay; that claim was retracted. Iteration 2 measured it properly but on the *confounded* file and got
+  +13..+24 %. Part of that error was the protocol, not the brake: with the current parameters the
+  confounded file still reads +21..+31 % while the matched one reads -5..+5 %.
 - **NOT out of sample:** the down-step (`SINE_PULLOUT_NM` was identified from it) and the `407 -> 680`
   step (both crossover parameters were). Those rows are consistency checks.
 
@@ -332,16 +426,19 @@ to this table would be inventing data.
    and 1.5 rpm.
 3. **`cross_up` guard 13.7 % at cmd 680 vs the 15 % floor.** The shift is a fixed *duty* offset, so it
    is relatively smallest at the largest duty. Mean 30 %, max 45 %.
-4. **`deadman` / `zero_held` brake phase +84 % / +255 %.** The mode-dependent torque, unmodelled by
+4. **`deadman` / `zero_held` brake phase +86 % / +259 %.** The mode-dependent torque, unmodelled by
    design and asserted as the factor.
-5. **`680 -> 407` down-crossing, VAF 32.9 %.** The measured descent covers 2226 -> 497 rpm in 40 ms
+5. **`680 -> 407` down-crossing, VAF 25.7 %.** The measured descent covers 2226 -> 497 rpm in 40 ms
    (~43 krpm/s); the model, with the constant pull-out torque identified at cmd 480, manages ~13 krpm/s
    and takes 78 ms to the half-value against a measured 40 ms. So the forced-sine braking torque **grows
    with slip** and one saturation value cannot cover both descents. The lock structure is still required
    (the rotor settles at exactly the field speed), but the saturation is not constant. Added to the
    not-modelled list rather than papered over with a second fitted coefficient on a single extra trace.
-6. **The brake torque scale disagrees with the pointwise residual by ~1.5x** (39.8 mN*m at 1226 rpm from
+6. **The brake torque scale disagrees with the pointwise residual by ~1.5x** (41.0 mN*m at 1263 rpm from
    the trajectory fit vs ~60 mN*m at ~1900 rpm from per-window residuals).
+7. **`J` carries a measured +-8.4 % uncertainty** (`J_SHAPE_UNCERTAINTY_PCT`) from the drag table's speed
+   dependence, and it propagates into everything fitted against it — `L`, the cut-out and the sine
+   pull-out.
 
 ## The startup overshoot: an honest negative result
 
@@ -416,16 +513,23 @@ the cross_up confusion above happened in the first place — and record the `cro
 | `DUTY6_A/B`, `DUTY6_CROSSUP_K` | `python3 host/duty_sweep.py 1 --cross-up <byte>` twice, at two `cross_up` | `--cross-up` is required and is stamped into the CSV |
 | `V_SUPPLY_*`, `EFF_350KV` | the same sweeps + a PSU reading | `eff` is the residual scale |
 | `DRAG_TABLE_PROP` | `duty_sweep` + PSU current, `tau = K_T*I_dc` | and re-read the warning above before believing it |
-| `J_PROP`, `FREE_DECEL_*` | `python3 host/coastdown.py 1 --rpm 2200 --repeats 3` | only the pre-brake window is a drag measurement |
+| `J_PROP` / `J_BARE_FITTED`, `FREE_DECEL_*` | `python3 host/coastdown.py 1 --thrust 800 --repeats 3` | **use `--thrust 800`, NOT `--rpm 2200`** — the spin-up sets where the brake engages, and mixing protocols is what confounded the original bare-vs-prop pair. `disarm` cut only. Only the pre-brake window is a drag measurement |
 | `CUT_RELEASE_S`, `BRAKE_ENGAGE_S` | `coastdown.py 1 --thrust 800 --cut {disarm,deadman,zero}` | three runs; `--analyze` accepts the `mode` column |
-| `J_BARE_FITTED` | the free-coast window of the same decays, then `python3 host/plantid.py fit` | `J = tau_drag(w_mid)/alpha_free`; nothing electrical enters it |
+| both `J`s | the free-coast window of those decays, then `python3 host/plantid.py fit` | `J = tau_drag(w_mid)/alpha_free`; nothing electrical enters it. Re-take BOTH configurations with the same protocol or the comparison is worthless |
+| `J_SHAPE_UNCERTAINTY_PCT` | the same rotor at two different starting speeds | the spread between the two `J` estimates IS the drag table's shape error |
 | `L_PHASE_FITTED`, `BRAKE_CUTOUT_RPM` | the BRAKE PHASE of the `disarm` decays, then `plantid.py fit` | revolutions + duration from ENGAGEMENT; check `L` with an LCR meter |
 | `BRAKE_PHASE_S` / `_REV` | all three `--cut` modes | data, not parameters — re-measure to see whether the 3x torque ordering persists |
 | `TELE_FLOOR_MECH`, `SINE_SPREAD_TABLE_*`, `SINE_COHERENT_CMD_MIN` | `python3 host/sinesweep.py 1 --updown` | encoder-only; the AS5600 must be fitted |
 | the seam brackets | `python3 host/sinesweep.py 1 --cmds 495,505,510,515,520,...` | the fine fold sweep |
 | `SINE_PULLOUT_NM` | `python3 host/steptrace.py 1 --mode thrust --from 600 --to 480` | do NOT decimate: the half-time is ~24 ms. Also record `--from 680 --to 407`, which is where one constant value fails |
 | `DUTY_SLEW_UP_PER_S`, `DUTY_CROSSOVER_CLAMP` | `python3 host/sysid.py` (the `407 -> 680` step) | not separable from each other on one step |
-| `STARTUP_*` | `python3 host/steptrace.py 1 --mode rpm --to 1200 --startup` | closed loop; re-check `--to 2400` for the abort |
+| `STARTUP_*` | `python3 host/steptrace.py 1 --mode rpm --to 1200 --startup` | closed loop; re-check `--to 2400` for the abort. Measured identical in both configurations, so a change here means the FIRMWARE or the crossover moved, not the rotor |
 
 `steptrace.py` now writes a `cmd` column, so traces recorded from 2026-07-30 onward are self-describing
-for replay. `--analyze` reads both schemas.
+for replay (the prop-on repeats carry it, and their manifest entries say "RECORDED" rather than
+"inferred"). `--analyze` reads both schemas.
+
+**Record the spin-up method.** Every coastdown fixture in `plant_fixtures.json` now carries `spin_up`,
+and the manifest names each fixture's CAMPAIGN so `cross_up` is not guessed from the filename —
+`coastdown_20260730_011123.csv` is dated the 30th but belongs to the 2026-07-26 cross_up-34 calibration.
+`cross_up` and `mech_config` are independent axes; neither implies the other.

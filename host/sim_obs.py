@@ -384,22 +384,26 @@ def main(argv=None):
    residual over the drag table has died by ~250 rpm, where the law's own w-branch would still be 7x
    that). The fixed delay is why the deceleration peak was measured at 1455-1596 rpm bare-shaft and
    865-973 rpm prop-on: the peak never moved, the speed the rotor had reached in 0.13 s did.
-   THE BRAKE TORQUE SCALE IS IN-SAMPLE FOR `disarm` ONLY. `deadman` and `zero_held` brake 2-3x harder
-   from the same ~2400 rpm and are NOT modelled; the mode dependence is in the torque, not the delay.
-   Load-independence of the torque is OPEN — the prop-on decays transfer to +24 %/-12 % on brake-phase
-   duration/revolutions, which is a real out-of-sample check but not a tight one.
+   THE BRAKE TORQUE SCALE IS FITTED ON `disarm` ONLY. `deadman` and `zero_held` brake 2-3x harder from
+   the same ~2400 rpm and are NOT modelled; the mode dependence is in the torque, not the delay. But it
+   TRANSFERS: replaying the protocol-matched prop-on decays (2026-07-30, +29 % inertia, nothing refitted)
+   gives brake-phase duration -4.9..+4.9 % and revolutions -11.3..+12.9 %, as good as the in-sample fit.
+   L and the cut-out are still tagged OPEN — one inertia change on the same motor is not water.
 4. THE DYNAMICS ARE ESC-DOMINATED. `J*R/K_T^2` is 8.3 ms at R=0.7 and 14.2 ms at the measured
    R_total=1.20, against the ~37 ms the loop sees. The residual is the ESC's command shaping — a
    crossover duty ramp plus a duty clamp — not inertia and not a lag.
 5. THE SINE REGION IS NOT A SPEED SOURCE. Below cmd 210 the rotor cogs and reverses (up to 7 reversals
    in a 3 s dwell, spread 92..234 rpm). The plant returns `coherent=False` and no speed rather than a
    mean that looks like a measurement.
-6. THE PROPELLER ADDS NOTHING RESOLVABLE IN AIR, so there is ONE measured drag law for both mechanical
-   configurations. Three independent lines: both free-coast decelerations (model 5552 vs measured
-   5550 rpm/s bare, 4966 vs 4860 prop-on), the bare-shaft static curve matching a prop-on-CALIBRATED
-   `duty6` to <=1 %, and the table's own unphysical FALL with speed (5.90 -> 4.16 mN*m over
-   753 -> 2922 rpm). So that table is bearing/iron loss plus a K_T*I_dc bias, NOT prop drag, and the
-   w^2 coefficient water needs is UNMEASURED.
+6. THE PROPELLER CHANGES INERTIA AND NOTHING ELSE WE CAN FIND. Controlled pair, 2026-07-30, same tools
+   and same starting speeds: J +29 % (7.585e-6 -> 9.761e-6) and the free coast -23 %, while the seam
+   bracket (cmd 525..530), the 182 rpm tele floor, the forced-sine spread, the down-step and the closed-
+   loop startup overshoot (53-54 % both) are all unchanged. TWO EXPECTATIONS FALSIFIED: the prop's
+   inertia does NOT help the rotor follow the forced field, and it does NOT stop `rpm 2400`
+   ABORT_STALLing — so that failure is a CONTROL / crossover-gap problem, not an inertia problem.
+   The drag TORQUE is unchanged to 0.5 % (4.20 vs 4.18 mN*m), so there is ONE air drag law; it is
+   bearing/iron loss plus a K_T*I_dc bias, NOT prop drag, and the w^2 coefficient water needs is
+   UNMEASURED. The same pair bounds that table's shape error at 8.4 % (J_SHAPE_UNCERTAINTY_PCT).
 7. THE STARTUP OVERSHOOT MECHANISM IS UNRESOLVED — section (c). The 182 rpm sensor floor is NOT the
    cause in this model, and nothing here was tuned toward the measured 53-54 %.
 8. WATER CHANGES ONE CALLABLE: `PlantParams.drag`. Not `drag_ref` (that belongs to the `duty6`
