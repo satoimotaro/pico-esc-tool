@@ -247,8 +247,15 @@ This is not a soft-sensor property, but it governs every "sample opportunistical
 assumption below, so it belongs with them. Measured on the bare shaft (no propeller), commit `5c205b2`:
 
 - **3100 rpm → dead stop in 0.19–0.54 s.** A free rotor of this inertia would take many seconds.
-- The deceleration **RISES ~10× as the rotor slows** — the opposite of aerodynamic/viscous drag decay,
-  and the signature of active braking.
+- The deceleration **PEAKS PART-WAY DOWN and then falls away again**: ~3500–5000 rpm/s above 2500 rpm,
+  peaking at ~48 000 rpm/s at **1455–1596 rpm** (3/3, ±5 %), back to ~4000 rpm/s below 500 rpm. The
+  *rise* alone already rules out passive drag — aerodynamic (∝ω²), viscous (∝ω) and Coulomb (constant)
+  are all flat or falling and none can grow 10× while the speed collapses. The *roll-off* on the far
+  side additionally rules out a constant brake: a peak with fall-off on both sides is the signature of
+  a **slip-dependent** torque (short-circuit / asynchronous braking, which peaks near ω_e = R/L).
+  Unresolved: with the propeller fitted the peak moves to **865–973 rpm** (3/3), which a purely
+  electrical slip law should not do — so either the peak location is not purely electrical, or the
+  prop-on figure is biased by that run only reaching 2200 rpm. Do not assume load-independence.
 - **Identical via all three routes**: `disarm`, letting the 500 ms deadman expire, and holding a zero
   target while armed. There is no "coast" path among them.
 - **`brake_on_stop = 0` does not disable it.** The braking is not that setting.

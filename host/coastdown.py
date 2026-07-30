@@ -23,9 +23,17 @@ ACTIVE BRAKING whenever the commanded throttle is zero, and it dominates the dec
 
   * bare-shaft, no prop: 3100 rpm -> dead stop in 0.19-0.54 s. Aerodynamic drag on a propeller-less
     shaft cannot do that, so the braking torque is not aerodynamic.
-  * the deceleration RISES ~10x as the rotor SLOWS (-5000 -> -72000 rpm/s). No passive law permits
-    that: aero drag goes as w^2, viscous as w, Coulomb is constant — all flat or falling. Only an
-    actively-driven torque can grow while the speed collapses.
+  * the deceleration PEAKS PART-WAY DOWN and then falls away again — it is ~3500-5000 rpm/s above
+    2500 rpm, peaks at ~48000 rpm/s at 1455-1596 rpm (3/3, +-5 %), and is back to ~4000 rpm/s below
+    500 rpm. No passive law permits even the rise: aero drag goes as w^2, viscous as w, Coulomb is
+    constant — all flat or falling, none can grow 10x while the speed collapses. And the ROLL-OFF on
+    the far side rules out a constant brake too: a peak with fall-off on both sides is the signature
+    of a SLIP-dependent torque (short-circuit / asynchronous braking, which peaks near w_e = R/L),
+    not an ever-growing one. That shape is what makes the mechanism identifiable at all.
+    CAUTION, unresolved: the peak sits at a DIFFERENT rotor speed with the propeller fitted
+    (865-973 rpm, 3/3) than bare-shaft (1455-1596). A purely electrical slip law should peak at the
+    same speed regardless of load, so either the peak location is not purely electrical, or the
+    prop-on peak is biased by that run only reaching 2200 rpm. Do not assume load-independence.
   * identical with `disarm`, with the 500 ms deadman simply expiring, and while ARMED holding zero
     throttle (fastest of the three, 0.19 s). So it is tied to ZERO COMMANDED THROTTLE, not to the
     disarm path. `brake_on_stop=0` does NOT disable it.
