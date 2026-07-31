@@ -104,3 +104,43 @@ def test_velctl_default_profile_reproducible():
     p = SpeedProfile.load(os.path.join(HOST, "profiles", "vel_930kv_12n14p_sim.yaml"))
     assert p.thrust_for(0) == 0
     assert p.thrust_for(p.max_rpm) == p.points[-1][0]
+
+
+def test_the_measured_dry_run_plant_is_selectable_and_is_not_the_toy_one(tmp_path):
+    """`--plant measured` puts the BENCH-IDENTIFIED plant into the dry run instead of the toy one.
+
+    Why it exists: the toy `SimEncEscHost` is rpm ~linear in throttle plus noise, and it is pinned
+    byte-for-byte through its RNG draw order by test_regression_baseline.py — so it cannot be taught
+    the three behaviours that actually bite a closed loop here (the ESC BRAKES at zero throttle
+    rather than coasting, `tele` never reads below 182 mech rpm however slowly the rotor turns, and
+    the sine->6-step seam is a discontinuity). `MeasuredEscHost` already spoke the same link
+    protocol; nothing was wired to it but sim_obs. A dry run that never sees those is not rehearsing
+    this bench.
+
+    Pinned here: the option selects it, the whole velctl loop runs on top of it unmodified, and the
+    default stays `toy` so every existing invocation is untouched.
+    """
+    prof = os.path.join(HOST, "profiles", "f2838_350kv_bench_20260726.yaml")
+    out = tmp_path / "m.csv"
+    r = _run("velctl.py", "speed", "--dry-run", "--plant", "measured", "--rpm", "400",
+             "--secs", "1", "--profile", prof, "--csv", str(out))
+    assert "MeasuredEscHost" in r.stdout and "BARE_SHAFT_350KV" in r.stdout
+    assert "182 mech rpm" in r.stdout          # the telemetry floor is announced, not silently on
+    assert "DISARMED" in r.stdout
+    rows = list(csv.DictReader(open(out)))
+    assert rows and float(rows[-1]["rpm_setpoint"]) == 400.0
+
+    # ...and the default is still the toy one, so nothing that exists today moved.
+    r2 = _run("velctl.py", "speed", "--dry-run", "--rpm", "400", "--secs", "1",
+              "--profile", prof, "--csv", str(tmp_path / "t.csv"))
+    assert "SimEncEscHost" in r2.stdout and "MeasuredEscHost" not in r2.stdout
+
+
+def test_the_measured_dry_run_plant_rejects_a_mechanical_config_it_has_no_inventory_for(tmp_path):
+    """Mixing mechanical configurations is the failure mode plant.py exists to prevent, so an
+    unknown one must be a loud KeyError from preset(), not a silent fallback to some default rotor."""
+    prof = os.path.join(HOST, "profiles", "f2838_350kv_bench_20260726.yaml")
+    r = _run("velctl.py", "speed", "--dry-run", "--plant", "measured", "--mech-config", "no_such_rotor",
+             "--rpm", "400", "--secs", "1", "--profile", prof, "--csv", str(tmp_path / "x.csv"),
+             expect=1)
+    assert "no_such_rotor" in (r.stderr + r.stdout)

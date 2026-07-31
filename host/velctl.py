@@ -58,8 +58,33 @@ SIM_PROFILE = os.path.join(HERE, "profiles", "vel_930kv_12n14p_sim.yaml")
 
 
 def open_host(opts):
-    """Return (host, clock).  --dry-run NEVER opens a serial port."""
+    """Return (host, clock).  --dry-run NEVER opens a serial port.
+
+    TWO dry-run plants, because they answer different questions and the toy one cannot be improved.
+
+      `--plant toy` (default)  SimEncEscHost: rpm ~linear in throttle plus noise. It is the CLI
+          smoke test, and it is PINNED byte-for-byte through its RNG draw order by
+          test_regression_baseline.py, so it must not grow a crossover or a brake.
+      `--plant measured`       MeasuredEscHost over MeasuredPlant: the provenanced bench model.
+          It exhibits the things that actually bite a closed loop and that the toy one is silent
+          about — the ESC BRAKES at zero throttle instead of coasting, `tele` never reads below
+          182 mech rpm however slowly the rotor turns (so a loop can wind up against a stalled
+          motor), and the sine->6-step seam is a real discontinuity rather than a smooth curve.
+          A dry run that never sees those is not rehearsing this bench.
+
+    `measured` needs the per-installation inventory (`pico_esc/measured.py`), which is deliberately
+    not shipped — see plant._require_inventory. Absent, it says so and names the tools that build one
+    rather than falling back to the toy silently, which would be the wrong kind of "it worked".
+    """
     if opts.dry_run:
+        if getattr(opts, "plant", "toy") == "measured":
+            from pico_esc.plant import MeasuredEscHost, MeasuredPlant, preset
+            clock = SimClock()
+            plant = MeasuredPlant(preset(opts.mech_config), cut_mode="disarm")
+            print(f"# DRY-RUN: MeasuredEscHost [{plant.p.name}] (no serial port opened)\n"
+                  f"#   zero-throttle BRAKE, tele floored at {plant.p.tele_floor_mech:.0f} mech rpm, "
+                  f"and the real seam are all IN — unlike --plant toy")
+            return MeasuredEscHost(plant, clock), clock
         inv = getattr(opts, "sim_invert", False)
         print(f"# DRY-RUN: SimEncEscHost (no serial port opened)"
               f"{' [--sim-invert: +thrust -> -encoder]' if inv else ''}")
@@ -135,6 +160,18 @@ def build_parser():
     sp.add_argument("--sim-invert", action="store_true",
                     help="(dry-run) model inverted wiring: +thrust drives the encoder negative")
     sp.add_argument("--seed", type=int, default=1234, help="RNG seed for --dry-run (deterministic)")
+    # WHICH dry-run plant. `toy` stays the default so every existing invocation and every pinned
+    # dry-run output is byte-identical; `measured` is the opt-in that puts the brake, the telemetry
+    # floor and the real seam into the rehearsal. See open_host().
+    sp.add_argument("--plant", choices=("toy", "measured"), default="toy",
+                    help="(dry-run) which simulated plant: toy = the linear smoke-test model "
+                         "(default, pinned); measured = the bench-identified one, which brakes at "
+                         "zero throttle, floors tele at 182 mech rpm and has the real crossover seam")
+    sp.add_argument("--mech-config", default="bare_shaft_350kv_20260730",
+                    help="(--plant measured) which MECHANICAL configuration to simulate; the "
+                         "inventory carries one preset per rotor, and mixing them is the failure "
+                         "mode plant.py exists to prevent "
+                         "(bare_shaft_350kv_20260730 | prop_350kv_20260726)")
     return ap
 
 
