@@ -109,7 +109,12 @@ class PlantParams:
     # it is what converts the loaded `duty6` back into an electrical duty, so it must stay put when
     # `drag` is swapped. Changing it would silently move the static curve.
     drag_ref: Callable[[float], float]
-    brake_cutout_rpm: float
+    # THE BRAKE CUT-OUT IS A BACK-EMF, NOT A SPEED, so it is stored as the voltage and the rpm is
+    # derived per motor. Settled 2026-07-31 out-of-sample on a 930KV (see
+    # measured.BRAKE_CUTOUT_BEMF_V): stored as an rpm it transferred WRONG — a plant handed
+    # kv=930 kept braking to 670 rpm where the bench says ~1780, over-braking by 2.4x across a
+    # 1100 rpm band. `brake_cutout_rpm` below keeps every existing reader working.
+    brake_cutout_bemf_v: float
     sine_pullout_nm: float
     duty_slew_up_per_s: float
     duty_crossover_clamp: float
@@ -132,6 +137,11 @@ class PlantParams:
     @property
     def kv_rad(self) -> float:
         return self.kv * RAD
+
+    @property
+    def brake_cutout_rpm(self) -> float:
+        """Speed the zero-throttle brake cuts out at, FOR THIS MOTOR = BEMF * kv."""
+        return self.brake_cutout_bemf_v * self.kv
 
     @property
     def no_load_top(self) -> float:
@@ -176,7 +186,7 @@ def preset(mech_config: str) -> PlantParams:
             # read explicitly so the provenance recorder SEES it: `_measured_drag` closes over
             # DRAG_TABLE_PROP, and a read the recorder cannot see is a hole in the guard.
             drag=(v("DRAG_TABLE_PROP") and _measured_drag), drag_ref=_measured_drag,
-            brake_cutout_rpm=v("BRAKE_CUTOUT_RPM"), sine_pullout_nm=v("SINE_PULLOUT_NM"),
+            brake_cutout_bemf_v=v("BRAKE_CUTOUT_BEMF_V"), sine_pullout_nm=v("SINE_PULLOUT_NM"),
             duty_slew_up_per_s=v("DUTY_SLEW_UP_PER_S"),
             duty_crossover_clamp=v("DUTY_CROSSOVER_CLAMP"),
             tele_floor_mech=v("TELE_FLOOR_MECH"), tele_live_s=v("TELE_LIVE_S"),
@@ -214,8 +224,8 @@ def with_brake(params: PlantParams, l_phase=None, j=None, brake_cutout_rpm=None)
     brake data; the provenance records say so."""
     return replace(params, l_phase=params.l_phase if l_phase is None else float(l_phase),
                    j=params.j if j is None else float(j),
-                   brake_cutout_rpm=(params.brake_cutout_rpm if brake_cutout_rpm is None
-                                     else float(brake_cutout_rpm)))
+                   brake_cutout_bemf_v=(params.brake_cutout_bemf_v if brake_cutout_rpm is None
+                                        else float(brake_cutout_rpm) / params.kv))
 
 
 def with_crossover_clamp(params: PlantParams, clamp: float) -> PlantParams:
