@@ -37,11 +37,35 @@ DUTY6_A = 0.00265
 DUTY6_B = -1.233
 # The ESC's `cross_rescale_duty` maps the 6-step demand relative to `Cross_Up`, so changing Cross_Up
 # SHIFTS this affine's intercept and leaves its slope alone. DUTY6_A/B above were fitted at Cross_Up=34.
-# Measured 2026-07-29 (host/duty_sweep.py, two no-load sweeps at 34 and 36, PSU-current corrected):
-# slopes agreed to 0.19%, intercepts differed by 0.0843 over 2 units. Mirrors vel::DUTY6_CROSSUP_* in
+#
+# RE-FITTED 2026-07-31 over a 14-UNIT baseline: 0.0421 -> 0.04134 (-1.8 %). The old value came from
+# `host/duty_sweep.py` at cross_up 34 and 36 — TWO units, so a 2 % error in either intercept became a
+# 2 % error in K, and it did: the frozen K put the handoff +3.90 counts out at cross_up 50 while
+# landing inside the bracket at 34 and 36, i.e. a TREND, which is the signature of a wrong slope
+# rather than a wrong offset.
+#
+# What is actually measured here is the RATIO K/DUTY6_A = command counts per cross_up unit, and three
+# independent routes agree on it (`host/reports/`):
+#     15.60  duty_sweep_20260731_{124644,124916}.csv — no-load pairs at cross_up 36 and 50, joint fit
+#            with a SHARED slope (fitting two free slopes is what produced the earlier wrong answer)
+#     15.63  the measured 6-step branches of sinesweep_20260731_{014004,012848}.csv, 34 <-> 50
+#     15.59  the measured handoff commands themselves, (734.5 - 485.0) / 16
+# against the old model's K/A = 15.89. Residuals go from -0.79 / +0.49 / +3.90 counts at cross_up
+# 34/36/50 to -0.79 / -0.09 / -0.69, i.e. a trend becomes a constant ~half-count.
+#
+# WHY THE RATIO AND NOT K DIRECTLY. The 2026-07-31 sweeps carry no PSU current readings, so their
+# ABSOLUTE duty is biased low (duty_sweep says so in its own header) and their apparent DUTY6_A is 4 %
+# under. That bias is a function of rpm, and the two sweeps were run over the SAME rpm range
+# (1480..2813 vs 1523..2847) precisely so it cancels out of the intercept DIFFERENCE. So K/A is sound
+# and the absolute scale is not — hence `K = DUTY6_A * 15.5998`, with DUTY6_A and DUTY6_B left frozen.
+# Re-measuring the absolute duty map needs the PSU current column (`duty_sweep.py --currents`).
+#
+# Two derived bounds move with this: the emittable band max stays 47 at cmd_hi=700, and the
+# handoff band max goes 66 -> 67. Both are computed, never written down — see
+# _max_emittable_cross_up() / _max_handoff_cross_up(). Mirrors vel::DUTY6_CROSSUP_* in
 # lib/vel_control/motor_model.h — keep the two in step.
 DUTY6_CROSSUP_REF = 34.0
-DUTY6_CROSSUP_K = 0.0421
+DUTY6_CROSSUP_K = 0.04134
 
 # --- the sine->6-step UP-HANDOFF TRIGGER: a minimum-modulation DUTY floor ------------------
 # The ESC hands off when its 6-STEP DUTY DEMAND clears a floor, NOT when the forced field reaches a
@@ -83,20 +107,25 @@ DUTY6_CROSSUP_K = 0.0421
 # was in the direction that made the cross_up 36 prediction MISS its measured bracket.)
 #
 # THE LAW AND ITS RESIDUALS. handoff_cmd = cmd_for_duty6(DUTY6_HANDOFF_FLOOR, cross_up) gives
-# 484.21 / 515.99 / 738.40 at cross_up 34 / 36 / 50, against the measured up-leg brackets
+# 484.21 / 515.41 / 733.81 at cross_up 34 / 36 / 50, against the measured up-leg brackets
 # (484, 486] / (515, 516] / (734, 735] = 485.0 +- 1.0 / 515.5 +- 0.5 / 734.5 +- 0.5, i.e. residuals
-# -0.79 / +0.49 / +3.90 counts. INSIDE the bracket at both 34 and 36. The +3.90 at 50 is NOT the law:
-# the measured 6-step branches at cross_up 34 and 50 are offset by 250.1 counts over 16 units = 15.63
-# counts/unit, while the code's DUTY6_CROSSUP_K/DUTY6_A = 0.0421/0.00265 = 15.887 — K runs 1.6 % high
-# (0.04142 measured), and (15.887 - 15.63) * 16 = +4.1 counts. Re-fitting K is deliberately OUT OF
-# SCOPE here; flagged. Re-reduce this floor together with K whenever that happens.
+# -0.79 / -0.09 / -0.69 counts, mean -0.52 with a 0.70 spread over a 250-command span.
+#
+# That flatness is the point, and it is NEW. Against the pre-2026-07-31 DUTY6_CROSSUP_K = 0.0421 the
+# residuals were -0.79 / +0.49 / +3.90 — a TREND of +0.29 counts per cross_up unit, which is the
+# signature of a wrong SLOPE, not of a wrong floor. Re-fitting K (see its own comment above) removed
+# it: the trend is now +0.006 counts/unit, i.e. 0.10 counts across the whole 16-unit span. What is
+# left is a constant ~half-count offset, below the 1-count resolution of the sweeps that produced the
+# brackets and well inside the +-0.5..1.0 the brackets themselves carry. Nothing in this floor
+# absorbed the K error and nothing about it changed when K moved — DUTY6_HANDOFF_FLOOR is a duty read
+# off the cross_up 34 reference leg, where the K term is identically zero.
 #
 # THE ALTERNATIVE THIS REFUTES. A fixed-SPEED floor ("hand off once the 6-step branch reaches 522.5
 # rpm" — the other reading of the same lock) is KV-dependent, and for the 350KV at 11.1 V / cross_up 36
-# it predicts cmd 547.8. That motor's own independently measured bracket is (515, 520]
+# it predicts cmd 547.2. That motor's own independently measured bracket is (515, 520]
 # (host/tests/data/sinesweep_fold_noprop_20260730_033417.csv: cmd 515 enc 192 with 122 rpm of spread,
 # still riding the field; cmd 520 enc 205.7 with 25 rpm of spread, off it). The duty law predicts
-# 516.0, inside the bracket; the speed law misses it by 28 counts.
+# 515.4, inside the bracket; the speed law misses it by 27 counts.
 #
 # THIS RUN ALSO RE-CONFIRMS DUTY6_A/B ON A SECOND MOTOR — and neither they nor DUTY6_CROSSUP_K are
 # re-fitted here: 930KV, cross_up 34, cmd 520 -> measured duty 1519.09/(930*11.2) = 0.14584 vs model
@@ -141,11 +170,12 @@ def _min_handoff_cross_up() -> int:
 
 
 def _max_handoff_cross_up() -> int:
-    """Highest `sine_cross_up` byte whose handoff command is still inside +-CMD_FULL_SCALE (= 66).
+    """Highest `sine_cross_up` byte whose handoff command is still inside +-CMD_FULL_SCALE (= 67).
 
-    DERIVED rather than written as 66, because it is a function of DUTY6_CROSSUP_K, whose re-fit is a
-    live follow-up: solving cmd_for_duty6(FLOOR, cu) == CMD_FULL_SCALE for cu gives
-    REF + (CMD_FULL_SCALE*A - FLOOR + B) / K, and the byte must not exceed it. (66.47 today.)"""
+    DERIVED rather than written as 67, because it is a function of DUTY6_CROSSUP_K: solving
+    cmd_for_duty6(FLOOR, cu) == CMD_FULL_SCALE for cu gives REF + (CMD_FULL_SCALE*A - FLOOR + B) / K,
+    and the byte must not exceed it (67.06 today). It moved 66 -> 67 when K was re-fitted on
+    2026-07-31, which is exactly why it is computed and never written down."""
     return int(DUTY6_CROSSUP_REF
                + (CMD_FULL_SCALE * DUTY6_A - DUTY6_HANDOFF_FLOOR + DUTY6_B) / DUTY6_CROSSUP_K)
 
@@ -153,12 +183,13 @@ def _max_handoff_cross_up() -> int:
 def _max_emittable_cross_up(cmd_hi: float) -> int:
     """Highest byte that still fits a 6-step SECTION inside `cmd_hi` (= 47 at the default 700).
 
-    A DIFFERENT bound from `_max_handoff_cross_up()` (= 66) and the distinction has bitten twice: 66
+    A DIFFERENT bound from `_max_handoff_cross_up()` (= 67) and the distinction has bitten twice: 67
     is where the handoff command stops being a command at all, while this is where the handoff
     outruns the top of the curve being sampled. Bytes between the two hand off perfectly well and
-    still cannot be given a parametric FF curve, so quoting 34..66 as the remedy for a curve failure
+    still cannot be given a parametric FF curve, so quoting 34..67 as the remedy for a curve failure
     sends the operator straight back into the other raise. Same solve as the sibling, with `cmd_hi`
-    in place of CMD_FULL_SCALE."""
+    in place of CMD_FULL_SCALE. (The 2026-07-31 K re-fit moved the sibling 66 -> 67 and left this one
+    at 47, which is the clearest demonstration that they are not the same number.)"""
     return int(DUTY6_CROSSUP_REF
                + (cmd_hi * DUTY6_A - DUTY6_HANDOFF_FLOOR + DUTY6_B) / DUTY6_CROSSUP_K)
 # sine: mech RPM = (cmd/1000) * SINE_FULLSCALE_MECH, SINE_FULLSCALE_MECH = SINE_FULLSCALE_ERPM / PP.
@@ -229,9 +260,9 @@ class MotorModel:
            FLOORS a low threshold up to the firmware minimum, which is precisely the mistake this
            predicate exists to stop — the firmware does not clamp, it refuses.
         2. THE COMMAND IS UNREACHABLE. The trigger is a duty and cross_up shifts it by
-           DUTY6_CROSSUP_K/DUTY6_A = 15.9 counts per unit, so a high enough byte puts the handoff
-           command past the +-CMD_FULL_SCALE the protocol carries: 992.6 at cross_up 66, 1008.5 at 67,
-           1533 at 100. Folding this in here is what keeps `handoff_cmd()` and
+           DUTY6_CROSSUP_K/DUTY6_A = 15.6 counts per unit, so a high enough byte puts the handoff
+           command past the +-CMD_FULL_SCALE the protocol carries: 999.0 at cross_up 67, 1014.6 at 68,
+           1513.8 at 100. Folding this in here is what keeps `handoff_cmd()` and
            `vel::handoffCmdFor()` agreeing on the same bytes, and what stops the C++ HANDOFF_CMD_NONE
            sentinel (1001, the value a refusal reports) from colliding with a genuine handoff command.
            This half is arithmetic on the protocol's range, NOT a measurement.
@@ -280,7 +311,7 @@ class MotorModel:
         DUTY6_HANDOFF_FLOOR for the measurement.
 
         KV- and PP-INDEPENDENT (it is a duty, and duty6/cmd_for_duty6 carry no motor terms): 484.21 /
-        515.99 / 738.40 at cross_up 34 / 36 / 50 on every motor. It is `sixstep_floor_rpm` that scales
+        515.41 / 733.81 at cross_up 34 / 36 / 50 on every motor. It is `sixstep_floor_rpm` that scales
         with KV. Returns None rather than NaN on refusal: `nan <= x` is False, so a NaN would route
         `regime`/`thrust_for` silently into the 6-step branch, where None raises TypeError at the first
         arithmetic — the direction a refused handoff has to fail in."""
@@ -290,7 +321,7 @@ class MotorModel:
 
     def handoff_mech(self) -> float | None:
         """Mech RPM the ROTOR is at when the handoff fires — still on the forced field, so it is the
-        sine curve evaluated at handoff_cmd (172.9 / 184.2 / 263.6 mech at PP=7 and cross_up 34/36/50).
+        sine curve evaluated at handoff_cmd (172.9 / 184.0 / 262.0 mech at PP=7 and cross_up 34/36/50).
         PP-governed and KV-independent. None when the firmware refuses to hand off."""
         cmd = self.handoff_cmd()
         return None if cmd is None else self.rpm_sine(cmd)
@@ -352,8 +383,8 @@ class MotorModel:
         """True if `rpm` falls in the no-steady-state crossover gap (FB should be gain-scheduled off here).
 
         The gap is [handoff_mech, sixstep_floor_rpm] and under the duty law it is no longer wide on
-        every motor. It can be NARROW (350KV at 11.1 V, cross_up 36: 184.2 -> 194.9 rpm, 11 rpm) or
-        EMPTY/INVERTED (350KV, cross_up 50: the trigger fires at 263.6 mech while the landing is still
+        every motor. It can be NARROW (350KV at 11.1 V, cross_up 36: 184.0 -> 194.9 rpm, 11 rpm) or
+        EMPTY/INVERTED (350KV, cross_up 50: the trigger fires at 262.0 mech while the landing is still
         194.9, so nothing is in the gap) — an inverted gap means the handoff fires where the 6-step
         branch is still BELOW the forced field, which is exactly the instability
         pico_esc.plant.MeasuredPlant.seam_cmd() is the necessary-condition test for. False everywhere

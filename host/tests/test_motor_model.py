@@ -61,7 +61,7 @@ def test_regime_boundaries():
 # fixtures themselves are per-installation assets (host/reports/ is gitignored), so the law is pinned
 # inline and this file needs no CSV.
 MEASURED_HANDOFF_CMD = {34: (485.0, 1.0), 36: (515.5, 0.5), 50: (734.5, 0.5)}
-PREDICTED_HANDOFF_CMD = {34: 484.21, 36: 515.99, 50: 738.40}
+PREDICTED_HANDOFF_CMD = {34: 484.21, 36: 515.41, 50: 733.81}
 
 
 @pytest.mark.parametrize("cross_up", (34, 36, 50))
@@ -77,46 +77,63 @@ def test_the_handoff_command_is_the_duty_floor(cross_up):
 
 
 def test_the_predictions_sit_inside_the_measured_brackets_and_the_residuals_are_named():
-    """Residuals -0.79 / +0.49 / +3.90 counts at cross_up 34 / 36 / 50.
+    """Residuals -0.79 / -0.09 / -0.69 counts at cross_up 34 / 36 / 50: a CONSTANT, not a trend.
 
     The measured up-leg brackets are (484, 486] / (515, 516] / (734, 735] — the last forced-sine
     command and the first handed-off one, from sinesweep_20260731_014004 / _013410 / _013236.csv.
 
-    THE +3.90 AT cross_up 50 IS NOT THE LAW, and it is pinned rather than absorbed. DUTY6_CROSSUP_K /
-    DUTY6_A = 0.0421/0.00265 = 15.887 command counts per cross_up unit, while the measured 6-step
-    branches at cross_up 34 and 50 are offset by 250.1 counts over 16 units = 15.63 counts/unit — the
-    same 250.1 the measured handoff commands themselves give (734.5 - 484.4). So K runs 1.6 % high,
-    (15.887 - 15.63) * 16 = +4.1 counts, and the duty-floor law is inside the measurement at all three
-    settings once that is taken out. Re-fitting K is deliberately out of scope: it would move the whole
-    6-step FF curve, the soft sensor and the DOB with it."""
+    THE SHAPE OF THE RESIDUAL IS THE EVIDENCE, and this test exists to hold it flat. Until the
+    2026-07-31 re-fit of DUTY6_CROSSUP_K these read -0.79 / +0.49 / +3.90 — a slope of +0.29 counts
+    per cross_up unit across a 16-unit span. A wrong FLOOR moves all three residuals together; only a
+    wrong cross_up SLOPE fans them out like that, so the trend was diagnostic of K and not of the
+    duty-floor law. K was then measured three independent ways (the duty_sweep pair at cross_up 36 and
+    50, the sine sweeps' 6-step branches, and the handoff commands themselves: 15.60 / 15.63 / 15.59
+    counts per unit against the model's 15.89) and re-fitted to 0.04134. The trend collapsed to +0.006
+    counts/unit — 0.10 counts over the whole span — leaving a constant ~-0.5 count offset that is
+    below the 1-count resolution of the sweeps the brackets came from.
+
+    Nothing was absorbed to achieve this: DUTY6_HANDOFF_FLOOR is read off the cross_up 34 leg, where
+    the K term is identically zero, so it did not move when K did — and the cross_up 34 residual is
+    the same -0.79 it always was. That is the control."""
     resid = {}
     for cross_up, (meas, tol) in MEASURED_HANDOFF_CMD.items():
         m = MotorModel(350, 7, 11.2, cross_up=cross_up)
         resid[cross_up] = m.handoff_cmd() - meas
     assert resid[34] == pytest.approx(-0.79, abs=0.05)
-    assert resid[36] == pytest.approx(+0.49, abs=0.05)
-    assert resid[50] == pytest.approx(+3.90, abs=0.05)
-    # Stated against the bracket EDGES too, and at 34 and 36 the prediction is plainly INSIDE the
-    # bracket the bench measured; only at 50, where the K term dominates, does it sit outside.
+    assert resid[36] == pytest.approx(-0.09, abs=0.05)
+    assert resid[50] == pytest.approx(-0.69, abs=0.05)
+    # THE TREND IS GONE. Slope across the 16-unit span, which is what a wrong K shows up as: it was
+    # (3.90 - -0.79)/16 = +0.293 counts/unit, and is now (-0.69 - -0.79)/16 = +0.006.
+    assert abs(resid[50] - resid[34]) / 16.0 == pytest.approx(0.006, abs=0.002)
+    assert max(resid.values()) - min(resid.values()) <= 0.75      # was 4.69
+    # ...and what is left is an OFFSET: all three on the same side of the measurement, with a mean
+    # pinned to a hundredth of a count. (Each residual is already pinned individually to +-0.05 above,
+    # and the spread to 0.75, so a per-element band here would only restate them.)
+    mean = sum(resid.values()) / 3.0
+    assert mean == pytest.approx(-0.52, abs=0.05)
+    assert all(r < 0.0 for r in resid.values())
+    # Stated against the bracket EDGES too. 34 and 36 are plainly INSIDE the bracket the bench
+    # measured; 50 now sits 0.19 counts BELOW its lower edge instead of 3.40 above its upper one —
+    # i.e. inside one command count of a bracket the sweep resolved to one command.
     # (The superseded 526.7 reduction of the floor put cross_up 36 at 516.14, i.e. 0.14 counts OUTSIDE
     # (515, 516]. Correcting the row filter moved it in — see DUTY6_HANDOFF_FLOOR.)
     assert 484.0 < MotorModel(350, 7, 11.2, cross_up=34).handoff_cmd() <= 486.0
     assert 515.0 < MotorModel(350, 7, 11.2, cross_up=36).handoff_cmd() <= 516.0
-    assert MotorModel(350, 7, 11.2, cross_up=50).handoff_cmd() - 735.0 == pytest.approx(3.40, abs=0.05)
+    assert 734.0 - MotorModel(350, 7, 11.2, cross_up=50).handoff_cmd() == pytest.approx(0.19, abs=0.05)
 
 
 def test_a_fixed_speed_floor_is_refuted_by_the_350kv():
     """The falsifiable alternative: "the ESC hands off once the 6-step branch reaches 522.5 rpm".
 
     That is the other reading of the same locked down-leg, and it is KV-DEPENDENT. On the 350KV at
-    11.1 V / cross_up 36 it predicts cmd 547.8, while that motor's own measured departure bracket is
+    11.1 V / cross_up 36 it predicts cmd 547.2, while that motor's own measured departure bracket is
     (515, 520] (host/tests/data/sinesweep_fold_noprop_20260730_033417.csv: cmd 515 rides the field with
-    122 rpm of spread, cmd 520 is off it at 205.7 rpm with 25). The duty law predicts 516.0 — inside.
+    122 rpm of spread, cmd 520 is off it at 205.7 rpm with 25). The duty law predicts 515.4 — inside.
     Both motors handing off at the same COMMAND is the whole discrimination."""
     m = MotorModel(350, 7, 11.1, cross_up=36)
     assert 515.0 < m.handoff_cmd() <= 520.0
     fixed_speed_cmd = m.cmd_for_6step(MotorModel(930, 7, 11.2, cross_up=36).sixstep_floor_rpm())
-    assert fixed_speed_cmd == pytest.approx(547.8, abs=0.2)
+    assert fixed_speed_cmd == pytest.approx(547.2, abs=0.2)
     assert fixed_speed_cmd > 520.0                      # outside the bracket: refuted
 
 
@@ -156,8 +173,8 @@ def test_the_landing_does_not_move_with_cross_up():
 
 def test_handoff_mech_is_the_rotor_on_the_forced_field():
     """At the handoff the rotor is still synchronous with the forced field, so handoff_mech is the SINE
-    curve at handoff_cmd — 172.9 / 184.2 / 263.6 mech at pp = 7. It is no longer cross_up_erpm()/pp."""
-    for cross_up, mech in ((34, 172.86), (36, 184.21), (50, 263.61)):
+    curve at handoff_cmd — 172.9 / 184.0 / 262.0 mech at pp = 7. It is no longer cross_up_erpm()/pp."""
+    for cross_up, mech in ((34, 172.86), (36, 184.00), (50, 261.97)):
         m = MotorModel(350, 7, 11.2, cross_up=cross_up)
         assert m.handoff_mech() == pytest.approx(m.rpm_sine(m.handoff_cmd()), abs=1e-9)
         assert m.handoff_mech() == pytest.approx(mech, abs=0.05)
@@ -227,34 +244,36 @@ def test_a_nonsense_cross_up_refuses_rather_than_raising(bad):
 def test_a_handoff_past_the_command_range_is_a_refusal_too():
     """The OTHER half of `handoff_possible`, and the one that keeps the C++ sentinel honest.
 
-    cross_up shifts the trigger by DUTY6_CROSSUP_K/DUTY6_A = 15.9 counts per unit, so the handoff
-    command walks off the end of the protocol: 992.6 at cross_up 66, 1008.5 at 67, 1533 at 100.
+    cross_up shifts the trigger by DUTY6_CROSSUP_K/DUTY6_A = 15.6 counts per unit, so the handoff
+    command walks off the end of the protocol: 999.0 at cross_up 67, 1014.6 at 68, 1513.8 at 100.
     Nothing can be SENT that hands off up there, so it is a refusal in exactly the same operational
     sense as a rejected tick window — and folding it into the predicate is also what stops the C++
     `HANDOFF_CMD_NONE` (1001.0f) from aliasing a REAL handoff command, which it would have done from
-    cross_up 67 up. Pinned at both bytes so a future move of the duty map is caught here."""
-    lo, hi = MotorModel(350, 7, 11.2, cross_up=66), MotorModel(350, 7, 11.2, cross_up=67)
-    assert lo.handoff_possible() and lo.handoff_cmd() == pytest.approx(992.59, abs=0.05)
+    cross_up 68 up. Pinned at both bytes so a future move of the duty map is caught here — and it has
+    already moved once: the 2026-07-31 K re-fit walked this boundary from 66/67 to 67/68, which is
+    what this pin is for."""
+    lo, hi = MotorModel(350, 7, 11.2, cross_up=67), MotorModel(350, 7, 11.2, cross_up=68)
+    assert lo.handoff_possible() and lo.handoff_cmd() == pytest.approx(999.01, abs=0.05)
     assert lo.handoff_cmd() <= CMD_FULL_SCALE
     assert not hi.handoff_possible() and hi.handoff_cmd() is None
-    assert cmd_for_duty6(DUTY6_HANDOFF_FLOOR, cross_up=67.0) == pytest.approx(1008.48, abs=0.05)
+    assert cmd_for_duty6(DUTY6_HANDOFF_FLOOR, cross_up=68.0) == pytest.approx(1014.61, abs=0.05)
     assert not MotorModel(350, 7, 11.2, cross_up=100).handoff_possible()
-    # the derived bounds in the diagnostics are the same two bytes, not literals (DUTY6_CROSSUP_K,
-    # which sets the upper one, has a live re-fit follow-up)
-    assert (_min_handoff_cross_up(), _max_handoff_cross_up()) == (34, 66)
+    # the derived bounds in the diagnostics are the same two bytes, not literals (they are functions
+    # of DUTY6_CROSSUP_K, and the upper one moved 66 -> 67 when it was re-fitted)
+    assert (_min_handoff_cross_up(), _max_handoff_cross_up()) == (34, 67)
     # the tick window alone would have accepted every one of these
-    assert up_erpm_handoffable(67 * 39.0625) and up_erpm_handoffable(100 * 39.0625)
+    assert up_erpm_handoffable(68 * 39.0625) and up_erpm_handoffable(100 * 39.0625)
     # ...and the diagnostics must name the RIGHT refusal — the two have opposite fixes (raise the
     # byte vs lower it), so a message that always blames the tick window is worse than none.
-    assert "unreachable" in hi.summary() and "1008" in hi.summary()
+    assert "unreachable" in hi.summary() and "1015" in hi.summary()
     assert "seed window" in MotorModel(350, 7, 11.2, cross_up=30).summary()
     with pytest.raises(ValueError) as e:
         hi.to_profile()
-    assert "1008" in str(e.value) and "seed window" not in str(e.value)
+    assert "1015" in str(e.value) and "seed window" not in str(e.value)
 
 
 def test_to_profile_refuses_a_handoff_above_cmd_hi_instead_of_stepping_backwards():
-    """cross_up 50 — the setting this bench run itself used — hands off at 738.4, above the default
+    """cross_up 50 — the setting this bench run itself used — hands off at 733.8, above the default
     cmd_hi=700. Unguarded, `to_profile()` emitted 8 points ending (736, 444.8), (739, 522.5): the
     6-step loop steps BACKWARDS, and the curve then inverts to the same command for 600, 1500 and
     3000 rpm alike. That is the silent FF mis-scale the refusal guard exists to prevent, so it raises
@@ -263,7 +282,7 @@ def test_to_profile_refuses_a_handoff_above_cmd_hi_instead_of_stepping_backwards
     assert m.handoff_possible() and m.handoff_cmd() > 700.0      # NOT the refusal case
     with pytest.raises(ValueError) as e:
         m.to_profile()
-    assert "738" in str(e.value) and "700" in str(e.value)
+    assert "733" in str(e.value) and "700" in str(e.value)
     prof = m.to_profile(cmd_hi=900)                               # sample past the handoff: fine
     thr = [p[0] for p in prof.points]
     rpm = [p[1] for p in prof.points]
@@ -341,21 +360,22 @@ def test_a_parametric_profile_declares_the_sine_branch_it_actually_contains():
 def test_the_emittable_band_is_narrower_than_the_handoff_band_and_both_are_derived():
     """Two DIFFERENT upper bounds, and conflating them shipped a wrong recovery message twice.
 
-    `_max_handoff_cross_up()` (66) is where the handoff command stops being a command at all
+    `_max_handoff_cross_up()` (67) is where the handoff command stops being a command at all
     (> CMD_FULL_SCALE). `_max_emittable_cross_up(cmd_hi)` (47 at the default 700) is where the
-    handoff outruns the top of the curve being sampled. Bytes in 48..66 hand off perfectly well and
-    still cannot be given a parametric FF curve, so quoting 34..66 as the remedy for a CURVE failure
-    sends the operator into the other raise. Both are derived from DUTY6_CROSSUP_K, whose refit is a
-    live follow-up, so neither may be written as a literal.
+    handoff outruns the top of the curve being sampled. Bytes in 48..67 hand off perfectly well and
+    still cannot be given a parametric FF curve, so quoting 34..67 as the remedy for a CURVE failure
+    sends the operator into the other raise. Both are derived from DUTY6_CROSSUP_K — and the
+    2026-07-31 re-fit moved ONE of them (66 -> 67) while leaving the other at 47, which is the
+    sharpest possible demonstration that they are not interchangeable.
     """
     assert _min_handoff_cross_up() == 34
-    assert _max_handoff_cross_up() == 66
+    assert _max_handoff_cross_up() == 67
     assert _max_emittable_cross_up(700) == 47
     assert _max_emittable_cross_up(700) < _max_handoff_cross_up()
     # the boundary is exactly where a curve stops fitting, checked against to_profile itself
     for cu in (46, 47):
         MotorModel(350, 7, 11.1, cross_up=cu).to_profile()          # must not raise
-    for cu in (48, 66):
+    for cu in (48, 67):
         assert MotorModel(350, 7, 11.1, cross_up=cu).handoff_possible() is True
         with pytest.raises(ValueError, match="cmd_hi"):
             MotorModel(350, 7, 11.1, cross_up=cu).to_profile()

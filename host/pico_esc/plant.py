@@ -596,7 +596,7 @@ class MeasuredPlant:
         The modelled gap now AGREES with the open-loop measurement instead of apologising to it. Under
         the old eRPM handoff law this band was 201..676 rpm on the bare shaft, and the measured
         open-loop sweep holds commands 520..545 stably at 205..453 rpm — inside it, which the old
-        docstring had to excuse. The duty law puts the bare-shaft gap at 184.2..194.9 rpm (11.1 V,
+        docstring had to excuse. The duty law puts the bare-shaft gap at 184.0..194.9 rpm (11.1 V,
         cross_up 36), so every one of those measured points is now OUTSIDE it and no excuse is needed.
         What survives unchanged is what the flag is FOR: it marks where the CLOSED loop must not close
         (no steady state to hold), not where no speed exists."""

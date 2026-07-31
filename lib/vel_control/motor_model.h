@@ -46,7 +46,17 @@ static const float DUTY6_B = -1.233f;
 //
 // Applying it drops the cmd 570..780 error at Cross_Up=36 from 11.9..44.4 % to <= 0.6 %.
 static const float DUTY6_CROSSUP_REF = 34.0f;      // the Cross_Up DUTY6_A/B were fitted at
-static const float DUTY6_CROSSUP_K   = 0.0421f;    // measured d(duty)/d(Cross_Up); theory
+// RE-FITTED 2026-07-31 over a 14-UNIT baseline: 0.0421f -> 0.04134f (-1.8 %). The old value came
+// from two no-load duty sweeps at cross_up 34 and 36 -- TWO units, so a 2 % error in either
+// intercept became a 2 % error in K, and it did. What is measured is the RATIO
+// K/DUTY6_A = command counts per cross_up unit, and three independent routes agree: 15.60
+// (duty_sweep pair at 36 and 50, joint fit with a SHARED slope), 15.63 (the measured 6-step
+// branches of the 2026-07-31 sine sweeps, 34 <-> 50), 15.59 (the measured handoff commands
+// themselves) -- against the old 15.89. Handoff residuals go from -0.79/+0.49/+3.90 counts at
+// cross_up 34/36/50 to -0.79/-0.09/-0.69: a TREND becomes a constant half-count.
+// The absolute duty scale from that run is NOT trustworthy (no PSU currents), which is why
+// DUTY6_A/B stay frozen and only the ratio moved. Full provenance in the Python mirror.
+static const float DUTY6_CROSSUP_K   = 0.04134f;   // measured d(duty)/d(Cross_Up); theory
                                                    // (32*2.5/2047) = 0.0391, measured runs 7.9 % higher
 static const float SINE_FULLSCALE_ERPM = 2499.0f;   // firmware S1 full-scale eRPM at cmd 1000
 static const float HANDOFF_ERPM = 1333.0f;          // lowest handoff the firmware allows (min slip)
@@ -73,12 +83,15 @@ static const int SINE_CROSS_TICKS_MAX = 30;
 // Read off the sweep-DOWN leg, where the rotor stays in 6-step but LOCKS at one speed and ignores the
 // command: 523.44 rpm at cross_up 34, 522.56 at 36, 522.17 at 50 — mean 522.53 over all five cited
 // fixtures (n=29, sd 0.81).
-//   handoffCmd() -> 484.21 / 515.99 / 738.40 at cross_up 34 / 36 / 50, against measured brackets
-//   485.0 +- 1.0 / 515.5 +- 0.5 / 734.5 +- 0.5: residuals -0.79 / +0.49 / +3.90 counts, INSIDE the
-//   bracket at 34 and 36. The +3.90 is DUTY6_CROSSUP_K running 1.6 % high (measured 15.63 counts per
-//   cross_up unit vs K/A = 15.887), NOT the law; K is deliberately NOT re-fitted here.
-// A fixed-SPEED floor is refuted: it would put the 350KV at 11.1 V / cross_up 36 at cmd 547.8, against
-// that motor's own measured bracket (515, 520] which the duty law's 516.0 lands inside.
+//   handoffCmd() -> 484.21 / 515.41 / 733.81 at cross_up 34 / 36 / 50, against measured brackets
+//   485.0 +- 1.0 / 515.5 +- 0.5 / 734.5 +- 0.5: residuals -0.79 / -0.09 / -0.69 counts — a CONSTANT
+//   ~half-count offset, below the 1-count resolution of the sweeps the brackets came from. Until
+//   DUTY6_CROSSUP_K was re-fitted on 2026-07-31 they read -0.79 / +0.49 / +3.90, a +0.29 counts-per-
+//   unit TREND; that was the signature of a wrong cross_up SLOPE, and re-fitting K flattened it to
+//   +0.006. This floor did not move with it — it is read off the cross_up 34 leg where the K term is
+//   identically zero, which is why the 34 residual is unchanged.
+// A fixed-SPEED floor is refuted: it would put the 350KV at 11.1 V / cross_up 36 at cmd 547.2, against
+// that motor's own measured bracket (515, 520] which the duty law's 515.4 lands inside.
 // HONEST LIMIT: one motor, one loom, one supply, down-leg lock only; "minimum modulation" is an
 // interpretation of a flat command-independent lock, not a modulator measurement.
 static const float DUTY6_HANDOFF_FLOOR = 522.53f / (930.0f * 11.2f);  // = 0.050166 effective duty
@@ -93,8 +106,9 @@ static const float CMD_FULL_SCALE = 1000.0f;
 // THE INVARIANT THE ALIAS DEPENDS ON, and it is enforced by handoffPossibleAt(), not by luck:
 // HANDOFF_CMD_NONE > CMD_FULL_SCALE >= every command handoffCmd() can return. Without the
 // CMD_FULL_SCALE half of the refusal that would be FALSE — the duty law crosses 1001 between cross_up
-// 66 (992.6) and 67 (1008.5), so a real handoff command would have aliased the sentinel and `>=
-// HANDOFF_CMD_NONE` would have been a silently wrong refusal test from cross_up 67 up.
+// 67 (999.0) and 68 (1014.6), so a real handoff command would have aliased the sentinel and `>=
+// HANDOFF_CMD_NONE` would have been a silently wrong refusal test from cross_up 68 up. (That crossing
+// sat at 66/67 before the 2026-07-31 K re-fit: it is a function of DUTY6_CROSSUP_K, never a constant.)
 static const float HANDOFF_CMD_NONE = 1001.0f;
 
 // The 6-step duty map's exact inverse, as a free function of (duty, cross_up). MotorModel::cmdForDuty6
@@ -117,9 +131,9 @@ inline float cmdForDuty6At(float duty, float crossUp) {
 //      never fail open. Truncation-equivalent by construction — `int(40000/up) <= MAX` iff
 //      `40000/up < MAX+1` iff `up > 40000/(MAX+1)`, and likewise on the MIN side. A NaN crossUp makes
 //      both comparisons false, i.e. refused.
-//   2. THE COMMAND IS UNREACHABLE. cross_up shifts the trigger by DUTY6_CROSSUP_K/DUTY6_A = 15.9
-//      counts per unit, so a high enough byte puts the handoff past +-CMD_FULL_SCALE: 992.6 at
-//      cross_up 66, 1008.5 at 67, 1533 at 100. Nothing can be sent that hands off there. This is also
+//   2. THE COMMAND IS UNREACHABLE. cross_up shifts the trigger by DUTY6_CROSSUP_K/DUTY6_A = 15.6
+//      counts per unit, so a high enough byte puts the handoff past +-CMD_FULL_SCALE: 999.0 at
+//      cross_up 67, 1014.6 at 68, 1513.8 at 100. Nothing can be sent that hands off there. This is also
 //      what keeps HANDOFF_CMD_NONE from colliding with a real command (see above). Arithmetic on the
 //      protocol's range, NOT a measurement.
 inline bool handoffPossibleAt(float crossUp) {
@@ -132,14 +146,15 @@ inline bool handoffPossibleAt(float crossUp) {
 
 // Highest byte that still fits a 6-step SECTION inside `cmdHi` (= 47 at fillProfile's 700).
 //
-// A DIFFERENT bound from handoffPossibleAt()'s upper edge (66), and conflating the two has already
-// shipped a wrong recovery message: 66 is where the handoff command stops being a command at all,
-// this is where the handoff outruns the top of the curve being SAMPLED. Bytes in 48..66 hand off
+// A DIFFERENT bound from handoffPossibleAt()'s upper edge (67), and conflating the two has already
+// shipped a wrong recovery message: 67 is where the handoff command stops being a command at all,
+// this is where the handoff outruns the top of the curve being SAMPLED. Bytes in 48..67 hand off
 // perfectly well and still cannot be given a parametric FF curve, so telling an operator whose
-// `motor` failed to "use 34..66" walks them straight back into the same failure.
+// `motor` failed to "use 34..67" walks them straight back into the same failure.
 //
-// DERIVED, not written as 47, because it moves with DUTY6_CROSSUP_K — whose re-fit is a live
-// follow-up (measured 0.041423 over a 16-unit baseline vs the frozen 0.0421). Solving
+// DERIVED, not written as 47, because it moves with DUTY6_CROSSUP_K. The 2026-07-31 re-fit of K
+// (0.0421 -> 0.04134) is the proof that mattered: it moved the SIBLING bound 66 -> 67 and left this
+// one at 47, so the two are demonstrably not the same number. Solving
 // cmdForDuty6At(FLOOR, cu) == cmdHi for cu. Mirrors host/pico_esc/motor_model.py's
 // _max_emittable_cross_up(); _min is handoffPossibleAt()'s own lower edge, 34.
 inline int maxEmittableCrossUp(float cmdHi) {
@@ -212,7 +227,7 @@ public:
 	// to be cmdForSine(crossUpErpm()/pp) — the CONFIGURED SEAM — which put the handoff at 533/563/781
 	// at cross_up 34/36/50 against measured 485/515.5/734.5, ~47 counts high on every motor, and made
 	// sixstepFloorRpm() 1813 rpm on a 930KV at cross_up 36, where the encoder says 522.5. KV- and PP-free
-	// (it is a duty): 484.21 / 515.99 / 738.40. Not to be confused with the seam itself, which is where
+	// (it is a duty): 484.21 / 515.41 / 733.81. Not to be confused with the seam itself, which is where
 	// the 6-step branch OVERTAKES the field — a necessary condition for a STABLE handoff, modelled in
 	// host/pico_esc/plant.py:MeasuredPlant.seam_cmd(). Mirrors
 	// host/pico_esc/motor_model.py:MotorModel.handoff_cmd().
@@ -221,7 +236,7 @@ public:
 	float handoffCmd()  const { return handoffPossible() ? cmdForDuty6(DUTY6_HANDOFF_FLOOR)
 	                                                     : HANDOFF_CMD_NONE; }
 	// Where the ROTOR is when the trigger fires: still on the forced field, so the sine curve at
-	// handoffCmd() (172.9 / 184.2 / 263.6 mech at pp = 7 and cross_up 34 / 36 / 50).
+	// handoffCmd() (172.9 / 184.0 / 262.0 mech at pp = 7 and cross_up 34 / 36 / 50).
 	float handoffMech() const { return handoffPossible() ? rpmSine(handoffCmd()) : INFINITY; }
 	// The 6-step "landing" = KV*V*eff*DUTY6_HANDOFF_FLOOR exactly (cmdForDuty6 inverts duty6), so it
 	// scales with KV*V and is INDEPENDENT of cross_up: 522.5 rpm on the 930KV at 11.2 V, 194.9 on the
@@ -255,8 +270,8 @@ public:
 		return s * cmd6stepFor(sixstepFloorRpm());       // gap: cannot hold -> snap to the landing
 	}
 	// The no-steady-state gap [handoffMech, sixstepFloorRpm]. Under the duty law it can be NARROW
-	// (350KV at 11.1 V, cross_up 36: 184.2 -> 194.9 rpm) or EMPTY/INVERTED (350KV at cross_up 50: the
-	// trigger fires at 263.6 mech while the landing is still 194.9), and false everywhere when the
+	// (350KV at 11.1 V, cross_up 36: 184.0 -> 194.9 rpm) or EMPTY/INVERTED (350KV at cross_up 50: the
+	// trigger fires at 262.0 mech while the landing is still 194.9), and false everywhere when the
 	// handoff is refused — `INFINITY < a` is false, so this fails closed with no extra branch.
 	bool inGap(float rpm) const {
 		float a = fabsf(rpm);

@@ -18,7 +18,7 @@
 // 1400. The 2026-07-31 encoder-truth run refuted that: the ESC hands off when its 6-STEP DUTY DEMAND
 // clears a minimum-modulation floor, so the handoff command is vel::DUTY6_HANDOFF_FLOOR inverted
 // through the 6-step duty map (motor_model.h), still a pure firmware property — KV-, supply- AND
-// pole-pair-independent, because a duty carries no motor terms. At cross_up 36 that is 516.0, not 563,
+// pole-pair-independent, because a duty carries no motor terms. At cross_up 36 that is 515.4, not 563,
 // and the 930KV telemetry goes honest exactly there: cmd 515 reads tele 203 against an encoder mean of
 // 198 while the rotor is still oscillating +-100 rpm on the forced field (the floor, not a
 // measurement); cmd 516 reads tele 536.8 against an encoder 522.3, 2.8 % — the first handed-off row.
@@ -44,14 +44,16 @@ namespace vel {
 // move them with evidence rather than by taste.
 // ---------------------------------------------------------------------------------------------------
 // Enter/stay margins above the derived handoff command. The bench runs cross_up = 36, where the duty
-// law puts the handoff at command 516.0, so enter = 541.8 and stay = 526.3 — against a measured honest
+// law puts the handoff at command 515.4, so enter = 541.2 and stay = 525.7 — against a measured honest
 // onset of ~516-520 (930KV: the first honest row is 516; the 350KV's own departure bracket is
 // (515, 520]). These were 591 / 574 while the floor was derived from the seam; the window has moved
 // ~49 counts OUTWARD, i.e. the soft sensor is publishable earlier, so the safety argument has to be
 // made rather than inherited: the model's worst LOW-side residual against the three measured brackets
 // is -0.79 counts, and the enter margin is 26 counts at cross_up 36 and 37 at 50 — 33x the residual.
+// (Both thresholds moved 0.6 counts DOWN when DUTY6_CROSSUP_K was re-fitted on 2026-07-31; they are
+// derived from cmdForDuty6At() and were never literals here, which is why nothing else had to move.)
 // A real margin without being greedy: the existing `loadtest` operating point (1200 rpm => cmd ~= 614
-// at cross_up = 36) must stay inside the window, and 613.6 / 516.0 = 1.19, so 5 % keeps it in with a
+// at cross_up = 36) must stay inside the window, and 613.6 / 515.4 = 1.19, so 5 % keeps it in with a
 // lot to spare. (The old 9 %-would-have-excluded-it argument was an artifact of the wrong floor; what
 // bounds the margin from above now is simply that it must not exclude the operating points in use.)
 // The gap between the two is the hysteresis: a command dithering around the floor must not chatter the

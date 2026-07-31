@@ -639,7 +639,7 @@ private:
 					// was driving the loop when the live FF is still the compile-time profile.
 					// The remedy is a BAND, not "lower the byte": the low-side failure (cross_up < 34, the
 					// firmware refuses to hand off at all) needs the byte RAISED, and only the high-side
-					// one needs it lowered. 34..47 is the band that can actually emit a curve — 48..66 can
+					// one needs it lowered. 34..47 is the band that can actually emit a curve — 48..67 can
 					// hand off but does it above the cmd 700 fillProfile samples to.
 					if(th_[i]->curveStale() && th_[i]->motorConfigured())
 						Serial.printf("# WARNING: no 6-step curve exists at cross_up %.0f, so the FF is still the "

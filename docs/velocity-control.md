@@ -71,7 +71,7 @@ The up-handoff does **not** fire at the configured `sine_cross_up` eRPM. Measure
 two motors 2.66× apart in KV, it fires when the ESC's **6-step duty demand** clears a
 minimum-modulation floor, which makes the handoff *command* a firmware property — the same on
 every motor — and the landing *speed* KV-scaled. `sine_cross_up` still moves it, but through the
-6-step duty map (`DUTY6_CROSSUP_K`), not through the seam: cmd 484 / 516 / 738 at `cross_up`
+6-step duty map (`DUTY6_CROSSUP_K`), not through the seam: cmd 484 / 515 / 734 at `cross_up`
 34 / 36 / 50. Set `sine_cross_up` too low and the firmware does not clamp, it **refuses** to hand
 off at all. See `host/pico_esc/motor_model.py:DUTY6_HANDOFF_FLOOR`.
 
