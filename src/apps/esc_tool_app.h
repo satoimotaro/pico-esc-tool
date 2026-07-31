@@ -607,9 +607,10 @@ private:
 						Serial.printf("err motor: no 6-step curve at cross_up %.0f (its handoff is refused, or "
 							"above the cmd 700 the curve is sampled to). FF curve UNCHANGED and still on the "
 							"old pole count; soft-sensor duty map + seam DID move to kv=%s pp=%s v=%s. Use "
-							"cross_up 34..47 (48+ hands off above the cmd 700 this curve is sampled to; below "
-							"34 the ESC never hands off), or push a measured curve (host/curvepush.py)\n",
-							th_[i]->motorCrossUp(), kv, pp, vv); continue; }
+							"cross_up %d..%d (above that it hands off past the cmd 700 this curve is sampled "
+							"to; below it the ESC never hands off), or push a measured curve "
+							"(host/curvepush.py)\n", th_[i]->motorCrossUp(), kv, pp, vv,
+							vel::minHandoffCrossUp(), vel::maxEmittableCrossUp(700.0f)); continue; }
 					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s|cross_up=%.0f\n", i, kv, pp, vv,
 						th_[i]->motorCrossUp()); Serial.println("ok"); } }
 			// crossup <i> <v>: the ESC's sine_cross_up, WITHOUT replacing the feed-forward curve.
@@ -643,8 +644,9 @@ private:
 					if(th_[i]->curveStale() && th_[i]->motorConfigured())
 						Serial.printf("# WARNING: no 6-step curve exists at cross_up %.0f, so the FF is still the "
 							"one generated at the PREVIOUS cross_up — it under-commands and the loop may never "
-							"reach 6-step. Push a measured curve (host/curvepush.py), or use cross_up 34..47\n",
-							th_[i]->motorCrossUp());
+							"reach 6-step. Push a measured curve (host/curvepush.py), or use cross_up %d..%d\n",
+							th_[i]->motorCrossUp(), vel::minHandoffCrossUp(),
+							vel::maxEmittableCrossUp(700.0f));
 					// The duty map moved by ~0.042/unit, and `sense vcal` is a MULTIPLICATIVE scale on the
 					// estimate that inverts it — so a stored vbattScale calibrated at the old cross_up is
 					// now wrong by the same shift. Say so; it is not recoverable by inspection.

@@ -130,6 +130,27 @@ inline bool handoffPossibleAt(float crossUp) {
 	return cmd > 0.0f && cmd <= CMD_FULL_SCALE;
 }
 
+// Highest byte that still fits a 6-step SECTION inside `cmdHi` (= 47 at fillProfile's 700).
+//
+// A DIFFERENT bound from handoffPossibleAt()'s upper edge (66), and conflating the two has already
+// shipped a wrong recovery message: 66 is where the handoff command stops being a command at all,
+// this is where the handoff outruns the top of the curve being SAMPLED. Bytes in 48..66 hand off
+// perfectly well and still cannot be given a parametric FF curve, so telling an operator whose
+// `motor` failed to "use 34..66" walks them straight back into the same failure.
+//
+// DERIVED, not written as 47, because it moves with DUTY6_CROSSUP_K — whose re-fit is a live
+// follow-up (measured 0.041423 over a 16-unit baseline vs the frozen 0.0421). Solving
+// cmdForDuty6At(FLOOR, cu) == cmdHi for cu. Mirrors host/pico_esc/motor_model.py's
+// _max_emittable_cross_up(); _min is handoffPossibleAt()'s own lower edge, 34.
+inline int maxEmittableCrossUp(float cmdHi) {
+	return (int)(DUTY6_CROSSUP_REF
+	             + (cmdHi * DUTY6_A - DUTY6_HANDOFF_FLOOR + DUTY6_B) / DUTY6_CROSSUP_K);
+}
+inline int minHandoffCrossUp() {
+	return (int)(4.0f * 10000.0f
+	             / ((float)(SINE_CROSS_TICKS_MAX + 1) * SINE_CROSS_UP_ERPM_PER_UNIT)) + 1;
+}
+
 class MotorModel {
 public:
 	MotorModel(float kv, int pole_pairs, float v_supply, float eff = 1.0f)

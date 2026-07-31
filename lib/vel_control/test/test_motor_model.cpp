@@ -256,6 +256,27 @@ int main() {
 		CHECK(rising, "...with a strictly increasing curve (no backwards 6-step ramp)");
 	}
 
+	// The EMITTABLE band vs the HANDOFF band. Two different upper bounds, and conflating them shipped
+	// a wrong recovery message twice: 66 is where the handoff command stops being a command at all,
+	// 47 is where the handoff outruns the cmdHi the curve is SAMPLED to. Bytes in 48..66 hand off
+	// perfectly well and still cannot be given a parametric FF curve. Both derive from
+	// DUTY6_CROSSUP_K, whose re-fit is a live follow-up, so neither may be a literal — and both must
+	// agree with host/pico_esc/motor_model.py's _min_handoff_cross_up/_max_emittable_cross_up.
+	{
+		CHECK(vel::minHandoffCrossUp() == 34, "min handoff byte derives to 34 (python parity)");
+		CHECK(vel::maxEmittableCrossUp(700.0f) == 47, "max emittable at cmdHi 700 is 47 (python parity)");
+		CHECK(vel::maxEmittableCrossUp(900.0f) == 60, "max emittable at cmdHi 900 is 60 (python parity)");
+		CHECK(vel::maxEmittableCrossUp(700.0f) < 66, "the emittable band is NARROWER than the handoff band");
+		CurvePoint buf2[24];
+		for (int cu = 34; cu <= 66; cu++) {
+			vel::MotorModel m(350.0f, 7, 11.1f); m.setCrossUp((float)cu);
+			bool emitted = m.fillProfile(buf2, 24) >= 2;
+			CHECK(emitted == (cu <= vel::maxEmittableCrossUp(700.0f)),
+			      "fillProfile succeeds exactly on the derived emittable band");
+			CHECK(m.handoffPossible(), "...while every byte in 34..66 can still hand off");
+		}
+	}
+
 	printf(fails ? "\n%d CHECK(s) FAILED\n" : "\nall motor_model checks passed\n", fails);
 	return fails ? 1 : 0;
 }

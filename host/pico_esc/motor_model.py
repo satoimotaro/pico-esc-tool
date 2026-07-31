@@ -148,6 +148,19 @@ def _max_handoff_cross_up() -> int:
     REF + (CMD_FULL_SCALE*A - FLOOR + B) / K, and the byte must not exceed it. (66.47 today.)"""
     return int(DUTY6_CROSSUP_REF
                + (CMD_FULL_SCALE * DUTY6_A - DUTY6_HANDOFF_FLOOR + DUTY6_B) / DUTY6_CROSSUP_K)
+
+
+def _max_emittable_cross_up(cmd_hi: float) -> int:
+    """Highest byte that still fits a 6-step SECTION inside `cmd_hi` (= 47 at the default 700).
+
+    A DIFFERENT bound from `_max_handoff_cross_up()` (= 66) and the distinction has bitten twice: 66
+    is where the handoff command stops being a command at all, while this is where the handoff
+    outruns the top of the curve being sampled. Bytes between the two hand off perfectly well and
+    still cannot be given a parametric FF curve, so quoting 34..66 as the remedy for a curve failure
+    sends the operator straight back into the other raise. Same solve as the sibling, with `cmd_hi`
+    in place of CMD_FULL_SCALE."""
+    return int(DUTY6_CROSSUP_REF
+               + (cmd_hi * DUTY6_A - DUTY6_HANDOFF_FLOOR + DUTY6_B) / DUTY6_CROSSUP_K)
 # sine: mech RPM = (cmd/1000) * SINE_FULLSCALE_MECH, SINE_FULLSCALE_MECH = SINE_FULLSCALE_ERPM / PP.
 SINE_FULLSCALE_ERPM = 2499.0      # firmware S1 full-scale eRPM at cmd 1000 (SINE_RCP_SHIFT=3 etc.)
 # The command magnitude the protocol tops out at. A "handoff command" above it is not a command at all
@@ -427,7 +440,12 @@ class MotorModel:
                 f"sine_cross_up={self.cross_up:g} ({up_erpm:.1f} eRPM) gives {why}: this ESC will "
                 f"never hand off to 6-step, so there is no 6-step curve to emit. Use a sine_cross_up "
                 f"in {_min_handoff_cross_up()}..{_max_handoff_cross_up()} "
-                f"(measured: cross_up 30 never handed off, 34 did)")
+                f"(measured: cross_up 30 never handed off, 34 did) — but only "
+                f"{_min_handoff_cross_up()}..{_max_emittable_cross_up(cmd_hi)} also fits a 6-step "
+                f"section inside cmd_hi={cmd_hi:g}; above that you land on the other raise below. "
+                f"If this ESC runs STOCK Bluejay or BLHeli-S it has no forced-sine crossover at all "
+                f"and `sine_cross_up` read back as an unwritten sentinel (0xFF=255, or 0) — there is "
+                f"no byte to fix, and this parametric low-speed branch does not describe that firmware")
         floor = self.handoff_cmd()
         if floor >= cmd_hi:
             raise ValueError(
@@ -448,7 +466,18 @@ class MotorModel:
         for c, r in sorted(pts):
             if (last_c is None or c > last_c) and (last_r is None or r > last_r + 0.1):
                 mono.append((c, r)); last_c, last_r = c, r
+        # CAPABILITIES, which this used to omit entirely — and omitting them is not neutral, because
+        # SpeedProfile._capability defaults every flag to False. So a parametric profile advertised
+        # `sine_lowspeed: false` while its own first five points ARE the forced-sine branch: a curve
+        # contradicting its own metadata, and that metadata is what gets written to YAML and shipped.
+        #   sine_lowspeed True — we only get here when handoff_possible(), and the five points below
+        #     `floor` are sampled from rpm_sine(). On stock Bluejay / BLHeli-S there is no such branch,
+        #     and that case cannot reach here: the refusal above fires on the sentinel cross_up.
+        #   down_catch stays absent (=> False). The DOWN handoff is NOT modelled and, where it has been
+        #     measured, it does not work: the 930KV never fell back at all (its 6-step floor sits 2.8x
+        #     above the cross_dn threshold). Claiming it from a parametric model would be an invention.
         return SpeedProfile(mono, motor=self.name, pole_pairs=self.pp,
+                            capabilities={"sine_lowspeed": True},
                             source=f"parametric KV={self.kv:g} V={self.v:g} eff={self.eff:.3f}")
 
     def summary(self) -> str:

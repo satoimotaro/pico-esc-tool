@@ -9,7 +9,8 @@ import pytest
 
 from pico_esc.config import up_erpm_handoffable
 from pico_esc.motor_model import (CMD_FULL_SCALE, DUTY6_HANDOFF_FLOOR, MotorModel, cmd_for_duty6,
-                                 _max_handoff_cross_up, _min_handoff_cross_up)
+                                 _max_emittable_cross_up, _max_handoff_cross_up,
+                                 _min_handoff_cross_up)
 
 
 def test_no_load_top_scales_with_kv_and_v():
@@ -311,3 +312,52 @@ def test_to_profile_monotone_and_loadable():
     assert thr == sorted(thr) and len(set(thr)) == len(thr)      # strictly increasing thrust
     assert rpm == sorted(rpm)                                     # monotone rpm
     assert isinstance(prof, SpeedProfile)
+
+
+def test_a_parametric_profile_declares_the_sine_branch_it_actually_contains():
+    """`to_profile()` used to omit `capabilities` entirely, and that is not neutral.
+
+    `SpeedProfile._capability` defaults every flag to False when the block is absent, so a
+    parametric profile advertised `sine_lowspeed: false` while its own first five points ARE the
+    forced-sine branch — a curve contradicting its own metadata, and the metadata is what gets
+    written to YAML and shipped to another machine. Measured profiles have always declared it
+    explicitly (host/profiles/vel_930kv_12n14p_6step.yaml says true, vel_930kv_sineoff.yaml false).
+
+    `down_catch` must stay False: the DOWN handoff is not modelled, and where it HAS been measured
+    it does not work — the 930KV never fell back at all, because its 6-step floor sits 2.8x above
+    the cross_dn threshold. Claiming it from a parametric model would be an invention.
+    """
+    m = MotorModel(350, 7, 11.1, cross_up=36)
+    p = m.to_profile()
+    assert p.sine_lowspeed is True
+    assert p.down_catch is False
+    # ...and the claim is true of the points: the ones below the handoff command are the sine branch
+    below = [(c, r) for c, r in p.points if c < m.handoff_cmd()]
+    assert below, "the profile should carry forced-sine points below the handoff command"
+    for c, r in below:
+        assert r == pytest.approx(m.rpm_sine(c), rel=0.02), f"cmd {c} is not on the sine branch"
+
+
+def test_the_emittable_band_is_narrower_than_the_handoff_band_and_both_are_derived():
+    """Two DIFFERENT upper bounds, and conflating them shipped a wrong recovery message twice.
+
+    `_max_handoff_cross_up()` (66) is where the handoff command stops being a command at all
+    (> CMD_FULL_SCALE). `_max_emittable_cross_up(cmd_hi)` (47 at the default 700) is where the
+    handoff outruns the top of the curve being sampled. Bytes in 48..66 hand off perfectly well and
+    still cannot be given a parametric FF curve, so quoting 34..66 as the remedy for a CURVE failure
+    sends the operator into the other raise. Both are derived from DUTY6_CROSSUP_K, whose refit is a
+    live follow-up, so neither may be written as a literal.
+    """
+    assert _min_handoff_cross_up() == 34
+    assert _max_handoff_cross_up() == 66
+    assert _max_emittable_cross_up(700) == 47
+    assert _max_emittable_cross_up(700) < _max_handoff_cross_up()
+    # the boundary is exactly where a curve stops fitting, checked against to_profile itself
+    for cu in (46, 47):
+        MotorModel(350, 7, 11.1, cross_up=cu).to_profile()          # must not raise
+    for cu in (48, 66):
+        assert MotorModel(350, 7, 11.1, cross_up=cu).handoff_possible() is True
+        with pytest.raises(ValueError, match="cmd_hi"):
+            MotorModel(350, 7, 11.1, cross_up=cu).to_profile()
+    # raising cmd_hi is the documented remedy, and it works
+    MotorModel(350, 7, 11.1, cross_up=50).to_profile(cmd_hi=900)

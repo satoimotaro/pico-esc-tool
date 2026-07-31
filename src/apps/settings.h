@@ -179,9 +179,10 @@ inline void apply(Thruster& t, const Record& r) {
 			// duty map silently back on the MotorModel defaults, under a measured curve that loads fine.
 			Serial.printf("# cfg: no parametric curve at cross_up %.0f (kv=%.0f pp=%u) — keeping the "
 			              "current curve; `motor` is NOT marked configured, so re-run `motor` with a "
-			              "cross_up in 34..47 before the next `cfg save` (a measured curve fixes the FF "
+			              "cross_up in %d..%d before the next `cfg save` (a measured curve fixes the FF "
 			              "but not the persisted motor identity)\n",
-			              (double)r.crossUp, (double)r.kv, (unsigned)r.polePairs);
+			              (double)r.crossUp, (double)r.kv, (unsigned)r.polePairs,
+			              vel::minHandoffCrossUp(), vel::maxEmittableCrossUp(700.0f));
 	}
 	// A stored MEASURED curve wins over the parametric one — that is the whole point of having uploaded
 	// it. setCurve() re-validates, so a plausible-but-corrupt table is rejected rather than installed.
