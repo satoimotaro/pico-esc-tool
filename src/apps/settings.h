@@ -164,9 +164,25 @@ inline void apply(Thruster& t, const Record& r) {
 	// — sync_crossup() with the compile-time profile in charge — so the blob would hold the right value
 	// while the running model reverted to the reference and re-introduced the bias on every boot.
 	if (r.crossUp >= 1.0f) t.setCrossUp(r.crossUp);
-	if (r.hasMotor && r.kv > 0.0f && r.polePairs >= 1 && r.volts > 0.0f)
+	// Report a failure for the same reason the stored-curve rejection below does: setMotor() correctly
+	// keeps the current curve, but silently falling back to the compile-time profile after a reset looks
+	// identical to "the save never happened". It is worse here, because motorSet_ is left FALSE while
+	// kv/pp/v stay applied — so the next capture() writes hasMotor=0 alongside a populated kv/volts/
+	// polePairs, i.e. the following `cfg save` demotes a configured motor to never-configured.
+	if (r.hasMotor && r.kv > 0.0f && r.polePairs >= 1 && r.volts > 0.0f) {
 		// crossUp 0 = never stored (or a migrated v2 blob that predates it) -> setMotor keeps its default.
-		t.setMotor(r.kv, (int)r.polePairs, r.volts, r.crossUp);
+		if (!t.setMotor(r.kv, (int)r.polePairs, r.volts, r.crossUp))
+			// Re-running `motor` is the ONLY remedy named here on purpose. Pushing a measured curve
+			// fixes the feed-forward but NOT the persisted motor identity: setCurve() never touches
+			// motorSet_ (only setMotor() does), so capture() would still write hasMotor=0 and the next
+			// boot's apply() would skip setMotor entirely — kv/pp/v never restored and the soft-sensor
+			// duty map silently back on the MotorModel defaults, under a measured curve that loads fine.
+			Serial.printf("# cfg: no parametric curve at cross_up %.0f (kv=%.0f pp=%u) — keeping the "
+			              "current curve; `motor` is NOT marked configured, so re-run `motor` with a "
+			              "cross_up in 34..47 before the next `cfg save` (a measured curve fixes the FF "
+			              "but not the persisted motor identity)\n",
+			              (double)r.crossUp, (double)r.kv, (unsigned)r.polePairs);
+	}
 	// A stored MEASURED curve wins over the parametric one — that is the whole point of having uploaded
 	// it. setCurve() re-validates, so a plausible-but-corrupt table is rejected rather than installed.
 	if (r.curveN >= 2 && r.curveN <= CFG_MAX_CURVE && r.polePairs >= 1 && r.crossUpErpm > 0.0f) {

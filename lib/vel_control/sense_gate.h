@@ -13,10 +13,15 @@
 // command from 60 to 450 while the rotor actually went 39 -> 170 rpm, and only became honest from
 // ~cmd 520 (cmd 530: tele 319 vs encoder 316; cmd 540: 436 vs 431). A gate that reads `tele` cannot
 // detect its own invalidity, so it published a number the caller could not tell apart from a good one.
-// In forced sine the firmware runs mech = (cmd/1000) * SINE_FULLSCALE_ERPM / pp, so the handoff
-// COMMAND is up_erpm / SINE_FULLSCALE_ERPM * 1000 — the pole pairs cancel exactly (see
-// MotorModel::cmdForSine(handoffMech())), and for the bench's up_erpm = 1400 that is 560, right where
-// telemetry was measured to become honest.
+// WHERE THE FLOOR COMES FROM (corrected 2026-07-31). It used to be the CONFIGURED SEAM inverted
+// through the forced-sine law, up_erpm / SINE_FULLSCALE_ERPM * 1000 — 560 at the bench's up_erpm =
+// 1400. The 2026-07-31 encoder-truth run refuted that: the ESC hands off when its 6-STEP DUTY DEMAND
+// clears a minimum-modulation floor, so the handoff command is vel::DUTY6_HANDOFF_FLOOR inverted
+// through the 6-step duty map (motor_model.h), still a pure firmware property — KV-, supply- AND
+// pole-pair-independent, because a duty carries no motor terms. At cross_up 36 that is 516.0, not 563,
+// and the 930KV telemetry goes honest exactly there: cmd 515 reads tele 203 against an encoder mean of
+// 198 while the rotor is still oscillating +-100 rpm on the forced field (the floor, not a
+// measurement); cmd 516 reads tele 536.8 against an encoder 522.3, 2.8 % — the first handed-off row.
 //
 // THREE FLAGS, NOT ONE. Folding the load conditions into `valid` would make `load` unavailable exactly
 // when a load appears — killing the sensor's primary product. So:
@@ -38,11 +43,17 @@ namespace vel {
 // with no hardware available); each carries the reason and the number behind it so a bench pass can
 // move them with evidence rather than by taste.
 // ---------------------------------------------------------------------------------------------------
-// Enter/stay margins above the derived handoff command. The bench runs cross_up = 36, i.e. a seam of
-// 36 * 39.0625 = 1406 eRPM and a handoff command of 563, so enter = 591 and stay = 574 — against the
-// measured honest onset of ~520. A real margin without being greedy: the existing `loadtest` operating
-// point (1200 rpm => cmd ~= 614 at cross_up = 36) must stay inside the window, and 614 / 563 = 1.091,
-// so 5 % keeps it in with 3.8 % to spare while 9 % would have excluded it outright.
+// Enter/stay margins above the derived handoff command. The bench runs cross_up = 36, where the duty
+// law puts the handoff at command 516.0, so enter = 541.8 and stay = 526.3 — against a measured honest
+// onset of ~516-520 (930KV: the first honest row is 516; the 350KV's own departure bracket is
+// (515, 520]). These were 591 / 574 while the floor was derived from the seam; the window has moved
+// ~49 counts OUTWARD, i.e. the soft sensor is publishable earlier, so the safety argument has to be
+// made rather than inherited: the model's worst LOW-side residual against the three measured brackets
+// is -0.79 counts, and the enter margin is 26 counts at cross_up 36 and 37 at 50 — 33x the residual.
+// A real margin without being greedy: the existing `loadtest` operating point (1200 rpm => cmd ~= 614
+// at cross_up = 36) must stay inside the window, and 613.6 / 516.0 = 1.19, so 5 % keeps it in with a
+// lot to spare. (The old 9 %-would-have-excluded-it argument was an artifact of the wrong floor; what
+// bounds the margin from above now is simply that it must not exclude the operating points in use.)
 // The gap between the two is the hysteresis: a command dithering around the floor must not chatter the
 // validity flag (every transition re-seeds the vest filter and restarts the dwell).
 static const float SENSE_CMD_ENTER_MARGIN = 1.05f;
@@ -90,7 +101,13 @@ static const float SENSE_OFFPOINT_DUTY    = 0.10f;
 // An UNCONFIGURED seam (up_erpm <= 0) must CLOSE the gate, not open it. Reporting a floor above the
 // +-1000 command range says exactly that on the wire ("no command can validate this"), where a 0 floor
 // would have read as "everything qualifies".
-static const float SENSE_CMD_UNREACHABLE  = 1001.0f;
+// DELIBERATELY the same constant as vel::HANDOFF_CMD_NONE rather than a second 1001.0f literal: "this
+// seam is not configured" and "this seam has no reachable handoff" are the same fact to a caller, and
+// one definition cannot drift from the other. The alias is only sound while
+// HANDOFF_CMD_NONE > CMD_FULL_SCALE >= every command handoffCmdFor() can return — an invariant
+// vel::handoffPossibleAt() enforces, and which did NOT hold before it did (the duty law crosses 1001
+// between cross_up 66 and 67). See the comment at HANDOFF_CMD_NONE in motor_model.h.
+static const float SENSE_CMD_UNREACHABLE  = HANDOFF_CMD_NONE;
 
 // Why the gate is closed. Ordered by the sequence the conditions are tested in, which is also their
 // diagnostic value: NOT_LIVE (no telemetry at all) < CMD_LOW (we never asked for 6-step) < DUTY_HIGH
@@ -110,11 +127,33 @@ inline const char* senseWhyName(SenseWhy w) {
 	return "?";
 }
 
-// The forced-sine command that lands exactly on a seam of `upErpm`: mech = (cmd/1000)*FS/pp and the
-// seam is upErpm/pp, so the pole pairs cancel and the command is a pure firmware property. 0 when the
-// seam is unknown (callers turn that into a closed gate, see SenseGate::cmdFloor()).
+// The command the ESC actually hands off at when its `sine_cross_up` is the byte that produces
+// `upErpm`. The seam byte is all this needs: the trigger is a DUTY floor, and the 6-step duty map's
+// only configuration-dependent term is cross_up — no KV, supply or pole-pair term survives, so this
+// stays a pure firmware property (see the header note). Built from the same two free functions
+// MotorModel::handoffCmd() is — vel::handoffPossibleAt and vel::cmdForDuty6At — so the gate's floor is
+// the model's handoff command by construction, with no dummy object and no invariant held by comment.
+//
+// Returns 0 — which every caller turns into a CLOSED gate (SENSE_CMD_UNREACHABLE, see cmdFloor()) —
+// in all three ways this could otherwise fail OPEN:
+//   * upErpm <= 0: the seam is unknown/unconfigured;
+//   * a seam with no reachable handoff — a seed-tick window the firmware refuses, or a cross_up whose
+//     handoff command is past +-CMD_FULL_SCALE (cross_up >= 67). A `curve commit` can pass a raw seam
+//     that MotorModel::crossUpErpm() would have floored. RESIDUAL HOLE, deliberately left: Thruster feeds
+//     this from its profile's ffcx_.up_erpm, which comes from MotorModel::crossUpErpm() and IS
+//     floored at HANDOFF_ERPM, so an operator running `crossup <i> 30` presents a legal 1333 eRPM here
+//     and the refusal is invisible to the gate no matter what this function does. Closing it means
+//     dropping the floor in crossUpErpm() (which also moves ffcx_, the profile regime tags and
+//     lineFloor()) or teaching Thruster the predicate — both outside this change. Python has no such
+//     hole: MotorModel::handoff_possible() reads the raw byte.
+//   * a non-positive computed command: a negative floor would admit EVERY command including zero,
+//     which is the one way this file could fail open.
 inline float handoffCmdFor(float upErpm) {
-	return upErpm > 0.0f ? upErpm / SINE_FULLSCALE_ERPM * 1000.0f : 0.0f;
+	if (!(upErpm > 0.0f)) return 0.0f;
+	float crossUp = upErpm / SINE_CROSS_UP_ERPM_PER_UNIT;
+	if (!handoffPossibleAt(crossUp)) return 0.0f;
+	float c = cmdForDuty6At(DUTY6_HANDOFF_FLOOR, crossUp);
+	return c > 0.0f ? c : 0.0f;      // handoffPossibleAt already guarantees it; belt and braces
 }
 
 // ---------------------------------------------------------------------------------------------------

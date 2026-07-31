@@ -12,7 +12,11 @@
 // Physics (validated on the F2838 350KV, RMSE ~12 rpm from KV alone):
 //   * 6-step (high speed) is KV-governed:  rpm(cmd) = KV*V*eff*(A6*cmd + B6)  (bracket = universal shape)
 //   * forced-sine (low speed) is PP-governed: mech = (cmd/1000)*SINE_FULLSCALE_ERPM/PP  (KV-independent)
-//   * handoff fires at the firmware floor HANDOFF_ERPM => mech handoff = HANDOFF_ERPM/PP.
+//   * the up-handoff fires on a DUTY, not on a speed: when the 6-step duty demand clears the
+//     minimum-modulation floor DUTY6_HANDOFF_FLOOR => handoffCmd() = cmdForDuty6(FLOOR), which is KV-
+//     AND PP-independent in COMMAND and KV-scaled in the landing rpm. crossUpErpm() (the CONFIGURED
+//     seam) still feeds the ESC config and Thruster's ffcx_, but no handoff quantity comes through it.
+//     At a low enough cross_up the firmware REFUSES to hand off at all — see handoffPossible().
 // What KV canNOT predict: the dynamics (tau ~ inertia/load) and thus the FB gains — those stay
 // load-dependent (tune under load, or the tele-live PI trim in VelocityController closes the residual).
 //
@@ -55,6 +59,76 @@ static const float HANDOFF_ERPM = 1333.0f;          // lowest handoff the firmwa
 // handoff speed/command must go through crossUpErpm(), or it silently keeps using the firmware
 // minimum while the operator has configured something else.
 static const float SINE_CROSS_UP_ERPM_PER_UNIT = 10000.0f / 256.0f;   // = 39.0625
+// The firmware seeds Comm_Period4x from a 4-sector tick window and only fires the up-handoff when that
+// window is within these bounds; outside them it REFUSES and stays in forced sine for ever (it does not
+// clamp). Lockstep with host/pico_esc/config.py:SINE_CROSS_TICKS_MIN/MAX and Bluejay.asm.
+static const int SINE_CROSS_TICKS_MIN = 9;
+static const int SINE_CROSS_TICKS_MAX = 30;
+
+// ---- the sine->6-step UP-HANDOFF TRIGGER: a minimum-modulation DUTY floor --------------------------
+// Mirrors host/pico_esc/motor_model.py:DUTY6_HANDOFF_FLOOR — same arithmetic, and the full provenance
+// (row-selection rule, per-file means, the superseded 526.7 and why it was wrong) lives there. In
+// short: measured 2026-07-31 on a 930KV at 11.2 V (host/sinesweep.py 1-count sweeps, AS5600), the ESC
+// hands off when its 6-STEP DUTY DEMAND clears a floor, not when the forced field reaches a speed.
+// Read off the sweep-DOWN leg, where the rotor stays in 6-step but LOCKS at one speed and ignores the
+// command: 523.44 rpm at cross_up 34, 522.56 at 36, 522.17 at 50 — mean 522.53 over all five cited
+// fixtures (n=29, sd 0.81).
+//   handoffCmd() -> 484.21 / 515.99 / 738.40 at cross_up 34 / 36 / 50, against measured brackets
+//   485.0 +- 1.0 / 515.5 +- 0.5 / 734.5 +- 0.5: residuals -0.79 / +0.49 / +3.90 counts, INSIDE the
+//   bracket at 34 and 36. The +3.90 is DUTY6_CROSSUP_K running 1.6 % high (measured 15.63 counts per
+//   cross_up unit vs K/A = 15.887), NOT the law; K is deliberately NOT re-fitted here.
+// A fixed-SPEED floor is refuted: it would put the 350KV at 11.1 V / cross_up 36 at cmd 547.8, against
+// that motor's own measured bracket (515, 520] which the duty law's 516.0 lands inside.
+// HONEST LIMIT: one motor, one loom, one supply, down-leg lock only; "minimum modulation" is an
+// interpretation of a flat command-independent lock, not a modulator measurement.
+static const float DUTY6_HANDOFF_FLOOR = 522.53f / (930.0f * 11.2f);  // = 0.050166 effective duty
+// The command magnitude the protocol tops out at. Used as a REFUSAL bound, not a clamp: a handoff
+// command past it cannot be sent, so that cross_up has no reachable handoff (see handoffPossibleAt).
+static const float CMD_FULL_SCALE = 1000.0f;
+// "No handoff command exists" — above CMD_FULL_SCALE, so every `cmd >= floor` comparison in the
+// sense/FF cascade fails CLOSED on it. vel::SENSE_CMD_UNREACHABLE in sense_gate.h is deliberately THE
+// SAME constant (it is defined as this one): a refused handoff and an unconfigured seam are the same
+// fact on the wire — "no command can validate this" — and two independent 1001.0f literals in two
+// headers would be a trap the first time one of them moved.
+// THE INVARIANT THE ALIAS DEPENDS ON, and it is enforced by handoffPossibleAt(), not by luck:
+// HANDOFF_CMD_NONE > CMD_FULL_SCALE >= every command handoffCmd() can return. Without the
+// CMD_FULL_SCALE half of the refusal that would be FALSE — the duty law crosses 1001 between cross_up
+// 66 (992.6) and 67 (1008.5), so a real handoff command would have aliased the sentinel and `>=
+// HANDOFF_CMD_NONE` would have been a silently wrong refusal test from cross_up 67 up.
+static const float HANDOFF_CMD_NONE = 1001.0f;
+
+// The 6-step duty map's exact inverse, as a free function of (duty, cross_up). MotorModel::cmdForDuty6
+// and vel::handoffCmdFor (sense_gate.h) BOTH call this, so the gate's command floor cannot drift from
+// the model's — the alternative was sense_gate.h constructing a dummy MotorModel and relying on a
+// comment that its KV/pp/V are never read. Mirrors host/pico_esc/motor_model.py:cmd_for_duty6().
+inline float cmdForDuty6At(float duty, float crossUp) {
+	return (duty - DUTY6_B + DUTY6_CROSSUP_K * (crossUp - DUTY6_CROSSUP_REF)) / DUTY6_A;
+}
+
+// Is there ANY reachable command that makes an ESC at this `sine_cross_up` hand off? Two conditions,
+// both meaning the same operational thing. Mirrors host/pico_esc/motor_model.py:handoff_possible()
+// and host/pico_esc/config.py:up_erpm_handoffable().
+//   1. THE FIRMWARE REFUSES. It seeds Comm_Period4x from a 4-sector tick window and only fires the
+//      up-handoff for a window inside [SINE_CROSS_TICKS_MIN, SINE_CROSS_TICKS_MAX]; outside it the ESC
+//      stays in forced sine for ever (it does not clamp). Measured 2026-07-31: cross_up 30 (1171.9
+//      eRPM, a 34-tick window) never handed off on either sweep leg, while 34/36/50 handed off exactly
+//      where DUTY6_HANDOFF_FLOOR says. Written in FLOAT rather than as `(int)(40000/up)`: the integer
+//      cast is UB for a tiny `up` (setCrossUp(1e-9f) gives 1.02e12, past INT_MAX) and this file must
+//      never fail open. Truncation-equivalent by construction — `int(40000/up) <= MAX` iff
+//      `40000/up < MAX+1` iff `up > 40000/(MAX+1)`, and likewise on the MIN side. A NaN crossUp makes
+//      both comparisons false, i.e. refused.
+//   2. THE COMMAND IS UNREACHABLE. cross_up shifts the trigger by DUTY6_CROSSUP_K/DUTY6_A = 15.9
+//      counts per unit, so a high enough byte puts the handoff past +-CMD_FULL_SCALE: 992.6 at
+//      cross_up 66, 1008.5 at 67, 1533 at 100. Nothing can be sent that hands off there. This is also
+//      what keeps HANDOFF_CMD_NONE from colliding with a real command (see above). Arithmetic on the
+//      protocol's range, NOT a measurement.
+inline bool handoffPossibleAt(float crossUp) {
+	float up = crossUp * SINE_CROSS_UP_ERPM_PER_UNIT;
+	if (!(up > 4.0f * 10000.0f / (float)(SINE_CROSS_TICKS_MAX + 1) &&
+	      up <= 4.0f * 10000.0f / (float)SINE_CROSS_TICKS_MIN)) return false;
+	float cmd = cmdForDuty6At(DUTY6_HANDOFF_FLOOR, crossUp);
+	return cmd > 0.0f && cmd <= CMD_FULL_SCALE;
+}
 
 class MotorModel {
 public:
@@ -84,9 +158,7 @@ public:
 	float duty6(float cmd) const {
 		return DUTY6_A * fabsf(cmd) + DUTY6_B - DUTY6_CROSSUP_K * (crossUp_ - DUTY6_CROSSUP_REF);
 	}
-	float cmdForDuty6(float duty) const {
-		return (duty - DUTY6_B + DUTY6_CROSSUP_K * (crossUp_ - DUTY6_CROSSUP_REF)) / DUTY6_A;
-	}
+	float cmdForDuty6(float duty) const { return cmdForDuty6At(duty, crossUp_); }
 
 	// SOFT-SENSOR (ESC perception): infer effective supply V from the live command + measured 6-step
 	// mech rpm, no voltage sensor. V_eff = rpm/(KV*duty(cmd)) = V_supply - I*R/duty. At no/light load
@@ -109,13 +181,31 @@ public:
 	// ---- scalar predictions ----
 	float noLoadTop()         const { return kv_ * v_ * eff_; }
 	float sineFullscaleMech() const { return SINE_FULLSCALE_ERPM / (float)pp_; }   // PP-governed
-	// The CONFIGURED seam, not the firmware floor. This used to read HANDOFF_ERPM directly, so
-	// crossUpErpm() existed but nothing downstream used it: at cross_up 36 the handoff command came
-	// out 533 instead of 563 and at 50 it was 533 instead of 781. Mirrors
-	// host/pico_esc/motor_model.py:MotorModel.handoff_mech().
-	float handoffMech()       const { return crossUpErpm() / (float)pp_; }
-	float handoffCmd()        const { return cmdForSine(handoffMech()); }
-	float sixstepFloorRpm()   const { return rpm6step(handoffCmd()); }             // the 6-step "landing"
+	// See handoffPossibleAt() above for both conditions and their evidence. Keyed on the RAW byte,
+	// never on crossUpErpm(), which FLOORS a low threshold up to the firmware minimum — the exact
+	// mistake this stops. Truncate-vs-round is not discriminated by the data and is not claimed:
+	// 33 -> 31.03 ticks refuses and 34 -> 30.12 accepts either way.
+	// Mirrors host/pico_esc/motor_model.py:MotorModel.handoff_possible().
+	bool handoffPossible() const { return handoffPossibleAt(crossUp_); }
+	// THE TRIGGER: the command whose 6-step duty demand clears the minimum-modulation floor. This used
+	// to be cmdForSine(crossUpErpm()/pp) — the CONFIGURED SEAM — which put the handoff at 533/563/781
+	// at cross_up 34/36/50 against measured 485/515.5/734.5, ~47 counts high on every motor, and made
+	// sixstepFloorRpm() 1813 rpm on a 930KV at cross_up 36, where the encoder says 522.5. KV- and PP-free
+	// (it is a duty): 484.21 / 515.99 / 738.40. Not to be confused with the seam itself, which is where
+	// the 6-step branch OVERTAKES the field — a necessary condition for a STABLE handoff, modelled in
+	// host/pico_esc/plant.py:MeasuredPlant.seam_cmd(). Mirrors
+	// host/pico_esc/motor_model.py:MotorModel.handoff_cmd().
+	// Refused => HANDOFF_CMD_NONE / INFINITY, so every `<=` / `>=` downstream fails CLOSED (thrustFor
+	// stays on the sine branch, inGap is false, fillProfile emits nothing).
+	float handoffCmd()  const { return handoffPossible() ? cmdForDuty6(DUTY6_HANDOFF_FLOOR)
+	                                                     : HANDOFF_CMD_NONE; }
+	// Where the ROTOR is when the trigger fires: still on the forced field, so the sine curve at
+	// handoffCmd() (172.9 / 184.2 / 263.6 mech at pp = 7 and cross_up 34 / 36 / 50).
+	float handoffMech() const { return handoffPossible() ? rpmSine(handoffCmd()) : INFINITY; }
+	// The 6-step "landing" = KV*V*eff*DUTY6_HANDOFF_FLOOR exactly (cmdForDuty6 inverts duty6), so it
+	// scales with KV*V and is INDEPENDENT of cross_up: 522.5 rpm on the 930KV at 11.2 V, 194.9 on the
+	// 350KV at 11.1 V. The old law made it FALL as cross_up rose; that was an artifact of the bug.
+	float sixstepFloorRpm() const { return handoffPossible() ? rpm6step(handoffCmd()) : INFINITY; }
 
 	// ---- FF curves ----
 	float rpmSine(float cmd) const { return (cmd / 1000.0f) * sineFullscaleMech(); }
@@ -133,6 +223,9 @@ public:
 	float cmdForSine(float rpm) const { return rpm / sineFullscaleMech() * 1000.0f; }
 
 	// Regime-aware inverse: sine below the handoff, 6-step above the landing; the gap between snaps up.
+	// When the handoff is REFUSED both bounds are INFINITY, so the first test swallows everything and
+	// the whole range inverts through the sine curve — which is the truth: that ESC config has no
+	// 6-step branch to ask for. Same decision as the Python side's `None` guard, by construction.
 	float thrustFor(float rpm) const {
 		float s = rpm < 0.0f ? -1.0f : 1.0f;
 		float a = fabsf(rpm);
@@ -140,6 +233,10 @@ public:
 		if (a >= sixstepFloorRpm()) return s * cmd6stepFor(a);
 		return s * cmd6stepFor(sixstepFloorRpm());       // gap: cannot hold -> snap to the landing
 	}
+	// The no-steady-state gap [handoffMech, sixstepFloorRpm]. Under the duty law it can be NARROW
+	// (350KV at 11.1 V, cross_up 36: 184.2 -> 194.9 rpm) or EMPTY/INVERTED (350KV at cross_up 50: the
+	// trigger fires at 263.6 mech while the landing is still 194.9), and false everywhere when the
+	// handoff is refused — `INFINITY < a` is false, so this fails closed with no extra branch.
 	bool inGap(float rpm) const {
 		float a = fabsf(rpm);
 		return handoffMech() < a && a < sixstepFloorRpm();
@@ -167,6 +264,17 @@ public:
 	int fillProfile(CurvePoint* buf, int cap, float cmdHi = 700.0f, int nSine = 4,
 	                Regime* regimesOut = nullptr) const {
 		if (cap < 2) return 0;
+		// TWO ways the 6-step section can fail to exist, and BOTH must emit nothing rather than a curve
+		// that is silently unusable. Reuses the `cap < 2` convention: Thruster::setMotor reads a
+		// 0/1-point return as "keep the current curve" (src/apps/thruster.h, setMotor's `n < 2` guard,
+		// which also reports it up through setMotor's bool and Thruster::curveStale()), and that is the
+		// fail-safe answer. Python raises ValueError at the same two points.
+		//   * the handoff is REFUSED at this cross_up -> there is no 6-step branch at all;
+		//   * the handoff command is at or above cmdHi -> fewer than two 6-step points fit, the loop
+		//     below steps BACKWARDS and the resulting curve inverts to one command for every rpm. At
+		//     the default cmdHi = 700 that is any cross_up >= 48, INCLUDING the cross_up 50 this bench
+		//     run used; unguarded it returned 4 points, which sails straight past the `n < 2` guard.
+		if (!handoffPossible() || handoffCmd() >= cmdHi) return 0;
 		int n6 = cap - nSine;
 		if (n6 < 2) { n6 = cap - 1; nSine = 1; }
 		float sineHiCmd = cmdForSine(handoffMech());

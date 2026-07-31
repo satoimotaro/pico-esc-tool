@@ -243,8 +243,10 @@ class MeasuredPlant:
         self.rpm = float(rpm0)
         self.t = float(t0)
         # A plant reset AT a 6-step speed starts already handed off with the ramp complete: the
-        # crossover slew models the TRANSITION, not the steady state.
-        self._handed_off = abs(rpm0) > self.motor.handoff_mech()
+        # crossover slew models the TRANSITION, not the steady state. `handoff_mech()` is None when
+        # this ESC config cannot hand off at all, and then no reset speed starts handed off.
+        handoff = self.motor.handoff_mech()
+        self._handed_off = handoff is not None and abs(rpm0) > handoff
         self._slew_duty = 1.0 if self._handed_off else 0.0
         self._zero_s = 0.0           # how long the command has been zero
         return self
@@ -307,7 +309,18 @@ class MeasuredPlant:
     def seam_cmd(self) -> float:
         """The command where the 6-step branch OVERTAKES the forced field. No hysteresis parameter
         exists: the seam is where two curves cross, so it is one number, not a band. Bisected rather
-        than solved in closed form so it stays right if either branch's shape changes."""
+        than solved in closed form so it stays right if either branch's shape changes.
+
+        NOT THE TRIGGER. This is a NECESSARY condition for a handoff to be STABLE — below it the 6-step
+        branch would be slower than the field the rotor is already following — whereas what actually
+        FIRES the handoff is the minimum-modulation duty floor in
+        pico_esc.motor_model.MotorModel.handoff_cmd(). Folding the trigger into this was considered and
+        rejected: on the 930KV the two branches cross at 471.4 / 503.6 / 728.9 at cross_up 34 / 36 / 50
+        while the bench measured the handoff at 485.0 / 515.5 / 734.5, i.e. 6-14 counts apart in the
+        same direction at every setting. The clincher is that they scale differently — this seam is
+        where two SPEED curves meet, so it moves with KV and supply (482.0 / 514.9 / 745.3 for the
+        350KV at 11.1 V), while the trigger is a DUTY and is the same command on every motor. Both are
+        kept, and each docstring names the other."""
         lo, hi = 1.0, 1000.0
         if self.sixstep_rpm(hi) <= self.sine_field(hi):
             return float("nan")
@@ -537,13 +550,30 @@ class MeasuredPlant:
             self._handed_off = False        # below the seam the ESC is in forced sine, full stop
             self._slew_duty = 0.0
             return
-        if abs(self.rpm) >= self.motor.sixstep_floor_rpm():
-            # The rotor is ALREADY above the 6-step LANDING, so there is no crossover GAP left to
-            # traverse and the handoff is immediate — the ramp exists to drag the rotor up through the
-            # gap, it is not a permanent duty rate limit. Gate on the landing rather than on the seam:
-            # in the measured 407 -> 680 step the rotor sits at 387 rpm during the ramp, which is ABOVE
-            # the 190 rpm seam but well below the 712 rpm landing, and a seam gate would end the dwell
-            # the step exists to measure.
+        if not self.motor.handoff_possible():
+            # This `sine_cross_up` gives a seed-tick window the firmware rejects, so the ESC never
+            # leaves forced sine however long the command is held (measured at cross_up 30,
+            # host/reports/sinesweep_20260731_013633.csv: no handoff on either leg up to cmd 500).
+            self._handed_off = False
+            self._slew_duty = 0.0
+            return
+        if self._handed_off or abs(self.rpm) >= self.sixstep_rpm(cmd):
+            # Nothing left to ramp INTO: the rotor is already turning at the speed this command's
+            # 6-step duty holds, so the crossover is complete on this tick.
+            #
+            # This used to gate on `motor.sixstep_floor_rpm()` and was justified as "the rotor is past
+            # the LANDING, so there is no crossover GAP left to traverse". That justification died with
+            # the eRPM handoff law: under the duty law the 350KV landing is 194.9 rpm at 11.1 V, and
+            # the rotor sits at 387 rpm — 190 ABOVE it — throughout the measured 407 -> 680 plateau. So
+            # the ramp is not a gap traversal at all; it is a duty ramp that runs on EVERY up-transition
+            # into 6-step, and the shortcut has to compare against this command's own 6-step speed
+            # (2240 rpm at cmd 680 prop-on) instead. Gating on the landing here would end the 0.26 s
+            # dwell the step exists to measure (t95 0.159 s against a measured 0.442 s).
+            #
+            # `self._handed_off or` keeps it STICKY: once the ESC is in 6-step, a command that stays
+            # above the seam raises the duty, it does not drop back to forced sine and re-ramp under
+            # the crossover clamp. Without it every 6-step -> larger-6-step step would collapse the
+            # rotor to the clamp speed first.
             self._handed_off = True
             self._slew_duty = target
             return
@@ -561,9 +591,15 @@ class MeasuredPlant:
         return self.steady(cmd)[1]
 
     def in_gap(self, rpm: float) -> bool:
-        """The nominal no-steady-state crossover gap. NOTE: measured bare-shaft OPEN LOOP, commands
-        520..545 hold 205..453 rpm stably (spread 15-53 rpm) even though that is inside this band — so
-        `in_gap` marks where the CLOSED loop must not close, not where no speed exists."""
+        """The nominal no-steady-state crossover gap, `[handoff_mech, sixstep_floor_rpm]`.
+
+        The modelled gap now AGREES with the open-loop measurement instead of apologising to it. Under
+        the old eRPM handoff law this band was 201..676 rpm on the bare shaft, and the measured
+        open-loop sweep holds commands 520..545 stably at 205..453 rpm — inside it, which the old
+        docstring had to excuse. The duty law puts the bare-shaft gap at 184.2..194.9 rpm (11.1 V,
+        cross_up 36), so every one of those measured points is now OUTSIDE it and no excuse is needed.
+        What survives unchanged is what the flag is FOR: it marks where the CLOSED loop must not close
+        (no steady state to hold), not where no speed exists."""
         return self.motor.in_gap(rpm)
 
     def mech_time_constant_ms(self) -> float:
@@ -571,12 +607,19 @@ class MeasuredPlant:
 
     def summary(self) -> str:
         p = self.p
+        if self.motor.handoff_possible():
+            handoff = (f"  handoff/land  : {self.motor.handoff_mech():.0f} / "
+                       f"{self.motor.sixstep_floor_rpm():.0f} rpm\n")
+        else:
+            # deliberately not naming WHICH refusal — MotorModel.summary() does that, and this line
+            # would otherwise go stale the next time a refusal condition is added.
+            handoff = (f"  handoff/land  : none — cross_up {p.cross_up:g} has no reachable handoff "
+                       f"(see MotorModel.handoff_possible); forced sine at every command\n")
         return (f"MeasuredPlant {p.name} [{p.mech_config}]\n"
                 f"  KV={p.kv:g} PP={p.pole_pairs} V={p.v_supply:g} eff={p.eff:g} "
                 f"cross_up={p.cross_up:g}\n"
                 f"  seam cmd      : {self.seam_cmd():.1f}  (6-step overtakes the forced field)\n"
-                f"  handoff/land  : {self.motor.handoff_mech():.0f} / "
-                f"{self.motor.sixstep_floor_rpm():.0f} rpm\n"
+                + handoff +
                 f"  R={p.r_total:g} ohm  L={p.l_phase*1e3:.3f} mH  J={p.j:.3e} kg*m^2  "
                 f"J*R/K_T^2={self.mech_time_constant_ms():.1f} ms\n"
                 f"  brake         : {M.brake_peak_torque(p.r_total, p.l_phase)*1e3:.1f} mN*m peak at "

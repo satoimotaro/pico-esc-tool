@@ -594,7 +594,22 @@ private:
 				// => keep the current value, so an existing `motor kv pp v` behaves exactly as before.
 				else { char* cu=strtok(nullptr," "); float cuf=cu?atof(cu):0.0f;
 					if(cu && (cuf < 1.0f || cuf > 255.0f)) { Serial.println("err motor: cross_up out of range (1..255)"); continue; }
-					th_[i]->setMotor(kvf, ppi, vvf, cuf);
+					// false = no parametric curve exists for this cross_up (its handoff is refused, or is
+					// above the cmd 700 the curve is sampled to — cross_up >= 48). The PREVIOUS curve is
+					// kept and the seam metadata is still updated, so the soft-sensor gate stays correct;
+					// what the operator must not get is an `ok` for a `motor` that installed nothing.
+					// Say what DID land, because it is not nothing: mm_ (hence the soft-sensor duty map,
+					// estimateV/estimateLoad and the reported kv/pp/v/cross_up) and the seam have all
+					// moved, while motorConfigured() stays false and the ENGINE's pole count was not
+					// touched — so a pp change in the same failing command leaves tele scaled by the old
+					// one. Advice mirrors host/pico_esc/motor_model.py:to_profile()'s ValueError.
+					if(!th_[i]->setMotor(kvf, ppi, vvf, cuf)) {
+						Serial.printf("err motor: no 6-step curve at cross_up %.0f (its handoff is refused, or "
+							"above the cmd 700 the curve is sampled to). FF curve UNCHANGED and still on the "
+							"old pole count; soft-sensor duty map + seam DID move to kv=%s pp=%s v=%s. Use "
+							"cross_up 34..47 (48+ hands off above the cmd 700 this curve is sampled to; below "
+							"34 the ESC never hands off), or push a measured curve (host/curvepush.py)\n",
+							th_[i]->motorCrossUp(), kv, pp, vv); continue; }
 					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s|cross_up=%.0f\n", i, kv, pp, vv,
 						th_[i]->motorCrossUp()); Serial.println("ok"); } }
 			// crossup <i> <v>: the ESC's sine_cross_up, WITHOUT replacing the feed-forward curve.
@@ -605,8 +620,31 @@ private:
 				if(i<0||i>=n_||!v) Serial.println("err bad-args (crossup <i> <sine_cross_up>)");
 				else if(th_[i]->armed()) Serial.println("err crossup: disarm first");
 				else if(!th_[i]->setCrossUp(atof(v))) Serial.println("err crossup: out of range (1..255)");
-				else { Serial.printf("crossup|%d|cross_up=%.0f|curve=%s (persist with: cfg save)\n", i,
-					th_[i]->motorCrossUp(), th_[i]->curveMeasured()?"measured (kept)":"parametric (regenerated)");
+				// The curve field has to distinguish four outcomes, because three of them are NOT a fresh
+				// parametric curve and the operator cannot tell from the outside: a measured curve is
+				// kept as-is, no `motor` has ever run (the compile-time profile is live), the parametric
+				// curve was regenerated, or it could NOT be (cross_up >= 48 has no curve below cmd 700) —
+				// in which case the STALE cross_up-36-era curve is still driving the loop. It used to say
+				// "regenerated" for all four.
+				else { const char* cs = th_[i]->curveMeasured()   ? "measured (kept)"
+				                      : !th_[i]->motorConfigured() ? "compile-time (run `motor` to generate one)"
+				                      : th_[i]->curveStale()       ? "parametric (STALE)"
+				                                                   : "parametric (regenerated)";
+					Serial.printf("crossup|%d|cross_up=%.0f|curve=%s (persist with: cfg save)\n", i,
+					th_[i]->motorCrossUp(), cs);
+					// Gated on motorConfigured() TOO, not on curveStale() alone: after a first-ever `motor`
+					// that failed, motorSet_ stays false while curveStale_ is true, so the bare gate made
+					// this warning contradict the line above it — it claimed a PREVIOUS parametric curve
+					// was driving the loop when the live FF is still the compile-time profile.
+					// The remedy is a BAND, not "lower the byte": the low-side failure (cross_up < 34, the
+					// firmware refuses to hand off at all) needs the byte RAISED, and only the high-side
+					// one needs it lowered. 34..47 is the band that can actually emit a curve — 48..66 can
+					// hand off but does it above the cmd 700 fillProfile samples to.
+					if(th_[i]->curveStale() && th_[i]->motorConfigured())
+						Serial.printf("# WARNING: no 6-step curve exists at cross_up %.0f, so the FF is still the "
+							"one generated at the PREVIOUS cross_up — it under-commands and the loop may never "
+							"reach 6-step. Push a measured curve (host/curvepush.py), or use cross_up 34..47\n",
+							th_[i]->motorCrossUp());
 					// The duty map moved by ~0.042/unit, and `sense vcal` is a MULTIPLICATIVE scale on the
 					// estimate that inverts it — so a stored vbattScale calibrated at the old cross_up is
 					// now wrong by the same shift. Say so; it is not recoverable by inspection.

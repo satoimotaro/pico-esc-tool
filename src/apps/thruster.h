@@ -126,13 +126,18 @@ public:
 	// crossUp = the ESC's `sine_cross_up`. It shifts the 6-step duty by a constant (cross_rescale_duty
 	// maps the demand relative to Cross_Up), so the parametric curve is only right at the Cross_Up its
 	// shape constants were fitted at. 0 keeps whatever is already set (default = the fit reference).
-	void setMotor(float kv, int polePairs, float vSupply, float crossUp = 0.0f) {
+	// Returns false when no parametric curve could be generated for this configuration (the handoff is
+	// refused, or it lands above the 700 the curve is sampled to — see MotorModel::fillProfile). The
+	// PREVIOUS curve is then kept, exactly as a rejected `curve` upload keeps it, but the seam metadata
+	// is still updated: see below. Both existing call sites (src/apps/esc_tool_app.h `motor`,
+	// src/apps/settings.h apply()) call this as a statement, so the void -> bool change is source
+	// compatible; the CLI one now reports the failure instead of printing `ok`.
+	bool setMotor(float kv, int polePairs, float vSupply, float crossUp = 0.0f) {
 		mm_.set(kv, polePairs, vSupply);
 		mm_.setCrossUp(crossUp > 0.0f ? crossUp : mm_.crossUp());   // set() must not clear it
 		// [#8] tag each generated point's regime so the profile's lineFloor() reports the real 6-step
 		// LANDING (~sixstepFloorRpm) rather than the seam — the soft-sensor gates below key off it.
 		int n = mm_.fillProfile(ffbuf_, (int)(sizeof(ffbuf_) / sizeof(ffbuf_[0])), 700.0f, 4, ffreg_);
-		if (n < 2) return;
 		// [B.6-fix] The seam is DERIVED from the configured cross_up, not pinned to the firmware
 		// minimum. It used to be hardcoded to HANDOFF_ERPM here, which made crossUpErpm() — the source
 		// the soft-sensor gate's command floor comes from — stop tracking `crossup <i> <byte>`
@@ -140,10 +145,35 @@ public:
 		// still opened at 560, so the advertised +5 % margin was really -0.5 %; at cross_up 50 the gate
 		// would have latched valid across a ~220-count band that is ENTIRELY forced sine — exactly the
 		// synthesised-telemetry regime B.6 exists to exclude, reachable through a persisted CLI command.
-		ffcx_ = vel::Crossover{mm_.crossUpErpm(), mm_.crossUpErpm()};
+		//
+		// THIS ASSIGNMENT MUST STAY ABOVE THE `n < 2` BAIL-OUT. The seam is a property of cross_up
+		// alone, not of whether a curve came out: once fillProfile started returning 0 for a cross_up
+		// whose handoff is above the sampled range (>= 48, which includes the 50 the 2026-07-31 bench
+		// ran), an early return left ffcx_ on the PREVIOUS seam while mm_ moved — and poll()'s
+		// `gate_.configure(crossUpErpm(), ...)` would then have opened the soft sensor at
+		// handoffCmdFor(1333)*1.05 = 510 against a real handoff of 738, i.e. the 228-count forced-sine
+		// band this comment exists to exclude, with duty6(510, cross_up 50) = -0.56 feeding estimateV.
+		// The live profile holds `&ffcx_`, so writing it here updates the installed curve's metadata in
+		// place — the same mechanism setCrossUp() below relies on.
+		//
+		// The `n >= 2 ||` half preserves the MEASURED-curve exemption: on the success path the seam is
+		// always overwritten (the parametric curve replaces any uploaded one), but when nothing was
+		// installed and the live curve is a measured one, `curve commit <pp> <up> <dn>`'s observed seam
+		// outranks this arithmetic — the identical rule setCrossUp() states.
+		if (n >= 2 || !curveMeasured_) ffcx_ = vel::Crossover{mm_.crossUpErpm(), mm_.crossUpErpm()};
+		if (n < 2) {
+			// Nothing was installed, so whatever curve is live was NOT generated for the model that is
+			// now in mm_. Record it: the `crossup` reply is generated after this returns and would
+			// otherwise report a regeneration that did not happen. A MEASURED curve is not stale — it
+			// is not a function of mm_ at all — which is the same exemption used two lines above.
+			curveStale_ = !curveMeasured_;
+			return false;
+		}
 		installCurve_(n, polePairs);
 		motorSet_ = true;
 		curveMeasured_ = false;   // the parametric prediction REPLACES any uploaded curve
+		curveStale_ = false;
+		return true;
 	}
 
 	// Install a MEASURED feed-forward curve (host/curvepush.py -> the `curve` command), replacing the
@@ -164,6 +194,7 @@ public:
 		ffcx_ = vel::Crossover{upErpm, dnErpm};
 		installCurve_(n, polePairs);
 		curveMeasured_ = true;
+		curveStale_ = false;      // a MEASURED curve is not a function of mm_, so it cannot go stale
 		return true;
 	}
 
@@ -181,6 +212,13 @@ public:
 	// keeps biasing `vest`/`load` even when the FF itself is measured. Routing this through `motor`
 	// would have forced the operator to destroy the measured curve just to correct a soft-sensor input.
 	// When the PARAMETRIC curve is the live one, regenerate it — there cross_up does move the FF.
+	// The return value means "the BYTE was in range" and nothing else — deliberately NOT overloaded
+	// with "and a curve came out of it", because a caller has to be able to tell those apart: the byte
+	// really has been applied to mm_ (and so to the soft-sensor's duty map) even when the parametric
+	// curve could not be regenerated. Read curveStale() for the second question; setMotor() maintains
+	// it across this call. Without that, `crossup <i> 50` reported "parametric (regenerated)" while the
+	// live curve was still the cross_up-36 one — whose thrustFor(1500) is 643, BELOW the 738 handoff at
+	// cross_up 50, so the loop could never reach 6-step and would forced-sine until ABORT_STALL.
 	bool setCrossUp(float crossUp) {
 		if (crossUp < 1.0f || crossUp > 255.0f) return false;
 		mm_.setCrossUp(crossUp);
@@ -198,6 +236,13 @@ public:
 	// while the curve is the parametric prediction (which is regenerable from kv/pp/v, so it is NOT
 	// persisted point-by-point).
 	bool  curveMeasured() const { return curveMeasured_; }
+	// True when the live PARAMETRIC curve was NOT regenerated for the model currently in mm_, because
+	// fillProfile() had nothing to emit at this cross_up (its handoff is refused, or above the cmd 700
+	// the curve is sampled to => cross_up >= 48). The FF then predicts speeds for a cross_up the ESC is
+	// no longer on, which is a plausible-looking wrong answer rather than an obvious one — so `crossup`
+	// and `motor` report it instead of claiming a fresh curve. Always false while a measured curve is
+	// live, and cleared by any successful setMotor()/setCurve().
+	bool  curveStale()    const { return curveStale_; }
 	int   curveCount()    const { return curveMeasured_ ? ffn_ : 0; }
 	// [#11-1] The pole count the LIVE CURVE was installed with — NOT mm_'s. `curve commit <pp>` sets the
 	// profile's pp without touching the parametric model, so the two can differ; persisting or reporting
@@ -430,6 +475,7 @@ private:
 	int               ffn_ = 0;                // live point count in ffbuf_ (0 = still the compile-time profile)
 	bool              motorSet_ = false;       // has `motor`/setMotor run? (else mm_ holds only defaults)
 	bool              curveMeasured_ = false;  // is ffbuf_ a MEASURED curve (`curve`) rather than parametric?
+	bool              curveStale_ = false;     // parametric curve not regenerated for the live mm_ (see curveStale())
 	float             vestFilt_ = 0.0f;        // low-passed voltage estimate (soft-sensor)
 	// [B.6] the soft-sensor's validity window — command-derived, hysteretic, dwelled. Owns what used to
 	// be the inline `senseValid_` test in poll(); reset by arm()/stop().

@@ -247,7 +247,28 @@ def main(argv=None):
 
         if opts.motor:
             kv, pp, v = (x.strip() for x in opts.motor.split(","))
-            print("motor:", *dev.cmd(f"motor {opts.index} {kv} {pp} {v}"))
+            # BEST-EFFORT, exactly like sync_crossup() above, and for a sharper reason. What this tool
+            # needs from `motor` is the SIDE EFFECT — kv/pp/v into the controller's parametric model, so
+            # the soft-sensor's duty map is right — not the parametric FF curve, which the measured one
+            # below is about to replace anyway. But `motor` legitimately fails when no parametric curve
+            # exists at the ESC's cross_up (>= 48: the handoff is above the cmd 700 the curve is sampled
+            # to), and the firmware applies kv/pp/v BEFORE it discovers that, so the side effect has
+            # already landed by the time the error arrives. Letting the RuntimeError out would abort the
+            # push — i.e. the one feed-forward that IS valid up there would never be uploaded, on the
+            # exact command line README.md documents.
+            # NARROW on purpose. `EscHost.cmd` raises RuntimeError for every `err ...` reply and
+            # TimeoutError for a dead link, and only ONE of those reply texts means "kv/pp/v landed,
+            # the curve did not". `err bad-args` and `err motor: disarm first` are rejected BEFORE
+            # setMotor runs, so the side effect did NOT land and the note below would be a lie; a
+            # TimeoutError or a serial fault is not a cross_up problem at all and must not be
+            # diagnosed as one. So: swallow the no-curve case, re-raise everything else.
+            try:
+                print("motor:", *dev.cmd(f"motor {opts.index} {kv} {pp} {v}"))
+            except RuntimeError as e:
+                if "no 6-step curve" not in str(e):
+                    raise
+                print(f"  note: no parametric curve at this cross_up ({e}); kv/pp/v ARE applied for the "
+                      f"soft-sensor, and the measured curve below is what drives the FF")
 
         sent, expect = push(dev, opts.index, prof, opts.max_points)
         print(f"pushed {len(sent)} point(s) from {os.path.basename(opts.profile)} "

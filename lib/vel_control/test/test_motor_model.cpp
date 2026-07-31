@@ -110,31 +110,150 @@ int main() {
 	CHECK(c36.cmd6stepFor(1600) > c34.cmd6stepFor(1600), "higher cross_up costs more command for 1600 rpm");
 
 	// ---- the SEAM must track cross_up too, not just the duty (E.9) ----
-	// crossUpErpm() existed before this but handoffMech()/handoffCmd()/sixstepFloorRpm() went straight
-	// to HANDOFF_ERPM, so the seam LOCATION stayed pinned to the firmware minimum at every cross_up.
-	// Table pinned against host/pico_esc/motor_model.py:MotorModel.cross_up_erpm() and
-	// lib/vel_control/test/test_sense_gate.cpp (same three bytes, 0.5 eRPM parity band). 34 floors at
-	// the firmware minimum because 34*39.0625 = 1328.1 < 1333.
+	// crossUpErpm() is the CONFIGURED seam and still feeds the ESC config + Thruster's ffcx_. It is no
+	// longer where the handoff comes from (see the block after this one). Table pinned against
+	// host/pico_esc/motor_model.py:MotorModel.cross_up_erpm() and test_sense_gate.cpp (same three
+	// bytes, 0.5 eRPM parity band). 34 floors at the firmware minimum because 34*39.0625 = 1328.1 < 1333.
 	{
 		MotorModel s34(350, 7, 11.2f), s36(350, 7, 11.2f), s50(350, 7, 11.2f);
 		s36.setCrossUp(36); s50.setCrossUp(50);
 		NEAR(s34.crossUpErpm(), HANDOFF_ERPM, 0.5f, "cross_up 34 -> the firmware floor");
 		NEAR(s36.crossUpErpm(), 1406.25f, 0.01f, "cross_up 36 -> 1406.25 eRPM");
 		NEAR(s50.crossUpErpm(), 1953.125f, 0.01f, "cross_up 50 -> 1953.125 eRPM");
-		// handoffMech = seam/PP, and every seam-derived quantity moves with it
-		NEAR(s36.handoffMech(), 1406.25f / 7.0f, 0.01f, "handoffMech follows the configured seam");
-		NEAR(s50.handoffCmd(), 1953.125f / SINE_FULLSCALE_ERPM * 1000.0f, 0.05f,
-		     "handoffCmd follows the configured seam (cross_up 50 -> cmd 781, not 533)");
+	}
+
+	// ---- the UP-HANDOFF IS A DUTY FLOOR, not the seam (measured 2026-07-31, 930KV @ 11.2 V) ----
+	// The old law inverted the CONFIGURED SEAM through the forced-sine curve and gave 533/563/781 at
+	// cross_up 34/36/50 on every motor. The 1-count sweeps say 485.0 +- 1.0 / 515.5 +- 0.5 /
+	// 734.5 +- 0.5 (host/reports/sinesweep_20260731_014004 / _013410 / _013236.csv), i.e. the old law
+	// was ~47 counts high everywhere. handoffCmd() is now DUTY6_HANDOFF_FLOOR inverted through the
+	// 6-step duty map. Mirrors host/tests/test_motor_model.py::test_the_handoff_command_is_the_duty_floor.
+	{
+		MotorModel s34(350, 7, 11.2f), s36(350, 7, 11.2f), s50(350, 7, 11.2f);
+		s36.setCrossUp(36); s50.setCrossUp(50);
+		NEAR(s34.handoffCmd(), 484.21f, 0.1f, "handoffCmd cross_up 34 = 484.21 (inside the measured (484, 486])");
+		NEAR(s36.handoffCmd(), 515.99f, 0.1f, "handoffCmd cross_up 36 = 515.99 (inside the measured (515, 516])");
+		// +3.90 counts against the measurement, and the cause is known and is NOT the law:
+		// DUTY6_CROSSUP_K/DUTY6_A = 15.887 counts per cross_up unit while the measured 6-step branches
+		// at cross_up 34 and 50 are offset by 250.1 counts over 16 units = 15.63. K runs 1.6 % high.
+		// Re-fitting K is out of scope here; this pins the frozen-K prediction deliberately.
+		NEAR(s50.handoffCmd(), 738.40f, 0.1f,
+		     "handoffCmd cross_up 50 = 738.40, not 781 (measured 734.5 +- 0.5; the +3.90 is K, not the law)");
+		// KV- AND PP-independent, because a duty carries no motor terms. Same three commands on a
+		// 930KV 12-pole at 22.2 V.
+		MotorModel big(930, 12, 22.2f); big.setCrossUp(36);
+		NEAR(big.handoffCmd(), s36.handoffCmd(), 0.01f,
+		     "the handoff COMMAND is KV/pp/V independent (930KV pp=12 @ 22.2 V == 350KV pp=7 @ 11.2 V)");
+		// ...while the LANDING is a 6-step rpm and scales with KV*V. It is KV*V*eff*FLOOR exactly.
+		NEAR(s36.sixstepFloorRpm(), 350.0f * 11.2f * DUTY6_HANDOFF_FLOOR, 0.05f,
+		     "sixstepFloorRpm == KV*V*eff*DUTY6_HANDOFF_FLOOR (196.7 rpm on 350KV @ 11.2 V)");
+		NEAR(MotorModel(930, 7, 11.2f).sixstepFloorRpm(), 522.53f, 0.1f,
+		     "...and 522.5 rpm on the 930KV @ 11.2 V it was measured on");
+		// THE INVERTED ASSERTION. This block used to require the landing to FALL as cross_up rises
+		// ("the extra command buys less duty than the seam gains"). That was an artifact of deriving
+		// the trigger from the seam: the trigger is a fixed DUTY, so the landing is the SAME speed at
+		// every cross_up — measured 522.19 / 522.56 / 523.44 rpm at cross_up 50 / 36 / 34, a 1.2 rpm
+		// spread over a 16-unit span and 250 commands. Equality, not an inequality.
+		NEAR(s50.sixstepFloorRpm(), s34.sixstepFloorRpm(), 1e-3f,
+		     "the 6-step landing is INDEPENDENT of cross_up (measured 523.4/522.6/522.2 at 34/36/50)");
+		NEAR(s36.sixstepFloorRpm(), s34.sixstepFloorRpm(), 1e-3f, "...at cross_up 36 too");
 		CHECK(s50.handoffCmd() > s36.handoffCmd() && s36.handoffCmd() > s34.handoffCmd(),
-		      "raising cross_up raises the handoff command");
-		// The LANDING falls as cross_up rises even though the handoff command rises: the extra command
-		// buys less duty (DUTY6_CROSSUP_K), and that costs more than the higher seam gains. So the gap
-		// narrows from BOTH ends — 34: 190..707 rpm, 36: 201..685, 50: 279..640.
-		CHECK(s50.sixstepFloorRpm() < s36.sixstepFloorRpm()
-		      && s36.sixstepFloorRpm() < s34.sixstepFloorRpm(),
-		      "raising cross_up LOWERS the 6-step landing (less duty per command)");
-		CHECK(s34.inGap(250.0f) && !s50.inGap(250.0f), "the gap's lower edge rises with cross_up");
-		CHECK(s34.inGap(670.0f) && !s50.inGap(670.0f), "the gap's upper edge falls with cross_up");
+		      "raising cross_up still raises the handoff COMMAND (the duty costs more command)");
+		// handoffMech is the rotor on the forced field at that command, so it DOES move with cross_up.
+		NEAR(s34.handoffMech(), 172.86f, 0.05f, "handoffMech cross_up 34 = 172.9 mech (pp=7)");
+		NEAR(s50.handoffMech(), 263.61f, 0.05f, "handoffMech cross_up 50 = 263.6 mech (pp=7)");
+		// So the gap 172.9..196.7 rpm at cross_up 34 is NARROW, and at cross_up 50 it is EMPTY/INVERTED
+		// (the trigger fires at 263.6 while the landing is still 196.7). Probes re-picked for those
+		// edges — 250 rpm is now 6-step at cross_up 34, and forced sine at 50.
+		CHECK(s34.inGap(185.0f) && !s50.inGap(185.0f), "185 rpm is in the gap at 34, forced sine at 50");
+		CHECK(!s34.inGap(250.0f) && !s50.inGap(250.0f), "250 rpm is 6-step at 34 and forced sine at 50");
+		CHECK(!s50.inGap(220.0f), "cross_up 50's gap is EMPTY: the trigger fires above the landing");
+	}
+
+	// ---- the firmware REFUSES to hand off outside its seed-tick window ----
+	// Measured 2026-07-31 (host/reports/sinesweep_20260731_013633.csv): at cross_up 30 -> 1171.9 eRPM
+	// -> a 34-tick window against SINE_CROSS_TICKS_MAX = 30, the 930KV never handed off on either leg
+	// up to cmd 500. crossUpErpm() would have floored that to 1333 and reported a confident handoff.
+	{
+		MotorModel r(350, 7, 11.2f), ok(350, 7, 11.2f);
+		r.setCrossUp(30); ok.setCrossUp(34);
+		CHECK(!r.handoffPossible(), "cross_up 30 -> 34-tick window -> the firmware refuses");
+		MotorModel r33(350, 7, 11.2f); r33.setCrossUp(33);
+		CHECK(!r33.handoffPossible(), "cross_up 33 -> 31 ticks -> still refused (byte granularity)");
+		CHECK(ok.handoffPossible(), "cross_up 34 -> 30 ticks -> accepted (the boundary byte)");
+		// ...and a refused config cannot produce a usable command or speed. HANDOFF_CMD_NONE is above
+		// the reachable +-1000 range and the rpms are INFINITY, so every downstream comparison fails
+		// CLOSED without a special case.
+		NEAR(r.handoffCmd(), HANDOFF_CMD_NONE, 1e-3f, "refused -> handoffCmd is the NONE sentinel");
+		CHECK(isinf(r.handoffMech()) && isinf(r.sixstepFloorRpm()), "refused -> both rpms are INFINITY");
+		CHECK(!r.inGap(200.0f) && !r.inGap(5000.0f), "refused -> nothing is in the gap");
+		NEAR(r.thrustFor(200.0f), r.cmdForSine(200.0f), 1e-3f, "refused -> thrustFor stays on sine");
+		CurvePoint buf[16];
+		CHECK(r.fillProfile(buf, 16) == 0, "refused -> fillProfile emits no curve (thruster keeps its own)");
+		CHECK(ok.fillProfile(buf, 16) > 2, "...while an accepted cross_up still fills one");
+	}
+
+	// ---- the OTHER refusal: the handoff command is past the reachable +-CMD_FULL_SCALE ----
+	// cross_up shifts the trigger by DUTY6_CROSSUP_K/DUTY6_A = 15.9 counts per unit, so the handoff
+	// command walks off the end of the protocol's range: 992.6 at cross_up 66, 1008.5 at 67. Two things
+	// ride on this boundary. (1) Nothing can be SENT that hands off above it, so it is a refusal in the
+	// same operational sense as a rejected tick window. (2) It is what keeps HANDOFF_CMD_NONE (1001)
+	// from aliasing a REAL handoff command — without it, `>= HANDOFF_CMD_NONE` would have been a
+	// silently wrong refusal test from cross_up 67 up, and the sense-gate wire contract with it.
+	{
+		MotorModel lo(350, 7, 11.2f), hi(350, 7, 11.2f);
+		lo.setCrossUp(66); hi.setCrossUp(67);
+		NEAR(lo.handoffCmd(), 992.59f, 0.1f, "cross_up 66 -> handoff 992.6, still reachable");
+		CHECK(lo.handoffPossible(), "cross_up 66 is VALID (the last byte with a reachable handoff)");
+		CHECK(!hi.handoffPossible(), "cross_up 67 -> 1008.5 > CMD_FULL_SCALE -> refused");
+		NEAR(hi.handoffCmd(), HANDOFF_CMD_NONE, 1e-3f, "...and reports the sentinel, not 1008.5");
+		MotorModel huge(350, 7, 11.2f); huge.setCrossUp(100);
+		CHECK(!huge.handoffPossible(), "cross_up 100 (1533 counts) is refused too, not reported");
+		CHECK(lo.handoffCmd() < CMD_FULL_SCALE && CMD_FULL_SCALE < HANDOFF_CMD_NONE,
+		      "the sentinel invariant: every reachable handoffCmd < CMD_FULL_SCALE < HANDOFF_CMD_NONE");
+	}
+
+	// ---- a nonsense cross_up REFUSES; it does not raise, saturate or wrap ----
+	// The tick window is a bounds test on the seam eRPM rather than `(int)(40000/up)` for exactly this:
+	// the cast is UB past INT_MAX (setCrossUp(1e-9f) would give 1.02e12) and this predicate feeds the
+	// soft-sensor gate, which must never fail open. Every comparison against a NaN is false, so a NaN
+	// refuses. Mirrors host/tests/test_motor_model.py::test_a_nonsense_cross_up_refuses_rather_than_raising,
+	// which pins the same six inputs on the Python side (there `int(inf)`/`int(nan)` would have thrown).
+	{
+		const float bad[] = {NAN, INFINITY, -INFINITY, 0.0f, -36.0f, 1e-30f, 1e30f};
+		bool allRefused = true, allSane = true;
+		for (float b : bad) {
+			if (handoffPossibleAt(b)) allRefused = false;
+			// setCrossUp() itself guards cu > 0, so the non-positive ones never reach crossUp_ — check
+			// the ones that DO land (a denormal and a huge byte) end up refused and inert.
+			MotorModel m(350, 7, 11.2f);
+			m.setCrossUp(b);
+			if (b > 0.0f && !handoffPossibleAt(b)) {
+				if (m.handoffPossible() || m.inGap(500.0f) || m.handoffCmd() != HANDOFF_CMD_NONE)
+					allSane = false;
+			}
+		}
+		CHECK(allRefused, "NaN / +-inf / 0 / negative / denormal / huge cross_up all REFUSE");
+		CHECK(allSane, "...and the ones setCrossUp accepts leave inGap false and the NONE sentinel set");
+	}
+
+	// ---- fillProfile must not emit a BACKWARDS 6-step ramp when the handoff is above cmdHi ----
+	// At the default cmdHi = 700 that is any cross_up >= 48 — including cross_up 50, the setting the
+	// 2026-07-31 bench itself ran. Unguarded it returned 4 points whose 6-step half descends, which
+	// sails past Thruster::setMotor's `n < 2` guard and installs a curve that inverts to one command
+	// for every rpm. Emitting nothing makes the thruster keep its previous curve instead.
+	{
+		MotorModel m50(350, 7, 11.2f); m50.setCrossUp(50);
+		CurvePoint buf[16];
+		CHECK(m50.handoffPossible(), "cross_up 50 CAN hand off (738.4) — this is not the refusal case");
+		CHECK(m50.handoffCmd() > 700.0f, "...but its handoff is above the default cmdHi of 700");
+		CHECK(m50.fillProfile(buf, 16) == 0, "handoff above cmdHi -> no curve emitted");
+		int n = m50.fillProfile(buf, 16, 900.0f);
+		CHECK(n > 2, "...and raising cmdHi past the handoff makes it fill again");
+		bool rising = true;
+		for (int i = 1; i < n; i++) if (buf[i].thrust <= buf[i-1].thrust || buf[i].rpm <= buf[i-1].rpm)
+			rising = false;
+		CHECK(rising, "...with a strictly increasing curve (no backwards 6-step ramp)");
 	}
 
 	printf(fails ? "\n%d CHECK(s) FAILED\n" : "\nall motor_model checks passed\n", fails);

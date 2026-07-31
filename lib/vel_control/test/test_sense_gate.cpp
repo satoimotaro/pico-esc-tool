@@ -42,17 +42,46 @@ struct Bench {
 };
 
 int main() {
-	// -- the command floor is a firmware property: pole pairs cancel exactly --
-	CHECK(fabsf(handoffCmdFor(1400.0f) - 560.2f) < 0.5f, "handoffCmdFor(1400) ~= 560");
-	CHECK(fabsf(handoffCmdFor(1333.0f) - 533.4f) < 0.5f, "handoffCmdFor(1333) ~= 533 (HANDOFF_ERPM)");
+	// -- the command floor is a firmware property, but it is the DUTY floor, not the seam (2026-07-31).
+	//    handoffCmdFor(1400) was pinned at 560.2 while the floor was the seam inverted through the
+	//    forced-sine curve; the 1-count sweeps put the real handoff ~47 counts lower at every cross_up
+	//    (measured 485.0/515.5/734.5 at 34/36/50). 1400 eRPM is cross_up 35.84, so 513.6. --
+	CHECK(fabsf(handoffCmdFor(1400.0f) - 513.4f) < 0.5f, "handoffCmdFor(1400) ~= 513.4 (was 560)");
 	{
-		// Same seam, three different pole counts -> the SAME command, and it agrees with the model's own
-		// cmdForSine(handoffMech()) route (which divides by pp and multiplies it back).
+		// A ROUND TRIP against the model, and a stronger pin than the old handoffCmdFor(1333.0f) ~= 533:
+		// 1333 is the FLOORED HANDOFF_ERPM, not a byte value, so it pinned a seam no configuration
+		// produces. 34 * 39.0625 is the real default byte, and the new law is KV-, supply- AND
+		// pole-pair-independent, so all three models must land on the same command as the free function.
 		MotorModel m7(350.0f, 7, 11.1f), m6(350.0f, 6, 11.1f), m12(120.0f, 12, 22.2f);
-		CHECK(fabsf(handoffCmdFor(HANDOFF_ERPM) - m7.handoffCmd()) < 0.05f &&
-		      fabsf(handoffCmdFor(HANDOFF_ERPM) - m6.handoffCmd()) < 0.05f &&
-		      fabsf(handoffCmdFor(HANDOFF_ERPM) - m12.handoffCmd()) < 0.05f,
-		      "handoffCmdFor is pole-pair independent (matches MotorModel::handoffCmd for pp=6/7/12)");
+		const float SEAM34 = 34.0f * SINE_CROSS_UP_ERPM_PER_UNIT;
+		CHECK(fabsf(handoffCmdFor(SEAM34) - 484.21f) < 0.1f, "handoffCmdFor(34 bytes) ~= 484.21");
+		CHECK(fabsf(handoffCmdFor(SEAM34) - m7.handoffCmd()) < 0.05f &&
+		      fabsf(handoffCmdFor(SEAM34) - m6.handoffCmd()) < 0.05f &&
+		      fabsf(handoffCmdFor(SEAM34) - m12.handoffCmd()) < 0.05f,
+		      "handoffCmdFor is KV/pp/V independent (matches MotorModel::handoffCmd for pp=6/7/12)");
+		// ...and it must never fail OPEN. A seam the firmware refuses to hand off at, an unconfigured
+		// one, and a garbage one all report 0 -> the caller's gate closes.
+		CHECK(handoffCmdFor(30.0f * SINE_CROSS_UP_ERPM_PER_UNIT) == 0.0f,
+		      "a refused seed-tick window (cross_up 30) reports no floor at all");
+		// ...and the OTHER refusal, which this function must agree with MotorModel on: above cross_up 66
+		// the handoff command is past the +-1000 the protocol carries. Before that was folded into the
+		// predicate, handoffCmdFor bounds-checked and MotorModel::handoffCmd did not, so the two paths
+		// disagreed for cross_up 67..113 and a real command aliased HANDOFF_CMD_NONE.
+		CHECK(handoffCmdFor(66.0f * SINE_CROSS_UP_ERPM_PER_UNIT) > 990.0f,
+		      "cross_up 66 still has a reachable floor (992.6)");
+		CHECK(handoffCmdFor(67.0f * SINE_CROSS_UP_ERPM_PER_UNIT) == 0.0f,
+		      "cross_up 67 (1008.5, past CMD_FULL_SCALE) closes the gate instead of reporting it");
+		{
+			MotorModel m66(350.0f, 7, 11.1f), m67(350.0f, 7, 11.1f);
+			m66.setCrossUp(66.0f); m67.setCrossUp(67.0f);
+			CHECK(fabsf(handoffCmdFor(66.0f * SINE_CROSS_UP_ERPM_PER_UNIT) - m66.handoffCmd()) < 0.05f &&
+			      !m67.handoffPossible(),
+			      "handoffCmdFor and MotorModel::handoffCmd agree on BOTH sides of the boundary");
+		}
+		CHECK(handoffCmdFor(0.0f) == 0.0f && handoffCmdFor(-1400.0f) == 0.0f && handoffCmdFor(NAN) == 0.0f
+		      && handoffCmdFor(INFINITY) == 0.0f && handoffCmdFor(1e-30f) == 0.0f,
+		      "zero / negative / NaN / inf / denormal seam -> no floor (never a negative one, which "
+		      "would open the gate). Python pins the same six in test_motor_model.py.");
 	}
 
 	// -- THE COMMAND FLOOR MUST TRACK `sine_cross_up`. cross_up does two independent things: it shifts
@@ -77,7 +106,15 @@ int main() {
 		       b34.g.cmdFloor(), b36.g.cmdFloor(), b50.g.cmdFloor());
 		CHECK(b36.g.cmdFloor() > b34.g.cmdFloor() && b50.g.cmdFloor() > b36.g.cmdFloor(),
 		      "raising cross_up RAISES cmdfloor (the seam moved, so the handoff command did too)");
-		CHECK(fabsf(b36.g.cmdFloor() - 590.9f) < 1.0f, "cross_up 36 -> cmdfloor 591 (563 * 1.05)");
+		// 541.8 = 515.99 * 1.05, was 590.9 = 563 * 1.05. The window moved ~49 counts OUTWARD, so the
+		// safety argument is explicit: the duty law's worst LOW-side residual against the three
+		// measured brackets is -0.79 counts, against a 26-count enter margin here (37 at cross_up 50).
+		CHECK(fabsf(b36.g.cmdFloor() - 541.8f) < 1.0f, "cross_up 36 -> cmdfloor 541.8 (516.0 * 1.05)");
+		CHECK(fabsf(b36.g.cmdExit() - 526.3f) < 1.0f, "cross_up 36 -> cmdexit 526.3 (516.0 * 1.02)");
+		// The 930KV's telemetry is honest from the first handed-off command (cmd 516: tele 536.8 vs
+		// encoder 522.3) and on a floor below it (cmd 515: tele 203 vs a rotor oscillating about 198),
+		// so the floor sits above the onset it is meant to protect, by the enter margin and no more.
+		CHECK(b36.g.cmdExit() > 515.99f, "even the STAY threshold is above the measured honest onset");
 		// The regression that mattered: at cross_up 50 a command of 600 is deep in forced sine, and the
 		// seam-pinned gate would have latched valid there for as long as the caller held it.
 		b50.ticks(60, 600.0f, 1500.0f);
@@ -168,7 +205,7 @@ int main() {
 		Bench b;
 		b.ticks(40, 652.0f, 1600.0f);
 		CHECK(b.g.valid(), "latched before the dither");
-		float lo = b.g.cmdExit() + 0.5f, hi = b.g.cmdFloor() - 0.5f;   // 571.9 .. 587.7
+		float lo = b.g.cmdExit() + 0.5f, hi = b.g.cmdFloor() - 0.5f;   // 526.8 .. 541.3
 		CHECK(lo < hi, "the hysteresis band is non-empty");
 		int transitions = 0;
 		for (int i = 0; i < 200; i++) {

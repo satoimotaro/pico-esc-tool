@@ -6,6 +6,8 @@ The point of the tool is that the curve which ends up LIVE is exactly the one me
 cover the round-trip and the rejections, against the sim host that mirrors the firmware's staging
 rules (SimEscHost._curve_cmd).
 """
+import re
+
 import pytest
 
 import curvepush
@@ -223,3 +225,91 @@ def test_main_returns_0_on_a_clean_push(fake_cfg, tmp_path):
     p = tmp_path / "p.yaml"
     prof.save(str(p))
     assert curvepush.main([str(1), str(p), "--dry-run"]) == 0
+
+
+# --- the `motor` step is BEST-EFFORT: it must not abort the push -----------------------------------
+
+class _MotorErrHost:
+    """The sim host, except that `motor ...` fails the way the firmware's `err motor:` reply fails.
+
+    `EscHost.cmd` (pico_esc/link.py) raises RuntimeError on any reply line starting with `err`, and
+    since 2026-07-31 the firmware answers `motor` with one whenever no parametric curve exists at the
+    ESC's cross_up (>= 48: the handoff is above the cmd 700 the curve is sampled to). Deliberately a
+    wrapper rather than a subclass — pico_esc/sim.py is pinned byte-for-byte through its RNG draw
+    order by test_regression_baseline.py and must not be touched.
+    """
+
+    def __init__(self):
+        self.inner = SimEncEscHost(SimClock())
+        self.motor_calls = 0
+
+    def cmd(self, line, *a, **kw):
+        if line.startswith("motor "):
+            self.motor_calls += 1
+            raise RuntimeError("device: err motor: no 6-step curve at cross_up 50 (its handoff is "
+                               "refused, or above the cmd 700 the curve is sampled to)")
+        return self.inner.cmd(line, *a, **kw)
+
+
+def test_a_motor_command_that_cannot_generate_a_curve_does_not_abort_the_push(fake_cfg, tmp_path,
+                                                                              monkeypatch, capsys):
+    """README.md's documented command line, on an ESC at a cross_up with no parametric curve.
+
+    `--motor` exists for its SIDE EFFECT (kv/pp/v into the controller's parametric model, so the
+    soft-sensor's duty map is right), not for the parametric FF curve — which the measured curve this
+    tool uploads is about to replace anyway. The firmware applies kv/pp/v before it discovers it has no
+    curve to emit, so the side effect has already landed when the error arrives. Aborting there was
+    pure loss: it skipped `push()` entirely, so the ONE feed-forward that is valid at that cross_up
+    never reached the device.
+    """
+    prof = _profile(SPAN, up=34 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [34, 239]
+    p = tmp_path / "p.yaml"
+    prof.save(str(p))
+    host = _MotorErrHost()
+    monkeypatch.setattr(curvepush, "open_host", lambda opts: host)
+
+    rc = curvepush.main([str(1), str(p), "--dry-run", "--motor", "350,7,11.2"])
+
+    assert host.motor_calls == 1                    # it really did try, and really did fail
+    assert rc == 0                                  # ...and the push still verified clean
+    out = capsys.readouterr().out
+    assert "note: no parametric curve at this cross_up" in out
+    assert "measured curve below is what drives the FF" in out
+    # the curve is LIVE on the device, which is the whole point of the tool
+    meta, got = curvepush.readback(host, 1)
+    assert meta["measured"] == "1" and int(meta["n"]) == len(SPAN)
+
+
+@pytest.mark.parametrize("msg", [
+    "device: err bad-args (motor <i> <kv> <pp> <v>)",   # rejected BEFORE setMotor: kv/pp/v did NOT land
+    "device: err motor: disarm first",                  # ditto
+    "read timed out",                                   # not a cross_up problem at all
+])
+def test_a_motor_failure_that_is_not_the_no_curve_case_still_aborts(fake_cfg, tmp_path, monkeypatch,
+                                                                    msg):
+    """The best-effort wrapper above must stay NARROW, and this is what pins that.
+
+    Only one `motor` failure means "kv/pp/v landed, the curve did not": the `no 6-step curve` reply.
+    `err bad-args` and `err motor: disarm first` are rejected before `setMotor` runs, so the side
+    effect did NOT land and the note's claim would be false; a timeout is a dead link, and diagnosing
+    it as "no parametric curve at this cross_up" would send the operator after the wrong fault. A
+    bare `except Exception` swallowed all three — this test fails if anyone widens it back.
+    """
+    prof = _profile(SPAN, up=34 * curvepush.SINE_CROSS_UP_ERPM_PER_UNIT, dn=239.0)
+    prof.crossover["bytes"] = [34, 239]
+    p = tmp_path / "p.yaml"
+    prof.save(str(p))
+
+    class _OtherErrHost(_MotorErrHost):
+        def cmd(self, line, *a, **kw):
+            if line.startswith("motor "):
+                self.motor_calls += 1
+                raise RuntimeError(msg)
+            return self.inner.cmd(line, *a, **kw)
+
+    host = _OtherErrHost()
+    monkeypatch.setattr(curvepush, "open_host", lambda opts: host)
+    with pytest.raises(RuntimeError, match=re.escape(msg)):
+        curvepush.main([str(1), str(p), "--dry-run", "--motor", "350,7,11.2"])
+    assert host.motor_calls == 1

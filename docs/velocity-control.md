@@ -63,10 +63,17 @@ non-decreasing) because a non-monotonic curve inverts ambiguously.
 ## One curve subsumes the S3 crossover
 
 BlueGill's S3 firmware runs **forced-sine** commutation at low speed (precise, slow: full
-scale ≈ 357 mech RPM) and hands off to fast, efficient **6-step BEMF** commutation above a
-configured eRPM (`sine_cross_up`), dropping back below `sine_cross_dn` (a hysteresis band).
-The two regimes have different command→speed laws, so there is a discontinuity — a **handoff
-jump** — at the seam.
+scale ≈ 357 mech RPM) and hands off to fast, efficient **6-step BEMF** commutation, dropping
+back below `sine_cross_dn` (a hysteresis band). The two regimes have different command→speed
+laws, so there is a discontinuity — a **handoff jump** — at the seam.
+
+The up-handoff does **not** fire at the configured `sine_cross_up` eRPM. Measured 2026-07-31 on
+two motors 2.66× apart in KV, it fires when the ESC's **6-step duty demand** clears a
+minimum-modulation floor, which makes the handoff *command* a firmware property — the same on
+every motor — and the landing *speed* KV-scaled. `sine_cross_up` still moves it, but through the
+6-step duty map (`DUTY6_CROSSUP_K`), not through the seam: cmd 484 / 516 / 738 at `cross_up`
+34 / 36 / 50. Set `sine_cross_up` too low and the firmware does not clamp, it **refuses** to hand
+off at all. See `host/pico_esc/motor_model.py:DUTY6_HANDOFF_FLOOR`.
 
 Because `velcal` measures across the **whole range with the crossover enabled**, that jump is
 baked into the points. The single calibrated curve therefore **subsumes** the discontinuity:

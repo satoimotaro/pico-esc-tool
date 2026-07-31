@@ -66,6 +66,42 @@ SINE_CROSS_UP_ERPM_MIN = 4 * 10000.0 / SINE_CROSS_TICKS_MAX   # ~1333 eRPM
 SINE_CROSS_UP_ERPM_MAX = 4 * 10000.0 / SINE_CROSS_TICKS_MIN   # ~4444 eRPM
 
 
+def handoff_ticks(up_erpm: float) -> float:
+    """The 4-sector seed window, in ticks, the firmware measures at a seam of `up_erpm`.
+
+    inf for a non-positive OR NaN seam: both are outside the window either way, and returning a number
+    keeps every caller (all of which only format it) free of its own zero/NaN check."""
+    return 4 * 10000.0 / up_erpm if up_erpm > 0 else float("inf")
+
+
+def up_erpm_handoffable(up_erpm: float) -> bool:
+    """True when the firmware will actually FIRE the up-handoff at this seam. THE one definition of
+    the window; mirrored by vel::handoffPossibleAt() in lib/vel_control/motor_model.h and read by
+    pico_esc.motor_model.MotorModel.handoff_possible().
+
+    The window is on the TRUNCATED integer tick count, which is not the same test as the continuous
+    band [SINE_CROSS_UP_ERPM_MIN, SINE_CROSS_UP_ERPM_MAX] that `sine_crossover_bytes()` below applies
+    to its (pre-rounding) argument, and the two DISAGREE for one seam that matters: cross_up 34 ->
+    1328.125 eRPM -> 30.12 ticks, which this accepts and that band rejects as "below the BEMF floor".
+    THE BENCH BACKS THIS ONE — the 2026-07-31 sweeps hand off at cross_up 34 on two different motors
+    (host/reports/sinesweep_20260731_014004.csv), and 34 is the byte `MotorModel.esc_config()`
+    recommends. `sine_crossover_bytes()` is deliberately NOT switched over in the same change: it
+    validates an operator-supplied eRPM PAIR before rounding, and relaxing its lower edge changes which
+    inputs `esctool.py set --up-erpm` and `autocal.py` reject. It also has one concrete victim already:
+    `MotorModel.esc_config(seamless_down=True)` RAISES today, because `_seamless_cross_dn()` feeds it
+    `sine_crossover_bytes(34 * 39.0625 = 1328.125, ...)` — the same byte 34 this function accepts. That
+    path is documented as unproven and unused, so it is left alone; unifying the two fixes it. Flagged.
+
+    Written as a bounds test on `up_erpm` rather than as `int(4*10000/up_erpm)` so it is the SAME
+    expression as vel::handoffPossibleAt() in lib/vel_control/motor_model.h, and so that NaN, inf, 0
+    and a denormal seam all come out False instead of raising (`int(inf)` is an OverflowError and
+    `int(nan)` a ValueError — a refusal predicate must not have a third outcome). Truncation-equivalent
+    by construction: `int(40000/up) <= MAX` iff `40000/up < MAX+1` iff `up > 40000/(MAX+1)`, and
+    likewise on the MIN side. Every comparison against a NaN is False, so a NaN refuses."""
+    return (4 * 10000.0 / (SINE_CROSS_TICKS_MAX + 1) < up_erpm
+            <= 4 * 10000.0 / SINE_CROSS_TICKS_MIN)
+
+
 def sine_crossover_bytes(up_erpm: float, dn_erpm: float) -> tuple[int, int]:
     """(up_erpm, dn_erpm) -> (cross_up, cross_dn) bytes, validating exactly as the firmware
     guards + hysteresis require. Returns rounded bytes; raises ValueError on any violation.
@@ -74,6 +110,9 @@ def sine_crossover_bytes(up_erpm: float, dn_erpm: float) -> tuple[int, int]:
     handoff-able band (where the seed would be too coarse / below the BEMF floor)."""
     if up_erpm <= 0 or dn_erpm <= 0:
         raise ValueError("both eRPM values must be positive")
+    # NOTE this is the CONTINUOUS pre-rounding band, which is one tick's worth STRICTER on the low side
+    # than the firmware's own truncated-tick test — see up_erpm_handoffable() above for the
+    # disagreement, which byte it bites at (34) and why this one is left alone for now.
     if not SINE_CROSS_UP_ERPM_MIN <= up_erpm <= SINE_CROSS_UP_ERPM_MAX:
         raise ValueError(f"up eRPM {up_erpm:g} outside the handoff-able band "
                          f"~{SINE_CROSS_UP_ERPM_MIN:.0f}..{SINE_CROSS_UP_ERPM_MAX:.0f} eRPM: below it "
