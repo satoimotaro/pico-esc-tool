@@ -358,6 +358,15 @@ public:
 	// Clear all closed-loop state (integrator/authority/measurement). Call before starting a fresh
 	// run so a re-arm from below the seam starts clean.
 	void reset() {
+		// setpoint_ IS closed-loop state, and leaving it behind DEFEATED slew_rpm_s entirely on real
+		// hardware. `setpoint_ = 0` lives in exactly one other place — step()'s stop branch — and
+		// Thruster::poll() has its OWN stop branch that returns BEFORE calling step(), so on the Pico
+		// that assignment is unreachable. The setpoint therefore survived every stop at its last
+		// target, and the next setTarget(same) found setpoint_ == target_ and slewed by nothing:
+		// measured 2026-08-01 on the 930KV, slew_rpm_s 2000 / 500 / 50 gave IDENTICAL trajectories
+		// (peak ~4620 rpm at t~1.2 s), and at slew=50 the command was 792 at t=0.44 s where a slewed
+		// setpoint of 22 rpm asks for ~60. Only the first run after a power-on ever slewed.
+		setpoint_ = 0.0f;
 		i_ = 0.0f; w_ = 0.0f; have_tele_ = false; tele_mech_ = 0.0f; live_ = false;
 		d_hat_ = 0.0f; settle_ = 0.0f;
 		stale_accum_ = 0.0f; last_sent_ = 0; last_applied_ = 0.0f;

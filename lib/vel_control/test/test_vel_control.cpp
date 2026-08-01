@@ -514,6 +514,28 @@ int main() {
 		}
 	}
 
+	// reset() must clear setpoint_, or slew_rpm_s is defeated on the second and every later run.
+	// `setpoint_ = 0` exists in exactly one other place (step()'s stop branch) and Thruster::poll()
+	// returns before step() on a stop, so on hardware that assignment is unreachable: the setpoint
+	// survived every stop at its last target and the next setTarget(same) slewed by nothing. Measured
+	// 2026-08-01 on the 930KV: slew 2000/500/50 rpm/s gave identical trajectories.
+	{
+		CurvePoint pts[] = {{60,20},{200,300},{400,1500},{700,4200}};
+		SpeedProfile prof(pts, 4, 7);
+		SimEsc sim; VelocityController vc(sim, prof);
+		vc.slew_rpm_s = 50.0f;
+		vc.setTarget(4000.0f);
+		for (int i = 0; i < 20; i++) vc.step(0.01f);          // 0.2 s at 50 rpm/s -> ~10 rpm
+		float crept = vc.setpoint();
+		CHECK(crept > 0.0f && crept < 60.0f, "the setpoint really is slewing (< 60 rpm after 0.2 s)");
+		vc.setTarget(0.0f);
+		vc.reset();
+		CHECK(vc.setpoint() == 0.0f, "reset() clears the setpoint — without this, slew is a no-op on run 2");
+		vc.setTarget(4000.0f);
+		for (int i = 0; i < 20; i++) vc.step(0.01f);
+		CHECK(vc.setpoint() < 60.0f, "...so the SECOND run slews exactly like the first");
+	}
+
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
 	return failures ? 1 : 0;
 }
