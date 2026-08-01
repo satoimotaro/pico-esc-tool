@@ -7,11 +7,14 @@ Everything below is either a measured fact or an explicit statement that somethi
 
 ## Six things that will bite you
 
-1. **Below the crossover seam, `tele` is not a measurement — it is a constant.** It reads exactly
-   fixed value for every command across the whole forced-sine range while the rotor speed varies by
-   several times, and only becomes honest at the seam. (On our 7-pole-pair bench it sits at exactly
-   182 rpm from cmd 60 to 450, honest from about cmd 520 — measure where yours sits.) Never close a
-   loop or judge a regime on `tele` below the seam.
+1. **Below the crossover seam, `tele` is not a measurement.** On BlueGill **S4 and later** it reads
+   ~0 there and is honest about knowing nothing; on **S3 and earlier** it read a fixed constant (182
+   rpm on our 7-pole-pair bench) for every command from cmd 60 to 450 while the rotor speed varied
+   several-fold, which is worse — a lie the liveness gate believed. That constant was
+   `div_2048000`'s 0xFFFF clamp, so the "virtual eRPM in sine" feature never varied at all. Either
+   way: **never close a loop or judge a regime on `tele` below the seam**, and if your telemetry
+   floor sits *below* your liveness threshold the controller will wind up against it (that was the
+   root cause of the closed-loop startup stall). Measure where yours sits.
 2. **The rotor never freely coasts. Zero commanded throttle is a BRAKE**, and it engages on a fixed
    ~0.30 s delay rather than at a speed. `brake_on_stop=0` does not disable it, and neither does
    `disarm`, letting the deadman expire, or holding zero while armed. Operationally: cutting thrust
@@ -66,11 +69,18 @@ is why the tools ship and the numbers do not.
   here ties the reported integer °C to either. **RAW drive (`thrust`/`throttle`) gets no thermal limiting
   at all**, because only the RPM submode runs the controller. That includes every measurement tool.
 - **Pass `--profile` explicitly.** The feed-forward curve is motor-specific; there is no safe default.
+- **A flash resets the config to firmware defaults — 14 settings on our bench — and three of the
+  four that matter still let the motor START.** `startup_power_max` at its default stops it dead,
+  but `low_rpm_power_protection`, `sine_cross_up` and `motor_direction` at theirs each leave it
+  running at a quarter to a ninth of the right speed while looking healthy. Flash through one
+  command that restores and verifies, and check the config before the first spin; see
+  [`thruster-bringup.md`](thruster-bringup.md) §6.
 
 ## Which document answers which question
 
 | Question | Document |
 |---|---|
+| **I have a new thruster. What do I do, in what order?** | [**`thruster-bringup.md`**](thruster-bringup.md) |
 | How do I drive it / what are the commands? | [`../README.md`](../README.md) |
 | How do I get voltage and load out of eRPM alone, and when is it valid? | [`soft-sensor.md`](soft-sensor.md) |
 | How does closed-loop velocity control work, incl. thermal limiting? | [`velocity-control.md`](velocity-control.md) |

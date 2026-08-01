@@ -36,12 +36,12 @@ def cmd_predict(m, opts):
     path = os.path.join(PROF_DIR, f"{m.name}_parametric.yaml")
     m.to_profile().save(path)
     print(f"\n  profile: {path}")
-    print(f"  apply ESC config:\n    {_esctool_cmd(m.esc_config())}")
+    print(f"  apply ESC config:\n    {_esctool_cmd(m.esc_config(opts.seamless_down))}")
 
 
 def cmd_apply(m, opts):
     import subprocess, sys
-    cfg = m.esc_config()
+    cfg = m.esc_config(opts.seamless_down)
     print(f"# applying derived ESC config for {m.name}:\n  {cfg}")
     subprocess.run([sys.executable, "esctool.py", "set", str(opts.esc)]
                    + [f"{k}={v}" for k, v in cfg.items()], cwd=os.path.dirname(__file__))
@@ -108,6 +108,12 @@ def main(argv=None):
     ap.add_argument("--port")
     ap.add_argument("--tmax", type=int, default=700)
     ap.add_argument("--enc-sign", type=int, default=-1, choices=(-1, 1))
+    ap.add_argument("--seamless-down", action="store_true",
+                    help="enable the down-crossover (sine_cross_dn=239). OFF by default because a "
+                         "seamless down-handoff is motor-specific and claiming one from a parametric "
+                         "model would be an invention — 255 is >= the firmware's 0xF0 disable "
+                         "threshold, i.e. the ESC stays in 6-step all the way down. Turn it on only "
+                         "after watching THIS motor decelerate through the seam on the bench")
     ap.add_argument("--cal-cmds", type=_floats, default=[550, 620, 690],
                     help="6-step cmds to sample for self-cal")
     sub = ap.add_subparsers(dest="cmd", required=True)
