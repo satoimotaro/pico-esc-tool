@@ -169,3 +169,56 @@ def test_a_stock_cross_up_can_never_be_mistaken_for_a_configured_crossover(cross
     assert m.thrust_for(300) == pytest.approx(m.cmd_for_sine(300))
     with pytest.raises(ValueError, match="cross_up"):
         m.to_profile()                        # a curve with no 6-step section would mis-scale velctl
+
+
+# --- shipped profiles must tag their own regimes consistently with the handoff [2026-08-01] --------
+def test_every_shipped_profile_tags_regimes_consistently_with_the_handoff():
+    """A `regime` tag is not decoration: `VelLoop._line_floor()` takes the MINIMUM rpm among the
+    line-tagged points as the lowest speed genuinely reachable in 6-step, and the ABORT_STALL guard
+    only arms at or above it. So one 6-step point mis-tagged `sine` raises that floor to the next
+    line point and opens a band where the guard silently never fires.
+
+    That is not hypothetical. `f2838_350kv_bench_20260726.yaml` tagged cmd 558 as `sine` while it
+    measured 628.1 rpm — the handoff for its cross_up byte 36 fires at command 515.4, and 186.8 rpm at
+    cmd 503 jumping to 628.1 at cmd 558 is a handoff, not forced sine. `_line_floor()` returned 1211.1
+    instead of 628.1, leaving 583 rpm unguarded.
+
+    The tag is checked against `MotorModel.handoff_cmd()` — the measured duty-floor trigger — because
+    that is what the firmware actually switches on.
+    """
+    import glob
+    import os
+    import yaml
+    from pico_esc.motor_model import MotorModel
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bad = []
+    for path in sorted(glob.glob(os.path.join(root, "profiles", "*.yaml"))):
+        d = yaml.safe_load(open(path)) or {}
+        pts = d.get("points")
+        if not pts:
+            continue
+        # SIM profiles are exempt: their tags describe the MODEL that generated them, and flipping one
+        # would assert a hardware fact that was never measured. They self-declare `source: sim` and say
+        # so in their header. `vel_930kv_12n14p_sim.yaml` is currently one such disagreement (cmd 827
+        # tagged sine where handoff_cmd says line) and it is velctl's --dry-run default, so it is noted
+        # in the file itself rather than silently corrected here.
+        if d.get("source") == "sim":
+            continue
+        cx = d.get("crossover") or {}
+        byts = cx.get("bytes")
+        if not byts:
+            continue
+        # handoff_cmd is KV- and PP-independent (it is a duty), so the placeholder motor is fine here.
+        hoc = MotorModel(350.0, int(d.get("pole_pairs", 7)), 11.25, 1.0,
+                         cross_up=float(byts[0])).handoff_cmd()
+        if hoc is None:
+            continue
+        for p in pts:
+            t, tag = float(p["thrust"]), p.get("regime")
+            if tag is None or t <= 0:
+                continue
+            want = "line" if t >= hoc else "sine"
+            if tag != want:
+                bad.append(f"{os.path.basename(path)}: cmd {t:.0f} tagged {tag!r}, handoff_cmd "
+                           f"{hoc:.1f} says {want!r} (measured {p['rpm']:.1f} rpm)")
+    assert not bad, "regime tags disagree with the handoff:\n  " + "\n  ".join(bad)
