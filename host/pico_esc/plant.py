@@ -87,6 +87,15 @@ def _require_inventory(what):
 
 RAD = 2.0 * math.pi / 60.0          # rpm -> rad/s
 
+# WHICH ESC FIRMWARE, because in forced sine the two report different things and every closed-loop
+# conclusion below the handoff turns on which one you are talking to. Deliberately HERE and not in
+# `measured`: the inventory is per-installation (one motor, one loom, one supply) and is not
+# distributed, while firmware behaviour is a property of the firmware and true for everybody. Putting
+# them there would also make this module fail to IMPORT without the inventory, since the default below
+# is evaluated at class-definition time and `M` is None in that case.
+TELE_SINE_S3 = "s3-virtual-erpm"    # reports a constant floor (measured 182 mech). bluegill <= 7f5cd61.
+TELE_SINE_S4 = "s4-not-measuring"   # reports 0, the bidir-DShot not-spinning sentinel. bluegill f0b5339.
+
 
 @dataclass(frozen=True)
 class PlantParams:
@@ -125,6 +134,11 @@ class PlantParams:
     sine_reversals: dict = field(default_factory=dict)
     cut_release_s: dict = field(default_factory=dict)
     brake_engage_s: dict = field(default_factory=dict)
+    # WHICH ESC FIRMWARE, because in forced sine S3 and S4 report different things (TELE_SINE_* above)
+    # and every closed-loop conclusion below the handoff turns on which one the bench was running.
+    # Defaults to S3 so that every trace and every conclusion taken before the S4 flash keeps meaning
+    # what it meant; a caller comparing the two sets it explicitly.
+    tele_sine: str = TELE_SINE_S3
     mech_config: str = ""
     name: str = ""
 
@@ -376,15 +390,58 @@ class MeasuredPlant:
         return self.p.sine_reversals[k]
 
     def tele(self, rpm: Optional[float] = None, t: Optional[float] = None) -> float:
-        """What the ESC's telemetry REPORTS, not what the rotor does. Two measured lies:
-          * nothing at all (exactly 0) until the first frame arrives, `TELE_LIVE_S` after arming;
-          * never below `TELE_FLOOR_MECH` = 182 mech rpm, at every command 60..450 in BOTH mechanical
-            configurations. That floor is why a closed loop can wind up while the rotor is stalled."""
+        """What the ESC's telemetry REPORTS, not what the rotor does.
+
+        Nothing at all (exactly 0) until the first frame arrives, `TELE_LIVE_S` after arming — that
+        one is firmware-independent. After that it depends on the REGIME, because forced sine has no
+        BEMF period to measure, so whatever comes out of the wire down there is the firmware's number
+        and not the rotor's:
+          * `_handed_off` — BEMF 6-step. The ESC measures, and both firmwares report the truth.
+          * forced sine, S3 (`TELE_SINE_S3`) — a constant `TELE_FLOOR_MECH` = 182 mech rpm, measured at
+            every command 60..450 in BOTH mechanical configurations. That lie is why a closed loop can
+            wind up while the rotor is stalled: 182 sits above the controller's 50 rpm liveness floor.
+          * forced sine, S4 (`TELE_SINE_S4`) — 0, the not-spinning sentinel. The gate rejects it and
+            the loop stays open across the whole sine region, which is the contract it was written to.
+
+        The S3 branch replaces an unconditional `max(TELE_FLOOR_MECH, |rpm|)` and is behaviour-identical
+        wherever the bench can go: above the handoff the slowest reachable landing is the 350KV's 197
+        mech rpm, already above the floor, so the old `max` never bit there either."""
         r = self.rpm if rpm is None else rpm
         tt = self.t if t is None else t
         if tt < self.p.tele_live_s:
             return 0.0
-        return max(self.p.tele_floor_mech, abs(r))
+        return self.tele_reported(r)
+
+    def tele_reported(self, rpm: Optional[float] = None) -> float:
+        """The REGIME/FIRMWARE half of `tele()`, with the startup-silence window left to the caller.
+
+        Split out for `MeasuredEscHost`, whose `tele_live` ablation owns that window and so cannot go
+        through `tele()` without the silence coming back on. The two used to carry independent copies
+        of the floor rule; one rule, one place."""
+        r = self.rpm if rpm is None else rpm
+        if self._bemf_locked(r):
+            return abs(r)
+        return self.p.tele_floor_mech if self.p.tele_sine == TELE_SINE_S3 else 0.0
+
+    def _bemf_locked(self, r: float) -> bool:
+        """Is the ESC measuring a real BEMF period, or imposing a forced one?
+
+        During a stepped run `_handed_off` is the authority — it is the same state machine the real
+        crossover runs. But `tele()` is also used as a PURE FUNCTION of an already-measured rpm (fixture
+        replay in test_plant_replay), where no stepping has happened and `_handed_off` is still its
+        post-reset False. There the only available evidence is the speed, so fall back to the handoff
+        LANDING: below it a 6-step regime cannot be sustained.
+
+        That fallback is ambiguous for a motor whose forced-sine range OVERLAPS its landing — the 350KV
+        lands at 197 mech and sine reaches past it, so a 250 rpm sample is genuinely regime-ambiguous
+        from speed alone. Harmless for replaying S3 traces (S3 reports 182 in sine and the landing sits
+        above it, so the two rules disagree only inside a 15 rpm band, far under the fixtures' 25 rpm
+        tolerance) but it must NOT be used to draw S4 conclusions: S4 reports 0 across that whole band.
+        Step the plant for those."""
+        if self._handed_off:
+            return True
+        h = self.motor.handoff_mech()
+        return h is not None and abs(r) >= h
 
     # ------------------------------------------------- layer 2: rotor torques
     def tau_short_circuit(self, w_rotor_rpm: float) -> float:
@@ -658,13 +715,18 @@ class MeasuredEscHost:
     `tele` reports what the ESC would REPORT, floor and startup silence included — which is the whole
     point of putting the sensor model in the loop instead of feeding the controller the truth. The two
     lies are SEPARATE knobs (`tele_floor`, `tele_live`) so an A/B changes one thing at a time.
+
+    `tele_floor=False` is an ABLATION, not a firmware: it asks "what if the sensor were perfect?" and
+    reports the true `|rpm|` in sine. That is NOT what S4 does — S4 reports 0 down there, because a
+    perfect sensor is not available to an ESC that has no BEMF period to measure. Select a firmware
+    with `plant.p.tele_sine` (TELE_SINE_*); keep `tele_floor` for the counterfactual.
     """
 
     def __init__(self, plant: MeasuredPlant, clock, tele_floor: bool = True,
                  tele_live: bool = True):
         self.plant = plant
         self.clock = clock
-        self.tele_floor = bool(tele_floor)   # False = report |rpm| however low it is
+        self.tele_floor = bool(tele_floor)   # False = ABLATION: report |rpm| however low it is
         self.tele_live = bool(tele_live)     # False = telemetry is live from t=0 (no startup silence)
         self.thrust = 0
         self.armed = False
@@ -705,9 +767,9 @@ class MeasuredEscHost:
             if self.tele_live and t < self.plant.p.tele_live_s:
                 rpm = 0.0
             elif self.tele_floor:
-                rpm = max(self.plant.p.tele_floor_mech, abs(self.plant.rpm))
+                rpm = self.plant.tele_reported()  # regime+firmware aware (S3 floor vs S4 sentinel)
             else:
-                rpm = abs(self.plant.rpm)
+                rpm = abs(self.plant.rpm)        # ablation: a perfect sensor, which no firmware has
             # rpm|volts|amps|tempC|stress — magnitude, as a bidir ESC reports; 31 C flat because no
             # fixture has thermal data (see the not-modelled list).
             return [f"tele|{rpm:.0f}|{self.plant.p.v_supply:.2f}|0|31|0"]

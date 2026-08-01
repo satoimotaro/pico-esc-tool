@@ -4,10 +4,18 @@
 
 Nobody knew. `velctl` has run against `pico_esc.sim`'s toy plant since it was written, and the toy
 plant implements the SPEC: `test_sim_crossover.py::test_sim_reports_stale_tele_in_sine_but_live_in_6step`
-pins that it reports NOTHING below the seam. `MeasuredPlant.tele()` implements the REALITY —
-`max(tele_floor_mech, abs(rpm))`, a floored 182 mech rpm that never goes stale — and until 4e77eba
-nothing but `sim_obs` was wired to it. So every closed-loop test in this suite has been rehearsing an
-ESC that does not exist, and the two bugs found on the bench on 2026-08-01 were both invisible here.
+pins that it reports NOTHING below the seam. `MeasuredPlant.tele()` implements the REALITY — a floored
+182 mech rpm that never goes stale — and until 4e77eba nothing but `sim_obs` was wired to it. So every
+closed-loop test in this suite has been rehearsing an ESC that does not exist, and the two bugs found
+on the bench on 2026-08-01 were both invisible here.
+
+THE SPEC IS NOW BECOMING TRUE, which is why every cell runs on BOTH firmwares (see `FIRMWARES`).
+bluegill f0b5339 replaces the 182 with the not-spinning sentinel, so after that flash the reality
+column and the spec column converge. Until the flash is bench-verified they are two different ESCs and
+both have to be represented, or every trace taken before it silently changes meaning. Note what the S4
+column already shows: not one new xfail. Running the whole forced-sine region OPEN, on feed-forward
+alone, costs nothing the 10 %/25 rpm tolerance can see — the closed loop down there was never buying
+anything, because there was never a measurement down there to close on.
 
 WHAT THE BENCH KNOWS (930KV and 350KV bare shaft, 2026-08-01):
   * sine OFF, 6-step only .......... no stalls (5/5), but 47 % steady-state error, because the FF
@@ -49,7 +57,8 @@ from pico_esc.control import DT                                       # noqa: E4
 from pico_esc.esc import ESC                                          # noqa: E402
 from pico_esc.link import SimClock                                    # noqa: E402
 from pico_esc.motor_model import MotorModel                           # noqa: E402
-from pico_esc.plant import MeasuredEscHost, MeasuredPlant, preset     # noqa: E402
+from pico_esc.plant import (MeasuredEscHost, MeasuredPlant, TELE_SINE_S3,   # noqa: E402
+                            TELE_SINE_S4, preset)
 from pico_esc.velocity import VelocityController                      # noqa: E402
 
 
@@ -83,15 +92,29 @@ class StuckPlant(MeasuredPlant):
 BARE_350 = "350KV"
 BARE_930 = "930KV"
 
+# THE FIRMWARE AXIS. Every cell below is run on BOTH, because "which closed-loop configurations work"
+# has a different answer depending on what the ESC says while it is forcing the field, and the answer
+# for the firmware on the bench today is not the answer for the firmware about to be flashed:
+#   S3 (bluegill <= 7f5cd61) reports a constant 182 mech rpm in sine — above TELE_MIN_MECH_RPM = 50,
+#     so the loop believes it and `track_min_frac` is the only thing standing between it and windup.
+#   S4 (bluegill f0b5339)    reports the not-spinning sentinel — the liveness gate rejects it and the
+#     loop runs open across the whole sine region, which is the contract vel_control.h was written to.
+# Keeping both here is the point: a trace taken before the flash must keep comparing against S3, and
+# the S4 column says what to expect after it, in one file rather than by editing a constant.
+FIRMWARES = (TELE_SINE_S3, TELE_SINE_S4)
+FW_ID = {TELE_SINE_S3: "s3-lies", TELE_SINE_S4: "s4-honest"}
 
-def _params(motor):
-    """The bare-shaft inventory, optionally re-KV'd.
+
+def _params(motor, tele_sine=TELE_SINE_S3):
+    """The bare-shaft inventory, optionally re-KV'd and on a chosen firmware.
 
     `MeasuredPlant`'s presets are 350KV only. `kv` is the one field a 930KV needs: `k_t`,
     `no_load_top` and `brake_cutout_rpm` are all derived properties of it (the last one only since
     0b54afa — stored as an rpm it transferred WRONG, over-braking a 930KV by 2.4x)."""
     p = preset(M.BARE)
-    return p if motor == BARE_350 else replace(p, kv=930.0, name="BARE_930KV_SYNTH")
+    if motor != BARE_350:
+        p = replace(p, kv=930.0, name="BARE_930KV_SYNTH")
+    return replace(p, tele_sine=tele_sine)
 
 
 def _bands(motor):
@@ -127,10 +150,11 @@ SECS = 6.0
 SETTLE_FROM = 0.8 * SECS
 
 
-def _run(motor, target, *, plant_cls=MeasuredPlant, profile_cross_up=None, secs=SECS, **kw):
+def _run(motor, target, *, plant_cls=MeasuredPlant, profile_cross_up=None, secs=SECS,
+         tele_sine=TELE_SINE_S3, **kw):
     """One closed-loop run. Returns the OUTCOMES, never the internals — a cell must be judged on
     what the operator would see."""
-    p = _params(motor)
+    p = _params(motor, tele_sine)
     plant = plant_cls(p, cut_mode="disarm")
     clock = SimClock()
     esc = ESC(MeasuredEscHost(plant, clock), 1, tmax=1000, clock=clock)
@@ -182,38 +206,48 @@ def _bounded(o):
 
 
 # =========================================================================== A. the grid
-MATRIX = [(motor, band, sine)
+MATRIX = [(motor, band, sine, fw)
           for motor in (BARE_350, BARE_930)
           for band in ("below-seam", "gap", "above-landing", "high")
-          for sine in (True, False)]
+          for sine in (True, False)
+          for fw in FIRMWARES]
 
 # Cells the model says do not work, with the reason. `strict=True`: if one starts passing, this file
 # has to be re-read rather than silently going green.
 KNOWN_BAD = {
-    (BARE_350, "below-seam", False):
+    (BARE_350, "below-seam", False, TELE_SINE_S3):
         "sine_mode=0 has no torque below the 6-step floor, so the rotor never turns at all — and "
         "`tele` still reports its 182 rpm floor, so nothing in the loop can tell",
-    (BARE_930, "below-seam", False):
+    (BARE_350, "below-seam", False, TELE_SINE_S4):
+        "same missing torque; on S4 the loop at least KNOWS it is blind (tele reads the not-spinning "
+        "sentinel) instead of being told 182, but knowing does not make the rotor turn",
+    (BARE_930, "below-seam", False, TELE_SINE_S3):
         "same as the 350KV: with no forced-sine branch the sub-landing region is unreachable, and "
         "the 930KV's landing is 522 rpm, so the unreachable band is 3x wider",
+    (BARE_930, "below-seam", False, TELE_SINE_S4):
+        "same unreachable 3x-wider band on the honest firmware",
 }
 
 
-@pytest.mark.parametrize("motor,band,sine", MATRIX,
-                         ids=[f"{m}-{b}-sine{'on' if s else 'off'}" for m, b, s in MATRIX])
-def test_the_closed_loop_configuration_matrix(motor, band, sine, request):
+@pytest.mark.parametrize("motor,band,sine,fw", MATRIX,
+                         ids=[f"{m}-{b}-sine{'on' if s else 'off'}-{FW_ID[f]}"
+                              for m, b, s, f in MATRIX])
+def test_the_closed_loop_configuration_matrix(motor, band, sine, fw, request):
     """Does this configuration reach its target, and does it stay inside its authority budget?
 
     Asserted on OUTCOMES, not on tuned numbers: `_reached` is 10 % or 25 rpm, whichever is looser,
-    and `_bounded` is the structural invariant that no feedback path may exceed what was granted."""
-    if (motor, band, sine) in KNOWN_BAD:
-        request.node.add_marker(pytest.mark.xfail(strict=True, reason=KNOWN_BAD[(motor, band, sine)]))
+    and `_bounded` is the structural invariant that no feedback path may exceed what was granted.
+    Run on BOTH firmwares (see FIRMWARES) so the flash cannot silently move a cell."""
+    if (motor, band, sine, fw) in KNOWN_BAD:
+        request.node.add_marker(
+            pytest.mark.xfail(strict=True, reason=KNOWN_BAD[(motor, band, sine, fw)]))
     target = _bands(motor)[band]
-    o = _run(motor, target, plant_cls=MeasuredPlant if sine else NoSinePlant)
-    assert _bounded(o), (f"{motor}/{band}/sine={sine}: command peaked {o['cmd_peak']:.0f} against a "
+    o = _run(motor, target, plant_cls=MeasuredPlant if sine else NoSinePlant, tele_sine=fw)
+    where = f"{motor}/{band}/sine={sine}/{FW_ID[fw]}"
+    assert _bounded(o), (f"{where}: command peaked {o['cmd_peak']:.0f} against a "
                          f"feed-forward of {o['ff']:.0f} — {o['excursion']:.0f} counts of feedback "
                          f"where only {GAINS['trim_max']:.0f} was granted")
-    assert _reached(o), (f"{motor}/{band}/sine={sine}: settled at {o['rpm_ss']:.0f} rpm against a "
+    assert _reached(o), (f"{where}: settled at {o['rpm_ss']:.0f} rpm against a "
                          f"target of {target:.0f} ({100 * (o['rpm_ss'] - target) / target:+.0f} %)")
 
 
@@ -221,22 +255,35 @@ def test_the_closed_loop_configuration_matrix(motor, band, sine, request):
 # The row the whole exercise is about. A rotor that never catches, behind telemetry that never admits
 # it. The requirement is NOT that the loop tracks — it cannot, there is nothing turning — it is that
 # it degrades instead of blowing up.
+@pytest.mark.parametrize("fw", FIRMWARES, ids=[FW_ID[f] for f in FIRMWARES])
 @pytest.mark.parametrize("motor", (BARE_350, BARE_930))
-def test_a_lying_sensor_over_a_stuck_rotor_degrades_to_feed_forward(motor):
+def test_a_stuck_rotor_degrades_to_feed_forward_on_either_firmware(motor, fw):
     """DEGRADED TRACKING IS ACCEPTABLE; A CONTROL-LEVEL BLOW-UP IS NOT.
 
-    `TELE_MIN_MECH_RPM = 50` sits BELOW the measured 182 rpm telemetry floor, so the liveness gate
-    can never separate "the rotor is at 182" from "the ESC is lying about a rotor that is not
-    turning". Before `track_min_frac`, the PI took full authority against a fabricated error and
-    parked at +trim_max for ever; on the firmware the observer stacked another +dob_max on top, which
-    is the measured 872-against-641.
+    The same fault, seen through both firmwares, because they fail the loop by DIFFERENT routes and
+    only one of them is a route the flash removes:
 
-    What must hold now: the authority is WITHDRAWN, the command is exactly the feed-forward, and the
-    loop does not reach the target — which it should not, because nothing is turning."""
+      * S3 — `TELE_MIN_MECH_RPM = 50` sits BELOW the 182 rpm floor, so the liveness gate can never
+        separate "the rotor is at 182" from "the ESC is lying about a rotor that is not turning".
+        Before `track_min_frac` the PI took full authority against a fabricated error and parked at
+        +trim_max for ever; on the firmware the observer stacked another +dob_max on top, which is the
+        measured 872-against-641. Here `track_min_frac` is the ONLY thing withdrawing authority.
+      * S4 — the sentinel reads 0, the liveness gate rejects it, and authority never rises in the
+        first place. The corroboration gate is not exercised at all.
+
+    The flash therefore does not make `track_min_frac` redundant: it removes the one lie we happen to
+    know about, on the one firmware we control. Any other ESC — stock Bluejay, a different fork — is
+    free to report whatever it likes down there, and the S3 column is what that looks like.
+
+    What must hold on BOTH: the authority is withdrawn, and the loop does not reach the target —
+    which it should not, because nothing is turning."""
     target = _bands(motor)["high"]
-    o = _run(motor, target, plant_cls=StuckPlant)
+    o = _run(motor, target, plant_cls=StuckPlant, tele_sine=fw)
     assert o["rpm_ss"] == 0.0                                  # the fault really is injected
-    assert o["authority"] < 0.01, f"authority stayed at {o['authority']:.2f} on a motionless rotor"
+    assert o["authority"] < 0.01, (f"authority stayed at {o['authority']:.2f} on a motionless rotor "
+                                   f"({FW_ID[fw]})")
+    assert _bounded(o), (f"{FW_ID[fw]}: command peaked {o['cmd_peak']:.0f} against a feed-forward of "
+                         f"{o['ff']:.0f} on a rotor that never moved")
     assert o["excursion"] <= 1.0, (f"{motor}: command {o['cmd_peak']:.0f} vs feed-forward "
                                    f"{o['ff']:.0f} — the loop is still pushing against a lie")
     assert not _reached(o)                                     # honest: it does NOT track
@@ -279,14 +326,14 @@ def test_a_feed_forward_built_for_the_wrong_cross_up_stays_inside_its_authority(
 def test_the_corroboration_gate_is_inert_on_every_healthy_cell():
     """The gate must be a no-op wherever the plant is really being driven, or it is just a lower
     clamp wearing a disguise. Every cell of the grid, with and without it, to the command count."""
-    for motor, band, sine in MATRIX:
-        if (motor, band, sine) in KNOWN_BAD:
+    for motor, band, sine, fw in MATRIX:
+        if (motor, band, sine, fw) in KNOWN_BAD:
             continue
         target = _bands(motor)[band]
         cls = MeasuredPlant if sine else NoSinePlant
-        on = _run(motor, target, plant_cls=cls)
-        off = _run(motor, target, plant_cls=cls, track_min_frac=0.0)
+        on = _run(motor, target, plant_cls=cls, tele_sine=fw)
+        off = _run(motor, target, plant_cls=cls, tele_sine=fw, track_min_frac=0.0)
         assert abs(on["cmd_peak"] - off["cmd_peak"]) <= 1.0, (
-            f"{motor}/{band}/sine={sine}: the gate moved the command "
+            f"{motor}/{band}/sine={sine}/{FW_ID[fw]}: the gate moved the command "
             f"{off['cmd_peak']:.0f} -> {on['cmd_peak']:.0f} on a HEALTHY plant")
         assert abs(on["rpm_ss"] - off["rpm_ss"]) <= 1.0
