@@ -536,6 +536,160 @@ int main() {
 		CHECK(vc.setpoint() < 60.0f, "...so the SECOND run slews exactly like the first");
 	}
 
+	// ================================================================================================
+	// STRUCTURAL AUTHORITY LIMITS (2026-08-01). Both of these exist because of one bench failure and
+	// one spec violation, and the point of them is that neither depends on the sensor being fixed.
+	//
+	// THE SPEC VIOLATION: the header of vel_control.h says the liveness gate rejects "forced-sine's
+	// stale ~0" — this controller was written for an ESC that reports ~0 when it is NOT BEMF-locked.
+	// BlueGill reports a floored 182 mech rpm instead, so TELE_MIN_MECH_RPM = 50 cannot separate "the
+	// rotor is turning at 182" from "the ESC is lying about a rotor that is not turning". The stall
+	// scenario already in this file (SimEsc::never_live) models the SPEC — readTele returns false — so
+	// it could never have caught this. LyingEsc below models the HARDWARE.
+	// ================================================================================================
+	struct LyingEsc : EscIo {
+		float rpm = 0.0f, dt = 0.02f, tau = 0.15f, floor_rpm = 60.0f, disturb = 0.0f;
+		bool  stuck = false;            // the rotor never catches the field (cogs in place)
+		int   last_sent = 0;
+		void thrust(int cmd) override {
+			last_sent = cmd;
+			float target = stuck ? 0.0f : copysignf(lineMech(cmd), (float)cmd);
+			if (cmd == 0) target = 0.0f;
+			if (target != 0.0f) { float m = fabsf(target) - disturb; if (m < 0.0f) m = 0.0f;
+			                      target = copysignf(m, target); }
+			rpm += (target - rpm) * (dt / tau);
+		}
+		// THE LIE: a frame always arrives, and it never reads below the floor however still the rotor is.
+		bool readTele(float& mechRpm, float& tempC_out) override {
+			tempC_out = 0.0f;
+			mechRpm = fabsf(rpm) > floor_rpm ? fabsf(rpm) : floor_rpm;
+			return true;
+		}
+		bool readTemp(float&, uint32_t&) override { return false; }
+	};
+
+	// -- (b) AUTHORITY REQUIRES CORROBORATION. A stuck rotor behind a floored telemetry: the gate says
+	//    LIVE on every tick, so before this the PI took full authority against a fabricated error and
+	//    both feedback paths saturated. Measured on the 930KV: trim_max 80 + dob_max 150 = 230 over a
+	//    steady-state feed-forward of 641, and the startup command was 872. --
+	{
+		CurvePoint lp[12]; Crossover lc{UP_ERPM, DN_ERPM};
+		SpeedProfile P = Prof::build(lp, &lc, 1.0f);
+		const float TARGET = 400.0f;
+		float ff = P.thrustFor(TARGET);
+		// The switch is track_min_frac, so run BOTH sides of it on the identical scenario.
+		float cmd_off = 0.0f, cmd_on = 0.0f, w_off = 0.0f, w_on = 0.0f, end_off = 0.0f, end_on = 0.0f;
+		for (int pass = 0; pass < 2; pass++) {
+			LyingEsc sim; sim.stuck = true;
+			VelocityController vc(sim, P);
+			vc.kp = 0.06f; vc.ki = 0.25f; vc.trim_max = 80.0f; vc.slew_rpm_s = 2000.0f;
+			vc.dob = 0.8f; vc.dob_max = 150.0f; vc.dob_settle_secs = 0.2f;
+			vc.stall_secs = 1e9f; vc.over_speed_rpm = 1e9f;
+			vc.track_min_frac = (pass == 0) ? 0.0f : 0.25f;   // pass 0 = the old behaviour
+			vc.setTarget(TARGET);
+			float peak = 0.0f, last = 0.0f;
+			for (int t = 0; t < 400; t++) {
+				vc.step(0.02f);
+				float c = fabsf((float)vc.command());
+				if (c > peak) peak = c;
+				last = c;
+			}
+			if (pass == 0) { cmd_off = peak; w_off = vc.authority(); end_off = last; }
+			else           { cmd_on  = peak; w_on  = vc.authority(); end_on  = last; }
+		}
+		printf("   lying sensor, stuck rotor: ff=%.0f   track_min_frac 0 -> peak %.0f end %.0f (w %.2f)"
+		       "   0.25 -> peak %.0f end %.0f (w %.2f)\n",
+		       ff, cmd_off, end_off, w_off, cmd_on, end_on, w_on);
+		CHECK(cmd_off > ff + 100.0f, "WITHOUT corroboration the loop slams the command far above the FF");
+		CHECK(w_off > 0.99f, "...because liveness alone gave the PI FULL authority on a lying sensor");
+		CHECK(w_on < 0.01f, "WITH corroboration the authority is withdrawn to zero");
+		CHECK(end_on <= ff + 1.0f, "...and the command settles at pure feed-forward, which is the ask");
+		// The excursion is not zero and must not be claimed to be: w_ FADES over blend_secs, so the PI
+		// keeps a shrinking share of authority for ~0.3 s before the withdrawal completes. What the
+		// fix does is bound that to the fade instead of to trim_max + dob_max.
+		CHECK(cmd_on - ff < 0.15f * (cmd_off - ff),
+		      "...and the transient excursion is a fraction of the unguarded slam (the blend_secs fade)");
+		// live() itself must NOT be suppressed: the over-speed and stall aborts are safety guards and
+		// have to keep firing on the raw frame whatever the authority logic thinks of it.
+		{
+			LyingEsc sim; sim.stuck = true;
+			VelocityController vc(sim, P);
+			vc.track_min_frac = 0.25f; vc.stall_secs = 1e9f;
+			vc.setTarget(TARGET);
+			for (int t = 0; t < 100; t++) vc.step(0.02f);
+			CHECK(vc.live() && !vc.corroborated(),
+			      "liveness stays TRUE (the guards still see the frame); only corroboration goes false");
+		}
+	}
+
+	// -- (b) MUST NOT break the case the DOB exists for: a REAL load in water is a rpm deficit of tens
+	//    of percent, not 95 %, so corroboration has to leave the observer its whole legitimate range. --
+	{
+		CurvePoint lp[12]; Crossover lc{UP_ERPM, DN_ERPM};
+		SpeedProfile P = Prof::build(lp, &lc, 1.0f);
+		LyingEsc sim; sim.disturb = 120.0f;          // a genuine load: ~30 % of the achieved speed
+		VelocityController vc(sim, P);
+		vc.kp = 0.06f; vc.ki = 0.25f; vc.trim_max = 300.0f; vc.slew_rpm_s = 2000.0f;
+		vc.dob = 0.8f; vc.dob_max = 150.0f; vc.dob_settle_secs = 0.2f;
+		vc.track_min_frac = 0.25f;
+		vc.setTarget(400.0f);
+		for (int t = 0; t < 400; t++) vc.step(0.02f);
+		printf("   real 120 rpm load: w=%.2f corroborated=%d dhat=%.0f err=%.0f\n",
+		       vc.authority(), (int)vc.corroborated(), vc.dhat(), 400.0f - fabsf(vc.measured()));
+		CHECK(vc.corroborated() && vc.authority() > 0.99f,
+		      "a genuine load still CORROBORATES — the loop keeps full authority under it");
+		CHECK(fabsf(400.0f - fabsf(vc.measured())) < 40.0f, "...and still tracks the target under it");
+	}
+
+	// -- (a) ONE BUDGET for both feedback paths. They were clamped independently, so the reachable
+	//    deviation from the FF was their SUM — a number nobody chose. Corroboration is disabled here on
+	//    purpose, to test the budget ALONE against the same slam. --
+	{
+		CurvePoint lp[12]; Crossover lc{UP_ERPM, DN_ERPM};
+		SpeedProfile P = Prof::build(lp, &lc, 1.0f);
+		const float TARGET = 400.0f;
+		float ff = P.thrustFor(TARGET);
+		float stacked[2] = {0.0f, 0.0f};
+		for (int pass = 0; pass < 2; pass++) {
+			LyingEsc sim; sim.stuck = true;
+			VelocityController vc(sim, P);
+			vc.kp = 0.06f; vc.ki = 0.25f; vc.trim_max = 80.0f; vc.slew_rpm_s = 2000.0f;
+			vc.dob = 0.8f; vc.dob_max = 150.0f; vc.dob_settle_secs = 0.2f;
+			vc.stall_secs = 1e9f; vc.over_speed_rpm = 1e9f; vc.track_min_frac = 0.0f;
+			vc.fb_max = (pass == 0) ? 1e6f : 0.0f;      // pass 0 = the old independent clamps
+			vc.setTarget(TARGET);
+			float peak = 0.0f;
+			for (int t = 0; t < 400; t++) { vc.step(0.02f); float d = fabsf((float)vc.command()) - ff;
+			                                if (d > peak) peak = d; }
+			stacked[pass] = peak;
+		}
+		printf("   stacking: trim_max 80 + dob_max 150 -> deviation %.0f unbounded, %.0f budgeted "
+		       "(budget = max(80,150) = 150)\n", stacked[0], stacked[1]);
+		CHECK(stacked[0] > 200.0f, "unbudgeted, the two paths STACK to more than either was allowed");
+		CHECK(stacked[1] <= 150.0f + 1.0f, "budgeted, the total cannot exceed max(trim_max, dob_max)");
+		CHECK(stacked[1] < stacked[0] - 50.0f, "...which is a real bound, not a rounding difference");
+	}
+
+	// -- (a) is a NO-OP where it should be: with the observer off there is only one path, and opposing
+	//    paths sum small. This bounds STACKING, not disagreement, and it never trims the PI. --
+	{
+		CurvePoint lp[12]; Crossover lc{UP_ERPM, DN_ERPM};
+		SpeedProfile P = Prof::build(lp, &lc, 1.2f);   // FF over-reports speed -> the PI must work
+		LyingEsc sim;
+		VelocityController vc(sim, P);
+		vc.kp = 0.06f; vc.ki = 0.25f; vc.trim_max = 200.0f; vc.slew_rpm_s = 2000.0f; vc.dob = 0.0f;
+		vc.setTarget(400.0f);
+		float peak = 0.0f;
+		for (int t = 0; t < 400; t++) { vc.step(0.02f); float a = fabsf(vc.trim()); if (a > peak) peak = a; }
+		CHECK(peak > 20.0f, "with dob = 0 the PI still uses its own authority freely");
+		CHECK(vc.fbMax() == 200.0f, "...and the derived budget is just trim_max when there is no observer");
+		VelocityController v2(sim, P);
+		v2.trim_max = 80.0f; v2.dob_max = 150.0f;
+		CHECK(v2.fbMax() == 150.0f, "the derived budget is the LARGER of the two, never their sum");
+		v2.fb_max = 42.0f;
+		CHECK(v2.fbMax() == 42.0f, "an explicit fb_max overrides the derivation");
+	}
+
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
 	return failures ? 1 : 0;
 }

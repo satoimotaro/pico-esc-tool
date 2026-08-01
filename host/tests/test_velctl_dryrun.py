@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 HOST = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -106,6 +108,14 @@ def test_velctl_default_profile_reproducible():
     assert p.thrust_for(p.max_rpm) == p.points[-1][0]
 
 
+def _needs_inventory():
+    """`--plant measured` needs pico_esc/measured.py, which is a per-installation asset and is NOT
+    shipped (see the 0ebf709 split). Without it these must SKIP, not fail: a public checkout has the
+    tools and none of the numbers. Mirrors test_closed_loop_matrix.py's importorskip."""
+    pytest.importorskip("pico_esc.measured",
+                        reason="--plant measured needs the local measured inventory")
+
+
 def test_the_measured_dry_run_plant_is_selectable_and_is_not_the_toy_one(tmp_path):
     """`--plant measured` puts the BENCH-IDENTIFIED plant into the dry run instead of the toy one.
 
@@ -120,6 +130,7 @@ def test_the_measured_dry_run_plant_is_selectable_and_is_not_the_toy_one(tmp_pat
     Pinned here: the option selects it, the whole velctl loop runs on top of it unmodified, and the
     default stays `toy` so every existing invocation is untouched.
     """
+    _needs_inventory()
     prof = os.path.join(HOST, "profiles", "f2838_350kv_bench_20260726.yaml")
     out = tmp_path / "m.csv"
     r = _run("velctl.py", "speed", "--dry-run", "--plant", "measured", "--rpm", "400",
@@ -139,6 +150,7 @@ def test_the_measured_dry_run_plant_is_selectable_and_is_not_the_toy_one(tmp_pat
 def test_the_measured_dry_run_plant_rejects_a_mechanical_config_it_has_no_inventory_for(tmp_path):
     """Mixing mechanical configurations is the failure mode plant.py exists to prevent, so an
     unknown one must be a loud KeyError from preset(), not a silent fallback to some default rotor."""
+    _needs_inventory()
     prof = os.path.join(HOST, "profiles", "f2838_350kv_bench_20260726.yaml")
     r = _run("velctl.py", "speed", "--dry-run", "--plant", "measured", "--mech-config", "no_such_rotor",
              "--rpm", "400", "--secs", "1", "--profile", prof, "--csv", str(tmp_path / "x.csv"),

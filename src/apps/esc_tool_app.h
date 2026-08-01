@@ -578,11 +578,21 @@ private:
 					else if(!strcmp(g,"trim")) th_[i]->vc.trim_max=fv; else if(!strcmp(g,"slew")) th_[i]->vc.slew_rpm_s=fv;
 					else if(!strcmp(g,"dob")) th_[i]->vc.dob=fv; else if(!strcmp(g,"dobtau")) th_[i]->vc.dob_tau=fv;
 					else if(!strcmp(g,"dobmax")) th_[i]->vc.dob_max=fv; else if(!strcmp(g,"dobsettle")) th_[i]->vc.dob_settle_secs=fv;
+					// [2026-08-01] The two STRUCTURAL authority limits, reachable from the wire on purpose:
+					// both are ON by default and both are safety-relevant, so an operator who finds one
+					// misbehaving on a bench must be able to back it out without a reflash.
+					//   fbmax  <=0 => the derived max(trim, dobmax); a positive value overrides the total
+					//   trackfrac 0 => disable the corroboration gate (pre-2026-08-01 liveness-only)
+					// NOT persisted by `cfg save`, for the same reason warntemp/maxtemp are not: a power
+					// cycle must always restore the guard, so disabling one is an explicit act each time.
+					else if(!strcmp(g,"fbmax")) th_[i]->vc.fb_max=fv;
+					else if(!strcmp(g,"trackfrac")) th_[i]->vc.track_min_frac=fv;
 					// [B.7] thermal thresholds, in C. warntemp 0 disables the derate, maxtemp 0 disables
 					// the temp check entirely. NOT persisted by `cfg save` on purpose (src/main.cpp): a
 					// power cycle always restores the conservative compile-time band.
 					else if(!strcmp(g,"warntemp")) th_[i]->vc.warn_temp=fv; else if(!strcmp(g,"maxtemp")) th_[i]->vc.max_temp=fv;
-					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle|warntemp|maxtemp)"); continue; }
+					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle|"
+						"fbmax|trackfrac|warntemp|maxtemp)"); continue; }
 					Serial.println("ok"); } }
 			else if (!strcmp(cmd,"motor")) { int i=argi(); char* kv=strtok(nullptr," "); char* pp=strtok(nullptr," "); char* vv=strtok(nullptr," ");   // motor <i> <kv> <pp> <v>: regenerate the FF curve parametrically (MotorModel)
 				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence

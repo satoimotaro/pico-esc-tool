@@ -39,6 +39,10 @@ static const float TELE_MIN_MECH_RPM = 50.0f;
 static const float VEL_DT_DEFAULT     = 0.02f;   // dt fallback when a caller passes <=0 (50 Hz)
 static const float W_BACKCALC_FLOOR   = 0.1f;    // outer-clamp back-calc only above this authority
 static const float DOB_LIVE_FLOOR     = 0.9f;    // DOB engages only when liveness is (near) fully established
+// Below this the profile's forward prediction carries no information worth checking a measurement
+// against: it is the curve's own low-command region, where the segment resolution and the ESC's
+// telemetry floor are the same size as the prediction. See VelocityController::track_min_frac.
+static const float TRACK_MIN_PREDICTED_RPM = 100.0f;
 
 // Built-in PI gains — the single default shared with the constructor below. These are the SIM-tuned
 // values; a real motor's plant gain is ~30x higher (930KV 6-step ~23 mech RPM per command-unit), so
@@ -318,6 +322,43 @@ public:
 	float dob_max   = 150.0f;   // clamp on the DOB command compensation — a MIS-calibrated FF makes the
 	                            // model deficit look like a huge load; this bounds the over-drive (the PI
 	                            // then trims the residual). Use an ACCURATE profile for the full benefit.
+	// TOTAL feedback authority: the largest deviation from the feed-forward that ALL closed-loop paths
+	// together may command. <= 0 (default) derives it as max(trim_max, dob_max).
+	//
+	// WHY THIS EXISTS. trim_max and dob_max were clamped INDEPENDENTLY, so the reachable deviation was
+	// their SUM — a number nobody chose. Measured 2026-08-01 on the 930KV: trim_max 80 + dob_max 150 =
+	// 230 against a steady-state feed-forward of 641, and the startup command was 872. The operator
+	// authorised 80 for the PI and 150 for the observer; they never authorised 230. Deriving the budget
+	// as the LARGER of the two says exactly that, and it needs no new number to tune.
+	//
+	// It is a bound on the SIGNED total, and the OBSERVER is the path that gives way: `applied` (the PI
+	// trim) is already <= trim_max <= the derived budget, so it is never cut and the integrator's
+	// back-calculation is untouched by this. When the two paths OPPOSE (a DOB pushing down against a PI
+	// pushing up) their signed sum is small and nothing is clamped at all — this bounds stacking, not
+	// disagreement. With dob == 0 it is a mathematical no-op.
+	//
+	// Raising it is a deliberate act: it says a genuine load may need both paths at once. Degraded
+	// tracking under a load that big is the acceptable failure; a command slam is not.
+	float fb_max    = 0.0f;
+	// AUTHORITY REQUIRES CORROBORATION: the fraction of the profile's own forward prediction that the
+	// measurement must reach before the PI is allowed to gain authority. 0 disables the test.
+	//
+	// WHY THIS EXISTS, and it is a spec violation this file was written around. The header above says
+	// the liveness gate rejects "forced-sine's stale ~0" — i.e. this controller assumed an ESC that
+	// reports ~0 when it is NOT BEMF-locked. BlueGill reports a floored 182 mech rpm instead, so
+	// TELE_MIN_MECH_RPM = 50 can never separate "the rotor is turning at 182" from "the ESC is lying
+	// about a rotor that is not turning at all". The gate said LIVE while the rotor cogged in place,
+	// and both feedback paths then integrated against a fabricated ~3800 rpm error.
+	//
+	// Liveness ("a frame arrived, and it is not obviously garbage") is not evidence that the plant is
+	// TRACKING. This is: the profile predicts the rpm the command we actually sent should produce, and
+	// a measurement far below that fraction of it is not a plant we are controlling. A real load in
+	// water — the case the DOB exists for — costs tens of percent of speed, not 95 %, so 0.25 leaves
+	// the observer its whole legitimate range while catching the 182-against-4000 case by 5x.
+	//
+	// It gates the PI AUTHORITY only. live_ itself is left alone on purpose: the over-speed and stall
+	// aborts are safety guards and must keep firing on the raw frame, whatever we think of it.
+	float track_min_frac = 0.25f;
 	// SETTLE gate (the firmware counterpart of the host loop's veltune.VelLoop._settle_gate): rpmFor()
 	// predicts the STEADY rpm of a command, but the plant is still rising toward it with tau ~25-130 ms in
 	// 6-step — so while the setpoint is slewing the raw deficit is the plant transient, not load, and
@@ -367,7 +408,7 @@ public:
 		// (peak ~4620 rpm at t~1.2 s), and at slew=50 the command was 792 at t=0.44 s where a slewed
 		// setpoint of 22 rpm asks for ~60. Only the first run after a power-on ever slewed.
 		setpoint_ = 0.0f;
-		i_ = 0.0f; w_ = 0.0f; have_tele_ = false; tele_mech_ = 0.0f; live_ = false;
+		i_ = 0.0f; w_ = 0.0f; have_tele_ = false; tele_mech_ = 0.0f; live_ = false; corroborated_ = true;
 		d_hat_ = 0.0f; settle_ = 0.0f;
 		stale_accum_ = 0.0f; last_sent_ = 0; last_applied_ = 0.0f;
 		prev_meas_ = 0.0f; have_prev_meas_ = false; d_filt_ = 0.0f; last_d_ = 0.0f;
@@ -422,11 +463,25 @@ public:
 		//    instead of hiding inside the tracking error where the DOB would fight it. --
 		if (updateTemp_(tc, dt)) { io_.thrust(0); return Status::ABORT_TEMP; }
 
-		// -- PI authority (w) fades with liveness: 0->1 live, 1->0 stale, over blend_secs. Reset the
-		//    integrator at w==0 so a re-arm from below the seam starts clean. --
+		// -- PI authority (w) fades with liveness AND CORROBORATION: 0->1 while a live frame is also
+		//    consistent with the plant we think we are driving, 1->0 otherwise, over blend_secs. Reset
+		//    the integrator at w==0 so a re-arm from below the seam starts clean.
+		//
+		//    Corroboration compares the measurement against the profile's forward prediction for the
+		//    command we ACTUALLY SENT last tick — the same map the DOB already trusts for d_meas. Two
+		//    deliberate escapes: last_sent_ == 0 on the first tick predicts ~0, and any prediction
+		//    below TRACK_MIN_PREDICTED_RPM is in the region where the curve's own resolution and the
+		//    ESC's telemetry floor dominate. Both mean "no information", and no information must not
+		//    withdraw authority — only a prediction we can actually check, and fail, does. --
+		corroborated_ = true;
+		if (live_ && track_min_frac > 0.0f) {
+			float predicted = profile_->rpmFor((float)last_sent_);
+			if (fabsf(predicted) > TRACK_MIN_PREDICTED_RPM)
+				corroborated_ = fabsf(tele_mech_) >= track_min_frac * fabsf(predicted);
+		}
 		float rate = (blend_secs > 0.0f) ? dt / blend_secs : 1.0f;
-		if (live_) { w_ += rate; if (w_ > 1.0f) w_ = 1.0f; }
-		else       { w_ -= rate; if (w_ < 0.0f) w_ = 0.0f; }
+		if (live_ && corroborated_) { w_ += rate; if (w_ > 1.0f) w_ = 1.0f; }
+		else                        { w_ -= rate; if (w_ < 0.0f) w_ = 0.0f; }
 		if (w_ <= 0.0f) i_ = 0.0f;
 
 		// -- feed-forward + blended PI trim --
@@ -464,6 +519,15 @@ public:
 		} else {
 			d_hat_ = 0.0f;   // no wound-up estimate from the catch / forced-sine transient
 		}
+		// -- ONE BUDGET for all feedback paths (see fb_max). The two clamps above are independent, so
+		//    without this the reachable deviation from the feed-forward is their SUM. Bound the SIGNED
+		//    total and let the OBSERVER absorb the whole cut: `applied` is already <= trim_max <= the
+		//    budget, so the PI is never trimmed here and its back-calculation below sees exactly what
+		//    it saw before. Opposing paths sum small and are untouched; dob == 0 makes this a no-op. --
+		float budget = fbMax();
+		float fb = applied + comp;
+		float fbc = clampf(fb, -budget, budget);
+		comp += (fbc - fb);
 		float cmd = ff + applied + comp;
 		int sent = clampCmd(cmd);
 		io_.thrust(sent);
@@ -525,6 +589,14 @@ public:
 	float trim()     const { return last_applied_; }     // BLENDED trim actually added to the FF
 	float measured() const { return tele_mech_; }        // last live mech RPM (signed); stale if !live()
 	bool  live()     const { return live_; }
+	// Did the last live frame CORROBORATE the profile's forward prediction? False = the loop is running
+	// open (feed-forward only) because the measurement is not evidence of a plant we are driving.
+	bool  corroborated() const { return corroborated_; }
+	// The total feedback budget in force this tick (see fb_max).
+	float fbMax() const {
+		if (fb_max > 0.0f) return fb_max;
+		return trim_max > dob_max ? trim_max : dob_max;
+	}
 	float authority() const { return w_; }               // PI weight 0..1
 	float dhat()     const { return d_hat_; }             // DOB load estimate (rpm-equivalent)
 	float settled()  const { return settle_; }            // DOB settle gate 0..1 (1 = settled, DOB full)
@@ -661,7 +733,7 @@ private:
 	float target_ = 0.0f, setpoint_ = 0.0f;
 	float pending_ = 0.0f; bool have_pending_ = false;
 	float i_ = 0.0f, w_ = 0.0f, d_hat_ = 0.0f, settle_ = 0.0f;
-	float tele_mech_ = 0.0f; bool have_tele_ = false, live_ = false;
+	float tele_mech_ = 0.0f; bool have_tele_ = false, live_ = false, corroborated_ = true;
 	float prev_meas_ = 0.0f; bool have_prev_meas_ = false; float d_filt_ = 0.0f, last_d_ = 0.0f;
 	float last_sign_ = 1.0f;
 	float stale_accum_ = 0.0f;
