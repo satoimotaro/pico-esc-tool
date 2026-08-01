@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import math
 import os
 import random
@@ -63,7 +64,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from esctool import EscHost, find_pico                 # noqa: E402
+from esctool import EscHost, find_pico, _read_raw      # noqa: E402
 from pico_esc.constants import COUNTS_PER_REV          # noqa: E402
 
 KEEPALIVE_S = 0.2                                      # < the 500 ms raw-throttle deadman
@@ -330,6 +331,16 @@ def main():
     dev.cmd("disconnect", timeout=6)
     time.sleep(0.4)
 
+    # Stamp the ESC's CONFIG on every row. The 2026-08-01 experiment showed that post-flash
+    # defaults cause a hard, deterministic start failure (startup_power_max=5 alone is enough), so
+    # "what was the ESC configured as" is at least as diagnostic as the parking angle — and a flash
+    # wipes the config every time. Once per session: it does not change mid-campaign.
+    raw = _read_raw(dev, opts.index)
+    cfg_tag = f"cfg:{hashlib.sha256(raw).hexdigest()[:12]}" if raw else "cfg:UNREADABLE"
+    print(f"# ESC config {cfg_tag} — compare against bench-registry snapshots if a row FAILS")
+    dev.cmd("disconnect", timeout=6)
+    time.sleep(0.4)
+
     rng = random.Random(opts.seed)
     rows, status = [], "completed"
     try:
@@ -341,7 +352,7 @@ def main():
             r.update(stamp=time.strftime("%Y-%m-%dT%H:%M:%S"), session=session, attempt=n,
                      esc=opts.index,
                      note=(f"nudge={opts.nudge_cmd} " if opts.nudge_cmd > 0 else "unnudged ")
-                          + opts.note)
+                          + f"{cfg_tag} " + opts.note)
             rows.append(r)
             mark = "ok" if r["outcome"] == "CAUGHT" else "*** FAILED ***"
             print(f"    {r['outcome']}  t_catch={r['t_catch_s'] or '-':>6}  "
