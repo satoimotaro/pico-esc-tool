@@ -77,6 +77,46 @@ def test_sine_crossover_rejects_out_of_band_up():
         config.sine_crossover_bytes(100000.0, 1500.0)
 
 
+# --- ONE handoff-able window, not two [2026-08-01] -------------------------------------------------
+# `sine_crossover_bytes` used to apply the CONTINUOUS pre-rounding band, one tick's worth stricter on
+# the low side than the firmware's own truncated-tick test, and so refused cross_up 34 — a seam the
+# 2026-07-31 bench sweeps hand off at on two different motors, and the byte `esc_config()` recommends.
+def test_the_validator_accepts_exactly_what_the_firmware_hands_off_at():
+    """The two predicates agree across the whole byte range. A validator that refuses a seam the
+    hardware accepts costs a working configuration; one that accepts a seam the hardware refuses
+    silently produces an ESC that never leaves sine. Neither is allowed, so they must be one test."""
+    for byte in range(1, 256):
+        up = byte * config.SINE_CROSS_UP_ERPM_PER_UNIT
+        handoffable = config.up_erpm_handoffable(up)
+        try:
+            config.sine_crossover_bytes(up, up - 20.0)
+            accepted = True
+        except ValueError:
+            accepted = False
+        # sine_crossover_bytes has FURTHER checks (hysteresis, byte range) that can reject a
+        # handoff-able seam, but it must never reject one for being OUT OF BAND when it is not, and
+        # never accept one that is.
+        if not handoffable:
+            assert not accepted, f"byte {byte} ({up:.1f} eRPM) is not handoff-able but was accepted"
+
+
+def test_cross_up_34_is_accepted_because_the_bench_hands_off_there():
+    """The specific regression: 34 -> 1328.125 eRPM -> 30.12 ticks. Inside the firmware's truncated
+    window (int() -> 30 <= SINE_CROSS_TICKS_MAX), outside the old continuous band."""
+    up = 34 * config.SINE_CROSS_UP_ERPM_PER_UNIT
+    assert config.up_erpm_handoffable(up)
+    assert config.sine_crossover_bytes(up, up - 20.0)[0] == 34
+
+
+def test_esc_config_seamless_down_no_longer_raises():
+    """Its one concrete victim: `_seamless_cross_dn()` feeds `sine_crossover_bytes` the very seam
+    `esc_config()` recommends, so the recommended configuration used to be unrepresentable."""
+    mm = pytest.importorskip("pico_esc.motor_model")
+    cfg = mm.MotorModel(930.0, 7, 11.2, 1.0, cross_up=34).esc_config(seamless_down=True)
+    assert cfg["sine_cross_up"] == 34
+    assert 1 <= cfg["sine_cross_dn"] <= config.SINE_CROSS_DN_MAX_BYTE
+
+
 # --------------------------------------------------------------------------------------------
 # STOCK (non-BlueGill) FIRMWARE. The README claims this tool "works with stock Bluejay and
 # BLHeli-S too", and the config codec is built for it: 0x04..0x27 are the shared BLHeli-S family

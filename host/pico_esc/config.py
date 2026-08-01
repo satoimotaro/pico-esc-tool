@@ -85,12 +85,12 @@ def up_erpm_handoffable(up_erpm: float) -> bool:
     1328.125 eRPM -> 30.12 ticks, which this accepts and that band rejects as "below the BEMF floor".
     THE BENCH BACKS THIS ONE — the 2026-07-31 sweeps hand off at cross_up 34 on two different motors
     (host/reports/sinesweep_20260731_014004.csv), and 34 is the byte `MotorModel.esc_config()`
-    recommends. `sine_crossover_bytes()` is deliberately NOT switched over in the same change: it
-    validates an operator-supplied eRPM PAIR before rounding, and relaxing its lower edge changes which
-    inputs `esctool.py set --up-erpm` and `autocal.py` reject. It also has one concrete victim already:
-    `MotorModel.esc_config(seamless_down=True)` RAISES today, because `_seamless_cross_dn()` feeds it
-    `sine_crossover_bytes(34 * 39.0625 = 1328.125, ...)` — the same byte 34 this function accepts. That
-    path is documented as unproven and unused, so it is left alone; unifying the two fixes it. Flagged.
+    recommends. [2026-08-01] `sine_crossover_bytes()` now shares this predicate rather than applying
+    the stricter continuous band, so the two no longer disagree. That also fixes its one concrete
+    victim: `MotorModel.esc_config(seamless_down=True)` used to RAISE, because `_seamless_cross_dn()`
+    feeds it `sine_crossover_bytes(34 * 39.0625 = 1328.125, ...)` — the same byte 34 this function
+    accepts. The widening is deliberate and one-directional: it makes `esctool.py set --up-erpm` and
+    `autocal.py` accept exactly the seams the firmware accepts, and nothing outside them.
 
     Written as a bounds test on `up_erpm` rather than as `int(4*10000/up_erpm)` so it is the SAME
     expression as vel::handoffPossibleAt() in lib/vel_control/motor_model.h, and so that NaN, inf, 0
@@ -110,14 +110,22 @@ def sine_crossover_bytes(up_erpm: float, dn_erpm: float) -> tuple[int, int]:
     handoff-able band (where the seed would be too coarse / below the BEMF floor)."""
     if up_erpm <= 0 or dn_erpm <= 0:
         raise ValueError("both eRPM values must be positive")
-    # NOTE this is the CONTINUOUS pre-rounding band, which is one tick's worth STRICTER on the low side
-    # than the firmware's own truncated-tick test — see up_erpm_handoffable() above for the
-    # disagreement, which byte it bites at (34) and why this one is left alone for now.
-    if not SINE_CROSS_UP_ERPM_MIN <= up_erpm <= SINE_CROSS_UP_ERPM_MAX:
+    # ONE definition of the window, shared with up_erpm_handoffable() — the firmware's own
+    # TRUNCATED-tick test. This used to apply the continuous pre-rounding band
+    # [SINE_CROSS_UP_ERPM_MIN, SINE_CROSS_UP_ERPM_MAX] instead, which is one tick's worth stricter on
+    # the low side and so rejected cross_up 34 (1328.125 eRPM -> 30.12 ticks) as "below the BEMF
+    # floor". The bench refutes that: the 2026-07-31 sweeps hand off at 34 on two different motors
+    # (host/reports/sinesweep_20260731_014004.csv), and 34 is the byte MotorModel.esc_config()
+    # recommends. A validator that refuses what the hardware accepts is wrong in the direction that
+    # costs you a working configuration, so it moves to the tested predicate.
+    if not up_erpm_handoffable(up_erpm):
+        lo = 4 * 10000.0 / (SINE_CROSS_TICKS_MAX + 1)
         raise ValueError(f"up eRPM {up_erpm:g} outside the handoff-able band "
-                         f"~{SINE_CROSS_UP_ERPM_MIN:.0f}..{SINE_CROSS_UP_ERPM_MAX:.0f} eRPM: below it "
-                         f"is under the BEMF floor, above it the 4-sector seed gets too coarse "
-                         f"(>~{100.0/SINE_CROSS_TICKS_MIN:.0f}%) and the firmware would refuse to hand off")
+                         f"~{lo:.0f}..{SINE_CROSS_UP_ERPM_MAX:.0f} eRPM: below it the 4-sector seed "
+                         f"window exceeds {SINE_CROSS_TICKS_MAX} ticks, above it it drops under "
+                         f"{SINE_CROSS_TICKS_MIN} and gets too coarse "
+                         f"(>~{100.0/SINE_CROSS_TICKS_MIN:.0f}%); the firmware refuses to hand off "
+                         f"either way")
     cross_up = round(up_erpm / SINE_CROSS_UP_ERPM_PER_UNIT)
     cross_dn = round(SINE_CROSS_DN_ERPM_NUM / dn_erpm)
     if not 1 <= cross_up <= 255:
