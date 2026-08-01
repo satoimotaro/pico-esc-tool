@@ -46,11 +46,23 @@ DUTY6_B = -1.233
 # The 930KV's apparent 4.3 % slope error (same day, same ESC config, byte-identical EEPROM) does NOT
 # transfer, and it is not a KV nameplate error — the two motors' measured-duty ratio runs 0.973 ->
 # 1.047 monotonically rather than sitting at a constant scale. Fitting BOTH motors at once, one shared
-# affine plus one shared DC-link drop `k*I_dc` (k*V = 0.51 ohm — the ESC/loom, NOT the winding, whose
-# resistances differ 2.6x) puts all 11 points inside 0.005 duty on a slope 0.6 % from the one above.
-# NOT decisive: a free affine per motor still fits 1.8x better in RMS for one more parameter, so a
-# small real KV dependence in duty6() is not excluded. See that file's README for the model table and
-# for why the I*R correction must be analysed at R=0 until `I_phase = I_dc/duty` is re-derived.
+# affine plus one shared DC-link drop `k*I_dc` (the ESC/loom, NOT the winding, whose resistances
+# differ 2.6x) puts all 11 points inside 0.005 duty on a slope 0.6 % from the one above.
+#
+# That drop was then MEASURED, not fitted: 0.52 V at 2.05 A = **0.254 ohm** from the PSU terminals to
+# the ESC input (leads shorted at the ESC end, PSU used as its own ohmmeter). Fixing k there — zero
+# free parameters for the drop — still cuts the two-motor RMS from 0.00430 to 0.00287 and puts the
+# 350KV at fw/meas **1.001**. The split narrows 4.3 % -> 3.1 %; the remaining 3.1 % is the 930KV's
+# alone and is LEFT AS ERROR on purpose (that motor is off the bench and no coefficient here moves
+# for it). A free affine per motor still fits better, so a small real KV dependence in duty6() is
+# not excluded — it is simply not worth another motor to chase.
+#
+# CONSEQUENCE FOR ANY LOADED TEST: the PSU regulates at ITS OWN terminals, so the panel voltage is
+# not what the ESC sees. 0.254 ohm is 0.03 V at this bench's 0.1 A (ignorable, which is why neither
+# sweep needed re-deriving) but 1.27 V at 5 A and 2.54 V at 10 A. `--v`, loadtest.py and the vbatt
+# calibration all assume the panel reading. See bench-registry/measurements/README.md for the model
+# table and for why the I*R correction must be analysed at R=0 until `I_phase = I_dc/duty` is
+# re-derived.
 #
 # The ESC's `cross_rescale_duty` maps the 6-step demand relative to `Cross_Up`, so changing Cross_Up
 # SHIFTS this affine's intercept and leaves its slope alone. DUTY6_A/B above were fitted at Cross_Up=34.
