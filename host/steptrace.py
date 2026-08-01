@@ -112,6 +112,39 @@ def trace(dev, idx, opts, rows):
     return True
 
 
+def quiet_settle(dev, idx, opts, n=5, gap=0.4, warmup=1.5):
+    """The settled speed measured with the LINK IDLE — because this tool perturbs what it measures.
+
+    THE OBSERVER EFFECT IS REAL AND IT IS BIG. `trace()` above issues `encv` + `tele` back to back as
+    fast as the link allows (~175-370 Hz), and the Pico services that CLI on core0 — the same loop
+    that runs `Thruster::poll()`, i.e. the velocity controller. Measured 2026-08-01 on the 930KV
+    holding a 4000 rpm target, changing NOTHING but the poll rate:
+
+        0.5 Hz  -> 3978.5 rpm      231 Hz -> 3872.5 rpm      0.5 Hz again -> 3980.1 rpm
+
+    106 rpm, 2.7 % of the target, and it comes straight back when the polling stops. So the settled
+    value taken from the trace tail is biased LOW by the act of tracing, and every absolute
+    steady-state number this tool has ever printed carries that bias. The transient shape (rise time,
+    overshoot, the stall) still needs the full rate, so the fix is not to slow the trace down — it is
+    to measure the settled value separately, after the window, with the link quiet.
+
+    Returns (mean, samples) or (nan, []) if the drive is gone (a stall disarms it)."""
+    t_end = time.time() + warmup                     # let the loop recover from the polled window
+    while time.time() < t_end:
+        if not _send(dev, idx, opts.mode, opts.to):
+            return float("nan"), []
+        time.sleep(0.25)
+    vals = []
+    for _ in range(n):
+        time.sleep(gap)
+        if not _send(dev, idx, opts.mode, opts.to):
+            break
+        r = _encv(dev)
+        if r is not None:
+            vals.append(abs(r))
+    return (sum(vals) / len(vals) if vals else float("nan")), vals
+
+
 def analyse(rows, opts):
     rows = [r[:3] for r in rows]                     # tolerate rows that carry the trailing cmd
     if len(rows) < 5:
@@ -190,6 +223,10 @@ def main(argv=None):
     ap.add_argument("--settle-band", type=float, default=0.05, help="settling band, fraction of final")
     ap.add_argument("--stall-rpm", type=float, default=30.0, help="below this the run counts as stalled")
     ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--no-quiet-settle", action="store_true",
+                    help="skip the post-window idle-link settle measurement (see quiet_settle: this "
+                         "tool's own polling costs ~2.7 %% of the settled speed, so the trace tail "
+                         "reads LOW; the quiet number is the honest one)")
     ap.add_argument("--analyze", default=None, help="re-analyse an existing CSV; no hardware")
     ap.add_argument("--out", default=None)
     ap.add_argument("--port", default=None)
@@ -251,6 +288,14 @@ def main(argv=None):
             analyse(rows, opts)
             if not ok:
                 print("  (run aborted by the controller — the trace above is what it managed)")
+            elif not opts.no_quiet_settle:
+                # The settled number that is NOT biased by this tool's own polling — see quiet_settle.
+                qs, qv = quiet_settle(dev, opts.index, opts)
+                if qv:
+                    polled = [abs(r[1]) for r in rows if r[0] >= rows[-1][0] * (1 - opts.tail_frac)]
+                    pm = sum(polled) / len(polled) if polled else float("nan")
+                    print(f"  QUIET settle: {qs:.0f} rpm (link idle, {len(qv)} samples) vs {pm:.0f} "
+                          f"polled — {qs - pm:+.0f} rpm of observer effect")
             all_rows += [(k + 1,) + r for r in rows]
             for step in (f"{'thrust' if opts.mode == 'thrust' else 'rpm'} {opts.index} 0",
                          f"disarm {opts.index}"):
