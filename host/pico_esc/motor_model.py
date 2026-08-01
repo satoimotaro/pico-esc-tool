@@ -35,6 +35,23 @@ from .velocity import SpeedProfile
 # 6-step: duty_eff(cmd) = rpm / (KV*V) = A6*cmd + B6, for cmd in the 6-step region. (350KV fit.)
 DUTY6_A = 0.00265
 DUTY6_B = -1.233
+#
+# RE-MEASURED ABSOLUTELY 2026-08-01, WITH the PSU current column the note below asks for, and LEFT
+# ALONE. 350KV bare shaft, 11.20 V, cross_up 36, six commands 540..740, all BEMF-locked
+# (bench-registry `measurements/duty_sweep_350kv_20260801_165026.csv`): measured slope 0.002654 over
+# the five commands the 930KV also ran, i.e. **0.1 % from the value above**, with fw/meas duty inside
+# 1.005..1.039 across all six. The standing suspicion that "a flat +0.0026 offset still sits in
+# DUTY6_A/B" is dead: there is no offset to remove on the motor these were fitted to.
+#
+# The 930KV's apparent 4.3 % slope error (same day, same ESC config, byte-identical EEPROM) does NOT
+# transfer, and it is not a KV nameplate error — the two motors' measured-duty ratio runs 0.973 ->
+# 1.047 monotonically rather than sitting at a constant scale. Fitting BOTH motors at once, one shared
+# affine plus one shared DC-link drop `k*I_dc` (k*V = 0.51 ohm — the ESC/loom, NOT the winding, whose
+# resistances differ 2.6x) puts all 11 points inside 0.005 duty on a slope 0.6 % from the one above.
+# NOT decisive: a free affine per motor still fits 1.8x better in RMS for one more parameter, so a
+# small real KV dependence in duty6() is not excluded. See that file's README for the model table and
+# for why the I*R correction must be analysed at R=0 until `I_phase = I_dc/duty` is re-derived.
+#
 # The ESC's `cross_rescale_duty` maps the 6-step demand relative to `Cross_Up`, so changing Cross_Up
 # SHIFTS this affine's intercept and leaves its slope alone. DUTY6_A/B above were fitted at Cross_Up=34.
 #
@@ -58,7 +75,9 @@ DUTY6_B = -1.233
 # under. That bias is a function of rpm, and the two sweeps were run over the SAME rpm range
 # (1480..2813 vs 1523..2847) precisely so it cancels out of the intercept DIFFERENCE. So K/A is sound
 # and the absolute scale is not — hence `K = DUTY6_A * 15.5998`, with DUTY6_A and DUTY6_B left frozen.
-# Re-measuring the absolute duty map needs the PSU current column (`duty_sweep.py --currents`).
+# Re-measuring the absolute duty map needs the PSU current column (`duty_sweep.py --currents`) —
+# DONE 2026-08-01 on the 350KV, see the block under DUTY6_A/B. The absolute scale came back at 0.1 %,
+# so nothing that was frozen for this reason needs unfreezing.
 #
 # Two derived bounds move with this: the emittable band max stays 47 at cmd_hi=700, and the
 # handoff band max goes 66 -> 67. Both are computed, never written down — see
