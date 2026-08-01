@@ -128,13 +128,13 @@ def _bands(motor):
     handoff, landing = m.handoff_mech(), m.sixstep_floor_rpm()
     return {
         "below-seam":    0.80 * handoff,                       # forced sine, under the trigger
-        # NOTE the two modules disagree about this band, and the matrix makes it visible rather than
-        # papering over it: `MotorModel.in_gap()` says 350 rpm has no steady state on the 930KV
-        # (handoff 184, landing 522), while `MeasuredPlant.steady(509)` returns (345.5, '6step') and
-        # the cell below tracks it. The plant's `_update_handoff` still fires on the SEAM
-        # (seam_cmd 503) where the motor model's trigger is the duty floor (handoff_cmd 515.4) —
-        # a known open inconsistency, not a bug in this file. Recorded here because a "gap" cell that
-        # tracks perfectly is exactly the sort of result that should not pass unremarked.
+        # NOTE this band is where the two modules used to disagree, and the disagreement is now FIXED
+        # (2026-08-01): `MeasuredPlant._update_handoff` fired the up-handoff on the SEAM (seam_cmd
+        # 503.6) where the trigger is really the minimum-modulation duty floor (handoff_cmd 515.4), so
+        # it handed off up to 12 counts early and a "gap" cell — a band DEFINED as having no steady
+        # state — tracked perfectly. It no longer does: see the (350KV, gap, sine off, S4) entry in
+        # KNOWN_BAD, which is the same cell now landing honestly on 0 rpm, and which the S3 column
+        # still passes by exactly one command count of fabricated tracking error.
         "gap":           0.5 * (handoff + landing),            # the nominal no-steady-state band
         "above-landing": 1.25 * landing,                       # just into genuine 6-step
         "high":          (0.62 if motor == BARE_350 else 0.38) * p.no_load_top,
@@ -226,6 +226,16 @@ KNOWN_BAD = {
         "the 930KV's landing is 522 rpm, so the unreachable band is 3x wider",
     (BARE_930, "below-seam", False, TELE_SINE_S4):
         "same unreachable 3x-wider band on the honest firmware",
+    (BARE_350, "gap", False, TELE_SINE_S4):
+        "a KNIFE EDGE at the up trigger, and the honest firmware lands on the wrong side of it by ONE "
+        "COMMAND COUNT. With sine off there is no forced field to carry the rotor, so the only way "
+        "into motion is the 6-step handoff, and the handoff fires at handoff_cmd = 515.41 (the "
+        "minimum-modulation duty floor). This cell's command peaks at 515 -> no handoff -> 0 rpm. The "
+        "S3 column passes only because its 182 rpm lie inflates the tracking error just enough to peak "
+        "at 516 and clear the floor: a fabricated measurement buying a real handoff. Nothing here is "
+        "tuneable — the gap band is BY DEFINITION the no-steady-state region (see _bands), so 0 rpm is "
+        "the honest answer and the S3 pass is the anomaly. Before 2026-08-01 both columns passed, "
+        "because the plant fired the handoff at the SEAM (503.6), up to 12 counts early.",
 }
 
 

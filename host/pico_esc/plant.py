@@ -624,6 +624,21 @@ class MeasuredPlant:
             self._handed_off = False
             self._slew_duty = 0.0
             return
+        # THE UP TRIGGER IS THE DUTY FLOOR, NOT THE SEAM [fixed 2026-08-01]. Clearing the seam is a
+        # NECESSARY condition — below it the 6-step branch would be slower than the field the rotor
+        # already follows — but what FIRES the handoff is the minimum-modulation duty floor, which sits
+        # 6-14 counts higher and in the same direction every time: on the 930KV the branches cross at
+        # 471.4 / 503.6 / 728.9 at cross_up 34 / 36 / 50 while the bench measured 485.0 / 515.5 / 734.5
+        # (motor_model.handoff_cmd, DUTY6_HANDOFF_FLOOR). Gating on the seam alone handed off up to 12
+        # counts EARLY, which is the inconsistency test_closed_loop_matrix's "gap" cell flagged.
+        #
+        # Applied only on the UP transition. Once in 6-step the ESC stays there until its own down
+        # hysteresis (`cross_dn`), so re-testing the up trigger on every tick would drop an already
+        # handed-off plant back into sine anywhere between the seam and the floor.
+        hoc = self.motor.handoff_cmd()
+        if not self._handed_off and hoc is not None and abs(cmd) < hoc:
+            self._slew_duty = 0.0
+            return
         if self._handed_off or abs(self.rpm) >= self.sixstep_rpm(cmd):
             # Nothing left to ramp INTO: the rotor is already turning at the speed this command's
             # 6-step duty holds, so the crossover is complete on this tick.
