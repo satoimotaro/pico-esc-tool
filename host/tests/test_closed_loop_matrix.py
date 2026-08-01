@@ -17,12 +17,29 @@ column already shows: not one new xfail. Running the whole forced-sine region OP
 alone, costs nothing the 10 %/25 rpm tolerance can see — the closed loop down there was never buying
 anything, because there was never a measurement down there to close on.
 
+THE GAP CELLS ARE FICTION, AND HARDWARE SAYS SO (930KV, S4, 2026-08-01). `MeasuredPlant` carries
+`sine_pullout_nm` as data and does not simulate pull-out, so it can hold a speed the real rotor cannot
+and every gap cell below tracks its target EXACTLY. On the bench the whole gap collapses to the 6-step
+landing instead:
+
+    target 250 -> 519 rpm    target 400 -> 525    target 480 -> 517    (landing = 523)
+
+i.e. the rotor cannot sit anywhere between the handoff (184 mech) and the landing (523) — which is
+what "gap" means, and what the model asserts through `in_gap()` while simultaneously reporting perfect
+tracking there. Two more measured points for scale: target 120 (below the seam) settles at 193 (+61 %,
+pure feed-forward with `tele = 0` on S4), and target 600 settles at 520 (-13 %) with the PI RAILED at
++trim_max, because the feed-forward wants command 449 for 600 rpm where 600 rpm really needs ~530.
+`test_the_model_still_claims_it_tracks_the_gap` below pins this so the model cannot be fixed silently.
+
+THE 930KV IS THE ONLY MOTOR THAT CAN TEST THIS. Its gap is 184..523 rpm while forced sine reaches only
+357, so sine cannot bridge to the landing. On the 350KV the gap is 184..197 and sine reaches past it.
+
 WHAT THE BENCH KNOWS (930KV and 350KV bare shaft, 2026-08-01):
   * sine OFF, 6-step only .......... no stalls (5/5), but 47 % steady-state error, because the FF
                                      curve is calibrated for sine_mode = 2
   * sine ON, target above the landing ~50 % stall at 4000 on the 930KV (38 % of its no-load top)
-  * sine ON, target inside the sine region ... UNTESTED on hardware
-  * sine ON, target inside the gap ........... UNTESTED on hardware
+  * sine ON, target inside the sine region ... MEASURED 2026-08-01: target 120 -> 193 rpm, tele 0
+  * sine ON, target inside the gap ........... MEASURED 2026-08-01: 250/400/480 all -> ~520 (see above)
   * the 350KV fails at a different target: 2400, i.e. 62 % of ITS no-load top
 
 WHAT THIS FILE IS, AND IS NOT. It is the model's answer for the same grid, so that a fix can be
@@ -347,3 +364,24 @@ def test_the_corroboration_gate_is_inert_on_every_healthy_cell():
             f"{motor}/{band}/sine={sine}/{FW_ID[fw]}: the gate moved the command "
             f"{off['cmd_peak']:.0f} -> {on['cmd_peak']:.0f} on a HEALTHY plant")
         assert abs(on["rpm_ss"] - off["rpm_ss"]) <= 1.0
+
+
+# =========================================================================== E. the model's own gap
+def test_the_model_still_claims_it_tracks_the_gap():
+    """A KNOWN, MEASURED MODEL DEFECT, pinned so that fixing it cannot pass unnoticed.
+
+    `MeasuredPlant` has no pull-out dynamics, so it settles exactly on a gap target. The 930KV bench
+    says targets 250 / 400 / 480 all collapse to ~520 (the landing) because the rotor cannot hold a
+    speed in the gap at all. Until the plant models pull-out, every "gap" cell in the grid above is
+    green for a reason that does not exist on hardware, and this test is the note saying so.
+
+    When the plant IS fixed this test fails — which is the point: re-read the grid, and move the gap
+    cells into KNOWN_BAD with the bench numbers rather than letting the green quietly change meaning.
+    """
+    target = _bands(BARE_930)["gap"]
+    o = _run(BARE_930, target, plant_cls=MeasuredPlant, tele_sine=TELE_SINE_S4)
+    assert _reached(o), "the model no longer tracks the gap — see the docstring, re-read the grid"
+    landing = MeasuredPlant(_params(BARE_930)).motor.sixstep_floor_rpm()
+    assert abs(o["rpm_ss"] - landing) > 100.0, (
+        f"the model settled at {o['rpm_ss']:.0f}, near the {landing:.0f} rpm landing the BENCH "
+        f"collapses to — if it now reproduces that, this test has served its purpose")
