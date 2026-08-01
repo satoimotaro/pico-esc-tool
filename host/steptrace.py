@@ -128,6 +128,16 @@ def quiet_settle(dev, idx, opts, n=5, gap=0.4, warmup=1.5):
     overshoot, the stall) still needs the full rate, so the fix is not to slow the trace down — it is
     to measure the settled value separately, after the window, with the link quiet.
 
+    IT IS CONTROL-LOOP STARVATION, not a DShot or measurement artefact — established by running the
+    same A/B OPEN LOOP (raw `thrust 650`, no velocity controller), warmed up and with the conditions
+    interleaved to separate the effect from spin-up drift:
+
+        SLOW 4140.3   HARD 4145.8   SLOW 4142.7   HARD 4147.2      (7 rpm spread, no trend)
+
+    Open loop is immune. That matters beyond this file: `duty_sweep.py` and `sinesweep.py` are
+    open-loop characterisations, so the duty map and the sine sweeps do NOT carry this bias and can be
+    re-measured without correcting for it. Only closed-loop numbers are suspect.
+
     Returns (mean, samples) or (nan, []) if the drive is gone (a stall disarms it)."""
     t_end = time.time() + warmup                     # let the loop recover from the polled window
     while time.time() < t_end:
