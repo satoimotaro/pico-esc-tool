@@ -80,6 +80,38 @@ static const int   TEMP_ABORT_READINGS     = 3;       // consecutive over-limit 
                                                       // — EDT temperature is an integer C in a frame
                                                       // that can garble, and one bad frame must not
                                                       // stop a thruster underwater.
+// THE SAME REASONING, APPLIED TO THE OTHER TWO THINGS A SINGLE FRAME COULD DO. Bench 2026-08-01 caught
+// both actually happening on this hardware, so neither is hypothetical:
+//
+//   * ABORT_OVERSPEED fired on ONE frame. steptrace_20260801_114818 run 6: at t=3.539 s a frame read
+//     12045 mech rpm while the encoder had the rotor at ~3900. The auto threshold (2 * profile maxRpm
+//     = 11235 for this 930KV) was exceeded by 810, the controller cut thrust and disarmed, and the
+//     ~1000 dead frames that follow in the trace are the CONSEQUENCE of the disarm, not its cause.
+//   * The thermal DERATE fired on ONE frame. Holding 4000 rpm, the reported MCU temperature went
+//     33 -> 83 -> 33 C between consecutive polls and the ESC really did drop to a 35 % command
+//     ceiling. 6357 samples over 40 s of the same run spanned 32-39 C, so 83 was never real — and it
+//     is one count under max_temp 80... above it, in fact, so the abort debounce was all that stood
+//     in the way. It also poisoned `tpeak` for the rest of the session.
+//
+// The abort stage was already debounced; these two were not. Both fixes below follow the principle
+// this file already argues for `track_min_frac`: a measurement is not authority until something
+// corroborates it.
+static const int   OVERSPEED_READINGS      = 3;       // consecutive over-threshold LIVE FRAMES before
+                                                      // ABORT_OVERSPEED. Counts frames, not ticks (see
+                                                      // the readTele contract) — at the measured
+                                                      // ~180-230 Hz frame rate this costs ~15 ms, which
+                                                      // is nothing against a real runaway and
+                                                      // everything against a garbled one.
+// A die temperature is a PHYSICAL quantity with bounded slew, so a jump no thermal mass could produce
+// is a frame error, not a reading. Expressed per SECOND and applied over the elapsed age so it does
+// not depend on a frame cadence nobody has measured (see DEFAULT_TEMP_STALE_SECS), with a floor for
+// integer-degree quantisation. NOT bench-validated as a thermal bound: 25 C/s is chosen to be far
+// above anything a 30 A ESC's die can do and far below the 50 C step actually observed.
+static const float TEMP_MAX_SLEW_C_PER_S   = 25.0f;
+static const float TEMP_SLEW_FLOOR_C       = 4.0f;    // always allowed, whatever the age
+static const int   TEMP_SLEW_OVERRIDE      = 3;       // consecutive out-of-bound readings that ACCEPT
+                                                      // anyway — a real fast rise, or a genuine step
+                                                      // after a gap, must not be filtered out for ever
 
 // What the limiter currently knows. NONE and STALE both mean "no protection" — the difference is that
 // NONE never had any and STALE lost it, and both are reported so the absence is never silent.
@@ -416,7 +448,10 @@ public:
 		// everything else — a counter that outlived the reset clearing every other latch would re-abort
 		// a freshly re-armed controller. The temperature itself (last/peak/age/state) deliberately does
 		// NOT clear: it is an observation about the hardware, and an arm/disarm does not cool the MCU.
+		// Same reasoning for the two other single-frame debounces: both are loop state, and both must
+		// start a run at zero rather than carry a half-accumulated verdict across an arm.
 		over_readings_ = 0; temp_clamped_ = false;
+		over_speed_readings_ = 0; temp_slew_rejects_ = 0;
 	}
 
 	// One control tick. dt = elapsed seconds since the last step (<=0 -> VEL_DT_DEFAULT). Reads
@@ -563,7 +598,20 @@ public:
 		}
 
 		// -- safety guards on the LIVE measurement (never on the profile/crossover config) --
-		if (live_ && fabsf(tele_mech_) > effectiveOverSpeed()) { io_.thrust(0); return Status::ABORT_OVERSPEED; }
+		// Over-speed is DEBOUNCED over OVERSPEED_READINGS consecutive live frames: one garbled frame
+		// reading 12045 against a true 3900 stopped a healthy thruster on the bench. The counter
+		// advances only on a live frame, so it counts FRAMES not ticks; a live frame under the
+		// threshold clears it; a dropout HOLDS it rather than clearing, because absence of telemetry is
+		// not evidence the rotor slowed down (and the stall guard below owns the dropout case).
+		if (live_) {
+			if (fabsf(tele_mech_) > effectiveOverSpeed()) {
+				if (++over_speed_readings_ >= OVERSPEED_READINGS) {
+					io_.thrust(0); return Status::ABORT_OVERSPEED;
+				}
+			} else {
+				over_speed_readings_ = 0;
+			}
+		}
 
 		// stall: the setpoint is at/above the profile's genuinely 6-step-reachable floor (so we EXPECT
 		// live telemetry) yet the command is still driving into that region and telemetry never went
@@ -623,6 +671,25 @@ private:
 		// anything, and accept that on that path a reading is per-tick (the pre-B.7 behaviour).
 		if (!have && !have_readtemp_ && teleTemp > 0.0f) { tc = teleTemp; fresh = true; }
 
+		// PLAUSIBILITY, BEFORE THE READING BECOMES AUTHORITY. A fresh stamp says the frame is new, not
+		// that it is right. Reject a jump no die could make in the elapsed time (see
+		// TEMP_MAX_SLEW_C_PER_S) — but only TEMP_SLEW_OVERRIDE times in a row, so a genuine fast rise,
+		// or a real step after a stale gap, still gets through instead of being filtered out for ever.
+		// This gates BOTH the derate and `peak_temp_`: the observed 83 C spike left tpeak poisoned at 83
+		// for the rest of the session, which is a diagnostic the operator reads.
+		if (fresh && have_temp_) {
+			float bound = TEMP_SLEW_FLOOR_C + TEMP_MAX_SLEW_C_PER_S * temp_age_;
+			if (fabsf(tc - last_temp_) > bound && ++temp_slew_rejects_ < TEMP_SLEW_OVERRIDE) {
+				// CONSUME THE STAMP even though the value is refused, or `fresh` recomputes true for
+				// this same frame on every following tick and the override counter would run at the
+				// TICK rate — turning one garbled frame into an accepted reading in ~15 ms, which is
+				// the exact failure the abort debounce above was written to prevent.
+				temp_stamp_ = stamp;
+				fresh = false;                 // not a reading; age on as if the frame never came
+			} else {
+				temp_slew_rejects_ = 0;
+			}
+		}
 		if (fresh) {
 			last_temp_ = tc; if (tc > peak_temp_) peak_temp_ = tc;
 			temp_stamp_ = stamp; temp_age_ = 0.0f; have_temp_ = true;
@@ -745,6 +812,8 @@ private:
 	uint32_t  temp_stamp_ = 0;              // stamp of the last NEW reading (see updateTemp_)
 	bool      have_temp_ = false, have_readtemp_ = false, temp_clamped_ = false;
 	int       over_readings_ = 0;
+	int       temp_slew_rejects_ = 0;       // consecutive implausible-jump readings refused (updateTemp_)
+	int       over_speed_readings_ = 0;     // consecutive live frames over the over-speed threshold
 	TempState temp_state_ = TempState::NONE;
 };
 

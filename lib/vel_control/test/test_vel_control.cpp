@@ -690,6 +690,92 @@ int main() {
 		CHECK(v2.fbMax() == 42.0f, "an explicit fb_max overrides the derivation");
 	}
 
+	// ================================================================================================
+	// [2026-08-01] ONE GARBLED FRAME MUST NOT BE A SAFETY DECISION. Both of these were observed on the
+	// bench, so neither is hypothetical — see OVERSPEED_READINGS / TEMP_MAX_SLEW_C_PER_S in the header.
+	// ================================================================================================
+
+	// -- (a) ABORT_OVERSPEED on a single frame. steptrace_20260801_114818 run 6: one frame read 12045
+	//    mech rpm against a true ~3900, the auto threshold (2*maxRpm = 11235 here) was exceeded, and a
+	//    healthy thruster was cut and disarmed. The ~1000 dead frames after it are the CONSEQUENCE. --
+	{
+		struct SpikeEsc : EscIo {
+			float rpm = 300.0f;
+			int   spike_at = -1, tick = 0, last_sent = 0;
+			float spike_rpm = 12045.0f;
+			int   spikes = 1;                    // how many CONSECUTIVE frames carry the spike
+			void thrust(int cmd) override { last_sent = cmd; }
+			bool readTele(float& mechRpm, float& tempC_out) override {
+				tempC_out = 0.0f;
+				bool in = (spike_at >= 0 && tick >= spike_at && tick < spike_at + spikes);
+				mechRpm = in ? spike_rpm : rpm;
+				tick++;
+				return true;
+			}
+			bool readTemp(float&, uint32_t&) override { return false; }
+		};
+		CurvePoint lp[12]; Crossover lc{UP_ERPM, DN_ERPM};
+		SpeedProfile P = Prof::build(lp, &lc, 1.0f);
+		for (int spikes = 1; spikes <= OVERSPEED_READINGS; spikes++) {
+			SpikeEsc sim; sim.spike_at = 20; sim.spikes = spikes;
+			VelocityController vc(sim, P);
+			vc.stall_secs = 1e9f; vc.over_speed_rpm = 11235.0f;
+			vc.setTarget(300.0f);
+			bool aborted = false;
+			for (int t = 0; t < 60 && !aborted; t++)
+				aborted = (vc.step(0.02f) == Status::ABORT_OVERSPEED);
+			if (spikes < OVERSPEED_READINGS)
+				CHECK(!aborted, "a burst of garbled over-speed frames shorter than the debounce is ignored");
+			else
+				CHECK(aborted, "...but OVERSPEED_READINGS consecutive over-threshold frames DO abort");
+		}
+		// A real runaway is not a burst — it must still stop the motor, and promptly.
+		SpikeEsc sim; sim.rpm = 20000.0f;
+		VelocityController vc(sim, P);
+		vc.stall_secs = 1e9f; vc.over_speed_rpm = 11235.0f;
+		vc.setTarget(300.0f);
+		int ticks = 0; bool aborted = false;
+		while (ticks < 60 && !aborted) { aborted = (vc.step(0.02f) == Status::ABORT_OVERSPEED); ticks++; }
+		CHECK(aborted && ticks <= OVERSPEED_READINGS,
+		      "a SUSTAINED over-speed still aborts, within the debounce and no later");
+		CHECK(sim.last_sent == 0, "...and the abort cut the command to zero");
+	}
+
+	// -- (b) The thermal DERATE on a single frame. Observed holding 4000 rpm: the reported MCU
+	//    temperature went 33 -> 83 -> 33 C between polls and the ESC really did drop to a 35 % command
+	//    ceiling; 6357 samples over the same run spanned 32-39 C. It also poisoned `tpeak` at 83. --
+	{
+		struct TempEsc : EscIo {
+			float tempC = 33.0f;
+			uint32_t stamp = 1;
+			void thrust(int) override {}
+			bool readTele(float& mechRpm, float& tempC_out) override {
+				mechRpm = 300.0f; tempC_out = 0.0f; return true;
+			}
+			bool readTemp(float& t, uint32_t& s) override { t = tempC; s = stamp; return true; }
+		};
+		CurvePoint lp[12]; Crossover lc{UP_ERPM, DN_ERPM};
+		SpeedProfile P = Prof::build(lp, &lc, 1.0f);
+		TempEsc sim;
+		VelocityController vc(sim, P);
+		vc.stall_secs = 1e9f; vc.over_speed_rpm = 1e9f; vc.warn_temp = 60.0f; vc.max_temp = 80.0f;
+		vc.setTarget(300.0f);
+		for (int t = 0; t < 20; t++) { sim.stamp++; vc.step(0.02f); }     // settle at 33 C
+		CHECK(vc.tempLimit() == 1.0f && vc.peakTemp() < 40.0f, "a steady 33 C derates nothing");
+
+		sim.tempC = 83.0f; sim.stamp++; vc.step(0.02f);                   // THE GARBLED FRAME
+		CHECK(vc.tempLimit() == 1.0f, "one implausible 83 C frame does NOT derate the command ceiling");
+		CHECK(vc.peakTemp() < 40.0f, "...and does NOT poison the tpeak high-water mark");
+		sim.tempC = 33.0f; sim.stamp++; vc.step(0.02f);
+		CHECK(vc.temp() < 40.0f && vc.tempLimit() == 1.0f, "the next honest frame is unaffected");
+
+		// A REAL rise must still get through — the rejection is bounded by TEMP_SLEW_OVERRIDE, so a
+		// temperature that keeps saying 83 is believed and acted on rather than filtered out for ever.
+		for (int t = 0; t < TEMP_SLEW_OVERRIDE; t++) { sim.tempC = 83.0f; sim.stamp++; vc.step(0.02f); }
+		CHECK(vc.tempLimit() < 1.0f, "a SUSTAINED 83 C is believed and does derate");
+		CHECK(vc.peakTemp() >= 83.0f, "...and only then does it move tpeak");
+	}
+
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
 	return failures ? 1 : 0;
 }

@@ -64,6 +64,13 @@ TRACK_MIN_PREDICTED_RPM = 100.0
 # allowed to gain authority. Mirrors vel::VelocityController::track_min_frac; see it for the whole
 # argument. 0 disables the test and restores the pre-2026-08-01 liveness-only behaviour.
 DEFAULT_TRACK_MIN_FRAC = 0.25
+# Consecutive over-threshold LIVE FRAMES before the over-speed abort fires. Mirrors
+# vel::OVERSPEED_READINGS. One garbled frame stopped a healthy thruster on the bench
+# (steptrace_20260801_114818 run 6: a frame read 12045 mech rpm against a true ~3900, the auto
+# threshold 2*maxRpm = 11235 was exceeded, and the ~1000 dead frames after it are the CONSEQUENCE of
+# the disarm, not its cause). This loop drives the same hardware through velctl, so it is equally
+# exposed and gets the same debounce.
+OVERSPEED_READINGS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +377,7 @@ class VelocityController:
         self._corroborated = True   # ...and that frame was consistent with the curve's own prediction
         self._last_sent = 0         # the command the current measurement is a response to
         self._stale_since = None    # time tele first went stale while commanding into "line"
+        self._over_speed_readings = 0   # consecutive live frames over the over-speed threshold
         self._pending = None        # a staged set_speed target (down-catch through ~0)
         self._last_sign = 1.0       # last non-zero setpoint sign (for signing a tele MAGNITUDE at sp==0)
 
@@ -629,10 +637,20 @@ class VelocityController:
                     self._i = max(-self.trim_max, min(self.trim_max, unblended - self.kp * err))
 
             # -- safety guards on the LIVE measurement (never on the profile/crossover config) --
-            if self._live and abs(self._tele_mech) > self.over_speed_rpm:
-                self.esc.thrust(0)
-                raise Aborted(f"over-speed: |tele|={abs(self._tele_mech):.0f} RPM > "
-                              f"{self.over_speed_rpm:.0f} — lower speed / check the curve")
+            # DEBOUNCED over OVERSPEED_READINGS consecutive live frames — see the constant. The counter
+            # advances only on a live frame (so it counts FRAMES, not loop iterations); a live frame
+            # under the threshold clears it; a dropout HOLDS it, because absence of telemetry is not
+            # evidence the rotor slowed down, and the stall guard below owns the dropout case.
+            if self._live:
+                if abs(self._tele_mech) > self.over_speed_rpm:
+                    self._over_speed_readings += 1
+                    if self._over_speed_readings >= OVERSPEED_READINGS:
+                        self.esc.thrust(0)
+                        raise Aborted(f"over-speed: |tele|={abs(self._tele_mech):.0f} RPM > "
+                                      f"{self.over_speed_rpm:.0f} on {OVERSPEED_READINGS} consecutive "
+                                      f"frames — lower speed / check the curve")
+                else:
+                    self._over_speed_readings = 0
             # stall: the setpoint is at/above the profile's genuinely 6-step-REACHABLE floor (so we
             # EXPECT live telemetry) yet the loop is still commanding into that region (the trim
             # hasn't backed the command off) and telemetry never went live -> the ESC failed to reach
