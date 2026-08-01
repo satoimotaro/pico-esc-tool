@@ -66,6 +66,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from esctool import EscHost, find_pico, _read_raw      # noqa: E402
 from pico_esc.constants import COUNTS_PER_REV          # noqa: E402
+from pico_esc.motor_model import duty6                 # noqa: E402
 
 KEEPALIVE_S = 0.2                                      # < the 500 ms raw-throttle deadman
 JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports",
@@ -183,11 +184,22 @@ def attempt(dev, idx, opts, trace_path=None):
 
     settle = ([abs(r) for _, _, r in rows[-8:]] or [0.0])
     settle = sum(settle) / len(settle)
-    outcome = "CAUGHT" if t_catch is not None else "FAILED"
+    # SLOW is not a nicety. The 2026-08-01 screen of what a flash resets found ONE setting that
+    # stops the motor (startup_power_max) and THREE that let it start and then hold a small
+    # fraction of the right speed — low_rpm_power_protection=9 at 380 rpm, sine_cross_up=255 at
+    # 230 (handoff refused, stuck in forced sine), motor_direction=Normal at 180, all against 1600.
+    # Classifying purely on "did it turn" would log every one of those as a clean CAUGHT, i.e. the
+    # instrument would miss three of the four known failure modes.
+    expect = opts.kv * opts.v * duty6(opts.thrust, opts.cross_up)
+    outcome = ("FAILED" if t_catch is None else
+               "SLOW" if expect > 0 and settle < opts.slow_frac * expect else "CAUGHT")
+    if outcome == "SLOW":
+        print(f"    ** SLOW: settled {settle:.0f} rpm against {expect:.0f} predicted — it started "
+              f"and is running WRONG, which is the mode that hides")
     # The trace is what makes a FAILED row diagnosable rather than merely counted, so it is always
     # written on failure. Successes are kept only with --trace-all: they are numerous and the row
     # itself carries what the control group needs.
-    if trace_path and (outcome == "FAILED" or opts.trace_all):
+    if trace_path and (outcome in ("FAILED", "SLOW") or opts.trace_all):
         with open(trace_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["t_s", "accum", "rpm"])
@@ -231,9 +243,10 @@ def analyze(path, bins):
     with open(path) as f:
         rows = [r for r in csv.DictReader(f)]
     ok = [r for r in rows if r["outcome"] == "CAUGHT"]
-    bad = [r for r in rows if r["outcome"] == "FAILED"]
+    bad = [r for r in rows if r["outcome"] in ("FAILED", "SLOW")]
+    slow = [r for r in rows if r["outcome"] == "SLOW"]
     print(f"=== {len(rows)} attempts over {len({r['session'] for r in rows})} session(s): "
-          f"{len(ok)} caught, {len(bad)} FAILED")
+          f"{len(ok)} caught, {len(bad) - len(slow)} FAILED, {len(slow)} SLOW")
     if not rows:
         return
     if not bad:
@@ -290,6 +303,11 @@ def main():
                     help="|rpm| that counts as caught. Well above cogging dither and well below any "
                          "real 6-step speed, so the classification is not a judgement call")
     ap.add_argument("--rpm-ceiling", type=float, default=3000.0)
+    ap.add_argument("--kv", type=float, default=350.0, help="for the expected-speed check")
+    ap.add_argument("--v", type=float, default=11.20)
+    ap.add_argument("--cross-up", type=int, default=36)
+    ap.add_argument("--slow-frac", type=float, default=0.7,
+                    help="settling below this fraction of the predicted speed is SLOW, not CAUGHT")
     ap.add_argument("--arm-settle", type=float, default=3.0, help="s after arm before commanding")
     ap.add_argument("--rest", type=float, default=2.0, help="s between attempts, after the brake")
     ap.add_argument("--still-secs", type=float, default=0.6, help="s of no motion = parked")
