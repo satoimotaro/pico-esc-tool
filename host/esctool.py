@@ -35,11 +35,16 @@ from pico_esc.config import (  # noqa: E402,F401
     SINE_CROSS_DN_MAX_BYTE, SINE_CROSS_TICKS_MIN, SINE_CROSS_TICKS_MAX,
     SINE_CROSS_UP_ERPM_MIN, SINE_CROSS_UP_ERPM_MAX, sine_crossover_bytes,
     encode_value, encode_overrides, overrides_str, _tag, decode, _emit_yaml, load_yaml, yaml,
+    BLUEJAY_EEPROM_REV, BLUEGILL_LAYOUT_REV, BLUEGILL_ONLY_FIELDS, write_compat,
 )
 from pico_esc.link import RPI_VID, find_pico, EscHost  # noqa: E402,F401
 from pico_esc.flash import (  # noqa: E402,F401
     APP_END, EEPROM_BASE, BOOT_BASE, SIG_FOR_MCU, parse_hex, hex_tag, _pages_from,
 )
+
+
+_FORCE_HELP = ("write even when the ESC's EEPROM layout revision is not the one these offsets "
+               "encode (danger: writes at the wrong addresses)")
 
 
 def _finish(dev: EscHost, index: int, run: bool):
@@ -51,6 +56,33 @@ def _finish(dev: EscHost, index: int, run: bool):
     else:
         print(f"ESC {index} held in bootloader (motor off): `esctool run {index}` to restart it, "
               f"or run another command (it reuses the session).")
+
+
+def _read_raw(dev: EscHost, index: int) -> bytes | None:
+    """The ESC's raw config block, or None. Reuses the bootloader session `set`/`apply` open."""
+    try:
+        line = next((l for l in dev.cmd(f"read {index}") if l.startswith("cfg|")), None)
+        return bytes.fromhex(line.split("|", 1)[1]) if line else None
+    except Exception:
+        return None
+
+
+def _guard_write(dev: EscHost, index: int, settings: dict, force: bool) -> dict:
+    """Drop (or refuse outright) settings this ESC's EEPROM layout cannot take. See
+    pico_esc.config.write_compat — `esctool` encodes ONE layout and used to guard on none."""
+    fatal, refused = write_compat(_read_raw(dev, index), settings)
+    if fatal:
+        if not force:
+            sys.exit(f"ESC {index}: refusing to write — {fatal}. "
+                     f"Re-run with --force only if you know the layout matches.")
+        print(f"ESC {index}: WARNING, --force: {fatal}")
+        return settings
+    for k, why in refused.items():
+        print(f"ESC {index}: skipping '{k}' — {why}" + (" (--force overrides)" if not force else ""))
+    if refused and force:
+        print(f"ESC {index}: WARNING, --force: writing {len(refused)} setting(s) anyway")
+        return settings
+    return {k: v for k, v in settings.items() if k not in refused}
 
 
 def _apply_overrides(dev: EscHost, index: int, ovs: list[tuple[int, int]]):
@@ -96,9 +128,10 @@ def cmd_set(dev: EscHost, args):
         dn_eff = SINE_CROSS_DN_ERPM_NUM / cross_dn
         print(f"sine crossover: up Cross_Up=0x{cross_up:02X} (~{up_eff:.0f} eRPM), "
               f"dn Cross_Dn=0x{cross_dn:02X} (~{dn_eff:.0f} eRPM)")
-    ovs = encode_overrides(settings)
+    # Encoded PER ESC: with `all`, two ESCs can be running different firmware, so the guard (and
+    # therefore the byte list) is not shared between them.
     for i in resolve_indices(dev, args.index):
-        _apply_overrides(dev, i, ovs)
+        _apply_overrides(dev, i, encode_overrides(_guard_write(dev, i, settings, args.force)))
         _finish(dev, i, args.run)
 
 
@@ -109,10 +142,10 @@ def cmd_apply(dev: EscHost, args):
         settings["name"] = doc["identity"]["name"]
     if args.name is not None:
         settings["name"] = args.name
-    ovs = encode_overrides(settings)
     for i in resolve_indices(dev, args.index):
         print(f"applying '{args.profile}' to ESC {i}: {', '.join(settings)}")
-        _apply_overrides(dev, i, ovs)
+        keep = _guard_write(dev, i, settings, args.force)          # per ESC — see cmd_set
+        _apply_overrides(dev, i, encode_overrides(keep))
         _finish(dev, i, args.run)
 
 
@@ -228,12 +261,14 @@ def main():
                     help="set sine<->BEMF crossover from two eRPM values (up,down); down must be "
                          "below up. Converts to the Cross_Up/Cross_Dn bytes with validation.")
     st.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
+    st.add_argument("--force", action="store_true", help=_FORCE_HELP)
     ap_ = sub.add_parser("apply", help="apply a YAML profile (index or 'all')")
     ap_.add_argument("index", help="ESC index or 'all'")
     ap_.add_argument("profile", help="YAML file (a read -o export or a hand-written profile)")
     ap_.add_argument("--name", help="also set the ESC name")
     ap_.add_argument("--with-name", action="store_true", help="also apply identity.name from the profile")
     ap_.add_argument("-r", "--run", action="store_true", help="restart the ESC afterward (else held)")
+    ap_.add_argument("--force", action="store_true", help=_FORCE_HELP)
     cn = sub.add_parser("connect", help="enter the bootloader and hold the session (index or 'all')")
     cn.add_argument("index", help="ESC index or 'all'")
     rn = sub.add_parser("run", aliases=["disconnect"], help="restart held ESC(s) (end the session)")

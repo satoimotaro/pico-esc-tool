@@ -222,3 +222,83 @@ def test_every_shipped_profile_tags_regimes_consistently_with_the_handoff():
                 bad.append(f"{os.path.basename(path)}: cmd {t:.0f} tagged {tag!r}, handoff_cmd "
                            f"{hoc:.1f} says {want!r} (measured {p['rpm']:.1f} rpm)")
     assert not bad, "regime tags disagree with the handoff:\n  " + "\n  ".join(bad)
+
+
+# --- the write guard: which ESCs may these offsets be written to? ------------------------------
+# The three headers are the real bench-observed ones (bench-registry/snapshots/), not invented:
+# BlueGill S4 = 0.21/226, stock Bluejay v0.21.0 = 0.21/208, BLHeli-S Rev16.7 = 16.7/33. All three
+# carry the SAME layout tag `#A_H_30#`, which is exactly why the flash compat check cannot catch
+# this — it compares the FET pin map, not the config layout.
+def _hdr(eeprom_hi, eeprom_lo, layout_rev):
+    raw = bytearray(bytes(255))
+    raw[0x00], raw[0x01], raw[0x02] = eeprom_hi, eeprom_lo, layout_rev
+    return bytes(raw)
+
+
+BLUEGILL_HDR = _hdr(0, 21, 226)
+BLUEJAY_HDR = _hdr(0, 21, 208)
+BLHELI_S_HDR = _hdr(16, 7, 33)
+ALL_FIELDS = sorted(config.FIELD_OFF)
+
+
+def test_bluegill_esc_accepts_every_field():
+    fatal, refused = config.write_compat(BLUEGILL_HDR, ALL_FIELDS)
+    assert fatal is None and refused == {}
+
+
+def test_blheli_s_refuses_everything_including_the_shared_settings():
+    """The whole block is fatal, not just the BlueGill-only tail: on a different EEPROM revision
+    even `brake_on_stop` is not promised to live at 0x27."""
+    fatal, refused = config.write_compat(BLHELI_S_HDR, ALL_FIELDS)
+    assert fatal is not None and "16.7" in fatal
+    assert refused == {}
+
+
+def test_stock_bluejay_takes_the_shared_settings_but_not_the_sine_block():
+    fatal, refused = config.write_compat(BLUEJAY_HDR, ALL_FIELDS)
+    assert fatal is None
+    assert set(refused) == set(config.BLUEGILL_ONLY_FIELDS)
+    # This is the case that must NOT become a blanket refusal: snapshots/stock-comparable.yaml
+    # writes these 13 to stock Bluejay on purpose, as the firmware control.
+    assert "brake_on_stop" not in refused and "comm_timing" not in refused
+
+
+def test_the_bluegill_only_set_is_exactly_the_appended_block():
+    assert config.BLUEGILL_ONLY_FIELDS == {
+        "comm_timing_angle", "max_erpm", "lowspeed_damping",
+        "sine_mode", "sine_hold_amp", "sine_amp_max", "sine_ramp",
+        "sine_cross_up", "sine_cross_dn",
+    }
+    assert all(config.FIELD_OFF[k] >= 0x2B for k in config.BLUEGILL_ONLY_FIELDS)
+
+
+def test_only_the_requested_keys_are_refused():
+    _, refused = config.write_compat(BLUEJAY_HDR, ["brake_on_stop", "sine_mode"])
+    assert set(refused) == {"sine_mode"}
+
+
+@pytest.mark.parametrize("raw", [None, b"", bytes(2)])
+def test_an_unreadable_block_fails_CLOSED(raw):
+    """Not knowing the layout is the hazard itself, so it must refuse rather than assume."""
+    fatal, refused = config.write_compat(raw, ALL_FIELDS)
+    assert fatal is not None and refused == {}
+
+
+# --- the CLI wiring around it -----------------------------------------------------------------
+def test_guard_write_filters_and_exits(monkeypatch, capsys):
+    """`write_compat` is only useful if `set`/`apply` actually consult it, so test the wiring:
+    drop the refused keys, keep the rest, and exit non-zero rather than write on a fatal."""
+    import esctool
+
+    settings = {"brake_on_stop": 1, "sine_mode": 2}
+    monkeypatch.setattr(esctool, "_read_raw", lambda dev, i: BLUEJAY_HDR)
+    assert esctool._guard_write(None, 1, settings, force=False) == {"brake_on_stop": 1}
+    assert "skipping 'sine_mode'" in capsys.readouterr().out
+
+    monkeypatch.setattr(esctool, "_read_raw", lambda dev, i: BLHELI_S_HDR)
+    with pytest.raises(SystemExit):
+        esctool._guard_write(None, 1, settings, force=False)
+    assert esctool._guard_write(None, 1, settings, force=True) == settings   # --force still writes
+
+    monkeypatch.setattr(esctool, "_read_raw", lambda dev, i: BLUEGILL_HDR)
+    assert esctool._guard_write(None, 1, settings, force=False) == settings

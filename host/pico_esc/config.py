@@ -38,6 +38,49 @@ FIELD_OFF = {
 FIELD_ENUM = {"motor_direction": DIRECTION, "comm_timing": TIMING, "demag_compensation": DEMAG}
 NAME_OFF, NAME_LEN = 0x60, 16
 
+# --- which ESCs is it safe to WRITE these offsets to? ----------------------------------------
+# `decode()` reads any BLHeli-S-family block, and the shared prefix makes a foreign one LOOK
+# decodable. Writing is a different promise: FIELD_OFF is the Bluejay 0.21 layout, and the
+# firmware family does not guarantee offsets across EEPROM revisions. The flash compat check is
+# no help — it compares the layout TAG (`#A_H_30#`), which is the FET pin map, not the config
+# layout. Three firmwares, three (eeprom, layout) pairs, all reporting the same tag, all
+# bench-observed on this ESC (bench-registry/snapshots/):
+#     BlueGill S4            0.21 / 226   <- what FIELD_OFF encodes, including 0x2B..0x33
+#     Bluejay v0.21.0 stock  0.21 / 208   <- shared offsets only; 0x2B..0x33 are NOT sine there
+#     BLHeli-S Rev16.7       16.7 / 33    <- a different layout; nothing here may be written
+# Refusing per FIELD rather than per ESC is deliberate: `snapshots/stock-comparable.yaml` writes
+# the 13 shared settings to stock Bluejay on purpose (it is the firmware control), and only
+# offsets 0x04/0x07/0x09/0x0B/0x1F moved. A blanket refusal would break a workflow that is
+# correct; a blanket permit is what would have written Bluejay-shaped bytes into BLHeli-S.
+BLUEJAY_EEPROM_REV = "0.21"
+BLUEGILL_LAYOUT_REV = 226
+BLUEJAY_LAYOUT_REV = 208
+BLUEGILL_ONLY_FIELDS = frozenset(k for k, o in FIELD_OFF.items() if o >= 0x2B)
+
+
+def write_compat(raw: bytes, keys) -> tuple[str | None, dict[str, str]]:
+    """Is it safe to write `keys` to the ESC whose config block is `raw`?
+
+    Returns `(fatal, refused)`. `fatal` is a reason to write NOTHING; `refused` maps the
+    individual settings that must be dropped to why. Both empty/None means go ahead.
+
+    Fails closed: a block too short to carry the revision bytes is fatal, because the whole point
+    is that we do not know what we would be writing into."""
+    if raw is None or len(raw) <= 0x02:
+        return ("could not read the ESC's config block, so its EEPROM layout is unknown", {})
+    eeprom, layout = f"{raw[0x00]}.{raw[0x01]}", raw[0x02]
+    if eeprom != BLUEJAY_EEPROM_REV:
+        return (f"EEPROM revision {eeprom} (layout {layout}) is not the Bluejay "
+                f"{BLUEJAY_EEPROM_REV} layout these offsets encode — writing would put bytes at "
+                f"the wrong addresses", {})
+    if layout != BLUEGILL_LAYOUT_REV:
+        why = (f"offset 0x2B..0x33 is BlueGill-only and this ESC reports layout revision {layout}, "
+               f"not {BLUEGILL_LAYOUT_REV}"
+               + (" (stock Bluejay: those slots are not the sine settings)"
+                  if layout == BLUEJAY_LAYOUT_REV else ""))
+        return (None, {k: why for k in keys if k in BLUEGILL_ONLY_FIELDS})
+    return (None, {})
+
 # BlueGill max_erpm (0x2C) is in units of 1000 eRPM. The firmware's 80000/N decode is
 # exact only for N <= 136 and the high-rpm path bypasses the governor above ~156k eRPM,
 # so the effective ceiling is <= 136k eRPM; values above that are clamped (with a warning).
