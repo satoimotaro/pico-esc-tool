@@ -225,7 +225,7 @@ def test_every_shipped_profile_tags_regimes_consistently_with_the_handoff():
 
 
 # --- the write guard: which ESCs may these offsets be written to? ------------------------------
-# The three headers are the real bench-observed ones (bench-registry/snapshots/), not invented:
+# The three headers are real, bench-observed on one ESC, not invented:
 # BlueGill S4 = 0.21/226, stock Bluejay v0.21.0 = 0.21/208, BLHeli-S Rev16.7 = 16.7/33. All three
 # carry the SAME layout tag `#A_H_30#`, which is exactly why the flash compat check cannot catch
 # this — it compares the FET pin map, not the config layout.

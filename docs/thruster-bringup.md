@@ -83,25 +83,32 @@ Enable it only after watching *this* motor decelerate through the seam on the be
 python3 host/motorpack.py --kv 300 --pp 7 --v 14.8 --seamless-down predict   # -> sine_cross_dn=239
 ```
 
-## 5. Apply the config, then snapshot it
+## 5. Apply the config, then record what is actually on the hardware
 
 ```
 python3 host/motorpack.py --kv 300 --pp 7 --v 14.8 apply
-python3 bench.py snapshot my-thruster-initial --firmware "BlueGill S4" \
-        --motor "<what it is>" --supply-v <measured, off the PSU panel>
+python3 host/esctool.py read 1 -o snapshots/$(date -u +%Y%m%dT%H%M%SZ)-initial.yaml
 ```
-
-`--supply-v` is the **measured** supply. The ESC's `vbatt` is a soft sensor, not a voltmeter.
 
 `esctool set` refuses to write settings the ESC's EEPROM layout revision cannot take, so a
 mismatched firmware fails loudly rather than writing at wrong offsets.
 
-## 6. Never flash by hand again
+**Record the measured supply voltage alongside it.** The ESC's `vbatt` is a soft sensor, not a
+voltmeter. And the supply reading is not what the ESC sees once amps flow, if anything resistive
+sits between them — measure that too if you are going to draw real current.
 
-```
-python3 bench.py flash <image>.hex <label> --firmware "<name>"     # snapshot->flash->restore->verify->snapshot->diff
-python3 bench.py check                                            # before the FIRST spin, every time
-```
+> **A snapshot is an observation; a profile is an intention.** Keep a per-installation store of
+> what the hardware actually reported (`esctool read -o`), and restore from *that*, never from a
+> checked-in profile. On our bench the profile we believed we were running had drifted from reality
+> in **eight** settings. This repo deliberately ships the tools and not the numbers, so that store
+> lives outside it; we wrap the sequence below into one command locally and recommend you do too.
+
+## 6. Never flash by hand
+
+The sequence — **snapshot → flash → restore from that snapshot → verify byte-for-byte → snapshot →
+diff** — is not the hard part. Remembering every step of it at the bench is. Wrap it in one command
+that refuses to succeed unless the restore verified, so a half-restored ESC cannot be mistaken for a
+finished one. Then **check the config against the snapshot before the first spin, every time.**
 
 A flash resets **14 settings** to firmware defaults. This is not a theoretical hazard — measured on
 the bench, one setting at a time, against a good config settling at 1600 rpm:
@@ -114,15 +121,15 @@ the bench, one setting at a time, against a good config settling at 1600 rpm:
 | `motor_direction = Normal` | 180 rpm |
 
 **Three of the four still start.** The dangerous outcome is not a dead motor, it is one running at a
-quarter to a ninth of the right speed while looking healthy. `bench.py check` names the drift and
-exits non-zero.
+quarter to a ninth of the right speed while looking healthy — which is exactly what a pre-spin config
+check catches and a smoke test does not.
 
 ## 7. Dry bench run — spend the encoder here
 
 ```
-python3 bench.py check                                    # config first, always
+# config first, always: diff `esctool read 1` against your known-good snapshot
 python3 host/startlog.py 1 --repeats 20 --kv 300 --v 14.8 --cross-up 34 \
-        --journal <bench-registry>/measurements/startlog_journal.csv
+        --journal <your versioned bench-data dir>/startlog_journal.csv
 ```
 
 Every attempt must come back `CAUGHT` at the predicted speed. A `SLOW` row means it started and is
@@ -184,7 +191,7 @@ the bench or not at all.
 ## Standing rules
 
 - **Never** restore from a checked-in profile. Profiles are intentions; snapshots are observations,
-  and a profile had already drifted from this bench in eight settings.
-- **Never** flash without `bench.py flash`, and never spin before `bench.py check`.
+  and a profile had already drifted from our bench in eight settings.
+- **Never** flash outside the verified sequence, and never spin before checking the config.
 - The measured supply is the PSU panel, not `vbatt` — and the panel is not what the ESC sees once
   amps flow, if anything resistive sits between them.

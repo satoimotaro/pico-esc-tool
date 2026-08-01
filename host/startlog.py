@@ -332,7 +332,8 @@ def main():
     ap.add_argument("--journal", default=JOURNAL,
                     help="where the cross-session journal lives. The default is under host/reports/, "
                          "which is GITIGNORED — fine for a tool heading for public release, wrong "
-                         "for the data. Point it at bench-registry/measurements/ to version it")
+                         "for the data. Point it somewhere versioned — a per-installation bench "
+                         "registry is the intended home")
     ap.add_argument("--port", default=None)
     opts = ap.parse_args()
 
@@ -355,7 +356,7 @@ def main():
     # wipes the config every time. Once per session: it does not change mid-campaign.
     raw = _read_raw(dev, opts.index)
     cfg_tag = f"cfg:{hashlib.sha256(raw).hexdigest()[:12]}" if raw else "cfg:UNREADABLE"
-    print(f"# ESC config {cfg_tag} — compare against bench-registry snapshots if a row FAILS")
+    print(f"# ESC config {cfg_tag} — compare against a known-good config snapshot if a row FAILS")
     dev.cmd("disconnect", timeout=6)
     time.sleep(0.4)
 

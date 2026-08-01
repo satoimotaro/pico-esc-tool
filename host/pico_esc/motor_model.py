@@ -38,7 +38,7 @@ DUTY6_B = -1.233
 #
 # RE-MEASURED ABSOLUTELY 2026-08-01, WITH the PSU current column the note below asks for, and LEFT
 # ALONE. 350KV bare shaft, 11.20 V, cross_up 36, six commands 540..740, all BEMF-locked
-# (bench-registry `measurements/duty_sweep_350kv_20260801_165026.csv`): measured slope 0.002654 over
+# (raw sweep kept per-installation, outside this repo): measured slope 0.002654 over
 # the five commands the 930KV also ran, i.e. **0.1 % from the value above**, with fw/meas duty inside
 # 1.005..1.039 across all six. The standing suspicion that "a flat +0.0026 offset still sits in
 # DUTY6_A/B" is dead: there is no offset to remove on the motor these were fitted to.
@@ -60,9 +60,9 @@ DUTY6_B = -1.233
 # CONSEQUENCE FOR ANY LOADED TEST: the PSU regulates at ITS OWN terminals, so the panel voltage is
 # not what the ESC sees. 0.254 ohm is 0.03 V at this bench's 0.1 A (ignorable, which is why neither
 # sweep needed re-deriving) but 1.27 V at 5 A and 2.54 V at 10 A. `--v`, loadtest.py and the vbatt
-# calibration all assume the panel reading. See bench-registry/measurements/README.md for the model
-# table and for why the I*R correction must be analysed at R=0 until `I_phase = I_dc/duty` is
-# re-derived.
+# calibration all assume the panel reading. The full two-motor model table lives with the raw data
+# in the bench registry; what matters here is the conclusion above, plus: analyse this map at R=0
+# until `I_phase = I_dc/duty` is re-derived.
 #
 # The ESC's `cross_rescale_duty` maps the 6-step demand relative to `Cross_Up`, so changing Cross_Up
 # SHIFTS this affine's intercept and leaves its slope alone. DUTY6_A/B above were fitted at Cross_Up=34.

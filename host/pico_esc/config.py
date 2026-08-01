@@ -44,7 +44,7 @@ NAME_OFF, NAME_LEN = 0x60, 16
 # firmware family does not guarantee offsets across EEPROM revisions. The flash compat check is
 # no help — it compares the layout TAG (`#A_H_30#`), which is the FET pin map, not the config
 # layout. Three firmwares, three (eeprom, layout) pairs, all reporting the same tag, all
-# bench-observed on this ESC (bench-registry/snapshots/):
+# bench-observed on one ESC (recorded per-installation, outside this repo):
 #     BlueGill S4            0.21 / 226   <- what FIELD_OFF encodes, including 0x2B..0x33
 #     Bluejay v0.21.0 stock  0.21 / 208   <- shared offsets only; 0x2B..0x33 are NOT sine there
 #     BLHeli-S Rev16.7       16.7 / 33    <- a different layout; nothing here may be written

@@ -114,5 +114,5 @@
     "deadband_thrust_fwd": 65,
     "note": "first-order rotor lag rpm += (tgt-rpm)*(1-exp(-dt/tau)); compare against sim.py TAU/FULLSCALE_RPM"
   },
-  "profile_yaml": "/home/satoimo/UWR_ESC_ws/pico-esc-tool/host/profiles/350kv_postfix_sysid.yaml"
+  "profile_yaml": "host/profiles/350kv_postfix_sysid.yaml"
 }
