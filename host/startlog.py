@@ -49,6 +49,16 @@ The journal is APPENDED ACROSS SESSIONS on purpose (host/reports/startlog_journa
 rate is ~2 in a week of benching, so no single campaign will contain one. The instrument is meant to
 be left in place and re-run, with `--analyze` reducing everything accumulated so far.
 
+TWO WITNESSES, ALWAYS. `encv` alone cannot tell a stopped rotor from a blind encoder, and on
+2026-08-08 that difference mattered: with the AS5600 unplugged the bench still reported md=1 (magnet
+detected) and a freely advancing sample counter while `accum` sat frozen, so every liveness signal
+the encoder offers about itself said "fine" while it saw nothing. Five attempts logged as FAILED,
+four of them "reproducing" at an identical parking angle with concentration R=1.000 — because a
+frozen accum cannot vary. That is fabricated evidence for the exact hypothesis this file exists to
+test, which is worse than no evidence. Every attempt now also reads the ESC's own telemetry, and a
+disagreement (tele turning, encoder not) is reported as NO-ENC and aborts the campaign. It is never
+a failure.
+
 OPEN LOOP ONLY, deliberately: the observed failures were open loop, and open loop is immune to the
 CLI-polling starvation that invalidates closed-loop steady-state numbers on this rig.
 """
@@ -90,6 +100,23 @@ def _encv(dev):
     except Exception:
         pass
     return None, None
+
+
+def _tele_rpm(dev, idx):
+    """The ESC's own mechanical rpm, or None when telemetry is not live.
+
+    The SECOND WITNESS, and it is not optional. `encv` alone cannot tell a stopped rotor from a
+    blind encoder: with the AS5600 unplugged this bench still reported md=1 (magnet detected) and a
+    freely advancing sample counter while `accum` sat frozen — so every liveness signal the encoder
+    itself offers said "fine" while it saw nothing. Telemetry is independent of that failure and
+    caught it immediately (tele climbed to 1398 rpm against encv 0.00)."""
+    try:
+        for ln in dev.cmd(f"tele {idx}", timeout=3):
+            if ln.startswith("tele|"):
+                return float(ln.split("|")[1])
+    except Exception:
+        return None
+    return None
 
 
 def park_angles(accum, pole_pairs):
@@ -164,7 +191,7 @@ def attempt(dev, idx, opts, trace_path=None):
     time.sleep(opts.arm_settle)
 
     rows, t0, t_catch, peak = [], time.time(), None, 0.0
-    next_ka = 0.0
+    tele_peak, next_ka = 0.0, 0.0
     while True:
         el = time.time() - t0
         if el >= opts.window:
@@ -173,6 +200,9 @@ def attempt(dev, idx, opts, trace_path=None):
             dev.cmd(f"thrust {idx} {opts.thrust}", timeout=3)
             next_ka = el + KEEPALIVE_S
         accum, rpm = _encv(dev)
+        t = _tele_rpm(dev, idx)
+        if t is not None:
+            tele_peak = max(tele_peak, abs(t))
         if accum is None:
             continue
         rows.append((el, accum, rpm))
@@ -191,15 +221,25 @@ def attempt(dev, idx, opts, trace_path=None):
     # Classifying purely on "did it turn" would log every one of those as a clean CAUGHT, i.e. the
     # instrument would miss three of the four known failure modes.
     expect = opts.kv * opts.v * duty6(opts.thrust, opts.cross_up)
-    outcome = ("FAILED" if t_catch is None else
-               "SLOW" if expect > 0 and settle < opts.slow_frac * expect else "CAUGHT")
+    # NO-ENC before anything else. A blind encoder reads exactly like a rotor that never moved, and
+    # on 2026-08-08 that manufactured five FAILED rows — including four that "reproduced" at an
+    # identical parking angle with R=1.000, because a frozen accum cannot vary. Fabricated evidence
+    # for the very hypothesis this file exists to test is worse than no evidence, so the disagreement
+    # is now a first-class outcome and NEVER a failure.
+    if t_catch is None and tele_peak >= opts.catch_rpm:
+        print(f"    ** NO-ENC: the ESC reports {tele_peak:.0f} rpm while the encoder never moved. "
+              f"The ROTOR IS FINE and the ENCODER is not. Not logged as a failure.")
+        outcome = "NO-ENC"
+    else:
+        outcome = ("FAILED" if t_catch is None else
+                   "SLOW" if expect > 0 and settle < opts.slow_frac * expect else "CAUGHT")
     if outcome == "SLOW":
         print(f"    ** SLOW: settled {settle:.0f} rpm against {expect:.0f} predicted — it started "
               f"and is running WRONG, which is the mode that hides")
     # The trace is what makes a FAILED row diagnosable rather than merely counted, so it is always
     # written on failure. Successes are kept only with --trace-all: they are numerous and the row
     # itself carries what the control group needs.
-    if trace_path and (outcome in ("FAILED", "SLOW") or opts.trace_all):
+    if trace_path and (outcome in ("FAILED", "SLOW", "NO-ENC") or opts.trace_all):
         with open(trace_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["t_s", "accum", "rpm"])
@@ -372,6 +412,10 @@ def main():
                      esc=opts.index,
                      note=(f"nudge={opts.nudge_cmd} " if opts.nudge_cmd > 0 else "unnudged ")
                           + f"{cfg_tag} " + opts.note)
+            if r["outcome"] == "NO-ENC":
+                raise Aborted("the encoder is not reading while the ESC says the rotor is turning "
+                              "— fix the encoder before collecting more rows, they would all be "
+                              "artifacts")
             rows.append(r)
             mark = "ok" if r["outcome"] == "CAUGHT" else "*** FAILED ***"
             print(f"    {r['outcome']}  t_catch={r['t_catch_s'] or '-':>6}  "
