@@ -198,11 +198,19 @@ class DualDrive:
     def send(self, s, d=0.0):
         """Drive the pod: azimuth command s, propeller command d. Returns the MixResult."""
         m = self.mixer.mix(s, d)
-        self.a.send_thrust(m.a)
-        self.b.send_thrust(m.b)
+        # ROUND, do not truncate. PosDrive.send_thrust does int(), which truncates toward zero, and
+        # s_trim is not an integer — so a steady sub-count bias survives on both channels and shows
+        # up in the DIFFERENCE, which is the azimuth. One count is ~22 deg/s here, so truncation
+        # alone can leave a constant creep the integrator has to fight forever.
+        self.a.send_thrust(round(m.a))
+        self.b.send_thrust(round(m.b))
         self.last_mix = m
         return m
 
     def read_enc(self):
         """Azimuth angle — ONE encoder on the azimuth axis, so it is read once, not per channel."""
         return self.a.read_enc()
+
+    def read_encv(self):
+        """De-aliased azimuth velocity + unwrapped accumulator, computed ON-DEVICE at ~1.25 kHz."""
+        return self.a.read_encv()

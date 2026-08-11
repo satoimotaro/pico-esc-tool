@@ -229,6 +229,26 @@ def _suspect(r, args):
     return (r.ml != 0) and not args.allow_weak_magnet
 
 
+def _feed_encv(ctrl, ev, base):
+    """Drive the controller from the ON-DEVICE accumulator instead of unwrapping `enc` on the host.
+
+    `PositionController.update_encoder` unwraps the 12-bit angle between 50 Hz ticks and REJECTS any
+    delta beyond DELTA_FAULT_FRAC of half a revolution as a possible alias. That is the right call
+    for a slow axis sampled slowly — but this pod reaches thousands of deg/s in a transient, and
+    3000 deg/s is 683 counts per 20 ms tick, close enough to the threshold that samples get thrown
+    away exactly when the azimuth is moving fastest. A rejected sample does not integrate, so
+    position FREEZES at the worst possible moment, which is the signature of a loop that sometimes
+    recovers and sometimes ends hundreds of degrees out.
+
+    `encv` removes the problem rather than tuning around it: the RP2040 samples the AS5600 at
+    ~1.25 kHz, so per-sample travel is far below half a revolution at any speed this mechanism can
+    reach, and it unwraps into a signed accumulator on-device. The velocity comes from the same
+    high-rate stream instead of being a 50 Hz difference of a noisy angle.
+    """
+    ctrl.pos_deg = ctrl.enc_sign * (ev.accum - base) * 360.0 / COUNTS_PER_REV
+    ctrl.vel = ctrl.enc_sign * ev.rpm * 6.0          # signed mech rpm -> deg/s
+
+
 def _servo_tick(drive, ctrl, carrier, args, rate_guard):
     """One closed-loop tick at a given carrier. Returns (MixResult, encoder reading).
 
@@ -236,10 +256,19 @@ def _servo_tick(drive, ctrl, carrier, args, rate_guard):
     carrier is still ramping — the transition is where heading is lost, so it cannot be an
     open-loop prelude that the servo only cleans up afterwards.
     """
-    r = drive.read_enc()
-    if r is None:
-        raise Aborted("azimuth encoder read failed mid-run — disarming")
-    ctrl.update_encoder(r.raw, DT, suspect=_suspect(r, args))
+    if args.use_encv:
+        ev = drive.read_encv()
+        if ev is None:
+            raise Aborted("encv read failed mid-run — disarming")
+        if ev.md != 1:
+            raise Aborted("azimuth magnet lost mid-run (md=0) — disarming")
+        _feed_encv(ctrl, ev, args._encv_base)
+        r = ev
+    else:
+        r = drive.read_enc()
+        if r is None:
+            raise Aborted("azimuth encoder read failed mid-run — disarming")
+        ctrl.update_encoder(r.raw, DT, suspect=_suspect(r, args))
     rate_guard(ctrl)
     u, _ = ctrl.step(DT)
     return drive.send(u, carrier), r
@@ -393,8 +422,15 @@ def _run_servo(args, targets, thrust):
         drive.prepare()
         _guard_encoder(drive, args.allow_weak_magnet)
         drive.arm()
-        raw0, _ = _enc_deg(drive)
-        ctrl.update_encoder(raw0, DT)
+        args._encv_base = 0
+        if args.use_encv:
+            ev0 = drive.read_encv()
+            if ev0 is None:
+                sys.exit("--use-encv but the firmware has no `encv` — use --no-use-encv")
+            args._encv_base = ev0.accum
+        else:
+            raw0, _ = _enc_deg(drive)
+            ctrl.update_encoder(raw0, DT)
         ctrl.pos_deg = 0.0
         rate_guard = _make_rate_guard(args)
         if carrier:
@@ -463,6 +499,10 @@ def add_common(p):
                    help="the ESC's sine_cross_up — sets where forced sine hands off to 6-step")
     p.add_argument("--allow-6step", action="store_true",
                    help="permit commands past the seam; the azimuth reaches hundreds of rpm there")
+    p.add_argument("--use-encv", action="store_true", default=True,
+                   help="feed the loop from the on-device de-aliased accumulator (default)")
+    p.add_argument("--no-use-encv", dest="use_encv", action="store_false",
+                   help="fall back to host-side unwrap of `enc` — aliases in fast transients")
     p.add_argument("--allow-weak-magnet", action="store_true",
                    help="run with ML=1 / AGC saturated — zero margin, see _guard_encoder")
     p.add_argument("-v", "--verbose", action="store_true")
