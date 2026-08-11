@@ -75,13 +75,23 @@ def _enc_deg(drive):
     return r.raw, r.raw * 360.0 / COUNTS_PER_REV
 
 
-def _guard_encoder(drive):
+def _guard_encoder(drive, allow_weak=False):
     """Refuse to servo without a live, healthy azimuth encoder.
 
     A blind encoder reads exactly like a stalled axis: raw stops changing, the controller sees a
     huge standing error and winds the sum command up against a mechanism that may well be moving.
     This is the same failure startlog hit — a dead read fabricating a mechanical fault — so it is
     checked before arming rather than discovered during the run.
+
+    `allow_weak` downgrades the ML (magnet-too-weak) bit from a refusal to a warning. On the AS5600,
+    ML is set precisely when AGC saturates at maximum gain, so ML=1 and AGC=128 (at 3.3 V) are one
+    fact, not two: the field is at the bottom of the usable range. Measured on this pod at that
+    setting, tracking was still clean — 10.8 hand-turned revolutions with zero dropped samples, a
+    monotonic accumulator, MAG stable to ±4 %, and the on-device velocity agreeing with the
+    accumulated travel. So it is usable, but with **no margin**: temperature, vibration or any
+    increase in the gap starts dropping samples, and a dropped sample is what this guard exists to
+    catch. Closing the gap is the fix; this flag exists so running without it is a deliberate,
+    logged choice rather than a silently weakened check.
     """
     r = drive.read_enc()
     if r is None:
@@ -90,10 +100,18 @@ def _guard_encoder(drive):
                  "  failure is a live I2C fault, not boot order. Check 3V3/GND at the sensor,\n"
                  "  SDA=GP16 / SCL=GP17 (I2C0, addr 0x36 — physical pins 21/22, NOT 16/17), the\n"
                  "  bus pull-ups, and whether the part is an AS5600L (configurable address).")
-    if not r.healthy:
+    if r.md != 1 or r.mh != 0:
         sys.exit(f"azimuth encoder unhealthy (md={r.md} ml={r.ml} mh={r.mh} agc={r.agc}): "
-                 "fix the magnet gap before servoing — a marginal magnet drops samples, and a "
-                 "dropped sample is indistinguishable from a stalled axis.")
+                 "no magnet detected, or it is too strong. Fix the magnet before servoing — a "
+                 "marginal magnet drops samples, and a dropped sample is indistinguishable from a "
+                 "stalled axis.")
+    if r.ml != 0:
+        if not allow_weak:
+            sys.exit(f"azimuth magnet TOO WEAK (ml=1, agc={r.agc} — AGC is saturated at maximum "
+                     "gain, which is the same fact stated twice). Close the axial gap so AGC comes "
+                     "off the rail, or pass --allow-weak-magnet to run at zero margin deliberately.")
+        print(f"# WARNING: magnet weak (ml=1, agc={r.agc} = AGC saturated). Running anyway on "
+              f"--allow-weak-magnet. Tracking has NO margin: watch for dropped samples.")
     return r
 
 
@@ -111,7 +129,7 @@ def cmd_identify(args):
         for name, idx in (("A", args.idx_a), ("B", args.idx_b)):
             drive = PosDrive(host, idx, args.tmax, clock, verbose=True)
             drive.prepare()
-            _guard_encoder(drive)
+            _guard_encoder(drive, args.allow_weak_magnet)
             drive.arm()
             try:
                 _, deg0 = _enc_deg(drive)
@@ -159,7 +177,7 @@ def _run_servo(args, targets, thrust):
 
     try:
         drive.prepare()
-        _guard_encoder(drive)
+        _guard_encoder(drive, args.allow_weak_magnet)
         drive.arm()
         raw0, _ = _enc_deg(drive)
         ctrl.update_encoder(raw0, DT)
@@ -220,6 +238,8 @@ def add_common(p):
     p.add_argument("--sign-a", type=int, default=1, choices=(1, -1))
     p.add_argument("--sign-b", type=int, default=1, choices=(1, -1),
                    help="RUN `identify` FIRST — an unverified sign swaps steering and thrust")
+    p.add_argument("--allow-weak-magnet", action="store_true",
+                   help="run with ML=1 / AGC saturated — zero margin, see _guard_encoder")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
