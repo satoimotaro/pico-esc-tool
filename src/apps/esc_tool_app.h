@@ -825,8 +825,18 @@ private:
 				if (sda && scl) Serial.println("i2c|external pull-ups PRESENT and powered on both lines");
 				else if (!sda && !scl) Serial.println("i2c|NO external pull-up on either line — the sensor "
 				                                      "board is unplugged, unpowered, or neither line is landed");
-				else Serial.printf("i2c|only %s has an external pull-up — the other line is open\n",
-				                   sda ? "SDA" : "SCL");
+				else {
+					// Both pull-ups sit on the SAME VCC on an AS5600 breakout, so one line up and the
+					// other down cannot be a power fault — the board HAS power and the dead line is
+					// simply not landed. Worth calling out because SCL open makes every address fail to
+					// ACK, which looks exactly like a dead part.
+					Serial.printf("i2c|only %s has an external pull-up — %s is OPEN, and both pull-ups "
+					              "share one VCC, so the board IS powered and that line is just not "
+					              "connected\n", sda ? "SDA" : "SCL", sda ? "SCL (GP17, physical pin 22)"
+					                                                     : "SDA (GP16, physical pin 21)");
+					if (!scl) Serial.println("i2c|SCL is the clock: with it open NOTHING can ever ACK. "
+					                         "Check GP17 = PHYSICAL PIN 22 (physical 17 is GP13).");
+				}
 				// then the idle levels with the pull-down removed: a line stuck LOW here is being held
 				pinMode(16, INPUT); pinMode(17, INPUT);
 				delayMicroseconds(200);
@@ -841,9 +851,12 @@ private:
 				if (!found && sda && scl)
 					Serial.println("i2c|pull-ups are powered but NOTHING answers — the part is dead, or it "
 					               "is a different device than expected.");
-				else if (!found)
+				else if (!found && !sda && !scl)
 					Serial.println("i2c|nothing answers and there is no external pull-up — check 3V3/GND at "
 					               "the sensor and that SDA=GP16 (physical 21) / SCL=GP17 (physical 22).");
+				else if (!found)
+					Serial.println("i2c|nothing answers, but that is expected while a line is open — fix "
+					               "the wiring above and re-run before suspecting the part.");
 				Wire.setClock(400000);                        // restore the tracker's rate
 				Serial.println("ok"); }
 			else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
