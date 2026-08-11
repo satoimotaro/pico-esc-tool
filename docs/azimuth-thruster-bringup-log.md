@@ -115,8 +115,17 @@ The fix is to mirror ch1's snapshot onto index 0 and verify byte-for-byte. Attem
 - GP16 (SDA) / GP17 (SCL) is a valid I2C0 pair on RP2040 and has never been anything else — `git log -S`
   finds the assignment unchanged since the encoder was introduced.
 
-So this is **not** boot order, not mode gating, and not a stale pin constant. `poll()` is retrying a
-thousand times a second and failing every time: the sensor is not ACKing on I2C. Check, in order:
+**Then the Pico was reflashed to rule out a stale binary, and it still fails.** The audit above reads
+*source*; it does not prove the flashed image matches. Two independent checks now close that gap:
+
+- The running firmware answers `encv` (it returned `err no-encoder`, not `err unknown-cmd`). `encv`
+  exists only from `7e6870b` onward, and `7e6870b` has `0b0dd82` — the commit that added the
+  self-healing `present_ = true` in `poll()` — as an ancestor. So the self-heal was already running.
+- `pio run -e main -t upload` (verified, `md5 e434b185…`, firmware source unchanged since 2026-08-01)
+  rebooted the Pico into a fresh `begin()`, and the cold re-probe **also** failed.
+
+A stale image, a missed probe and boot order are all eliminated. `poll()` is retrying a thousand
+times a second and failing every time: the sensor is not ACKing on I2C. Check, in order:
 3V3/GND at the sensor; **SDA on GP16 = physical pin 21, SCL on GP17 = physical pin 22** — physical
 pins 16/17 are GP12/GP13, which is the classic way this gets miswired; bus pull-ups; continuity of the
 run into the pod; and whether the part is an AS5600**L** (configurable address — 0x36 is fixed only on
@@ -140,10 +149,20 @@ lost at 5 A). One bare-shaft motor stayed under that; **two motors turning a pro
 the memo budgets ~10 A per motor. Replace the loom before any loaded run — every voltage-derived
 number is wrong until then.
 
+### The Pico's stored config SURVIVES a Pico flash
+
+Worth recording because the tooling says otherwise: `bench.py`'s `_pico()` docstring claims "`motor`
+is **NOT** persisted across a Pico flash". After `-t upload` the device came back with `cfg|stored=1`
+and both channels still `kv=350 pp=7`, gains, `vscale` and `cross_up` intact — LittleFS survives, and
+the current `CFG_VERSION` covers motor identity. **That comment is stale.** It still pays to snapshot
+before flashing, but a Pico flash is no longer the config-losing event it is documented to be.
+
 ### State left on the hardware
 
-As found. Both ESCs read and released (`esctool run`); no config applied, no channel armed, no motor
-spun. Captured in `bench-registry/snapshots/20260811T041059Z-azimuth-ch0` and `…041108Z-azimuth-ch1`.
+ESC config as found — both ESCs read and released (`esctool run`), no config applied, no channel
+armed, no motor spun. Captured in `bench-registry/snapshots/20260811T041059Z-azimuth-ch0` and
+`…041108Z-azimuth-ch1`. The Pico firmware was re-flashed with the same image built from this branch;
+its stored runtime config is unchanged.
 
 ---
 
