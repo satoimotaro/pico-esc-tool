@@ -74,6 +74,27 @@ HANDOFF_CMD = {34: 484, 36: 515, 40: 578, 44: 640}
 # forced-commutation + detent hold is written for.
 AZIMUTH_RATE_AT_650_RPM = 554.0
 
+# ...BUT THE 6-STEP REGION IS USABLE AFTER ALL, VIA THE DIFFERENTIAL ITSELF.
+# Azimuth rate is set by the DIFFERENCE of the two motors, not by either one's speed. Carry both
+# motors deep inside 6-step (|command| ~600, well clear of the 515 seam) and trim the difference:
+# the ESC never goes near its unusable low end, and the azimuth still creeps.
+#
+# MEASURED ON THIS POD 2026-08-12, continuous trim ramp at carrier -600, motors never stopped:
+#     azimuth_rpm = 3.629 * delta + 178.5      (R2 = 0.912, delta = A - B in command counts)
+# so with s = delta/2:
+AZIMUTH_RPM_PER_S = 7.26          # rpm of azimuth per unit of s (command counts)
+AZIMUTH_NULL_S    = -29.8         # s that actually holds still — the motors are not identical.
+                                  # Refined from -24.6 (ramp fit) by direct hold measurement, and
+                                  # it DRIFTS: three nulls in one 30 s run read +24.4, +33.9, +45.0
+                                  # rpm, monotonically rising. Feedforward alone therefore creeps —
+                                  # the position loop has to stay closed to hold a heading.
+CARRIER_CMD       = 600           # |command| both motors are held at; 60+ counts clear of the seam
+#
+# Resolution is 0.435 deg per 50 Hz tick per command count — far finer than the 6 deg tolerance.
+# The costs are real and must not be forgotten: A + B stays large, so THE PROPELLER ALWAYS RUNS in
+# this mode (stationary pointing still needs forced sine), and the open-loop fit scatters by about
+# +/-30 rpm, so the loop has to stay closed rather than run on feedforward.
+
 
 # ---------------------------------------------------------------------------------
 def _mk_host(args):
@@ -181,8 +202,24 @@ def cmd_identify(args):
 def _run_servo(args, targets, thrust):
     """Shared servo loop for move/hold: cascade PID on s, feedforward d, both via the mixer."""
     host, clock = _mk_host(args)
-    mixer = DifferentialMixer(tmax=args.tmax, sign_a=args.sign_a, sign_b=args.sign_b)
-    drive = DualDrive(host, mixer, args.idx_a, args.idx_b, args.tmax, clock)
+    # In carrier mode the propeller command IS the carrier: it is what keeps both motors deep in
+    # 6-step, so it overrides whatever `thrust` asked for, and tmax has to clear carrier + smax.
+    carrier = float(args.carrier)
+    if carrier:
+        thrust = carrier
+        print(f"# 6-STEP CARRIER {carrier:+.0f} on both motors — the propeller WILL run. "
+              f"Azimuth authority smax={args.smax} (~{args.smax*AZIMUTH_RPM_PER_S:.0f} rpm max), "
+              f"s_trim={args.s_trim:+.1f}")
+    # The ceiling must clear carrier + trim + authority. Leaving s_trim out of it silently CLAMPS
+    # the trim, so the null is never reached and the pod slews at the residual — which is exactly
+    # how this failed on the bench: a -24.6 trim was clipped to -12 and the azimuth ran at 226 rpm
+    # while nominally commanded to hold still.
+    ceiling = int(abs(carrier) + abs(args.s_trim) + args.smax) if carrier else args.tmax
+    mixer = DifferentialMixer(tmax=ceiling, sign_a=args.sign_a, sign_b=args.sign_b,
+                              s_trim=args.s_trim, carrier=bool(carrier))
+    drive = DualDrive(host, mixer, args.idx_a, args.idx_b, ceiling, clock)
+    # The position loop's own output is s, so its thrust clamp IS the azimuth authority.
+    args.tmax = args.smax if carrier else args.tmax
     ctrl = PositionController(args)
     stop = {"flag": False}
 
@@ -254,6 +291,14 @@ def add_common(p):
     p.add_argument("--sign-a", type=int, default=1, choices=(1, -1))
     p.add_argument("--sign-b", type=int, default=1, choices=(1, -1),
                    help="RUN `identify` FIRST — an unverified sign swaps steering and thrust")
+    p.add_argument("--carrier", type=int, default=0,
+                   help=f"6-step carrier command on BOTH motors (e.g. {CARRIER_CMD}); 0 = forced-sine mode")
+    p.add_argument("--smax", type=int, default=8,
+                   help="azimuth authority in command counts (NOT tmax) — see AZIMUTH_RPM_PER_S")
+    p.add_argument("--max-azimuth-rpm", type=float, default=90.0,
+                   help="hard ceiling on pod rotation rate; --smax is checked against it")
+    p.add_argument("--s-trim", type=float, default=AZIMUTH_NULL_S,
+                   help="per-installation s that holds the azimuth still (measured, not assumed)")
     p.add_argument("--cross-up", type=int, default=36,
                    help="the ESC's sine_cross_up — sets where forced sine hands off to 6-step")
     p.add_argument("--allow-6step", action="store_true",
@@ -281,21 +326,22 @@ def _validate(args):
     args.tmax = abs(int(args.tmax))
     if args.tmax <= 0:
         sys.exit("--tmax must be > 0")
-    # Keep the azimuth channel inside forced sine. Crossing the seam is not a degraded control
-    # result, it is a hazard: measured, the first 6-step points already spin the pod at hundreds of
-    # rpm (see AZIMUTH_RATE_AT_650_RPM). tmax is the per-channel ceiling, and `identify` also drives
-    # a single channel at --cmd, so both are checked.
-    handoff = HANDOFF_CMD.get(args.cross_up)
-    if handoff is None:
-        print(f"# WARNING: no handoff command known for sine_cross_up={args.cross_up} "
-              f"(known: {sorted(HANDOFF_CMD)}). Cannot check that --tmax stays in forced sine.")
-    elif args.tmax >= handoff and not args.allow_6step:
-        sys.exit(f"--tmax {args.tmax} reaches the 6-step seam (handoff is command {handoff} at "
-                 f"sine_cross_up={args.cross_up}).\n"
-                 f"  Measured on this pod: ~{AZIMUTH_RATE_AT_650_RPM:.0f} rpm of AZIMUTH at command "
-                 f"650, and the region has no slow end — it jumps from forced-sine creep to hundreds\n"
-                 f"  of rpm at the seam. Keep --tmax below {handoff}, or pass --allow-6step if you "
-                 f"really mean to spin the pod up.")
+    # What must be bounded is the AZIMUTH RATE, not the raw command. Under a 6-step carrier both
+    # commands sit far above the seam on purpose, so a command-magnitude limit would forbid the one
+    # mode that works; and in forced sine a modest command can still be fast. Limit what actually
+    # hurts.
+    args.smax = abs(int(args.smax))
+    rate = args.smax * AZIMUTH_RPM_PER_S
+    if rate > args.max_azimuth_rpm:
+        sys.exit(f"--smax {args.smax} implies ~{rate:.0f} rpm of AZIMUTH "
+                 f"({rate*6:.0f} deg/s), over the --max-azimuth-rpm {args.max_azimuth_rpm} limit.\n"
+                 f"  Measured on this pod: {AZIMUTH_RPM_PER_S:.2f} rpm of azimuth per unit s. "
+                 f"Use --smax <= {int(args.max_azimuth_rpm / AZIMUTH_RPM_PER_S)}.")
+    if args.carrier and abs(args.carrier) < HANDOFF_CMD.get(args.cross_up, 515) + 40:
+        sys.exit(f"--carrier {args.carrier} is too close to the seam "
+                 f"({HANDOFF_CMD.get(args.cross_up, 515)} at cross_up={args.cross_up}).\n"
+                 f"  The carrier exists to hold BOTH motors clear of it; sitting near the seam is "
+                 f"where the azimuth jumps to hundreds of rpm.")
     ident_cmd = args.cmd if isinstance(getattr(args, "cmd", None), int) else 0
     if ident_cmd and handoff and ident_cmd >= handoff and not args.allow_6step:
         sys.exit(f"identify --cmd {ident_cmd} reaches the 6-step seam (handoff {handoff}). Identify "

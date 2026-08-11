@@ -61,7 +61,7 @@ class DifferentialMixer:
     default to +1, which is a PLACEHOLDER, not a measurement (see the module docstring).
     """
 
-    def __init__(self, tmax=1000, sign_a=1, sign_b=1):
+    def __init__(self, tmax=1000, sign_a=1, sign_b=1, s_trim=0.0, carrier=False):
         if sign_a not in (1, -1) or sign_b not in (1, -1):
             raise ValueError("sign_a/sign_b must be +1 or -1")
         if tmax <= 0:
@@ -69,6 +69,16 @@ class DifferentialMixer:
         self.tmax = tmax
         self.sign_a = sign_a
         self.sign_b = sign_b
+        # Per-installation null offset. The two motors are never identical, so the s that actually
+        # holds the azimuth still is not 0. MEASURED ON THIS POD: with both motors carried at
+        # command -600, the azimuth nulls at delta = -49.2, i.e. s = -24.6. It is a calibration, not
+        # a constant — re-measure per installation with a continuous trim ramp.
+        self.s_trim = s_trim
+        # CARRIER MODE INVERTS THE SATURATION PRIORITY, and getting this backwards is dangerous.
+        # Normally d is shed to protect s. Under a 6-step carrier, d is what holds BOTH motors above
+        # the handoff seam; shedding it drops them toward the seam, where the azimuth jumps from
+        # creep to hundreds of rpm. So here s is shed and the carrier is kept.
+        self.carrier = carrier
 
     # -- forward ------------------------------------------------------------------
     def mix(self, s, d):
@@ -77,11 +87,19 @@ class DifferentialMixer:
         s is preserved and d is shed on saturation; if |s| alone already exceeds the ceiling,
         s is clamped too and d goes to zero.
         """
+        s = s + self.s_trim                          # null the per-installation mismatch first
         s_req, d_req = s, d
-        s = max(-self.tmax, min(self.tmax, s))       # s alone cannot exceed the ceiling
-        headroom = self.tmax - abs(s)                # what is left for the propeller channel
-        if abs(d) > headroom:
-            d = headroom if d > 0 else -headroom
+        if self.carrier:
+            # keep d (it holds both motors above the seam), shed s
+            d = max(-self.tmax, min(self.tmax, d))
+            headroom = self.tmax - abs(d)
+            if abs(s) > headroom:
+                s = headroom if s > 0 else -headroom
+        else:
+            s = max(-self.tmax, min(self.tmax, s))   # s alone cannot exceed the ceiling
+            headroom = self.tmax - abs(s)            # what is left for the propeller channel
+            if abs(d) > headroom:
+                d = headroom if d > 0 else -headroom
         a = self.sign_a * (s + d)
         b = self.sign_b * (s - d)
         return MixResult(a=a, b=b, s=s, d=d, d_requested=d_req,
