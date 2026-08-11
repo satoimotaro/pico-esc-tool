@@ -102,16 +102,25 @@ it was told to hold**. That reads as a mechanical fault in the differential and 
 The fix is to mirror ch1's snapshot onto index 0 and verify byte-for-byte. Attempted; the harness
 **denied the write** as a hardware-mutating action. Needs an explicit go-ahead.
 
-### Blocker 2 — the azimuth AS5600 is not on the bus
+### Blocker 2 — the azimuth AS5600 is not on the bus. **The firmware was audited and is not at fault.**
 
-`enc`, `encv`, `enc raw|md|mag|agc` all return `err no-encoder`.
+`enc`, `encv`, `enc raw|md|mag|agc` all return `err no-encoder`. The code path was checked end to end:
 
-**This is not a boot-order problem.** `As5600Tracker::poll()` re-reads RAW_ANGLE at ~1 kHz and sets
-`present_ = true` on any successful read (`src/apps/as5600.h:61`), so a hot-plug recovers within a
-millisecond. Persistent `no-encoder` means the sensor **is not ACKing on I2C right now**. Check, in
-order: 3V3/GND at the sensor, SDA on **GP16** and SCL on **GP17** (I2C0, addr **0x36**), bus pull-ups,
-continuity of the run into the pod, and whether the part is an AS5600**L** (configurable address —
-0x36 is fixed only on the plain AS5600).
+- `enc_.begin()` runs in `EscTool::begin()` (`esc_tool_app.h:165`), after `LittleFS.begin()`, before
+  anything can contend for the bus.
+- `enc_.poll()` runs in `EscTool::poll()` (`:209`) **unconditionally, every loop**, on the same core
+  (core0) that called `begin()` — not gated behind SETUP/DRIVE mode, not behind arming.
+- `As5600Tracker::poll()` re-reads RAW_ANGLE at ~1 kHz and sets `present_ = true` on **any** successful
+  read (`as5600.h:61`), so a hot-plug recovers within a millisecond.
+- GP16 (SDA) / GP17 (SCL) is a valid I2C0 pair on RP2040 and has never been anything else — `git log -S`
+  finds the assignment unchanged since the encoder was introduced.
+
+So this is **not** boot order, not mode gating, and not a stale pin constant. `poll()` is retrying a
+thousand times a second and failing every time: the sensor is not ACKing on I2C. Check, in order:
+3V3/GND at the sensor; **SDA on GP16 = physical pin 21, SCL on GP17 = physical pin 22** — physical
+pins 16/17 are GP12/GP13, which is the classic way this gets miswired; bus pull-ups; continuity of the
+run into the pod; and whether the part is an AS5600**L** (configurable address — 0x36 is fixed only on
+the plain AS5600).
 
 Without it there is no azimuth feedback at all, and the sum channel is the half of this mechanism
 that cannot be run open-loop.
@@ -137,6 +146,32 @@ As found. Both ESCs read and released (`esctool run`); no config applied, no cha
 spun. Captured in `bench-registry/snapshots/20260811T041059Z-azimuth-ch0` and `…041108Z-azimuth-ch1`.
 
 ---
+
+## Implemented while the bench is blocked
+
+Experiments are stood down until the operator is back; the code is written and tested against the
+sim so the bench session is spent on the mechanism, not on typing.
+
+| new | what it is |
+|---|---|
+| `host/pico_esc/differential.py` | `DifferentialMixer` — the (s,d) ↔ (A,B) kinematics, saturation policy and sign identification. Pure, no I/O. Plus `DualDrive`, two `PosDrive` sessions armed and disarmed as one pod. |
+| `host/azimuth.py` | CLI: `identify` / `move` / `hold`. Reuses `PositionController` **unchanged**. |
+| `host/tests/test_differential.py` | 16 tests. Suite is 380 passed / 5 xfailed, no regressions. |
+
+Three things are deliberately encoded rather than left to the bench:
+
+- **Saturation sheds `d`, never `s`.** Clamping A and B independently would distort *both* channels —
+  a saturating turn would inject thrust it was never asked for. Losing angle hold points the thruster
+  somewhere unintended; losing thrust just slows the vehicle. `test_saturation_never_injects_thrust_
+  into_a_turn` pins this.
+- **`DualDrive` cannot arm one channel.** A pod with one channel live is the state that steers when
+  told to hold. Identification, which genuinely needs one motor at a time, uses `PosDrive` directly.
+- **`identify()` raises on a near-zero rate** instead of returning a sign. A sign inferred from noise
+  swaps steering and thrust, and would look like a mechanical fault.
+
+`--dry-run` exercises the code path, it does not model the pod: `SimEncEscHost` is one rotor with one
+encoder, so there is no differential in the loop and no second motor to mismatch. The mixer kinematics
+are covered properly by the unit tests instead.
 
 ## Bench order, once the two blockers clear
 
