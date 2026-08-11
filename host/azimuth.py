@@ -92,6 +92,13 @@ AZIMUTH_NULL_S    = -29.8         # s that actually holds still — the motors a
                                   # it DRIFTS: three nulls in one 30 s run read +24.4, +33.9, +45.0
                                   # rpm, monotonically rising. Feedforward alone therefore creeps —
                                   # the position loop has to stay closed to hold a heading.
+SIGN_B_MEASURED   = -1            # MEASURED on this pod: motor B is mounted mirrored, so a +ve
+                                  # command on B turns the differential the other way. Left at the
+                                  # +1 placeholder the mixer commands the two motors in OPPOSITE
+                                  # directions — the maximum-azimuth configuration — while the
+                                  # caller believes it is carrying them together. Every closed-loop
+                                  # run on 2026-08-12 failed this way before it was spotted in a
+                                  # trace showing A=-589 with B=+610. Re-identify per installation.
 KFF_SENTINEL      = -1.0          # 'not given' — the right Kff depends on the mode
 CARRIER_CMD       = 600           # |command| both motors are held at; 60+ counts clear of the seam
 #
@@ -204,6 +211,24 @@ def cmd_identify(args):
 
 
 # ---------------------------------------------------------------------------------
+def _suspect(r, args):
+    """Is THIS sample untrustworthy enough to refuse to integrate it?
+
+    Not the same question as `healthy`. EncReading.healthy also requires ML=0, but ML only says the
+    AGC has saturated — the field is at the bottom of its usable range, not that the reading is
+    wrong. Measured on this pod at ML=1: 10.8 hand-turned revolutions, zero dropped samples, a
+    monotonic accumulator. What genuinely invalidates a sample is MD=0 (no magnet) or MH=1.
+
+    This mattered: passing `not r.healthy` made EVERY tick a fault under the weak magnet, so
+    PositionController never integrated position and the servo ran completely blind — and reported
+    err 0.00, worst 0.00, a perfect-looking run. A blind controller that claims success is the exact
+    failure this file's guards exist to prevent, wearing a different hat.
+    """
+    if r.md != 1 or r.mh != 0:
+        return True
+    return (r.ml != 0) and not args.allow_weak_magnet
+
+
 def _servo_tick(drive, ctrl, carrier, args, rate_guard):
     """One closed-loop tick at a given carrier. Returns (MixResult, encoder reading).
 
@@ -214,7 +239,7 @@ def _servo_tick(drive, ctrl, carrier, args, rate_guard):
     r = drive.read_enc()
     if r is None:
         raise Aborted("azimuth encoder read failed mid-run — disarming")
-    ctrl.update_encoder(r.raw, DT, suspect=not r.healthy)
+    ctrl.update_encoder(r.raw, DT, suspect=_suspect(r, args))
     rate_guard(ctrl)
     u, _ = ctrl.step(DT)
     return drive.send(u, carrier), r
@@ -227,8 +252,12 @@ def _make_rate_guard(args):
     operator called dangerous. Debounced because one aliased encoder tick must not stop a healthy
     run — the same reason the firmware's over-speed guard needs three live frames.
     """
-    state = {"n": 0}
-    limit_deg_s = args.max_azimuth_rpm * 6.0
+    # The limit is PHASE-DEPENDENT. Spin-up has an unavoidable transient — both motors start from
+    # rest and reach the carrier at slightly different rates, and the differential integrates that
+    # difference straight into heading. Measured here at 94-220 rpm. Holding the steady-state limit
+    # across it would abort every healthy run, so the guard is loosened for the transition only and
+    # tightened again the moment the carrier is reached.
+    state = {"n": 0, "limit": args.max_azimuth_rpm * 6.0}
     if args.dry_run and args.carrier:
         # SimEncEscHost is one rotor with the encoder on it, so under a carrier its "azimuth" is
         # really the rotor spinning at carrier speed and the guard would trip on a fiction. Dry-run
@@ -237,13 +266,18 @@ def _make_rate_guard(args):
         return lambda ctrl: None
 
     def guard(ctrl):
-        if abs(ctrl.vel) > limit_deg_s:
+        if abs(ctrl.vel) > state["limit"]:
             state["n"] += 1
             if state["n"] >= 3:
-                raise Aborted(f"azimuth {ctrl.vel/6:.0f} rpm exceeds --max-azimuth-rpm "
-                              f"{args.max_azimuth_rpm} on 3 consecutive ticks — disarming")
+                raise Aborted(f"azimuth {ctrl.vel/6:.0f} rpm exceeds the {state['limit']/6:.0f} rpm "
+                              f"limit for this phase on 3 consecutive ticks — disarming")
         else:
             state["n"] = 0
+
+    def set_limit(rpm):
+        state["limit"] = rpm * 6.0
+        state["n"] = 0
+    guard.set_limit = set_limit
     return guard
 
 
@@ -264,7 +298,22 @@ def _spinup(drive, ctrl, clock, args, carrier, rate_guard):
     """
     seam = HANDOFF_CMD.get(args.cross_up, 515)
     sgn = 1.0 if carrier > 0 else -1.0
+    # AUTHORITY, not gentleness, is what bounds the transition. The ESCs start the two motors on
+    # independent ramps, so there is always an interval with one turning and the other not — and in
+    # air the differential sends nearly all of that to the azimuth, because the pod's bearings are a
+    # far lighter load than the propeller. The mismatch is therefore up to a WHOLE MOTOR, which no
+    # trim can cancel; the loop needs comparable authority or it just watches.
+    # The ceiling on that authority is the seam: s must stay small enough that BOTH commands remain
+    # in 6-step, i.e. |s| + |s_trim| <= |carrier| - seam.
+    room = int(abs(carrier) - seam - abs(args.s_trim))
+    spin_smax = min(args.spinup_smax, max(1, room))
+    if spin_smax < args.spinup_smax:
+        print(f"# spin-up authority capped at {spin_smax} (not {args.spinup_smax}): more would push "
+              f"a motor below the seam at carrier {carrier:+.0f}")
+    held_tmax = ctrl.tmax
+    ctrl.tmax = spin_smax
     start_pos = ctrl.pos_deg
+    rate_guard.set_limit(args.spinup_max_azimuth_rpm)
     t0 = clock.now()
 
     def profile(el):
@@ -288,6 +337,9 @@ def _spinup(drive, ctrl, clock, args, carrier, rate_guard):
             ctrl.ivel = 0.0
         _servo_tick(drive, ctrl, c, args, rate_guard)
         _pace(clock, tick)
+    rate_guard.set_limit(args.max_azimuth_rpm)      # back to the steady-state limit
+    ctrl.tmax = held_tmax
+    ctrl.ivel = 0.0                                 # do not carry transition windup into the hold
     drift = ctrl.pos_deg - start_pos
     print(f"# spin-up [{args.spinup_mode}] {args.spinup_secs:.1f}s -> carrier {carrier:+.0f}: "
           f"azimuth drift {drift:+.1f} deg")
@@ -319,6 +371,17 @@ def _run_servo(args, targets, thrust):
     # is 1 / (deg/s per unit s), which we MEASURED — posctl's 0.47 belongs to a bare 930KV rotor,
     # a different plant entirely, and using it here would feed forward ~20x too much.
     ctrl = PositionController(args)
+    if carrier:
+        # NEVER hand off to a passive hold under a carrier. PositionController drops thrust to 0 and
+        # ZEROES THE INTEGRAL once inside tol — correct for posctl, whose S1 detent holds position
+        # with no power, and wrong here, where the pod is spinning and s=0 means "trim only", which
+        # does not hold: the null drifts (+24 -> +45 rpm within one 30 s run). The loop would reach
+        # tolerance, go open-loop, drift out, re-converge, and land anywhere. Measured final errors
+        # across four identically-configured runs: -1.6, -9.8, -34.4, -233.3 deg.
+        # The integral IS the thing that nulls steady-state drift, so it has to keep running.
+        # Thresholds that can never be met disable the branch without forking the shared class.
+        ctrl.tol = -1.0
+        ctrl.hold_vel = -1.0
     stop = {"flag": False}
 
     def _bail(*_):
@@ -386,8 +449,8 @@ def add_common(p):
     p.add_argument("--idx-b", type=int, default=1, help="ESC index of motor B (GP11)")
     p.add_argument("--tmax", type=int, default=400, help="per-channel thrust ceiling")
     p.add_argument("--sign-a", type=int, default=1, choices=(1, -1))
-    p.add_argument("--sign-b", type=int, default=1, choices=(1, -1),
-                   help="RUN `identify` FIRST — an unverified sign swaps steering and thrust")
+    p.add_argument("--sign-b", type=int, default=SIGN_B_MEASURED, choices=(1, -1),
+                   help="default is this pod's MEASURED value; re-identify per installation")
     p.add_argument("--carrier", type=int, default=0,
                    help=f"6-step carrier command on BOTH motors (e.g. {CARRIER_CMD}); 0 = forced-sine mode")
     p.add_argument("--smax", type=int, default=8,
@@ -419,6 +482,10 @@ def add_gains(p):
     p.add_argument("--tmin", type=float, default=0.0)
     p.add_argument("--max-secs", type=float, default=15.0)
     p.add_argument("--spinup-secs", type=float, default=3.0)
+    p.add_argument("--spinup-smax", type=int, default=55,
+                   help="azimuth authority DURING the transition; the mismatch there is up to a whole motor")
+    p.add_argument("--spinup-max-azimuth-rpm", type=float, default=260.0,
+                   help="looser rate limit DURING the transition; measured 94-220 rpm here")
     p.add_argument("--spinup-mode", choices=("jump","ramp","two-stage"), default="two-stage")
 
 
