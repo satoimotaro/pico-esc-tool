@@ -58,6 +58,22 @@ from pico_esc.sim import SimEncEscHost
 DT = 0.02                      # 50 Hz tick — same as posctl, well under the 500 ms spin deadman
 COUNTS_PER_REV = 4096
 
+# Command at which the ESC hands off from forced sine to 6-step, per `sine_cross_up`
+# (docs/thruster-bringup.md §2 — the handoff fires at a duty floor, so this is KV-independent).
+HANDOFF_CMD = {34: 484, 36: 515, 40: 578, 44: 640}
+
+# MEASURED ON THIS POD 2026-08-11: at command 650 — just past the 515 handoff for cross_up 36 —
+# the azimuth axis reached ~554 rpm, i.e. more than NINE REVOLUTIONS PER SECOND of the pod itself.
+# Extrapolating the 6-step duty map back to the handoff still leaves several hundred rpm at the
+# very first 6-step point, so there is no slow end to that region: the azimuth goes from a few
+# degrees of forced-sine creep straight to hundreds of rpm the instant it crosses the seam.
+#
+# THE 6-STEP REGION IS THEREFORE UNUSABLE FOR AZIMUTH POSITIONING, and entering it by accident is
+# a hazard, not just a bad control result — it was fast enough to be called dangerous at the bench.
+# Azimuth authority must stay entirely inside forced sine, which is exactly the regime posctl's S1
+# forced-commutation + detent hold is written for.
+AZIMUTH_RATE_AT_650_RPM = 554.0
+
 
 # ---------------------------------------------------------------------------------
 def _mk_host(args):
@@ -238,6 +254,10 @@ def add_common(p):
     p.add_argument("--sign-a", type=int, default=1, choices=(1, -1))
     p.add_argument("--sign-b", type=int, default=1, choices=(1, -1),
                    help="RUN `identify` FIRST — an unverified sign swaps steering and thrust")
+    p.add_argument("--cross-up", type=int, default=36,
+                   help="the ESC's sine_cross_up — sets where forced sine hands off to 6-step")
+    p.add_argument("--allow-6step", action="store_true",
+                   help="permit commands past the seam; the azimuth reaches hundreds of rpm there")
     p.add_argument("--allow-weak-magnet", action="store_true",
                    help="run with ML=1 / AGC saturated — zero margin, see _guard_encoder")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -261,6 +281,25 @@ def _validate(args):
     args.tmax = abs(int(args.tmax))
     if args.tmax <= 0:
         sys.exit("--tmax must be > 0")
+    # Keep the azimuth channel inside forced sine. Crossing the seam is not a degraded control
+    # result, it is a hazard: measured, the first 6-step points already spin the pod at hundreds of
+    # rpm (see AZIMUTH_RATE_AT_650_RPM). tmax is the per-channel ceiling, and `identify` also drives
+    # a single channel at --cmd, so both are checked.
+    handoff = HANDOFF_CMD.get(args.cross_up)
+    if handoff is None:
+        print(f"# WARNING: no handoff command known for sine_cross_up={args.cross_up} "
+              f"(known: {sorted(HANDOFF_CMD)}). Cannot check that --tmax stays in forced sine.")
+    elif args.tmax >= handoff and not args.allow_6step:
+        sys.exit(f"--tmax {args.tmax} reaches the 6-step seam (handoff is command {handoff} at "
+                 f"sine_cross_up={args.cross_up}).\n"
+                 f"  Measured on this pod: ~{AZIMUTH_RATE_AT_650_RPM:.0f} rpm of AZIMUTH at command "
+                 f"650, and the region has no slow end — it jumps from forced-sine creep to hundreds\n"
+                 f"  of rpm at the seam. Keep --tmax below {handoff}, or pass --allow-6step if you "
+                 f"really mean to spin the pod up.")
+    ident_cmd = args.cmd if isinstance(getattr(args, "cmd", None), int) else 0
+    if ident_cmd and handoff and ident_cmd >= handoff and not args.allow_6step:
+        sys.exit(f"identify --cmd {ident_cmd} reaches the 6-step seam (handoff {handoff}). Identify "
+                 f"in forced sine; --allow-6step to override.")
     if args.idx_a == args.idx_b:
         sys.exit("--idx-a and --idx-b must differ: a differential needs two distinct ESCs")
     for name in ("kff", "vmax", "tol", "max_secs"):
@@ -274,7 +313,7 @@ def _validate(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="subcmd", required=True)   # NOT "cmd": identify has a --cmd
 
     ident = sub.add_parser("identify", help="resolve sign_a/sign_b + azimuth gain from the encoder")
     ident.add_argument("--cmd", type=int, default=150, help="single-motor command for the run")
