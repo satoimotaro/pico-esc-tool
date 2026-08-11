@@ -25,6 +25,7 @@
 #include "as5600.h"
 #include "esc_flash.h"
 #include "thruster.h"
+#include "azimuth.h"
 #include "settings.h"
 
 // ---- small helpers (unchanged from esc_tool.cpp) ----
@@ -207,6 +208,7 @@ public:
 	void poll() {
 		handleSerial();
 		enc_.poll();                                            // high-rate AS5600 sampling (self-gated)
+		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
 			for (uint8_t i = 0; i < n_; i++) { th_[i]->poll(); thermalNotice(i); }   // RPM submode closes the loop
@@ -269,6 +271,7 @@ private:
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
 	uint8_t         n_;          // how many
 	As5600Tracker   enc_;
+	Azimuth         az_;
 	Mode            mode_   = SETUP;
 	bool            wifiUp_ = false;
 	WebServer       server_{80};
@@ -809,6 +812,38 @@ private:
 			// missing/shorted, and NO address can ever ACK in that state), then walks 0x08..0x77.
 			// An AS5600 is fixed at 0x36; an AS5600L is configurable, so a device at some OTHER address
 			// is a different part, not a wiring fault.
+			else if (!strcmp(cmd,"az")) {   // az on <carrier> <deg> | off | tgt <deg> | gain <k> <v> | status
+				char* sub=strtok(nullptr," ");
+				if(!sub || !strcmp(sub,"status")) {
+					Serial.printf("az|%d|tgt=%.2f|pos=%.2f|err=%.2f|vel=%.1f|s=%.1f|kp=%.2f|ki=%.2f|kd=%.2f|"
+					              "kff=%.4f|trim=%.1f|smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f\n",
+					              az_.on()?1:0, az_.target(), az_.pos(), az_.target()-az_.pos(), az_.vel(),
+					              az_.s(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim, az_.smax, az_.vmax,
+					              az_.carrier, az_.max_rate);
+					Serial.println("ok"); }
+				else if(!strcmp(sub,"on")) {
+					char* c=strtok(nullptr," "); char* g=strtok(nullptr," ");
+					if(n_<2) { Serial.println("err az: needs two ESCs"); }
+					else if(!th_[0]->armed()||!th_[1]->armed()) Serial.println("err az: arm 0 and arm 1 first");
+					else { if(c) az_.carrier=atof(c);
+						az_.bind(th_[0], th_[1], &enc_);
+						if(!az_.begin(g?atof(g):0.0f)) Serial.println("err az: no encoder");
+						else { Serial.printf("az|on|carrier=%.0f|tgt=%.2f\n", az_.carrier, az_.target()); Serial.println("ok"); } } }
+				else if(!strcmp(sub,"off")) { az_.stop(); Serial.println("ok"); }
+				else if(!strcmp(sub,"tgt")) { char* g=strtok(nullptr," ");
+					if(!g) Serial.println("err az: tgt <deg>"); else { az_.setTarget(atof(g)); Serial.println("ok"); } }
+				else if(!strcmp(sub,"gain")) { char* k=strtok(nullptr," "); char* v=strtok(nullptr," ");
+					if(!k||!v) { Serial.println("err az: gain <kp|ki|kd|kff|trim|smax|vmax|carrier|maxrate|signb> <v>"); }
+					else { float f=atof(v);
+						if(!strcmp(k,"kp")) az_.kp=f; else if(!strcmp(k,"ki")) az_.ki=f;
+						else if(!strcmp(k,"kd")) az_.kd=f; else if(!strcmp(k,"kff")) az_.kff=f;
+						else if(!strcmp(k,"trim")) az_.s_trim=f; else if(!strcmp(k,"smax")) az_.smax=f;
+						else if(!strcmp(k,"vmax")) az_.vmax=f; else if(!strcmp(k,"carrier")) az_.carrier=f;
+						else if(!strcmp(k,"maxrate")) az_.max_rate=f;
+						else if(!strcmp(k,"signb")) az_.sign_b=(f<0)?-1:1;
+						else { Serial.println("err az: unknown gain"); continue; }
+						Serial.println("ok"); } }
+				else Serial.println("err az: on|off|tgt|gain|status"); }
 			else if (!strcmp(cmd,"i2cscan")) {
 				// Probe the lines against an INTERNAL PULL-DOWN, not a bare input. Wire.begin() enables
 				// the RP2040's internal pull-UPs on these pads and Wire.end() does not undo them, so a
