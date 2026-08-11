@@ -157,9 +157,24 @@ and both channels still `kv=350 pp=7`, gains, `vscale` and `cross_up` intact —
 the current `CFG_VERSION` covers motor identity. **That comment is stale.** It still pays to snapshot
 before flashing, but a Pico flash is no longer the config-losing event it is documented to be.
 
+### Safed 2026-08-11 — verified idle
+
+Both channels disarmed (`thrust` now returns `err not-armed`, so **no DShot frames are being sent at
+all**), no bootloader session held (`run` + `disconnect`), no host process running.
+
+One trap was disarmed on the way out: the Pico's runtime model for ch0 still said `v=11.10,
+cross_up=34` while its ESC is now at 36 and the measured supply is 11.2 V. The FF curve is only valid
+at the `cross_up` it was fitted at — leaving it wrong biases the feedforward by up to +44 % at low
+command *and* the soft-sensor that inverts the same map. Both channels are now
+`kv=350 pp=7 v=11.20 cross_up=36`, `cfg save`d.
+
+The PI gains are still deliberately **not** matched: ch1 carries the tuned 350KV set, ch0 the library
+defaults. Gains are tuned in situ, and ch0's plant is no longer a bare shaft — it is one input of a
+differential. Copying them would be inventing a tune.
+
 ### State left on the hardware
 
-ESC config as found — both ESCs read and released (`esctool run`), no config applied, no channel
+ch0 flashed to BlueGill S4 and configured to match ch1 byte-for-byte (both `layout_revision` 226).
 armed, no motor spun. Captured in `bench-registry/snapshots/20260811T041059Z-azimuth-ch0` and
 `…041108Z-azimuth-ch1`. The Pico firmware was re-flashed with the same image built from this branch;
 its stored runtime config is unchanged.
@@ -208,6 +223,22 @@ legitimately produce zero azimuth motion**, which invalidates the naive reading 
 caveat is now in its docstring. To identify signs, brake the idle channel instead of disarming it.
 
 It does not explain the both-motors run, nor the dead telemetry at command 650.
+
+### 1-wire proves more than it looks, and less
+
+Both ESCs are recognised by `esctool list` and their EEPROMs round-trip reads and writes. That
+proves the signal wire and ground are landed, the bootloader answers — **and that the ESC MCUs are
+powered**, since an EFM8BB21 runs off the ESC's own regulator fed from the battery input. An ESC that
+answers at all has DC on its input.
+
+It proves nothing about the three phase wires, the FET stage, or the motor: the 1-wire bootloader
+lives entirely on the signal line.
+
+**Which makes a current-limited supply the leading suspect.** A bench PSU sitting in CC with a low
+limit reproduces every symptom exactly: the MCU draws milliamps and stays happy on 1-wire, then the
+first commutation asks for amps, the rail collapses, and the ESC browns out before it can spin or
+report. The 2026-08-01 camera frame shows this PSU at **0.005 A** — an unloaded session. If the limit
+knob is still where it was, a motor start hits the ceiling immediately.
 
 ### Still to check, in order — all physical
 
