@@ -166,6 +166,59 @@ its stored runtime config is unchanged.
 
 ---
 
+## First spin attempts — the pod did not move, and telemetry never came alive
+
+With ch0 and ch1 finally matched, four runs were attempted on camera. **None produced any motion.**
+
+| run | command | result |
+|---|---|---|
+| ch0 alone | 100 → 150 | no azimuth motion |
+| ch0 alone, 9 s | 220 | no azimuth motion |
+| **both, same direction**, 10 s | +250 / +250 | no azimuth motion |
+| ch0 alone, ramped | 300 → 450 → 560 → **650** | `tele` all zeros at every step |
+
+The 650 step matters: `sine_cross_up = 36` puts handoff at command ≈515, so 650 is **past the seam and
+in 6-step**, where eRPM telemetry is honest. It returned `rpm 0, V 0.00, A 0, T 0, stress 0` — not the
+forced-sine sentinel but *every field zero*, including voltage and temperature.
+
+Both ESCs still answer 1-wire (`esctool list`), so they have DC power and healthy MCUs. What is not
+established is whether the motors turn at all.
+
+### Measuring motion from the camera needs a static control region
+
+The first run *looked* like a large movement: the pod region changed by mean 37/255 with 45 % of
+pixels over threshold. It was **auto-exposure**, not the pod. The frame's mean brightness went
+79.2 → 127.5, and regions that physically cannot move changed *more* than the pod did:
+
+| region | mean |diff| | pixels >30 |
+|---|---|---|
+| pod (can move) | 36.98 | 44.95 % |
+| bookshelf (**cannot** move) | 44.15 | 68.47 % |
+| wall + poster (**cannot** move) | 60.59 | 95.38 % |
+
+**Always difference the pod region against a region that cannot move.** Once exposure settled, every
+consecutive-frame comparison sat at the noise floor (pod 1.61 vs static 2.42) — unambiguously still.
+
+### A differential does not move its output when one input is free
+
+Driving one motor with the other ESC disarmed leaves that motor's windings open, so it free-wheels,
+and the differential sends torque down the path of least resistance — the free input, not the loaded
+azimuth. This is a car differential with one wheel on ice. It means **single-motor identification can
+legitimately produce zero azimuth motion**, which invalidates the naive reading of `identify()`; the
+caveat is now in its docstring. To identify signs, brake the idle channel instead of disarming it.
+
+It does not explain the both-motors run, nor the dead telemetry at command 650.
+
+### Still to check, in order — all physical
+
+1. **Is the PSU output actually enabled and at 11.2 V?** The ESC MCUs run off the DC input, so they
+   would be alive on 1-wire either way only if the supply is on — worth confirming on the panel, and
+   watching the current draw during a spin attempt. Zero amps is the answer.
+2. **Are the three phase wires landed on both ESCs?** Arming should beep *through the motor windings*;
+   silence means the phases are not connected.
+3. **Does the azimuth axis turn by hand, and do the motor shafts?** A jammed build would stall the
+   start, and BLHeli would retry rather than report.
+
 ## Implemented while the bench is blocked
 
 Experiments are stood down until the operator is back; the code is written and tested against the

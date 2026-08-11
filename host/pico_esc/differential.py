@@ -100,6 +100,15 @@ class DifferentialMixer:
     def identify(rate_from_a, rate_from_b, tol=0.25):
         """Resolve the sign convention from two single-motor runs.
 
+        **CAVEAT, MEASURED ON THIS BENCH 2026-08-11: a lone motor may not move the carrier at all.**
+        A disarmed ESC leaves its motor's windings open, so that motor free-wheels — and a
+        differential sends torque down whichever path resists least, which is the free input rather
+        than the loaded output. Same as a car differential with one wheel on ice. Driving ch0 alone
+        for 9 s at a command well past handoff produced ZERO azimuth motion here. If a single-motor
+        run does not move the axis, brake the idle channel (`brake_on_stop`, or hold it armed at a
+        commanded zero instead of disarmed) so the differential has something to react against, and
+        only then read the rate.
+
         Drive ONE motor at a time at the same low command and measure the resulting azimuth rate
         on the encoder (deg/s, signed): `rate_from_a` with only ESC A driven, `rate_from_b` with
         only ESC B. In the differential's frame a lone motor turns the carrier either way, so:
