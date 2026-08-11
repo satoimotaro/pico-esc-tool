@@ -1,98 +1,155 @@
 # Differential azimuth thruster — bring-up log
 
-Two BLDCs, one pod, wired to **GP10 (ESC index 0)** and **GP11 (ESC index 1)**. This is the log of
-taking it from "just built" to a first spin, following `docs/thruster-bringup.md`. It records what
-the hardware actually reported, not what it was supposed to be.
+One pod: two F2838 BLDCs into a differential, wired to **GP10 (ESC index 0)** and **GP11 (index 1)**.
+The upper cylinder is the azimuth axis and carries the propeller inside it. Both motors are fixed to
+the pod body — there is no azimuth servo, the differential *is* the steering actuator
+(`/srv/share/書類/diff_azimuth_auv.md`: F2838 ×6 → 差動アジマスポッド ×3, 350KV).
 
-Snapshots referenced here live in the `bench-registry` repo (observations belong outside this one).
+Snapshots and evidence live in the `bench-registry` repo (observations belong outside this one).
 
 ---
 
-## Session 2026-08-11 — pre-spin audit. **The spin did not happen; two blockers.**
+## The two modes, and what they imply
 
-### What is confirmed good
+Per the operator, with ω0/ω1 the two signed motor speeds:
+
+| commanded | result |
+|---|---|
+| ω0 = −ω1 (counter-rotating, equal speed) | azimuth **held**, propeller turns → pure thrust |
+| ω0 = ω1 (same direction) | azimuth axis rotates → steering |
+
+So the differential decouples into a **sum** channel and a **difference** channel:
+
+```
+s = ω0 + ω1   ->  azimuth rate     ψ̇ = s / (2·N_a)
+d = ω0 − ω1   ->  propeller speed  ω_p = d / (2·N_p)      inverse:  ω0 = (s+d)/2 ,  ω1 = (s−d)/2
+```
+
+`N_a`, `N_p` and **the signs** are not known yet and must be identified on the bench, not assumed —
+the design memo describes the same mechanism as "2モーターの**速度差**でアジマス角を作る", which is
+the opposite convention to the operator's. Both descriptions are self-consistent under a mirrored
+bevel, and picking wrong swaps steering for thrust. §3 below identifies it directly.
+
+**Two consequences worth stating before any tuning:**
+
+- **"Hold angle while thrusting" is not an open-loop counter-rotation.** Nominal ω0 = −ω1 is the
+  *feedforward*; two different motors on two different ESCs under different loads will never be
+  exactly equal, and any mismatch integrates straight into azimuth drift. The azimuth loop has to
+  stay closed and keep trimming `s` around zero while `d` is large. Open-loop counter-rotation will
+  slowly rotate the pod.
+- **Propeller speed is relative to the carrier.** While the azimuth is slewing, `d` no longer maps to
+  absolute prop speed. Holding is clean; slewing-while-thrusting cross-couples by construction.
+
+## Control architecture — why the encoder placement is the whole design
+
+The encoder is **one AS5600 reading the azimuth axis directly**. That is the right place for it, and
+it is what makes this tractable:
+
+- **Sum channel (azimuth) — closed loop on the AS5600.** Azimuth positioning is a *low-speed
+  position* problem, which is exactly where this stack's sensorless feedback is worthless: DShot
+  telemetry has a hard floor (a constant 182 rpm below the seam on this bench) and honestly reports
+  `tele = 0` throughout forced sine. Integrating that to get an angle would drift without bound. A
+  direct azimuth encoder removes the dependency entirely — the sum channel never needs telemetry.
+- **Difference channel (propeller) — open loop / eRPM.** The prop runs high, in the 6-step region
+  where eRPM telemetry is honest. The existing `velctl` path applies unchanged.
+
+`host/posctl.py` already implements the control law we need — cascade PID, outer position → velocity
+setpoint, inner `Kff·vel_sp + Ki·∫err` → signed `thrust`, with detent hold inside tolerance. What it
+does **not** have is the mixer: today it drives one ESC and reads the AS5600 on *that same rotor*.
+Here the controller output is `s`, which must be split across both ESCs, and `enc` reads the azimuth
+rather than a rotor. **That is a mixer layer on top of posctl, not a new controller.**
+
+Note posctl is written for BlueGill **S1 forced-commutation** mode, where the ESC creeps far below
+the 6-step floor and holds with detent torque at thrust 0 — that hold is what makes a static angle
+hold work without pulsing. ch1 is currently `sine_mode: 2` (S2). S1 vs S2 for the azimuth channel is
+an open decision: S1 buys the detent hold, S2 buys resolution. Quoted hold resolution is ~one detent
+(12N14P ⇒ ~8.6° at the rotor), which the azimuth reduction `N_a` divides down.
+
+---
+
+## Session 2026-08-11 — pre-spin audit. **Nothing was written; nothing was spun.**
+
+### Confirmed good
 
 | check | result |
 |---|---|
 | Pico link (`/dev/ttyACM0`, VID 2E8A) | `id esc_tool v1` |
 | ESC signal pins | `pins 2 10 11` — two channels, as wired |
 | Both ESCs powered + talking 1-wire | idx 0 and idx 1, sig `E8B2`, layout `#A_H_30#`, fw `0.21` |
-| Pico runtime config persisted | `cfg\|stored=1` — both channels `kv=350 pp=7` |
+| Pico runtime config persisted | `cfg\|stored=1`, both channels `kv=350 pp=7` — matches the F2838 350KV in the memo |
 | ch1 (GP11) ESC EEPROM | **byte-identical** to `20260801T103254Z-verify-after-flash-defaults-experiment` (BlueGill S4) |
 
-`tele 0` / `tele 1` return `err no-telem` and `enc` returns `err no-encoder`. Both are expected here:
-telemetry only flows while frames are being sent, and there is no AS5600 on a real pod.
+### Blocker 1 — ch0 (GP10) is at post-flash defaults
 
-### Blocker 1 — ch0 (GP10) is sitting at post-flash defaults
+`bench.py diff` ch0 vs ch1 → **16 settings differ**, including all four this bench has already
+measured one at a time as start-killers:
 
-`bench.py diff 20260811T041059Z-azimuth-ch0 20260811T041108Z-azimuth-ch1` → **16 settings differ.**
-Four of them are the exact four this bench has already measured, one at a time, against a good config:
-
-| setting | ch0 (GP10) | ch1 (GP11) | measured effect of the ch0 value |
+| setting | ch0 | ch1 | measured effect of the ch0 value |
 |---|---|---|---|
 | `startup_power_max` | **5** | 25 | **0 rpm — will not start at all** |
 | `low_rpm_power_protection` | **9** | 0 | 380 rpm (a quarter) |
 | `sine_cross_up` | **255** | 36 | 230 rpm — handoff refused, never leaves forced sine |
 | `motor_direction` | **Normal** | Bidirectional | 180 rpm |
 
-Plus `sine_mode 255` vs `2` (forced sine off entirely), `sine_cross_dn 255` vs `239`,
-`pwm_frequency 48` vs `24`, `startup_power_min 204` vs `30`, and eight more.
+ch0 has never been configured. **In a differential this is worse than a dead channel.** With ch0 not
+starting, a commanded pure-thrust (ω0 = −ω1) delivers ω1 only, so `s ≠ 0` and **the pod steers when
+it was told to hold**. That reads as a mechanical fault in the differential and it is a config fault.
 
-ch0 has never been configured — it is a stock ESC. **Spinning the pod in this state would not have
-been a test of the thruster.** Either the motor sits dead and the mechanism looks broken, or worse it
-turns at a quarter speed against a correctly-driven ch1, and a *differential* pod driven by a matched
-pair that is not matched will yaw when it was commanded to translate. That reads as a mechanical
-fault, and it is a config fault.
+> Every pre-spin guard here is per-channel: `bench.py check` compares one live ESC to one snapshot.
+> Nothing checks the two channels of one pod against **each other**. On a single-motor bench that
+> check could not fail, so it does not exist. For a differential it is the first thing to run.
 
-> **New failure mode this repo did not have before.** Every existing pre-spin guard is per-channel:
-> `bench.py check` compares one live ESC against one snapshot. Nothing checks that the two channels
-> of one thruster agree with *each other*. On a single-motor bench that check did not exist because
-> it could not fail. It is now the first thing to run.
+The fix is to mirror ch1's snapshot onto index 0 and verify byte-for-byte. Attempted; the harness
+**denied the write** as a hardware-mutating action. Needs an explicit go-ahead.
 
-### Blocker 2 — the camera is not pointed at the thruster
+### Blocker 2 — the azimuth AS5600 is not on the bus
 
-The session premise was that the camera framing shows the pod. It does not. A live frame from
-`/dev/video0` (HD Pro Webcam C920, the only camera on the machine — `video1` is its metadata node and
-will not open) shows a desk lamp head, a BenQ monitor, a window with blinds and a bookshelf. There is
-no motor, propeller, ESC or pod anywhere in frame.
+`enc`, `encv`, `enc raw|md|mag|agc` all return `err no-encoder`.
 
-Evidence: `bench-registry/evidence/20260811-azimuth-bringup/camera-as-found.jpg`.
+**This is not a boot-order problem.** `As5600Tracker::poll()` re-reads RAW_ANGLE at ~1 kHz and sets
+`present_ = true` on any successful read (`src/apps/as5600.h:61`), so a hot-plug recovers within a
+millisecond. Persistent `no-encoder` means the sensor **is not ACKing on I2C right now**. Check, in
+order: 3V3/GND at the sensor, SDA on **GP16** and SCL on **GP17** (I2C0, addr **0x36**), bus pull-ups,
+continuity of the run into the pod, and whether the part is an AS5600**L** (configurable address —
+0x36 is fixed only on the plain AS5600).
 
-The camera has been **moved** since the last bench session: the lake's last capture
-(`derived/camera/latest.jpg`, 2026-08-01T19:48Z) is the same device framing the **PSU panel**
-(HANMATEK HM310 reading 11.20 V / 0.005 A). That framing is gone. The daemon is also not running —
-`/dev/video0` opened directly with no contention, and `latest.json` is ten days stale.
+Without it there is no azimuth feedback at all, and the sum channel is the half of this mechanism
+that cannot be run open-loop.
 
-A first spin of a newly built mechanism with no eyes on it is not a test, it is a hope. Held.
+### Correction
 
-### Not yet established — needed before the spin means anything
+An earlier revision of this log recorded that the camera was not pointed at the thruster and that the
+frame showed a desk lamp. **That was wrong** — the black T-shaped object centre-frame is the pod, the
+upper cylinder being the azimuth axis. The camera framing is correct and that finding is withdrawn.
+(The 2026-08-01 comparison frame really did show the PSU panel; the camera was re-aimed since, as
+intended.) Live view from the tailnet: `https://tarossas-g10.tailc78d3b.ts.net/camera`.
 
-- **What motors are in the pod.** Both Pico channels are configured `kv=350 pp=7`, inherited from the
-  bare-shaft F2838 bench motor. If the pod uses anything else, every speed silently mis-scales and
-  there is no second opinion. `docs/thruster-bringup.md` §1 wants the pole count *verified*, and the
-  encoder that would verify it is not on this pod.
-- **Whether propellers are fitted.** Changes the first-spin hazard completely.
-- **The supply, measured.** `cfg` carries `v=11.10` (ch0) and `v=11.20` (ch1) — those are configured
-  numbers, not observations, and they disagree with each other.
+### Standing hazard: the loom
 
-### Standing hazard, unresolved: the loom
-
-The supply loop is a **measured 0.254 Ω**. Above ~1 A the PSU panel is no longer what the ESC sees
-(1.27 V lost at 5 A). One bare-shaft motor stayed under that. **Two motors turning propellers will
-not.** The loom is to be replaced before any loaded or in-water run — a pod test is exactly the run
-that first exceeds it, and every voltage-derived number is wrong until it is.
+The supply loop is a **measured 0.254 Ω**. Above ~1 A the PSU panel is not what the ESC sees (1.27 V
+lost at 5 A). One bare-shaft motor stayed under that; **two motors turning a propeller will not**, and
+the memo budgets ~10 A per motor. Replace the loom before any loaded run — every voltage-derived
+number is wrong until then.
 
 ### State left on the hardware
 
-Nothing was written. Both ESCs were read and released (`esctool run`); no config was applied, no
-motor was armed, no channel was spun. As-found state is captured in
-`bench-registry/snapshots/20260811T041059Z-azimuth-ch0` and `…041108Z-azimuth-ch1`.
+As found. Both ESCs read and released (`esctool run`); no config applied, no channel armed, no motor
+spun. Captured in `bench-registry/snapshots/20260811T041059Z-azimuth-ch0` and `…041108Z-azimuth-ch1`.
 
-### To resume
+---
 
-1. Re-aim the camera at the pod and confirm the frame.
-2. Confirm the pod's motor KV / pole count, and whether props are fitted.
-3. Mirror the known-good config onto ch0 — `bench.py restore 20260811T041108Z-azimuth-ch1` against
-   index 0, **not** a checked-in profile — then re-diff ch0 against ch1 and require zero drift.
-4. Re-check `motor <i> <kv> <pp> <v>` on both channels against the real motor.
-5. Only then spin, one channel at a time, lowest command first, on camera.
+## Bench order, once the two blockers clear
+
+1. **Mirror ch0 from ch1's snapshot**, verify byte-for-byte, re-diff ch0 vs ch1 → require zero drift.
+   Never from a checked-in profile: profiles are intentions, and one had already drifted here in
+   eight settings.
+2. **Encoder sanity**: `enc` returns a live angle; turn the azimuth by hand and watch `encv` accumulate
+   monotonically with the right sign. Establish the azimuth zero.
+3. **Identify the mixer — one motor at a time, lowest command, on camera.** Drive ch0 alone and
+   measure the azimuth rate on the encoder → `a0`; then ch1 alone → `a1`.
+   `a0 ≈ +a1` means azimuth ∝ sum (the operator's convention); `a0 ≈ −a1` means ∝ difference (the
+   memo's). This also gives `N_a`, and it is the first run that produces a number.
+4. **Azimuth PID with `d = 0`** — pure positioning, no thrust. Reuse posctl's law through the mixer.
+   Gains do not transfer between motors or mechanisms; tune in situ.
+5. **Hold-under-thrust last**: ramp `d` with the azimuth loop closed and measure angle drift against
+   `d`. This is the mode that fails silently if the loop is left open.
