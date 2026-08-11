@@ -9,6 +9,10 @@ driven by the SUM of two motors through a differential (pico_esc.differential):
 
     s = (A + B) / 2  -> azimuth        d = (A - B) / 2  -> propeller
 
+in MOTOR space. Note that in COMMAND space this pod is the other way round — measured, azimuth
+tracks (A - B) and the propeller tracks (A + B) — because motor B is mounted mirrored and so runs
+with sign_b = -1. The mixer folds that in; do not reason about raw commands without it.
+
 So the control law is unchanged — PositionController's cascade PID from pico_esc.control, the
 same one posctl uses — and what is new is only that its output is `s`, split across two ESCs by
 DifferentialMixer, and that `enc` reads the controlled axis directly rather than a rotor.
@@ -68,13 +72,13 @@ HANDOFF_CMD = {34: 484, 36: 515, 40: 578, 44: 640}
 # very first 6-step point, so there is no slow end to that region: the azimuth goes from a few
 # degrees of forced-sine creep straight to hundreds of rpm the instant it crosses the seam.
 #
-# THE 6-STEP REGION IS THEREFORE UNUSABLE FOR AZIMUTH POSITIONING, and entering it by accident is
-# a hazard, not just a bad control result — it was fast enough to be called dangerous at the bench.
-# Azimuth authority must stay entirely inside forced sine, which is exactly the regime posctl's S1
-# forced-commutation + detent hold is written for.
+# So steering by ONE MOTOR'S SPEED is unusable in 6-step, and drifting into it by accident is a
+# hazard rather than merely a bad control result — it was fast enough to be called dangerous at the
+# bench. That is what the rate guard below exists to prevent.
 AZIMUTH_RATE_AT_650_RPM = 554.0
 
-# ...BUT THE 6-STEP REGION IS USABLE AFTER ALL, VIA THE DIFFERENTIAL ITSELF.
+# BUT THE 6-STEP REGION IS USABLE AFTER ALL, VIA THE DIFFERENTIAL ITSELF — the conclusion above
+# only rules out steering with a single motor's speed, which was never what the mechanism does.
 # Azimuth rate is set by the DIFFERENCE of the two motors, not by either one's speed. Carry both
 # motors deep inside 6-step (|command| ~600, well clear of the 515 seam) and trim the difference:
 # the ESC never goes near its unusable low end, and the azimuth still creeps.
