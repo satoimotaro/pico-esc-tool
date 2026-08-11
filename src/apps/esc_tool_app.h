@@ -816,10 +816,10 @@ private:
 				char* sub=strtok(nullptr," ");
 				if(!sub || !strcmp(sub,"status")) {
 					Serial.printf("az|%d|tgt=%.2f|pos=%.2f|err=%.2f|vel=%.1f|s=%.1f|kp=%.2f|ki=%.2f|kd=%.2f|"
-					              "kff=%.4f|trim=%.1f|smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f\n",
+					              "kff=%.4f|trim=%.1f|smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f\n",
 					              az_.on()?1:0, az_.target(), az_.pos(), az_.target()-az_.pos(), az_.vel(),
 					              az_.s(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim, az_.smax, az_.vmax,
-					              az_.carrier, az_.max_rate);
+					              az_.carrier, az_.max_rate, az_.verr_clamp);
 					Serial.println("ok"); }
 				else if(!strcmp(sub,"on")) {
 					char* c=strtok(nullptr," "); char* g=strtok(nullptr," ");
@@ -840,6 +840,7 @@ private:
 						else if(!strcmp(k,"trim")) az_.s_trim=f; else if(!strcmp(k,"smax")) az_.smax=f;
 						else if(!strcmp(k,"vmax")) az_.vmax=f; else if(!strcmp(k,"carrier")) az_.carrier=f;
 						else if(!strcmp(k,"maxrate")) az_.max_rate=f;
+						else if(!strcmp(k,"verrclamp")) az_.verr_clamp=f;
 						else if(!strcmp(k,"signb")) az_.sign_b=(f<0)?-1:1;
 						else { Serial.println("err az: unknown gain"); continue; }
 						Serial.println("ok"); } }

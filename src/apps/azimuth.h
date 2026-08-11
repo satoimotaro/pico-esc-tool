@@ -38,16 +38,23 @@ public:
 	// buys phase margin only once the gains stop over-driving that lag.
 	// ki = 0 RUNS AWAY (|err| 5300-7700 deg): the integral is what cancels the drifting null, so it
 	// is required, just small. Measured: ki 0.05 -> |err| 6.9-84.6; ki 0.2 -> 55.6-88.4.
-	float kp = 8.0f, ki = 0.05f, kd = 0.6f;
+	float kp = 8.0f, ki = 0.1f, kd = 0.6f;
 	float kff       = 1.0f / (7.26f * 6.0f);   // 1 / (deg/s per unit s), measured
 	float s_trim    = -29.8f;                  // s that holds still; the integral trims around it
 	float smax      = 40.0f;                   // azimuth authority, command counts
-	float vmax      = 200.0f;                  // deg/s setpoint clamp
+	// vmax MUST NOT throttle the proportional path. vsp is clamped to vmax and the feedforward is
+	// kff*vsp, so the P term can never command more than kff*vmax counts — at vmax=200 that was 4.6
+	// counts out of an smax of 40, i.e. nine tenths of the authority was reachable ONLY through the
+	// integral. That is why pure PD "ran away" (|err| 5300-7700 deg): not instability, simply not
+	// enough proportional authority to cancel a null offset needing ~15-30 counts. At vmax=2000 the
+	// same PD is bounded and stable (|err| 20.6-135.0, mean 73.1).
+	float vmax      = 2000.0f;                 // deg/s setpoint clamp — see above before lowering
 	int   sign_a    = 1, sign_b = -1;          // B is mirrored — measured, not assumed
 	float carrier   = -600.0f;                 // both motors held here, 85 counts clear of the seam
 	// The spin-up transient alone reaches thousands of deg/s (the two ESCs start on independent
 	// ramps, and in air the differential sends nearly all of the mismatch to the azimuth), so a
 	// 400 deg/s ceiling aborts before the loop ever runs.
+	float verr_clamp = 50.0f;   // bound on the velocity error fed to the integral; 50 measured best
 	float max_rate  = 4000.0f;                 // deg/s abort threshold (debounced over 3 ticks)
 
 	void bind(Thruster* a, Thruster* b, As5600Tracker* enc) { a_ = a; b_ = b; enc_ = enc; }
@@ -87,7 +94,15 @@ public:
 		vsp = constrain(vsp, -vmax, vmax);
 
 		float uff = kff * vsp;
-		ivel_ += ki * (vsp - vel_) * dt;
+		// CLAMP THE VELOCITY ERROR BEFORE INTEGRATING IT. vsp is bounded by vmax but vel_ is the raw
+		// plant velocity, which reaches thousands of deg/s in a transient the loop never asked for —
+		// so (vsp - vel_) becomes essentially -vel_ and the integral degenerates into an integrator
+		// of VELOCITY, slamming to the rail in milliseconds. Bounding the error keeps the integral
+		// doing its actual job (cancelling the drifting null) instead of chasing a transient it
+		// cannot influence. verr_clamp <= 0 disables, restoring the old behaviour for comparison.
+		float verr = vsp - vel_;
+		if (verr_clamp > 0.0f) verr = constrain(verr, -verr_clamp, verr_clamp);
+		ivel_ += ki * verr * dt;
 		float u = uff + ivel_;
 		float uc = constrain(u, -smax, smax);
 		if (u != uc) { ivel_ = constrain(uc - uff, -smax, smax); u = uc; }   // back-calculation

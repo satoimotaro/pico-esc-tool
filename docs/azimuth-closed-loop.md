@@ -98,3 +98,49 @@ tracker's rate with no round trip at all, and `main.cpp` already composes per-th
   `not r.healthy` instead made **every** tick a fault, so the servo ran blind and reported
   `err 0.00, worst 0.00` — a perfect-looking run with no feedback at all.
 - The propeller always runs in this mode. Stationary pointing is out of scope by design.
+
+---
+
+## 2026-08-12 later — the velocity clamp, and why pure PD had been "unstable"
+
+Two operator suggestions, both correct, and the second one exposed a structural mistake.
+
+**Clamp the velocity error before integrating it.** `ivel += ki*(vsp - vel)*dt` was being fed a raw
+plant velocity reaching thousands of deg/s while `vsp` was bounded by `vmax`, so the term degenerated
+into an integrator of *velocity* and slammed to the rail. Bounding it (`verr_clamp`) let `ki` rise
+10–30x and dropped the best settled error from 6.9 deg to **2.0 deg**.
+
+**Tune PD first, then add a little I.** Attempting this revealed why pure PD had appeared to run away
+at 5300–7700 deg: **`vmax` was throttling the proportional path.** `vsp` is clamped to `vmax` and the
+feedforward is `kff*vsp`, so P could never command more than `kff*vmax` counts — at `vmax=200` that
+is **4.6 counts out of an `smax` of 40**. Nine tenths of the authority was reachable only through the
+integral. It was never instability; it was a proportional term with almost no authority against a
+null offset needing 15–30 counts.
+
+At `vmax=2000` the same PD is bounded and stable:
+
+| config | settled \|err\| (last 8) | mean |
+|---|---|---|
+| kp 8, kd 0.6, **ki 0**, vmax 2000 | 20.6 – 135.0 | **73.1** |
+| kp 8, kd 1.5, ki 0, vmax 2000 | 55.9 – 302.7 | 179.3 |
+| kp 8, kd 0.6, ki 0.1, vmax 2000 | 10.9 – 161.5 | 100.8 |
+| kp 8, kd 0.6, ki 0.3, vmax 2000 | 60.7 – 140.2 | 99.6 |
+
+**Adding I did not beat pure PD on the mean.** That is the finding that matters for tuning direction:
+the residual is a **limit cycle, not a steady offset**, so an integrator has nothing to null. Firmware
+defaults are now kp 8, kd 0.6, ki 0.1, vmax 2000, verr_clamp 50 — the best measured minimum — but the
+honest reading is that further gain sweeping is exhausted.
+
+## What to do next, and why gain sweeping is the wrong tool now
+
+The residual is an oscillation whose frequency is set by the plant's lag, which has never been
+measured — every gain choice so far rests on an *assumed* 0.1–0.2 s motor time constant.
+
+**Identify the plant.** With both motors carried and the loop OFF, step `s` by a known amount and
+record the azimuth velocity response from `encv`. That yields the real gain (counts → deg/s) and the
+real time constant. From those, the stable maximum gain and the expected limit-cycle frequency are
+*calculated*, and the loop can be designed instead of searched. It also gives the number needed to
+decide whether the residual can be tuned away at all or is bounded by the actuator's own lag.
+
+Second: the spin-up transient still dominates the peak error, and the two ESCs starting on
+independent ramps is the cause. Coordinating those starts in firmware is the remaining lever.
