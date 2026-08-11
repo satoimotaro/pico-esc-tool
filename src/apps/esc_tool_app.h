@@ -810,15 +810,27 @@ private:
 			// An AS5600 is fixed at 0x36; an AS5600L is configurable, so a device at some OTHER address
 			// is a different part, not a wiring fault.
 			else if (!strcmp(cmd,"i2cscan")) {
-				Wire.end();                                   // release the pads so the levels are real
+				// Probe the lines against an INTERNAL PULL-DOWN, not a bare input. Wire.begin() enables
+				// the RP2040's internal pull-UPs on these pads and Wire.end() does not undo them, so a
+				// plain digitalRead reports HIGH whether or not anything is attached — it measures our
+				// own pull-up and says nothing. The internal pulls are ~50-80k and an I2C bus pull-up is
+				// 2.2-10k, so a pull-down loses to a real external pull-up and wins against nothing:
+				//   sda/scl = 1 -> a POWERED external pull-up is present (sensor board has power)
+				//   sda/scl = 0 -> no external pull-up: unplugged, unpowered, or the line is not landed
+				Wire.end();
+				pinMode(16, INPUT_PULLDOWN); pinMode(17, INPUT_PULLDOWN);
+				delay(2);                                     // let the RC of the bus settle
+				int sda = digitalRead(16), scl = digitalRead(17);
+				Serial.printf("i2c|pulldown|sda=%d|scl=%d\n", sda, scl);
+				if (sda && scl) Serial.println("i2c|external pull-ups PRESENT and powered on both lines");
+				else if (!sda && !scl) Serial.println("i2c|NO external pull-up on either line — the sensor "
+				                                      "board is unplugged, unpowered, or neither line is landed");
+				else Serial.printf("i2c|only %s has an external pull-up — the other line is open\n",
+				                   sda ? "SDA" : "SCL");
+				// then the idle levels with the pull-down removed: a line stuck LOW here is being held
 				pinMode(16, INPUT); pinMode(17, INPUT);
 				delayMicroseconds(200);
-				int sda = digitalRead(16), scl = digitalRead(17);
-				Serial.printf("i2c|idle|sda=%d|scl=%d\n", sda, scl);
-				if (!sda || !scl)
-					Serial.println("i2c|STUCK: a line idles LOW — no address can ACK. Dead device holding "
-					               "the bus, a short to GND, or a missing pull-up. Unplug the sensor and "
-					               "re-run: both lines must read 1.");
+				Serial.printf("i2c|float|sda=%d|scl=%d\n", digitalRead(16), digitalRead(17));
 				Wire.setSDA(16); Wire.setSCL(17); Wire.begin(); Wire.setClock(100000);
 				int found = 0;
 				for (uint8_t a = 0x08; a <= 0x77; a++) {
@@ -827,8 +839,11 @@ private:
 				}
 				Serial.printf("i2c|devices=%d\n", found);
 				if (!found && sda && scl)
-					Serial.println("i2c|bus idles clean but NOTHING answers — sensor unpowered, not wired "
-					               "to GP16/GP17 (physical pins 21/22), or dead.");
+					Serial.println("i2c|pull-ups are powered but NOTHING answers — the part is dead, or it "
+					               "is a different device than expected.");
+				else if (!found)
+					Serial.println("i2c|nothing answers and there is no external pull-up — check 3V3/GND at "
+					               "the sensor and that SDA=GP16 (physical 21) / SCL=GP17 (physical 22).");
 				Wire.setClock(400000);                        // restore the tracker's rate
 				Serial.println("ok"); }
 			else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
