@@ -3,9 +3,14 @@
 //
 // azimuth — ON-DEVICE closed loop for the two-motor DIFFERENTIAL azimuth pod.
 //
-// WHY THIS IS ON THE PICO AND NOT THE HOST. The host loop works (host/azimuth.py) and holds to a
+// WHY THIS IS ON THE PICO AND NOT THE HOST. Read the CORRECTION below first: "the ceiling is
+// bandwidth, not tuning" was concluded from kp 8 / ki 1.5, which is at damping ratio ~0.73 and
+// never should have been the reference. A LOWER-gain host config (kp 3, ki 0.5, kd 0.3, ~1.0) DID
+// converge at 50 Hz. More rate is still worth having, but it was not what was missing.
+//
+// The host loop works (host/azimuth.py) and holds to a
 // couple of degrees on a good run, but it is not repeatable: the same gains gave -2.2, -184.8,
-// +0.9 and -74.2 deg across four runs. The ceiling is BANDWIDTH, not tuning. The host closes at
+// +0.9 and -74.2 deg across four runs. The host closes at
 // 50 Hz over USB; raising the gain to stiffen the hold pushed the loop into a saturated limit
 // cycle (s bang-banging between its rails while position swung +/-80 deg), because the motors need
 // ~0.1-0.2 s to change speed and a 50 Hz loop has no phase margin left to spend.
@@ -36,8 +41,15 @@ public:
 	// to the rail — at 1 kHz it does so 20x faster than it did at 50 Hz. Running the loop quicker
 	// does not help by itself, because the motors still need 0.1-0.2 s to change speed; the rate
 	// buys phase margin only once the gains stop over-driving that lag.
-	// ki = 0 RUNS AWAY (|err| 5300-7700 deg): the integral is what cancels the drifting null, so it
-	// is required, just small. Measured: ki 0.05 -> |err| 6.9-84.6; ki 0.2 -> 55.6-88.4.
+	// CORRECTION 2026-08-12 — THESE DEFAULTS DESCEND FROM THE WRONG HOST RUN. See
+	// docs/azimuth-closed-loop.md "THE PORT COPIED THE WRONG RUN". The host configuration that
+	// actually converged (final err +0.00, and it recovered from a hand disturbance) was
+	// kp 3, ki 0.5, kd 0.3, vmax 200 — NOT the kp 8 / ki 1.5 ported here, which was picked on
+	// `worst`, a spin-up-transient metric, and never reproduced (-184.8, +0.88, -74.2).
+	// The old claim "ki = 0 RUNS AWAY, so the integral is required" was also wrong: at vmax 200
+	// nothing could supply the 5-30 counts of null bias, by EITHER path. ki and vmax size together
+	// (ki 0.5 + vmax 200 converged; ki 0.05 + vmax 200 ran away; ki 0 + vmax 2000 is merely bounded).
+	// Try kp 3 / ki 0.5 / kd 0.3 / vmax 200 / verr_clamp 0 first, with a trace running.
 	float kp = 8.0f, ki = 0.1f, kd = 0.6f;
 	float kff       = 1.0f / (7.26f * 6.0f);   // 1 / (deg/s per unit s), measured
 	float s_trim    = -29.8f;                  // s that holds still; the integral trims around it

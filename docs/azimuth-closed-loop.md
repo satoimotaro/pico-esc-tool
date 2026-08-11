@@ -11,14 +11,22 @@ away.
 
 ## What works now
 
+**THE CONVERGED CONFIGURATION — kp 3, ki 0.5, kd 0.3.** Measured 2026-08-11T17:44Z:
+
 ```
-python3 azimuth.py hold --deg 0 --carrier=-600 --spinup-mode two-stage --spinup-secs 6 \
-        --spinup-smax 50 --spinup-max-azimuth-rpm 500 --max-secs 25 --smax 40 \
-        --max-azimuth-rpm 300 --kp 15 --ki 3.0 --allow-weak-magnet
+python3 azimuth.py hold --deg 0 --carrier=-600 --spinup-mode two-stage --spinup-secs 4 \
+        --spinup-smax 50 --spinup-max-azimuth-rpm 500 --max-secs 18 --smax 40 \
+        --max-azimuth-rpm 300 --kp 3 --ki 0.5 --kd 0.3 --allow-weak-magnet
+#  -> pos +0.00  err +0.00  worst 225.53
 ```
 
-- Both motors carried at |600|, never nearer than 60 counts to the 515 seam.
-- The loop runs end to end and has converged to **−1.6 deg** on a good run.
+`pos_deg` only ever moves in whole encoder counts (0.0879 deg), so `+0.00` means the pod came to
+rest on **count 0 exactly** — and the passive-hold handoff was already disabled by then
+(`ctrl.tol = -1.0`, 17:25Z), so this is the closed loop holding, not an open-loop coast. The
+operator also disturbed the pod by hand and it returned. This is the only run on this pod that
+has demonstrably converged.
+
+- Both motors carried at |600|. Worst-case seam margin is **15 counts**, not 60 — see below.
 - **Spin-up strategy decided by measurement**: two-stage **+7.8 deg**, ramp +182, jump −210.
   Snapping past the seam minimises time in the band where `s` has no authority — drift accrued
   there can never be recovered.
@@ -108,7 +116,10 @@ Two operator suggestions, both correct, and the second one exposed a structural 
 **Clamp the velocity error before integrating it.** `ivel += ki*(vsp - vel)*dt` was being fed a raw
 plant velocity reaching thousands of deg/s while `vsp` was bounded by `vmax`, so the term degenerated
 into an integrator of *velocity* and slammed to the rail. Bounding it (`verr_clamp`) let `ki` rise
-10–30x and dropped the best settled error from 6.9 deg to **2.0 deg**.
+10–30x. **The "2.0 deg" this was reported as is not a result** — it is the *minimum* of the range
+`2.0 .. 416.1` (peak 416.1), against `6.9 .. 84.6` (peak 138.8) before. On any comparable reading
+that run was worse. Its `vmax` was also never set: it inherited **120** from the previous sweep's
+last trial, because gains persist on the device across `az off`/`az on`.
 
 **Tune PD first, then add a little I.** Attempting this revealed why pure PD had appeared to run away
 at 5300–7700 deg: **`vmax` was throttling the proportional path.** `vsp` is clamped to `vmax` and the
@@ -131,7 +142,87 @@ the residual is a **limit cycle, not a steady offset**, so an integrator has not
 defaults are now kp 8, kd 0.6, ki 0.1, vmax 2000, verr_clamp 50 — the best measured minimum — but the
 honest reading is that further gain sweeping is exhausted.
 
-## What to do next, and why gain sweeping is the wrong tool now
+---
+
+## 2026-08-12 — THE PORT COPIED THE WRONG RUN. Read this before touching a gain.
+
+Re-read of the 8/11 overnight session log. Three findings, in order of how much they change.
+
+### 1. The configuration that converged was discarded on a transient metric
+
+Two host runs finished near zero. The selection between them was made on `worst`:
+
+| gains | spin-up drift | final err | `worst` | picked? |
+|---|---|---|---|---|
+| **kp 3, ki 0.5, kd 0.3** | −160.7 | **+0.00** | 225.5 | no |
+| kp 8, ki 1.5, kd 0.6 | −25.9 | −2.20 | **30.06** | **yes** |
+
+`worst` is `max|target − pos|` over the hold phase, which on this pod is dominated by the excursion
+right after spin-up. **It is a transient metric and says nothing about whether the loop settles.**
+kp 8 / ki 1.5 was then shown to be irreproducible on repeats (−184.8, +0.88, −74.2) and *that* is
+the configuration `src/apps/azimuth.h` was ported from, and every on-device sweep since is a
+descendant of it. **kp 3 / ki 0.5 / kd 0.3 has never been run on the Pico.**
+
+The damping estimate agrees with the measurement. With the plant as a velocity source of lag τ and
+position as its integral, `τs² + (1+kd)s + kp = 0`, so ζ = (1+kd)/(2√(kp·τ)). At τ = 0.15 s:
+
+| gains | ζ | outcome |
+|---|---|---|
+| **kp 3, kd 0.3** | **0.97** | converged |
+| kp 5, kd 0.3 | 0.75 | −453.8 |
+| kp 8, kd 0.6 | 0.73 | scatters −184.8 … +0.88 |
+| kp 15, kd 0.6 | 0.53 | saturated limit cycle (seen in the trace) |
+
+τ is still **assumed**, so the ζ column is an ordering, not a number. But the ordering matches every
+run, and only the converged one is near critical damping.
+
+### 2. Every "runaway" is one cause: nothing was left to supply the null bias
+
+`s_trim = -29.8` is an estimate of a null that also drifts (+24 → +45 rpm inside one 30 s run), so
+5–30 counts of bias must come from somewhere. Only two paths exist: the integral, or the
+proportional path — and the P path is capped at `kff·vmax` counts.
+
+| ki | vmax | P can supply | result |
+|---|---|---|---|
+| **0.5** | 200 | 4.6 counts | **converged** (host, kp 3) |
+| 0.05 | 200 | 4.6 counts | runaway 10834 – 14856 |
+| 0 | 200 | 4.6 counts | runaway 5299 – 7694 |
+| 0 | 2000 | 40 counts | bounded, mean 73 — P carries the bias |
+
+So **`ki = 0 RUNS AWAY` (in `azimuth.h`) is wrong**: it was not evidence that an integral is needed
+for stability, only that at `vmax = 200` nothing could supply the bias. The port cut `ki` 1.5 → 0.05
+while leaving `vmax = 200`, which removed both paths at once. `vmax = 2000` later restored the P
+path — a different, worse way to solve the same problem. `ki` and `vmax` must be sized together.
+
+### 3. Convergence and steady-state error were being measured as one number
+
+`settled |err| min..max` over 6–8 samples of `az status`, polled at **0.6–1.2 s**, cannot separate
+"stopped 70 deg off" from "oscillating ±70 deg", and aliases anything above ~0.4 Hz. Worse, the
+later sweeps read only `err` — **`vel` was not recorded at all**, and `vel → 0` is the definition of
+convergence. There is no time series from any azimuth run; `host/reports/` holds only autocal CSVs.
+
+Report these three separately, over the last 5 s, and nothing else:
+
+| quantity | measure | role |
+|---|---|---|
+| **convergence** | `rms(vel)`, `peak|vel|` | **primary** |
+| limit cycle | peak-to-peak of `pos` | the failure mode |
+| steady-state error | `mean(err)` | secondary — this is what I is for |
+
+### Order of work
+
+1. **`az dump`** — ring-buffer `(t, pos, vel, s, ivel)` at loop rate on-device and read it out.
+   Nothing below is measurable without it.
+2. **Reproduce the converged host config on the Pico**: kp 3, ki 0.5, kd 0.3, vmax 200, smax 40,
+   `verr_clamp` disabled. This is what the port should have carried.
+3. **Hand-disturbance test with the trace running** — the only evidence of real stiffness.
+4. **Identify the plant** (step `s`, loop off, record the velocity rise) → real τ → compute how far
+   the 1 kHz rate actually lets kp rise.
+5. **Carrier −600 → −640.** With `s ∈ [-69.8, +10.2]`, motor B bottoms at **530** against the 515
+   seam — 15 counts. In the 17:38Z trace every excursion is immediately preceded by `SAT` with
+   B = −531. −640 leaves 55 counts.
+
+## Superseded: what to do next, and why gain sweeping is the wrong tool now
 
 The residual is an oscillation whose frequency is set by the plant's lag, which has never been
 measured — every gain choice so far rests on an *assumed* 0.1–0.2 s motor time constant.
