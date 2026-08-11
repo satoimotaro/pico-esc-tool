@@ -92,6 +92,7 @@ AZIMUTH_NULL_S    = -29.8         # s that actually holds still — the motors a
                                   # it DRIFTS: three nulls in one 30 s run read +24.4, +33.9, +45.0
                                   # rpm, monotonically rising. Feedforward alone therefore creeps —
                                   # the position loop has to stay closed to hold a heading.
+KFF_SENTINEL      = -1.0          # 'not given' — the right Kff depends on the mode
 CARRIER_CMD       = 600           # |command| both motors are held at; 60+ counts clear of the seam
 #
 # Resolution is 0.435 deg per 50 Hz tick per command count — far finer than the 6 deg tolerance.
@@ -203,6 +204,96 @@ def cmd_identify(args):
 
 
 # ---------------------------------------------------------------------------------
+def _servo_tick(drive, ctrl, carrier, args, rate_guard):
+    """One closed-loop tick at a given carrier. Returns (MixResult, encoder reading).
+
+    Split out of the main loop because SPIN-UP has to run the identical control law while the
+    carrier is still ramping — the transition is where heading is lost, so it cannot be an
+    open-loop prelude that the servo only cleans up afterwards.
+    """
+    r = drive.read_enc()
+    if r is None:
+        raise Aborted("azimuth encoder read failed mid-run — disarming")
+    ctrl.update_encoder(r.raw, DT, suspect=not r.healthy)
+    rate_guard(ctrl)
+    u, _ = ctrl.step(DT)
+    return drive.send(u, carrier), r
+
+
+def _make_rate_guard(args):
+    """Abort if the pod itself exceeds --max-azimuth-rpm, debounced over consecutive ticks.
+
+    The controller's own clamp bounds the COMMAND; this bounds the OUTCOME, which is what the
+    operator called dangerous. Debounced because one aliased encoder tick must not stop a healthy
+    run — the same reason the firmware's over-speed guard needs three live frames.
+    """
+    state = {"n": 0}
+    limit_deg_s = args.max_azimuth_rpm * 6.0
+    if args.dry_run and args.carrier:
+        # SimEncEscHost is one rotor with the encoder on it, so under a carrier its "azimuth" is
+        # really the rotor spinning at carrier speed and the guard would trip on a fiction. Dry-run
+        # exists to exercise the code path, not to predict the pod (see the module docstring).
+        print("# dry-run + carrier: rate guard disabled — the sim has no differential to slow it")
+        return lambda ctrl: None
+
+    def guard(ctrl):
+        if abs(ctrl.vel) > limit_deg_s:
+            state["n"] += 1
+            if state["n"] >= 3:
+                raise Aborted(f"azimuth {ctrl.vel/6:.0f} rpm exceeds --max-azimuth-rpm "
+                              f"{args.max_azimuth_rpm} on 3 consecutive ticks — disarming")
+        else:
+            state["n"] = 0
+    return guard
+
+
+def _spinup(drive, ctrl, clock, args, carrier, rate_guard):
+    """Bring the carrier from 0 to `carrier` with the azimuth loop ALREADY CLOSED.
+
+    Why this is its own phase: below the seam the ESC is in forced sine, where s has almost no
+    authority over the azimuth — the loop can see error it cannot correct, and an integrator left
+    running there winds up and then dumps that windup the instant authority appears. So the
+    integral is held at zero until the carrier is past the seam, and the crossing itself is made
+    quickly, because time spent in the low-authority band is drift you can never get back.
+
+    Modes, so the strategy can be chosen by measurement rather than argument:
+      jump      — straight to the carrier. Shortest time in the dead band, biggest torque step.
+      ramp      — linear 0 -> carrier over --spinup-secs. Gentlest, longest exposure.
+      two-stage — snap past the seam, then ramp. The compromise this pod is expected to want.
+    Returns the azimuth drift accrued during the transition, in degrees.
+    """
+    seam = HANDOFF_CMD.get(args.cross_up, 515)
+    sgn = 1.0 if carrier > 0 else -1.0
+    start_pos = ctrl.pos_deg
+    t0 = clock.now()
+
+    def profile(el):
+        f = min(1.0, el / max(args.spinup_secs, 1e-3))
+        if args.spinup_mode == "jump":
+            return carrier
+        if args.spinup_mode == "ramp":
+            return sgn * abs(carrier) * f
+        past = sgn * (seam + 40)                       # clear of the seam, then ramp the rest
+        return past if el < 0.4 else past + (carrier - past) * min(1.0, (el - 0.4) /
+                                                                  max(args.spinup_secs - 0.4, 1e-3))
+
+    while True:
+        el = clock.now() - t0
+        if el >= args.spinup_secs:
+            break
+        tick = clock.now()
+        c = profile(el)
+        # No integral authority until the ESC can actually act on s.
+        if abs(c) < seam:
+            ctrl.ivel = 0.0
+        _servo_tick(drive, ctrl, c, args, rate_guard)
+        _pace(clock, tick)
+    drift = ctrl.pos_deg - start_pos
+    print(f"# spin-up [{args.spinup_mode}] {args.spinup_secs:.1f}s -> carrier {carrier:+.0f}: "
+          f"azimuth drift {drift:+.1f} deg")
+    return drift
+
+
 def _run_servo(args, targets, thrust):
     """Shared servo loop for move/hold: cascade PID on s, feedforward d, both via the mixer."""
     host, clock = _mk_host(args)
@@ -224,6 +315,9 @@ def _run_servo(args, targets, thrust):
     drive = DualDrive(host, mixer, args.idx_a, args.idx_b, ceiling, clock)
     # The position loop's own output is s, so its thrust clamp IS the azimuth authority.
     args.tmax = args.smax if carrier else args.tmax
+    # Kff maps a velocity setpoint straight to the command that produces it. Under a carrier that
+    # is 1 / (deg/s per unit s), which we MEASURED — posctl's 0.47 belongs to a bare 930KV rotor,
+    # a different plant entirely, and using it here would feed forward ~20x too much.
     ctrl = PositionController(args)
     stop = {"flag": False}
 
@@ -239,6 +333,10 @@ def _run_servo(args, targets, thrust):
         raw0, _ = _enc_deg(drive)
         ctrl.update_encoder(raw0, DT)
         ctrl.pos_deg = 0.0
+        rate_guard = _make_rate_guard(args)
+        if carrier:
+            ctrl.set_target(0.0)                       # hold the heading we started at
+            _spinup(drive, ctrl, clock, args, carrier, rate_guard)
 
         for target in targets:
             ctrl.set_target(target)
@@ -246,12 +344,7 @@ def _run_servo(args, targets, thrust):
             worst = 0.0
             while not stop["flag"] and clock.now() < t_end:
                 tick = clock.now()
-                r = drive.read_enc()
-                if r is None:
-                    raise Aborted("azimuth encoder read failed mid-run — disarming")
-                ctrl.update_encoder(r.raw, DT, suspect=not r.healthy)
-                u, _vel_sp = ctrl.step(DT)
-                m = drive.send(u, thrust)
+                m, _r = _servo_tick(drive, ctrl, thrust, args, rate_guard)
                 worst = max(worst, abs(ctrl.target - ctrl.pos_deg))
                 if args.verbose:
                     print(f"  t={clock.now():6.2f}  pos={ctrl.pos_deg:8.2f}  err="
@@ -316,14 +409,17 @@ def add_gains(p):
     """posctl's 930KV single-motor tune, as a STARTING POINT ONLY. Gains do not transfer between
     motors, and this is not even the same plant — the load here is the whole azimuth axis through
     a reduction, not a bare rotor. Tune in situ."""
-    p.add_argument("--kp", type=float, default=14.0)
+    p.add_argument("--kp", type=float, default=3.0)
     p.add_argument("--kd", type=float, default=0.6)
     p.add_argument("--ki", type=float, default=0.4)
-    p.add_argument("--kff", type=float, default=0.47)
-    p.add_argument("--vmax", type=float, default=500.0)
+    p.add_argument("--kff", type=float, default=KFF_SENTINEL,
+                   help="default: 1/(measured deg/s per unit s) under a carrier, else posctl's 0.47")
+    p.add_argument("--vmax", type=float, default=200.0)   # deg/s of AZIMUTH, not rotor
     p.add_argument("--tol", type=float, default=6.0)
     p.add_argument("--tmin", type=float, default=0.0)
     p.add_argument("--max-secs", type=float, default=15.0)
+    p.add_argument("--spinup-secs", type=float, default=3.0)
+    p.add_argument("--spinup-mode", choices=("jump","ramp","two-stage"), default="two-stage")
 
 
 def _validate(args):
@@ -334,6 +430,10 @@ def _validate(args):
     # commands sit far above the seam on purpose, so a command-magnitude limit would forbid the one
     # mode that works; and in forced sine a modest command can still be fast. Limit what actually
     # hurts.
+    # Resolve the Kff sentinel here, before the >0 checks: the right feedforward depends on the
+    # mode, and posctl's 0.47 belongs to a bare 930KV rotor — ~20x too much for the azimuth plant.
+    if args.kff == KFF_SENTINEL:
+        args.kff = (1.0 / (AZIMUTH_RPM_PER_S * 6.0)) if args.carrier else 0.47
     args.smax = abs(int(args.smax))
     rate = args.smax * AZIMUTH_RPM_PER_S
     if rate > args.max_azimuth_rpm:
