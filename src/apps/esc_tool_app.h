@@ -802,6 +802,35 @@ private:
 				else { uint8_t st=enc_.status();
 					Serial.printf("encv|%ld|%.2f|%lu|%d\n", (long)enc_.accum(), (double)enc_.rpm(),
 					             (unsigned long)enc_.samples(), (st>>5)&1); Serial.println("ok"); } }
+			// i2cscan — what is ACTUALLY on I2C0, and is the bus even usable?
+			// `enc` only ever probes 0x36, so a silent sensor and a shorted bus look identical from it.
+			// This separates them: it reports the IDLE LEVELS of SDA/SCL first (both must read HIGH — a
+			// line stuck LOW with nothing driving it means a dead device is holding it or the pull-up is
+			// missing/shorted, and NO address can ever ACK in that state), then walks 0x08..0x77.
+			// An AS5600 is fixed at 0x36; an AS5600L is configurable, so a device at some OTHER address
+			// is a different part, not a wiring fault.
+			else if (!strcmp(cmd,"i2cscan")) {
+				Wire.end();                                   // release the pads so the levels are real
+				pinMode(16, INPUT); pinMode(17, INPUT);
+				delayMicroseconds(200);
+				int sda = digitalRead(16), scl = digitalRead(17);
+				Serial.printf("i2c|idle|sda=%d|scl=%d\n", sda, scl);
+				if (!sda || !scl)
+					Serial.println("i2c|STUCK: a line idles LOW — no address can ACK. Dead device holding "
+					               "the bus, a short to GND, or a missing pull-up. Unplug the sensor and "
+					               "re-run: both lines must read 1.");
+				Wire.setSDA(16); Wire.setSCL(17); Wire.begin(); Wire.setClock(100000);
+				int found = 0;
+				for (uint8_t a = 0x08; a <= 0x77; a++) {
+					Wire.beginTransmission(a);
+					if (Wire.endTransmission() == 0) { Serial.printf("i2c|found|0x%02X\n", a); found++; }
+				}
+				Serial.printf("i2c|devices=%d\n", found);
+				if (!found && sda && scl)
+					Serial.println("i2c|bus idles clean but NOTHING answers — sensor unpowered, not wired "
+					               "to GP16/GP17 (physical pins 21/22), or dead.");
+				Wire.setClock(400000);                        // restore the tracker's rate
+				Serial.println("ok"); }
 			else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
 				if(i<0||i>=n_||!th_[i]->tele(t)) Serial.println("err no-telem");
 				else { Serial.printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); Serial.println("ok"); } }
