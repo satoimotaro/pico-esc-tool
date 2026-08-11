@@ -224,6 +224,43 @@ caveat is now in its docstring. To identify signs, brake the idle channel instea
 
 It does not explain the both-motors run, nor the dead telemetry at command 650.
 
+### RESOLVED — it was one intermittent jumper on SCL
+
+`i2cscan` now returns `sda=1 scl=1`, `found|0x36`, `devices=1`, and the tracker advances ~1240
+samples/s. **The AS5600 was never dead.** SCL was intermittent, and SCL is the clock: with it open
+no address on the bus can ACK, which is indistinguishable from a dead part if all you look at is
+"nothing answered".
+
+Getting there took two corrections worth keeping:
+
+1. **The first level probe measured our own pull-up.** `Wire.begin()` enables the RP2040's internal
+   pull-ups on the I2C pads and `Wire.end()` does not undo them, so a plain `digitalRead` returned
+   `sda=1 scl=1` with the sensor in the pod, wired directly, *and fully unplugged* — three identical
+   answers, which should have been the tell. The conclusion drawn from it ("a powered external
+   pull-up proves the board has power, so the chip is dead") was unfounded.
+2. **Probe against an internal pull-down instead.** Internal pulls are ~50–80 kΩ; an I2C bus pull-up
+   is 2.2–10 kΩ. The pull-down loses to a real external pull-up and wins against nothing, so the
+   reading finally means something. That immediately gave `sda=1 scl=0` — and since both pull-ups on
+   the breakout share one VCC, one line up and the other down **cannot** be a power fault. The board
+   had 3V3; SCL simply was not landed.
+
+The lesson for the tool: `enc` only probes 0x36, so "dead chip", "absent sensor" and "open bus line"
+were one indistinguishable error. `i2cscan` now separates them, and names the physical pin — GP17 is
+**physical pin 22**, while physical 17 is GP13, which is the mix-up it exists to catch.
+
+### Now blocked on the magnet, not the bus
+
+`enc|0|0|0.0|0|1|0|128|2` = `raw|raw|deg|md|ml|mh|agc|mag`: **MD=0, ML=1, AGC=128, MAG=2**. The chip
+is talking and healthy; there is no magnet in front of it. Expected — the sensor is currently off the
+pod, and the diametric magnet is on the azimuth shaft.
+
+AGC railed at 128 is itself informative twice over: it is maximum gain (nothing to see), and the AS5600's
+AGC range is 0–128 only at **3.3 V** (0–255 at 5 V), which independently confirms the part is running
+at the right rail despite having been found hot.
+
+Refit over the magnet, 0.5–3 mm axial gap, die-centred, and expect `md=1 ml=0 mh=0` with AGC dropping
+to mid-scale.
+
 ### 1-wire proves more than it looks, and less
 
 Both ESCs are recognised by `esctool list` and their EEPROMs round-trip reads and writes. That
