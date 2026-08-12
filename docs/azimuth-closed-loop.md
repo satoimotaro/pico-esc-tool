@@ -209,18 +209,38 @@ Report these three separately, over the last 5 s, and nothing else:
 | limit cycle | peak-to-peak of `pos` | the failure mode |
 | steady-state error | `mean(err)` | secondary — this is what I is for |
 
-### Order of work
+### Order of work — steps 1 and 4 are now BUILT, bench-ready
 
-1. **`az dump`** — ring-buffer `(t, pos, vel, s, ivel)` at loop rate on-device and read it out.
-   Nothing below is measurable without it.
+1. **`az dump`** — ✅ built. A 2048-sample ring of `(t, pos, vel, s, ivel)` recorded inside `poll()`
+   at the loop's own rate (decimated, default ~200 Hz ⇒ the last ~10 s). RAM 48.9 % → 61.4 %.
+   Refused while the loop runs — it prints thousands of lines and `poll()` does not run meanwhile.
+   The header carries the **full configuration**, so a trace can always say what produced it.
 2. **Reproduce the converged host config on the Pico**: kp 3, ki 0.5, kd 0.3, vmax 200, smax 40,
-   `verr_clamp` disabled. This is what the port should have carried.
+   `verr_clamp` disabled. These are the **defaults of `azimuth.py trace`** — the firmware's own
+   defaults are deliberately left alone until they are re-measured.
+   ```
+   python3 azimuth.py trace --secs 20 --name kp3
+   ```
 3. **Hand-disturbance test with the trace running** — the only evidence of real stiffness.
-4. **Identify the plant** (step `s`, loop off, record the velocity rise) → real τ → compute how far
-   the 1 kHz rate actually lets kp rise.
+   ```
+   python3 azimuth.py trace --secs 25 --poke-at 12 --name poke
+   ```
+4. **Identify the plant** — ✅ built. `az step` drives an open-loop step with both motors carried
+   and no feedback, self-terminating (≤ 10 s) with the rate abort still live.
+   ```
+   python3 azimuth.py step --step-s 20 --step-secs 3
+   ```
+   The host fits `v(t) = K·Δs·(1 − e^(−t/τ))` by regression over the whole rise and prints the
+   **computed** kp for a chosen ζ, via ζ = (1+kd)/(2√(kp·τ)). Δs is taken from the *delivered*
+   command minus the trim, because `beginStep` clamps to ±smax.
 5. **Carrier −600 → −640.** With `s ∈ [-69.8, +10.2]`, motor B bottoms at **530** against the 515
    seam — 15 counts. In the 17:38Z trace every excursion is immediately preceded by `SAT` with
-   B = −531. −640 leaves 55 counts.
+   B = −531. −640 leaves 55 counts. `trace`/`step` warn when the margin drops below 20.
+
+`host/pico_esc/aztrace.py` holds the parsing, the three metrics, the seam-margin channel and the
+step fit; it is pure computation and fully covered by `host/tests/test_aztrace.py` without
+hardware — including a regression test that a pod *stopped* 70 deg off and a pod *swinging*
+±70 deg score differently.
 
 ## Superseded: what to do next, and why gain sweeping is the wrong tool now
 

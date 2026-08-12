@@ -49,10 +49,12 @@ and thrust channels — pure thrust steers, and a turn command drives the propel
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
 
+from pico_esc.aztrace import fit_step, metrics, parse_dump, suggest_gains, verdict
 from pico_esc.control import PositionController, _pace
 from pico_esc.differential import DifferentialMixer, DualDrive
 from pico_esc.drive import Aborted, PosDrive
@@ -476,6 +478,177 @@ def cmd_hold(args):
 
 
 # ---------------------------------------------------------------------------------
+# ON-DEVICE loop (src/apps/azimuth.h) — drive it and read its own trace back.
+#
+# These do NOT use PositionController. The loop runs on the Pico at ~1 kHz; the host's only jobs
+# are to set the configuration, arm, start, stop, and pull `az dump`. Sampling `az status` from
+# here is exactly the mistake this replaces: at 0.6-1.2 s it aliases the dynamics and it never
+# recorded `vel`, which is what convergence means.
+# ---------------------------------------------------------------------------------
+REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+
+# Every gain the firmware has. PUSH ALL OF THEM, ALWAYS. Device-side gains persist across
+# `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
+# previous trial and filed the result against the wrong number. Never trust what is already there.
+_AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp", "signb")
+
+
+def _az_host(args):
+    if args.dry_run:
+        sys.exit("--dry-run cannot exercise the on-device loop: the sim host has no `az` command.\n"
+                 "The parsing and metrics ARE covered without hardware — see tests/test_aztrace.py.")
+    return EscHost(args.port)
+
+
+def _az_push_config(d, args):
+    vals = {"kp": args.kp, "ki": args.ki, "kd": args.kd, "kff": args.kff, "trim": args.s_trim,
+            "smax": args.smax, "vmax": args.vmax, "maxrate": args.max_rate,
+            "verrclamp": args.verr_clamp, "signb": args.sign_b}
+    for k in _AZ_GAINS:
+        d.cmd(f"az gain {k} {vals[k]}", timeout=5)
+    d.cmd(f"az log {args.decim}", timeout=5)
+
+
+def _az_safe(d):
+    """Stop everything, in the order that leaves nothing spinning if a step raises."""
+    for fn in (lambda: d.cmd("az off", timeout=5),):
+        try:
+            fn()
+        except Exception:
+            pass
+    for _ in range(3):
+        for i in (0, 1):
+            try:
+                d.cmd(f"thrust {i} 0", timeout=3)
+            except Exception:
+                pass
+    for i in (0, 1):
+        try:
+            d.cmd(f"disarm {i}", timeout=3)
+        except Exception:
+            pass
+
+
+def _az_pull(d, name, quiet=False):
+    """`az dump` -> AzTrace, and a CSV alongside it. Refused while the loop runs, so stop first."""
+    lines = d.cmd("az dump", timeout=90)
+    tr = parse_dump(lines)
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    path = os.path.join(REPORT_DIR, f"az_{name}_{time.strftime('%Y%m%d-%H%M%S')}.csv")
+    with open(path, "w") as f:
+        f.write("# " + "|".join(f"{k}={v}" for k, v in tr.config.items()) + "\n")
+        f.write("t_s,pos,vel,s,ivel\n")
+        for i in range(len(tr)):
+            f.write(f"{tr.t[i]:.4f},{tr.pos[i]:.2f},{tr.vel[i]:.1f},{tr.s[i]:.1f},{tr.ivel[i]:.1f}\n")
+    if not quiet:
+        print(f"# wrote {path}  ({len(tr)} samples, {tr.duration:.1f} s at {tr.rate_hz:.0f} Hz)")
+    return tr, path
+
+
+def cmd_trace(args):
+    """Run the ON-DEVICE hold and read its own trace back. This is the measurement, not `az status`."""
+    d = _az_host(args)
+    try:
+        _az_push_config(d, args)
+        for i in (args.idx_a, args.idx_b):
+            d.cmd(f"arm {i} bidir", timeout=10)
+        print(f"# spinning up {args.spinup_secs:.1f}s, then az on carrier={args.carrier} tgt={args.deg}")
+        time.sleep(args.spinup_secs)
+        print(d.cmd(f"az on {args.carrier} {args.deg}", timeout=8)[0])
+        t0 = time.time()
+        if args.poke_at:
+            # A hand disturbance is the only direct evidence of closed-loop stiffness, and the one
+            # observation from 8/11 that was never captured as data. Prompt for it, then let the
+            # ring record the recovery.
+            time.sleep(min(args.poke_at, args.secs))
+            print(f"### POKE THE POD BY HAND NOW ({args.secs - args.poke_at:.0f}s of recording left)")
+        time.sleep(max(0.0, args.secs - (time.time() - t0)))
+    finally:
+        _az_safe(d)
+    tr, _ = _az_pull(d, args.name)
+    m = metrics(tr, window=args.window)
+    print(f"\n# last {m.get('secs', 0):.1f}s  ({m['n']} samples)")
+    print(f"#   convergence  rms(vel) {m['vel_rms']:8.1f} deg/s   peak |vel| {m['vel_peak']:8.1f}")
+    print(f"#   limit cycle  pos pk-pk {m['pos_pkpk']:7.1f} deg")
+    print(f"#   steady state err mean {m['err_mean']:+8.2f} deg  (sd {m['err_std']:.2f})")
+    print(f"#   actuator     s mean {m['s_mean']:+7.1f}  seam margin min {m['seam_margin_min']:.1f} "
+          f"counts  saturated {100*m['sat_frac']:.0f}%")
+    print(f"# => {verdict(m)}")
+    if m["seam_margin_min"] < 20:
+        print(f"# WARNING: a motor came within {m['seam_margin_min']:.0f} counts of the 6-step seam. "
+              f"Every excursion in the 8/11 host trace was preceded by exactly this. "
+              f"Raise |--carrier|.")
+
+
+def cmd_step(args):
+    """OPEN-LOOP step, to identify the plant. No feedback — this measures tau and the gain."""
+    d = _az_host(args)
+    try:
+        _az_push_config(d, args)
+        for i in (args.idx_a, args.idx_b):
+            d.cmd(f"arm {i} bidir", timeout=10)
+        time.sleep(args.spinup_secs)
+        ms = int(args.step_secs * 1000)
+        reply = d.cmd(f"az step {args.carrier} {args.step_s} {ms}", timeout=8)[0]
+        print(reply)
+        if "asked=" in reply:
+            fields = dict(f.split("=", 1) for f in reply.split("|") if "=" in f)
+            if abs(float(fields["s"]) - float(fields["asked"])) > 0.05:
+                print(f"# NOTE: the step was clamped to smax: {fields['asked']} -> {fields['s']}. "
+                      f"The fit uses the DELIVERED command, not what was asked.")
+        time.sleep(args.step_secs + 0.5)
+    finally:
+        _az_safe(d)
+    tr, _ = _az_pull(d, args.name)
+    # No s_cmd: infer the step from the delivered `s` minus the trim, i.e. what the plant actually
+    # saw. Passing the requested value would scale the gain by the clamp ratio.
+    f = fit_step(tr)
+    if not f["ok"]:
+        print(f"# fit failed: {f['why']}")
+        return
+    print(f"\n# PLANT, MEASURED (first-order fit over {f['n_fit']} points, R^2 {f['r2']:.4f})")
+    print(f"#   tau  {f['tau']:.4f} s          <- every gain so far ASSUMED 0.1-0.2 s")
+    print(f"#   gain {f['gain']:.2f} deg/s per command count   (v_inf {f['v_inf']:.0f} deg/s)")
+    g = suggest_gains(f, zeta=args.zeta, kd=args.kd)
+    print(f"# COMPUTED gains for zeta={args.zeta} at kd={args.kd}:")
+    print(f"#   --kp {g['kp']:.2f} --kd {g['kd']:.2f} --kff {g['kff']:.5f}")
+    print(f"#   {g['note']}")
+
+
+def add_ondevice(p):
+    """Options for the ON-DEVICE subcommands.
+
+    THE DEFAULTS HERE ARE THE HOST CONFIGURATION THAT CONVERGED (2026-08-11T17:44Z: final err
+    +0.00, and it recovered from a hand disturbance) — kp 3, ki 0.5, kd 0.3, vmax 200, no
+    velocity-error clamp. They are deliberately NOT the firmware's own defaults, which descend
+    from kp 8 / ki 1.5: a run selected on `worst` (a spin-up-transient metric) that then failed
+    to reproduce four times running. See docs/azimuth-closed-loop.md.
+    """
+    p.add_argument("--port")
+    p.add_argument("--dry-run", action="store_true", help="rejected: the sim host has no `az`")
+    p.add_argument("--idx-a", type=int, default=0)
+    p.add_argument("--idx-b", type=int, default=1)
+    p.add_argument("--carrier", type=float, default=-600.0,
+                   help="6-step carrier on BOTH motors. -640 leaves 55 counts of seam margin at "
+                        "the authority rail; -600 leaves 15 (docs/azimuth-closed-loop.md)")
+    p.add_argument("--spinup-secs", type=float, default=4.5)
+    p.add_argument("--decim", type=int, default=5, help="trace every Nth poll (5 ~= 200 Hz)")
+    p.add_argument("--name", default="trace", help="report filename stem")
+    p.add_argument("--kp", type=float, default=3.0)
+    p.add_argument("--ki", type=float, default=0.5)
+    p.add_argument("--kd", type=float, default=0.3)
+    p.add_argument("--kff", type=float, default=1.0 / (AZIMUTH_RPM_PER_S * 6.0))
+    p.add_argument("--s-trim", type=float, default=AZIMUTH_NULL_S)
+    p.add_argument("--smax", type=float, default=40.0)
+    p.add_argument("--vmax", type=float, default=200.0)
+    p.add_argument("--max-rate", type=float, default=4000.0)
+    p.add_argument("--verr-clamp", type=float, default=0.0,
+                   help="0 disables. Non-zero turns the integral into a fixed-rate ramp whenever "
+                        "|vsp-vel| exceeds it; the config that converged had no clamp")
+    p.add_argument("--sign-b", type=int, default=SIGN_B_MEASURED, choices=(1, -1))
+
+
+# ---------------------------------------------------------------------------------
 def add_common(p):
     """Shared options on every subcommand — posctl's convention, so `… move --deg 90 --dry-run`
     works the way the docstring advertises rather than only before the subcommand."""
@@ -592,8 +765,26 @@ def main():
     add_common(hd)
     hd.set_defaults(fn=cmd_hold)
 
+    tc = sub.add_parser("trace", help="run the ON-DEVICE hold and read its own 1 kHz trace back")
+    tc.add_argument("--deg", type=float, default=0.0)
+    tc.add_argument("--secs", type=float, default=20.0)
+    tc.add_argument("--window", type=float, default=5.0, help="metrics window, seconds from the end")
+    tc.add_argument("--poke-at", type=float, default=0.0,
+                    help="prompt for a hand disturbance this many seconds in (0 = no prompt)")
+    add_ondevice(tc)
+    tc.set_defaults(fn=cmd_trace)
+
+    st = sub.add_parser("step", help="OPEN-LOOP step to identify the plant (tau + gain)")
+    st.add_argument("--step-s", type=float, default=20.0, help="azimuth command step, counts")
+    st.add_argument("--step-secs", type=float, default=3.0)
+    st.add_argument("--zeta", type=float, default=1.0, help="target damping for the suggested kp")
+    add_ondevice(st)
+    st.set_defaults(fn=cmd_step)
+
     args = ap.parse_args()
-    _validate(args)
+    if args.subcmd in ("trace", "step"):
+        args.fn(args)                      # _validate() belongs to the host-side servo, not these
+        return
     try:
         args.fn(args)
     except Aborted as e:

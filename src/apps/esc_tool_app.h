@@ -844,7 +844,54 @@ private:
 						else if(!strcmp(k,"signb")) az_.sign_b=(f<0)?-1:1;
 						else { Serial.println("err az: unknown gain"); continue; }
 						Serial.println("ok"); } }
-				else Serial.println("err az: on|off|tgt|gain|status"); }
+					// az step <carrier> <s> <ms> — OPEN LOOP, for plant identification. No feedback:
+					// both motors carried, a known s applied, the trace recording. Self-terminates.
+					else if(!strcmp(sub,"step")) {
+						char* c=strtok(nullptr," "); char* v=strtok(nullptr," "); char* t=strtok(nullptr," ");
+						if(!c||!v||!t) Serial.println("err az: step <carrier> <s> <ms>");
+						else if(n_<2) Serial.println("err az: needs two ESCs");
+						else if(!th_[0]->armed()||!th_[1]->armed()) Serial.println("err az: arm 0 and arm 1 first");
+						else { az_.bind(th_[0], th_[1], &enc_);
+							if(!az_.beginStep(atof(c), atof(v), (uint32_t)atol(t)))
+								Serial.println("err az: step needs an encoder and 0 < ms <= 10000");
+							// Report the CLAMPED step, not what was asked for: beginStep holds it inside
+							// +/-smax, and a gain fit that divides by the requested value instead of the
+							// delivered one is wrong by exactly that ratio.
+							else { Serial.printf("az|step|carrier=%.0f|s=%.1f|asked=%.1f|ms=%ld\n",
+							                     az_.carrier, (double)az_.stepS(), (double)atof(v), atol(t));
+							       Serial.println("ok"); } } }
+					// az log [decim] — how often poll() writes to the trace ring (1 = every tick).
+					else if(!strcmp(sub,"log")) { char* d=strtok(nullptr," ");
+						if(d) az_.setDecim((uint16_t)atoi(d));
+						Serial.printf("az|log|decim=%u|n=%u|cap=%u\n", az_.decim(), az_.traceCount(),
+						              (unsigned)Azimuth::TRACE_N); Serial.println("ok"); }
+					// az dump — the whole ring, oldest first. REFUSED while the loop is running: this
+					// prints thousands of lines and poll() does not run meanwhile, which would both
+					// freeze the loop and trip the spin deadman. Stop first, then read.
+					// The header carries the FULL configuration on purpose. A sweep once inherited
+					// vmax=120 from a previous trial and the result was recorded against the wrong
+					// number; a trace that cannot say what produced it is not evidence.
+					else if(!strcmp(sub,"dump")) {
+						if(az_.on()) { Serial.println("err az: stop the loop first (az off) — dump blocks poll()"); }
+						else {
+							uint16_t n = az_.traceCount();
+							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
+							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
+							              "signa=%d|signb=%d|seam=%d|tgt=%.2f\n",
+							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
+							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
+							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target());
+							Serial.println("t_ms,pos,vel,s,ivel");
+							uint32_t t0 = n ? az_.traceAt(0).t_us : 0;
+							for (uint16_t i = 0; i < n; i++) {
+								const Azimuth::Sample& x = az_.traceAt(i);
+								Serial.printf("%.3f,%.2f,%.1f,%.1f,%.1f\n",
+								              (double)(uint32_t)(x.t_us - t0) / 1000.0,
+								              (double)x.pos, (double)x.vel,
+								              (double)x.s_q / 10.0, (double)x.ivel_q / 10.0);
+							}
+							Serial.println("ok"); } }
+					else Serial.println("err az: on|off|tgt|gain|status|log|dump|step"); }
 			else if (!strcmp(cmd,"i2cscan")) {
 				// Probe the lines against an INTERNAL PULL-DOWN, not a bare input. Wire.begin() enables
 				// the RP2040's internal pull-UPs on these pads and Wire.end() does not undo them, so a

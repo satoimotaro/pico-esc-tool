@@ -93,3 +93,32 @@ def test_package_import_smoke():
     r = _run("-c", "from pico_esc import EscLink, ESC; "
                    "from pico_esc.control import PositionController; print('ok')")
     assert r.stdout.strip() == "ok"
+
+
+def test_azimuth_ondevice_subcommands_refuse_dry_run():
+    """`trace` and `step` drive the ON-DEVICE loop, which the sim host cannot emulate. They must
+    say so and exit non-zero rather than silently opening a port or faking a result — a dry-run
+    that appears to succeed is how a blind controller once reported err 0.00 as a perfect run."""
+    for sub in ("trace", "step"):
+        r = _run("azimuth.py", sub, "--dry-run", expect=1)
+        assert "sim host has no `az`" in r.stderr
+        assert "test_aztrace.py" in r.stderr
+
+
+def test_azimuth_ondevice_defaults_are_the_config_that_converged():
+    """Defaults must be kp 3 / ki 0.5 / kd 0.3 / vmax 200 with the velocity-error clamp OFF —
+    the 2026-08-11T17:44Z host run — NOT the firmware's own defaults, which descend from
+    kp 8 / ki 1.5, a run that never converged and was picked on a spin-up-transient metric."""
+    import argparse
+
+    import azimuth
+
+    p = argparse.ArgumentParser()
+    azimuth.add_ondevice(p)
+    d = vars(p.parse_args([]))
+    assert (d["kp"], d["ki"], d["kd"]) == (3.0, 0.5, 0.3)
+    assert d["vmax"] == 200.0
+    assert d["verr_clamp"] == 0.0          # the clamp was not present in the run that converged
+    assert d["smax"] == 40.0               # authority, NOT the thing to shrink when detuning
+    assert d["s_trim"] == azimuth.AZIMUTH_NULL_S
+    assert d["sign_b"] == -1               # motor B is mirrored — measured, not assumed
