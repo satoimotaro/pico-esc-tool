@@ -844,6 +844,8 @@ private:
 						else if(!strcmp(k,"signb")) az_.sign_b=(f<0)?-1:1;
 						else if(!strcmp(k,"spinsecs")) az_.spin_secs=f;
 						else if(!strcmp(k,"spinsmax")) az_.spin_smax=f;
+							else if(!strcmp(k,"seamkeep")) az_.seam_keep=f;
+							else if(!strcmp(k,"spinhold")) az_.spin_hold=f;
 						else { Serial.println("err az: unknown gain"); continue; }
 						Serial.println("ok"); } }
 					// az step <carrier> <s> <ms> — OPEN LOOP, for plant identification. No feedback:
@@ -882,22 +884,22 @@ private:
 							uint16_t n = az_.traceCount();
 							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
-							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f"
+							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f"
 							              "|step_s=%.1f|step_ms=%.1f\n",
 							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
 							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
 							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target(),
-							              az_.spin_secs, az_.spin_smax, az_.stepS(),
+							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.stepS(),
 							              n ? (double)(int32_t)(az_.stepBeginUs() - az_.traceAt(0).t_us) / 1000.0
 							                : 0.0);
-							Serial.println("t_ms,pos,vel,s,ivel");
+							Serial.println("t_ms,pos,vel,s,ivel,carrier");
 							uint32_t t0 = n ? az_.traceAt(0).t_us : 0;
 							for (uint16_t i = 0; i < n; i++) {
 								const Azimuth::Sample& x = az_.traceAt(i);
-								Serial.printf("%.3f,%.2f,%.1f,%.1f,%.1f\n",
+								Serial.printf("%.3f,%.2f,%.1f,%.1f,%.1f,%d\n",
 								              (double)(uint32_t)(x.t_us - t0) / 1000.0,
 								              (double)x.pos, (double)x.vel,
-								              (double)x.s_q / 10.0, (double)x.ivel_q / 10.0);
+								              (double)x.s_q / 10.0, (double)x.ivel_q / 10.0, (int)x.c_q);
 							}
 							Serial.println("ok"); } }
 					else Serial.println("err az: on|off|tgt|gain|status|log|dump|step"); }

@@ -491,7 +491,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
 _AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
-             "signb", "spinsecs", "spinsmax")
+             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold")
 
 
 def _az_host(args):
@@ -505,7 +505,8 @@ def _az_push_config(d, args):
     vals = {"kp": args.kp, "ki": args.ki, "kd": args.kd, "kff": args.kff, "trim": args.s_trim,
             "smax": args.smax, "vmax": args.vmax, "maxrate": args.max_rate,
             "verrclamp": args.verr_clamp, "signb": args.sign_b,
-            "spinsecs": args.spin_secs, "spinsmax": args.spin_smax}
+            "spinsecs": args.spin_secs, "spinsmax": args.spin_smax,
+            "seamkeep": args.seam_keep, "spinhold": args.spin_hold}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -560,9 +561,10 @@ def _az_pull(d, name, quiet=False):
     path = os.path.join(REPORT_DIR, f"az_{name}_{time.strftime('%Y%m%d-%H%M%S')}.csv")
     with open(path, "w") as f:
         f.write("# " + "|".join(f"{k}={v}" for k, v in tr.config.items()) + "\n")
-        f.write("t_s,pos,vel,s,ivel\n")
+        f.write("t_s,pos,vel,s,ivel,carrier\n")
         for i in range(len(tr)):
-            f.write(f"{tr.t[i]:.4f},{tr.pos[i]:.2f},{tr.vel[i]:.1f},{tr.s[i]:.1f},{tr.ivel[i]:.1f}\n")
+            f.write(f"{tr.t[i]:.4f},{tr.pos[i]:.2f},{tr.vel[i]:.1f},{tr.s[i]:.1f},"
+                    f"{tr.ivel[i]:.1f},{tr.carrier[i]:.0f}\n")
     if not quiet:
         print(f"# wrote {path}  ({len(tr)} samples, {tr.duration:.1f} s at {tr.rate_hz:.0f} Hz)")
     return tr, path
@@ -662,6 +664,12 @@ def add_ondevice(p):
                         "the authority rail; -600 leaves 15 (docs/azimuth-closed-loop.md)")
     p.add_argument("--spin-secs", type=float, default=4.0,
                    help="ON-DEVICE carrier transition (two-stage, loop closed throughout)")
+    p.add_argument("--spin-hold", type=float, default=0.8,
+                   help="seconds at the snap carrier with s forced to 0, so both motors cross the "
+                        "seam together instead of straddling it")
+    p.add_argument("--seam-keep", type=float, default=35.0,
+                   help="counts the LOWER motor must stay above the 6-step seam; without it the "
+                        "authority formula leaves exactly zero margin and the loop spends it")
     p.add_argument("--spin-smax", type=float, default=55.0,
                    help="authority during the transition; the mismatch there is up to a whole motor")
     p.add_argument("--spinup-secs", type=float, default=4.5,

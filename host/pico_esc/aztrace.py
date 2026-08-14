@@ -44,6 +44,7 @@ class AzTrace:
     vel: list[float] = field(default_factory=list)    # deg/s, signed
     s: list[float] = field(default_factory=list)      # delivered azimuth command, counts (trim in)
     ivel: list[float] = field(default_factory=list)   # integral state, counts
+    carrier: list[float] = field(default_factory=list)  # LIVE carrier — varies through the spin-up
 
     def __len__(self):
         return len(self.t)
@@ -105,7 +106,7 @@ def parse_dump(lines) -> AzTrace:
         if ln.startswith("err "):
             raise ValueError(f"device refused the dump: {ln}")
         parts = ln.split(",")
-        if len(parts) != 5:
+        if len(parts) not in (5, 6):          # 6 since the live carrier was added
             continue
         try:
             rows.append(tuple(float(p) for p in parts))
@@ -114,12 +115,14 @@ def parse_dump(lines) -> AzTrace:
     if cfg is None:
         raise ValueError("no 'azd|' header in the dump — cannot attribute the trace to a config")
     tr = AzTrace(config=cfg)
-    for t_ms, pos, vel, s, ivel in rows:
+    for row in rows:
+        t_ms, pos, vel, s, ivel = row[:5]
         tr.t.append(t_ms / 1000.0)
         tr.pos.append(pos)
         tr.vel.append(vel)
         tr.s.append(s)
         tr.ivel.append(ivel)
+        tr.carrier.append(row[5] if len(row) > 5 else float(tr.config.get("carrier", 0.0)))
     if seen_header and not rows and cfg.get("n", 0):
         raise ValueError(f"header claims n={cfg['n']} but no rows parsed")
     return tr
@@ -133,9 +136,11 @@ def seam_margin(tr: AzTrace) -> list[float]:
     by saturation with motor B at 531 against a 515 seam. Sign conventions do not matter here —
     only magnitudes reach the seam.
     """
-    carrier = abs(float(tr.config.get("carrier", 0.0)))
     seam = abs(float(tr.config.get("seam", DEFAULT_SEAM)))
-    return [abs(carrier) - abs(sv) - seam for sv in tr.s]
+    # Use the LIVE carrier where the trace has it: during the transition the margin is set by the
+    # carrier of that instant, and taking the final value hides exactly the interval that matters.
+    cs = tr.carrier if len(tr.carrier) == len(tr.s) else [float(tr.config.get("carrier", 0.0))] * len(tr.s)
+    return [abs(c) - abs(sv) - seam for c, sv in zip(cs, tr.s)]
 
 
 def metrics(tr: AzTrace, window=5.0, target=None) -> dict:

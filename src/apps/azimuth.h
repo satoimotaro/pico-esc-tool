@@ -71,6 +71,18 @@ public:
 	// --- carrier transition (see spinProfile_) ---
 	float spin_secs = 4.0f;                    // 0 -> carrier; the loop is closed throughout
 	float spin_smax = 55.0f;                   // authority during it, capped by the seam
+	// KEEP THE LOWER MOTOR THIS FAR ABOVE THE SEAM. Without it the authority formula permits the
+	// delivered s to reach exactly |carrier| - SEAM, i.e. the lower motor lands ON the seam — a
+	// zero margin guaranteed BY CONSTRUCTION, and the loop always spends all the room it is given.
+	// MEASURED 2026-08-14 at carrier -585: ivel wound to its rail, that pushed B from 544 down to
+	// 515 exactly, B fell out of 6-step and the azimuth went from ~0 to 3021 deg/s. The same
+	// signature is in the 8/11 host traces (every excursion preceded by SAT with B = -531).
+	float seam_keep = 35.0f;
+	// Seconds at the snap carrier with the DELIVERED s forced to zero, so both motors are given the
+	// identical command and cross the seam together. s_trim splits them by 2*|s_trim| (~60 counts),
+	// and a pair straddling the seam is a whole motor of mismatch (~1500 rpm) that no azimuth
+	// authority can cancel — measured at -944 deg/s on 2026-08-14.
+	float spin_hold = 0.8f;
 
 	// --- trace ring -------------------------------------------------------------------------
 	// WHY THIS EXISTS. Every azimuth result on record was read by polling `az status` from the host
@@ -80,7 +92,7 @@ public:
 	// keep its own history; there is no host tick fast enough to stand in for it.
 	// 16 bytes/sample: at the default decimation of 5 (~200 Hz) the ring holds the last ~10 s,
 	// which is the window the convergence metrics are defined over.
-	struct Sample { uint32_t t_us; float pos; float vel; int16_t s_q; int16_t ivel_q; };
+	struct Sample { uint32_t t_us; float pos; float vel; int16_t s_q; int16_t ivel_q; int16_t c_q; };
 	static const uint16_t TRACE_N = 2048;
 
 	void bind(Thruster* a, Thruster* b, As5600Tracker* enc) { a_ = a; b_ = b; enc_ = enc; }
@@ -174,8 +186,8 @@ public:
 		// Authority is capped by the seam: s = u + s_trim must keep BOTH motors in 6-step, so
 		// |u| <= |carrier| - seam - |s_trim|. During the transition the loop is fighting a mismatch
 		// of up to a whole motor, so it gets all the room that leaves; afterwards it uses smax.
-		float room_u = fabsf(c_now) - (float)SEAM_CMD - fabsf(s_trim);
-		float u_max  = spinning_ ? fmaxf(1.0f, fminf(spin_smax, room_u)) : smax;
+		float room_u = fabsf(c_now) - (float)SEAM_CMD - fabsf(s_trim) - seam_keep;
+		float u_max  = fmaxf(1.0f, fminf(spinning_ ? spin_smax : smax, room_u));
 
 		float err = target_ - pos_;
 		float vsp = kp * err - kd * vel_;
@@ -202,6 +214,18 @@ public:
 		// loop is frozen at whatever command it had settled on and the step is added open-loop.
 		// Stepping relative to the settled command — not to the static s_trim — is what makes the
 		// identified step size exactly step_s_ and the baseline velocity a measured zero.
+		// CROSS THE SEAM WITH s == 0. s_trim splits the two commands by 2*|s_trim| (~60-70 counts
+		// here), so while the carrier is near the seam one motor is already in 6-step and the other
+		// is still in forced sine. MEASURED 2026-08-14: that state drives the azimuth at -944 deg/s,
+		// a whole motor's worth of mismatch (~1500 rpm), which no azimuth authority can cancel —
+		// spin-up aborted on the rate guard every time. Holding the DELIVERED s at zero makes both
+		// motors identical, so they cross together and the only mismatch left is the intrinsic one
+		// the trim exists to cancel. The trim (and the loop) come back once both are clear.
+		if (spinning_ && (int32_t)(now - t0_us_) < (int32_t)(spin_hold * 1e6f)) {
+			ivel_ = 0.0f;
+			u = -s_trim;                       // => apply_ delivers s = u + s_trim = 0
+		}
+
 		if (mode_ == STEP && (int32_t)(now - step_begin_us_) >= 0) {
 			if (!step_armed_) { step_armed_ = true; step_base_u_ = u; }
 			u = constrain(step_base_u_ + step_s_, -u_max, u_max);
@@ -235,7 +259,7 @@ private:
 	// authority the loop needs to track the drifting null).
 	void apply_(float u, float c) {
 		float s = u + s_trim;
-		float room = fabsf(c) - SEAM_CMD;
+		float room = fabsf(c) - SEAM_CMD - seam_keep;
 		s = constrain(s, -room, room);
 		a_->setRaw((int)lroundf(sign_a * (s + c)));
 		b_->setRaw((int)lroundf(sign_b * (s - c)));
@@ -256,7 +280,18 @@ private:
 		}
 		spinning_ = true;
 		float sgn  = (carrier < 0.0f) ? -1.0f : 1.0f;
-		float past = sgn * (float)(SEAM_CMD + 40);               // clear of the seam, then ramp
+		// THE SNAP TARGET MUST CLEAR THE SEAM FOR THE *LOWER* MOTOR, NOT FOR THE CARRIER.
+		// s_trim splits the two commands by 2*|s_trim| (A = c + s, B = c - s), so at carrier
+		// SEAM+40 = 555 with trim -35 the pair is A=590 (6-step) and B=520 (still forced sine) —
+		// exactly the one-motor-in-one-motor-out state, which MEASURED -944 deg/s on 2026-08-14.
+		// The profile used to park the pod there on every start.
+		// The snap must fund EVERYTHING the loop needs at once: the trim's split, the authority the
+		// loop will actually use, and the margin that keeps the lower motor off the seam. Snapping
+		// to SEAM+|trim|+40 = 585 looked safe and left room_u = 5 counts — the loop had no authority
+		// at all and the pod ran away regardless (measured 2026-08-14). Fund all three or the
+		// transition is unrecoverable by construction.
+		float past = sgn * ((float)SEAM_CMD + fabsf(s_trim) + spin_smax + seam_keep);
+		if (fabsf(past) > fabsf(carrier)) past = carrier;        // never overshoot the target carrier
 		if (el < 0.4f) return past;
 		float f = fminf(1.0f, (el - 0.4f) / fmaxf(spin_secs - 0.4f, 1e-3f));
 		return past + (carrier - past) * f;
@@ -271,6 +306,7 @@ private:
 		x.vel    = vel_;
 		x.s_q    = (int16_t)lroundf(constrain(s_    * 10.0f, -32000.0f, 32000.0f));
 		x.ivel_q = (int16_t)lroundf(constrain(ivel_ * 10.0f, -32000.0f, 32000.0f));
+		x.c_q    = (int16_t)lroundf(constrain(c_,           -32000.0f, 32000.0f));
 		tr_head_ = (uint16_t)((tr_head_ + 1) % TRACE_N);
 		if (tr_count_ < TRACE_N) tr_count_++;
 	}
