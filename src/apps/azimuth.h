@@ -68,6 +68,9 @@ public:
 	// 400 deg/s ceiling aborts before the loop ever runs.
 	float verr_clamp = 50.0f;   // bound on the velocity error fed to the integral; 50 measured best
 	float max_rate  = 4000.0f;                 // deg/s abort threshold (debounced over 3 ticks)
+	// --- carrier transition (see spinProfile_) ---
+	float spin_secs = 4.0f;                    // 0 -> carrier; the loop is closed throughout
+	float spin_smax = 55.0f;                   // authority during it, capped by the seam
 
 	// --- trace ring -------------------------------------------------------------------------
 	// WHY THIS EXISTS. Every azimuth result on record was read by polling `az status` from the host
@@ -88,7 +91,8 @@ public:
 		target_ = target_deg;
 		ivel_ = 0.0f; vel_ = 0.0f; pos_ = 0.0f; over_ = 0;
 		traceClear();
-		last_us_ = micros();
+		last_us_ = t0_us_ = micros();
+		spinning_ = true;
 		mode_ = HOLD; on_ = true;
 		return true;
 	}
@@ -100,22 +104,38 @@ public:
 	// The rate abort still applies, `s_cmd` is held inside the loop's own authority, and the step
 	// self-terminates — an open-loop command on a pod that accelerates to thousands of deg/s must
 	// not depend on the host still being there to stop it.
-	bool beginStep(float carrier_cmd, float s_cmd, uint32_t ms) {
+	// THE PRE-ROLL IS CLOSED-LOOP, AND IT HAS TO BE. Applying the step straight from rest measures
+	// two things at once: both ESCs ramping up from zero on independent schedules — a mismatch
+	// documented at up to a WHOLE motor, which the differential sends almost entirely to the azimuth
+	// in air — and the azimuth's actual response to the step.
+	// Holding s at the STATIC null through the ramp does not fix it, and MEASURED 2026-08-14 it
+	// diverges: with s pinned at s_trim the pod reached 4090 deg/s in 1.3 s and tripped the rate
+	// abort before the motors had even reached the carrier. There is no null during a ramp — the
+	// azimuth is a pure integrator, so the ramp mismatch accumulates into heading without limit.
+	// So `pre_ms` runs the ORDINARY closed loop (the host reached the same conclusion in 5d59aea,
+	// "close the loop through the SPIN-UP, not just after it"), and the step is applied relative to
+	// the command the loop settled on. That also makes the identified step exactly step_s_ and the
+	// baseline velocity a measured zero rather than an assumption.
+	bool beginStep(float carrier_cmd, float s_cmd, uint32_t ms, uint32_t pre_ms) {
 		if (!enc_ || !enc_->present() || !a_ || !b_) return false;
-		if (ms == 0 || ms > 10000) return false;          // typo guard: never an unbounded open loop
+		if (ms == 0 || ms > 10000 || pre_ms > 10000) return false;   // never an unbounded open loop
 		carrier = carrier_cmd;
 		base_   = enc_->accum();
 		target_ = 0.0f;
 		ivel_ = 0.0f; vel_ = 0.0f; pos_ = 0.0f; over_ = 0;
 		traceClear();
-		step_s_     = constrain(s_cmd, -smax, smax);
-		last_us_    = micros();
-		step_end_us_ = last_us_ + ms * 1000UL;
+		step_s_       = constrain(s_cmd, -smax, smax);
+		step_armed_   = false; step_base_u_ = 0.0f;
+		last_us_ = t0_us_ = micros();
+		spinning_ = true;
+		// pre_ms is settle time AFTER the carrier transition, not counted from the very start.
+		step_begin_us_ = last_us_ + (uint32_t)(spin_secs * 1e6f) + pre_ms * 1000UL;
+		step_end_us_   = step_begin_us_ + ms * 1000UL;
 		mode_ = STEP; on_ = true;
 		return true;
 	}
 
-	void stop() { on_ = false; mode_ = OFF; ivel_ = 0.0f;
+	void stop() { on_ = false; mode_ = OFF; ivel_ = 0.0f; step_armed_ = false;
 	              if (a_) a_->setRaw(0); if (b_) b_->setRaw(0); }   // NOTE: keeps the trace — it is
 	                                                               // read back after the run stops.
 	void setTarget(float deg) { target_ = deg; }
@@ -148,12 +168,14 @@ public:
 		if (fabsf(vel_) > max_rate) { if (++over_ >= 3) { stop(); return; } }
 		else over_ = 0;
 
-		if (mode_ == STEP) {
-			apply_(step_s_);
-			record_(now);
-			if ((int32_t)(now - step_end_us_) >= 0) stop();
-			return;
-		}
+		// --- carrier transition. NOT a jump; see spinProfile_(). ---
+		float c_now = spinProfile_(now);
+		bool  below = fabsf(c_now) < (float)SEAM_CMD;
+		// Authority is capped by the seam: s = u + s_trim must keep BOTH motors in 6-step, so
+		// |u| <= |carrier| - seam - |s_trim|. During the transition the loop is fighting a mismatch
+		// of up to a whole motor, so it gets all the room that leaves; afterwards it uses smax.
+		float room_u = fabsf(c_now) - (float)SEAM_CMD - fabsf(s_trim);
+		float u_max  = spinning_ ? fmaxf(1.0f, fminf(spin_smax, room_u)) : smax;
 
 		float err = target_ - pos_;
 		float vsp = kp * err - kd * vel_;
@@ -168,23 +190,39 @@ public:
 		// cannot influence. verr_clamp <= 0 disables, restoring the old behaviour for comparison.
 		float verr = vsp - vel_;
 		if (verr_clamp > 0.0f) verr = constrain(verr, -verr_clamp, verr_clamp);
-		ivel_ += ki * verr * dt;
+		// NO INTEGRAL BELOW THE SEAM. There `s` has almost no authority over the azimuth, so the
+		// loop can see an error it cannot act on; an integrator left running there winds up and
+		// then dumps the whole windup the instant authority appears. Held at zero instead.
+		if (below) ivel_ = 0.0f; else ivel_ += ki * verr * dt;
 		float u = uff + ivel_;
-		float uc = constrain(u, -smax, smax);
-		if (u != uc) { ivel_ = constrain(uc - uff, -smax, smax); u = uc; }   // back-calculation
+		float uc = constrain(u, -u_max, u_max);
+		if (u != uc) { ivel_ = constrain(uc - uff, -u_max, u_max); u = uc; }   // back-calculation
 
-		apply_(u);
+		// STEP mode: the pre-roll above ran the CLOSED loop (see beginStep); from step_begin_us_ the
+		// loop is frozen at whatever command it had settled on and the step is added open-loop.
+		// Stepping relative to the settled command — not to the static s_trim — is what makes the
+		// identified step size exactly step_s_ and the baseline velocity a measured zero.
+		if (mode_ == STEP && (int32_t)(now - step_begin_us_) >= 0) {
+			if (!step_armed_) { step_armed_ = true; step_base_u_ = u; }
+			u = constrain(step_base_u_ + step_s_, -u_max, u_max);
+		}
+
+		apply_(u, c_now);
 		record_(now);
+		if (mode_ == STEP && (int32_t)(now - step_end_us_) >= 0) stop();
 	}
 
 	bool  on()     const { return on_; }
 	bool  stepping() const { return mode_ == STEP; }
-	float stepS()  const { return step_s_; }   // AFTER the +/-smax clamp — the step the plant saw,
+	float stepS()  const { return step_s_; }
+	uint32_t stepBeginUs() const { return step_begin_us_; }   // AFTER the +/-smax clamp — the step the plant saw,
 	                                           // which is what the gain fit must divide by.
 	float pos()    const { return pos_; }
 	float target() const { return target_; }
 	float vel()    const { return vel_; }
 	float s()      const { return s_; }
+	float carrierNow() const { return c_; }
+	bool  spinning()   const { return spinning_; }
 
 private:
 	enum Mode : uint8_t { OFF, HOLD, STEP };
@@ -195,13 +233,33 @@ private:
 	// [-69.8, +10.2] — motor B bottoms at |carrier|-69.8, i.e. 530 against a 515 seam at
 	// carrier -600. Raise |carrier| if that margin matters, do not shrink smax (that costs
 	// authority the loop needs to track the drifting null).
-	void apply_(float u) {
+	void apply_(float u, float c) {
 		float s = u + s_trim;
-		float room = fabsf(carrier) - SEAM_CMD;
+		float room = fabsf(c) - SEAM_CMD;
 		s = constrain(s, -room, room);
-		a_->setRaw((int)lroundf(sign_a * (s + carrier)));
-		b_->setRaw((int)lroundf(sign_b * (s - carrier)));
-		s_ = s;
+		a_->setRaw((int)lroundf(sign_a * (s + c)));
+		b_->setRaw((int)lroundf(sign_b * (s - c)));
+		s_ = s; c_ = c;
+	}
+
+	// TWO-STAGE, and the stages are not cosmetic. Below the seam the ESC is in forced sine and `s`
+	// has almost no authority over the azimuth, so time spent there is drift that can never be
+	// recovered — hence the snap PAST the seam first. Above it the loop can act, so the rest is a
+	// ramp, which keeps the two ESCs' independent start ramps from diverging faster than the loop
+	// can trim. MEASURED on the host: two-stage +7.8 deg of drift, vs ramp +182 and jump -210.
+	// A plain jump is what the firmware used to do, and on 2026-08-14 it put the pod at 4090 deg/s.
+	float spinProfile_(uint32_t now) {
+		float el = (float)(uint32_t)(now - t0_us_) * 1e-6f;
+		if (el >= spin_secs) {
+			if (spinning_) { spinning_ = false; ivel_ = 0.0f; }  // no transition windup into the hold
+			return carrier;
+		}
+		spinning_ = true;
+		float sgn  = (carrier < 0.0f) ? -1.0f : 1.0f;
+		float past = sgn * (float)(SEAM_CMD + 40);               // clear of the seam, then ramp
+		if (el < 0.4f) return past;
+		float f = fminf(1.0f, (el - 0.4f) / fmaxf(spin_secs - 0.4f, 1e-3f));
+		return past + (carrier - past) * f;
 	}
 
 	void record_(uint32_t now) {
@@ -223,9 +281,11 @@ private:
 	bool     on_ = false;
 	Mode     mode_ = OFF;
 	int32_t  base_ = 0;
-	uint32_t last_us_ = 0, step_end_us_ = 0;
+	uint32_t last_us_ = 0, t0_us_ = 0, step_begin_us_ = 0, step_end_us_ = 0;
 	uint8_t  over_ = 0;
-	float    target_ = 0, pos_ = 0, vel_ = 0, ivel_ = 0, s_ = 0, step_s_ = 0;
+	float    target_ = 0, pos_ = 0, vel_ = 0, ivel_ = 0, s_ = 0, c_ = 0;
+	float    step_s_ = 0, step_base_u_ = 0;
+	bool     step_armed_ = false, spinning_ = false;
 
 	Sample   trace_[TRACE_N];
 	uint16_t tr_head_ = 0, tr_count_ = 0, decim_ = 5, dec_n_ = 0;

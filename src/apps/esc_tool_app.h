@@ -833,7 +833,7 @@ private:
 				else if(!strcmp(sub,"tgt")) { char* g=strtok(nullptr," ");
 					if(!g) Serial.println("err az: tgt <deg>"); else { az_.setTarget(atof(g)); Serial.println("ok"); } }
 				else if(!strcmp(sub,"gain")) { char* k=strtok(nullptr," "); char* v=strtok(nullptr," ");
-					if(!k||!v) { Serial.println("err az: gain <kp|ki|kd|kff|trim|smax|vmax|carrier|maxrate|signb> <v>"); }
+					if(!k||!v) { Serial.println("err az: gain <kp|ki|kd|kff|trim|smax|vmax|carrier|maxrate|verrclamp|signb|spinsecs|spinsmax> <v>"); }
 					else { float f=atof(v);
 						if(!strcmp(k,"kp")) az_.kp=f; else if(!strcmp(k,"ki")) az_.ki=f;
 						else if(!strcmp(k,"kd")) az_.kd=f; else if(!strcmp(k,"kff")) az_.kff=f;
@@ -842,23 +842,28 @@ private:
 						else if(!strcmp(k,"maxrate")) az_.max_rate=f;
 						else if(!strcmp(k,"verrclamp")) az_.verr_clamp=f;
 						else if(!strcmp(k,"signb")) az_.sign_b=(f<0)?-1:1;
+						else if(!strcmp(k,"spinsecs")) az_.spin_secs=f;
+						else if(!strcmp(k,"spinsmax")) az_.spin_smax=f;
 						else { Serial.println("err az: unknown gain"); continue; }
 						Serial.println("ok"); } }
 					// az step <carrier> <s> <ms> — OPEN LOOP, for plant identification. No feedback:
 					// both motors carried, a known s applied, the trace recording. Self-terminates.
 					else if(!strcmp(sub,"step")) {
 						char* c=strtok(nullptr," "); char* v=strtok(nullptr," "); char* t=strtok(nullptr," ");
-						if(!c||!v||!t) Serial.println("err az: step <carrier> <s> <ms>");
+						char* pr=strtok(nullptr," ");            // pre-roll at s=0, default 3000 ms
+						if(!c||!v||!t) Serial.println("err az: step <carrier> <s> <ms> [pre_ms]");
 						else if(n_<2) Serial.println("err az: needs two ESCs");
 						else if(!th_[0]->armed()||!th_[1]->armed()) Serial.println("err az: arm 0 and arm 1 first");
 						else { az_.bind(th_[0], th_[1], &enc_);
-							if(!az_.beginStep(atof(c), atof(v), (uint32_t)atol(t)))
-								Serial.println("err az: step needs an encoder and 0 < ms <= 10000");
+							if(!az_.beginStep(atof(c), atof(v), (uint32_t)atol(t),
+							                  pr?(uint32_t)atol(pr):3000UL))
+								Serial.println("err az: step needs an encoder, 0 < ms <= 10000, pre_ms <= 10000");
 							// Report the CLAMPED step, not what was asked for: beginStep holds it inside
 							// +/-smax, and a gain fit that divides by the requested value instead of the
 							// delivered one is wrong by exactly that ratio.
-							else { Serial.printf("az|step|carrier=%.0f|s=%.1f|asked=%.1f|ms=%ld\n",
-							                     az_.carrier, (double)az_.stepS(), (double)atof(v), atol(t));
+							else { Serial.printf("az|step|carrier=%.0f|s=%.1f|asked=%.1f|ms=%ld|pre_ms=%ld\n",
+							                     az_.carrier, (double)az_.stepS(), (double)atof(v), atol(t),
+							                     pr?atol(pr):3000L);
 							       Serial.println("ok"); } } }
 					// az log [decim] — how often poll() writes to the trace ring (1 = every tick).
 					else if(!strcmp(sub,"log")) { char* d=strtok(nullptr," ");
@@ -877,10 +882,14 @@ private:
 							uint16_t n = az_.traceCount();
 							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
-							              "signa=%d|signb=%d|seam=%d|tgt=%.2f\n",
+							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f"
+							              "|step_s=%.1f|step_ms=%.1f\n",
 							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
 							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
-							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target());
+							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target(),
+							              az_.spin_secs, az_.spin_smax, az_.stepS(),
+							              n ? (double)(int32_t)(az_.stepBeginUs() - az_.traceAt(0).t_us) / 1000.0
+							                : 0.0);
 							Serial.println("t_ms,pos,vel,s,ivel");
 							uint32_t t0 = n ? az_.traceAt(0).t_us : 0;
 							for (uint16_t i = 0; i < n; i++) {

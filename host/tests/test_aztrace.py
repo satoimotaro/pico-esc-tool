@@ -11,7 +11,8 @@ import math
 import pytest
 
 from pico_esc.aztrace import (
-    AzTrace, fit_step, metrics, parse_dump, seam_margin, suggest_gains, verdict,
+    AzTrace, find_step_onset, fit_step, metrics, parse_dump, seam_margin,
+    suggest_gains, verdict,
 )
 
 HDR = ("azd|n=3|decim=5|kp=3.000|ki=0.500|kd=0.300|kff=0.02296|trim=-29.8|smax=40|vmax=200|"
@@ -159,3 +160,48 @@ def test_suggest_gains_will_not_invent_ki():
 def test_empty_trace_is_not_a_pass():
     assert metrics(AzTrace(config={"tgt": 0.0})) == {"n": 0}
     assert verdict({"n": 0}) == "no data"
+
+
+# --- pre-roll + baseline (az step holds s=0 before the step) -----------------------
+def _synth_prestep(pre_n, post_n, dt, tau, gain, ds, v0=0.0, trim=-29.8):
+    """Pre-roll at s=trim drifting at v0, then a step to s=trim+ds with a first-order rise."""
+    rows = []
+    for i in range(pre_n):
+        rows.append((i * dt * 1000.0, 0.0, v0, trim, 0.0))
+    for j in range(post_n):
+        t = j * dt
+        v = v0 + gain * ds * (1 - math.exp(-t / tau))
+        rows.append(((pre_n + j) * dt * 1000.0, 0.0, v, trim + ds, 0.0))
+    return parse_dump(_dump(rows))
+
+
+def test_onset_is_found_from_the_command_column():
+    tr = _synth_prestep(200, 600, 0.005, 0.15, 43.6, 20.0)
+    assert find_step_onset(tr) == 200
+
+
+def test_no_onset_when_the_command_never_steps():
+    tr = _synth(200, 0.005, lambda t: 0.0, lambda t: 0.0, s=-29.8)
+    assert find_step_onset(tr) is None
+
+
+def test_fit_subtracts_the_measured_pre_roll_velocity():
+    """The two ESCs start on independent ramps, so the pod is usually already drifting when the
+    step lands. Taking the baseline as zero would inflate the gain by exactly that drift."""
+    tau, gain, ds, v0 = 0.15, 43.6, 20.0, 120.0     # 120 deg/s of spin-up drift still present
+    tr = _synth_prestep(300, 700, 0.005, tau, gain, ds, v0=v0)
+    f = fit_step(tr)
+    assert f["ok"], f
+    assert f["v0"] == pytest.approx(v0, rel=0.02)
+    assert f["tau"] == pytest.approx(tau, rel=0.05)
+    assert f["gain"] == pytest.approx(gain, rel=0.05)   # NOT (v_inf)/ds, which would be ~1.14x high
+    assert f["onset_s"] == pytest.approx(300 * 0.005, abs=0.01)
+
+
+def test_fit_step_is_independent_of_s_trim():
+    """The step is read as (post - pre) off the command column, so whatever trim is in force
+    cancels. A fit that divided by the delivered `s` would be wrong by the trim."""
+    a = fit_step(_synth_prestep(300, 700, 0.005, 0.15, 43.6, 20.0, trim=-29.8))
+    b = fit_step(_synth_prestep(300, 700, 0.005, 0.15, 43.6, 20.0, trim=+11.4))
+    assert a["gain"] == pytest.approx(b["gain"], rel=1e-9)
+    assert a["step_s"] == pytest.approx(20.0, rel=1e-9)

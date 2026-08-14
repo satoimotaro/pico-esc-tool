@@ -490,7 +490,8 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # Every gain the firmware has. PUSH ALL OF THEM, ALWAYS. Device-side gains persist across
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
-_AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp", "signb")
+_AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
+             "signb", "spinsecs", "spinsmax")
 
 
 def _az_host(args):
@@ -503,7 +504,8 @@ def _az_host(args):
 def _az_push_config(d, args):
     vals = {"kp": args.kp, "ki": args.ki, "kd": args.kd, "kff": args.kff, "trim": args.s_trim,
             "smax": args.smax, "vmax": args.vmax, "maxrate": args.max_rate,
-            "verrclamp": args.verr_clamp, "signb": args.sign_b}
+            "verrclamp": args.verr_clamp, "signb": args.sign_b,
+            "spinsecs": args.spin_secs, "spinsmax": args.spin_smax}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -588,15 +590,17 @@ def cmd_step(args):
         for i in (args.idx_a, args.idx_b):
             d.cmd(f"arm {i} bidir", timeout=10)
         time.sleep(args.spinup_secs)
-        ms = int(args.step_secs * 1000)
-        reply = d.cmd(f"az step {args.carrier} {args.step_s} {ms}", timeout=8)[0]
+        ms, pre = int(args.step_secs * 1000), int(args.pre_secs * 1000)
+        reply = d.cmd(f"az step {args.carrier} {args.step_s} {ms} {pre}", timeout=8)[0]
         print(reply)
         if "asked=" in reply:
             fields = dict(f.split("=", 1) for f in reply.split("|") if "=" in f)
             if abs(float(fields["s"]) - float(fields["asked"])) > 0.05:
                 print(f"# NOTE: the step was clamped to smax: {fields['asked']} -> {fields['s']}. "
                       f"The fit uses the DELIVERED command, not what was asked.")
-        time.sleep(args.step_secs + 0.5)
+        # spin_secs happens ON THE DEVICE inside `az step`; cutting the wait short calls
+        # `az off` mid-run and the trace ends before the step (measured 2026-08-14).
+        time.sleep(args.spin_secs + args.pre_secs + args.step_secs + 0.5)
     finally:
         _az_safe(d)
     tr, _ = _az_pull(d, args.name)
@@ -608,7 +612,11 @@ def cmd_step(args):
         return
     print(f"\n# PLANT, MEASURED (first-order fit over {f['n_fit']} points, R^2 {f['r2']:.4f})")
     print(f"#   tau  {f['tau']:.4f} s          <- every gain so far ASSUMED 0.1-0.2 s")
-    print(f"#   gain {f['gain']:.2f} deg/s per command count   (v_inf {f['v_inf']:.0f} deg/s)")
+    print(f"#   gain {f['gain']:.2f} deg/s per command count   (step {f['step_s']:+.1f} counts, "
+          f"v {f['v0']:+.0f} -> {f['v_inf']:+.0f} deg/s)")
+    if abs(f["v0"]) > 30:
+        print(f"#   NOTE: the pod was still drifting at {f['v0']:+.0f} deg/s when the step landed — "
+              f"the baseline was subtracted, but consider a longer --pre-secs.")
     g = suggest_gains(f, zeta=args.zeta, kd=args.kd)
     print(f"# COMPUTED gains for zeta={args.zeta} at kd={args.kd}:")
     print(f"#   --kp {g['kp']:.2f} --kd {g['kd']:.2f} --kff {g['kff']:.5f}")
@@ -631,7 +639,13 @@ def add_ondevice(p):
     p.add_argument("--carrier", type=float, default=-600.0,
                    help="6-step carrier on BOTH motors. -640 leaves 55 counts of seam margin at "
                         "the authority rail; -600 leaves 15 (docs/azimuth-closed-loop.md)")
-    p.add_argument("--spinup-secs", type=float, default=4.5)
+    p.add_argument("--spin-secs", type=float, default=4.0,
+                   help="ON-DEVICE carrier transition (two-stage, loop closed throughout)")
+    p.add_argument("--spin-smax", type=float, default=55.0,
+                   help="authority during the transition; the mismatch there is up to a whole motor")
+    p.add_argument("--spinup-secs", type=float, default=4.5,
+                   help="wait after `arm` before `az on`/`az step` — the ESCs need this to finish "
+                        "the bidir-DShot arming sequence; 1.0 s is NOT enough (measured)")
     p.add_argument("--decim", type=int, default=5, help="trace every Nth poll (5 ~= 200 Hz)")
     p.add_argument("--name", default="trace", help="report filename stem")
     p.add_argument("--kp", type=float, default=3.0)
@@ -777,6 +791,9 @@ def main():
     st = sub.add_parser("step", help="OPEN-LOOP step to identify the plant (tau + gain)")
     st.add_argument("--step-s", type=float, default=20.0, help="azimuth command step, counts")
     st.add_argument("--step-secs", type=float, default=3.0)
+    st.add_argument("--pre-secs", type=float, default=3.0,
+                    help="carry both motors at s=0 this long BEFORE the step, so the spin-up "
+                         "transient is not measured as part of the response")
     st.add_argument("--zeta", type=float, default=1.0, help="target damping for the suggested kp")
     add_ondevice(st)
     st.set_defaults(fn=cmd_step)

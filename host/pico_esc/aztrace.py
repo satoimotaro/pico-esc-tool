@@ -198,8 +198,35 @@ def verdict(m: dict, vel_rms_ok=25.0, pkpk_ok=10.0) -> str:
 # ---------------------------------------------------------------------------------
 # Plant identification from an `az step` trace.
 # ---------------------------------------------------------------------------------
+def _median(xs):
+    s = sorted(xs)
+    return s[len(s) // 2]
+
+
+def find_step_onset(tr: AzTrace):
+    """Index where the commanded `s` steps, or None if it never does.
+
+    `az step` holds s = 0 (i.e. s = trim as delivered) for a pre-roll before applying the step, so
+    both phases are in the one trace. Reading the transition off the COMMAND column makes the fit
+    independent of `s_trim` — the step is (post - pre), whatever the trim happened to be.
+    """
+    n = len(tr)
+    if n < 8:
+        return None
+    k = max(2, n // 20)
+    s_pre, s_post = _median(tr.s[:k]), _median(tr.s[-k:])
+    ds = s_post - s_pre
+    if abs(ds) < 0.5:                       # under half a command count: no step happened
+        return None
+    thresh = s_pre + 0.5 * ds
+    for i in range(n):
+        if (tr.s[i] - thresh) * (1 if ds > 0 else -1) >= 0:
+            return i
+    return None
+
+
 def fit_step(tr: AzTrace, s_cmd=None, settle_frac=0.25) -> dict:
-    """First-order fit of an open-loop step: v(t) = K*ds*(1 - exp(-t/tau)).
+    """First-order fit of an open-loop step: v(t) = v0 + K*ds*(1 - exp(-t/tau)).
 
     Returns gain (deg/s per command count), tau (s), v_inf and an R^2 over the fitted region.
 
@@ -208,29 +235,55 @@ def fit_step(tr: AzTrace, s_cmd=None, settle_frac=0.25) -> dict:
     swept: position is the integral of a velocity source of lag tau, so the closed loop is
     tau*s^2 + (1+kd)*s + kp = 0 and zeta = (1+kd)/(2*sqrt(kp*tau)).
 
-    tau comes from a least-squares line through ln(1 - v/v_inf), not from the 63% crossing: one
-    noisy sample decides the crossing, whereas the regression uses the whole rise.
+    Two things this does NOT assume:
+    - that the pod was still when the step landed. The two ESCs start on independent ramps and the
+      differential sends nearly all of that mismatch to the azimuth, so the pre-roll's measured
+      velocity is subtracted as a baseline rather than taken to be zero.
+    - that `s_cmd` is what the plant saw. beginStep clamps to +/-smax, and the delivered command
+      carries `s_trim`; the step is read as (post - pre) off the command column instead.
+
+    tau comes from a least-squares line through ln(1 - (v-v0)/(v_inf-v0)), not from the 63%
+    crossing: one noisy sample decides the crossing, whereas the regression uses the whole rise.
     """
     if len(tr) < 8:
         return {"ok": False, "why": "trace too short"}
-    ds = float(tr.config.get("step_s", 0.0)) if s_cmd is None else float(s_cmd)
-    if ds == 0.0:
-        # Fall back to the delivered command minus the trim, which is what the plant actually saw.
-        ds = (sum(tr.s) / len(tr.s)) - float(tr.config.get("trim", 0.0))
+
+    # The device reports the onset in the dump header. Prefer it: the pre-roll runs the CLOSED
+    # loop, so `s` varies continuously and cannot be read as "constant, then a step".
+    onset = None
+    if "step_ms" in tr.config and float(tr.config["step_ms"]) > 0:
+        t_step = float(tr.config["step_ms"]) / 1000.0 + tr.t[0]
+        onset = next((i for i, tv in enumerate(tr.t) if tv >= t_step), None)
+    if onset is None:
+        onset = find_step_onset(tr)
+    if onset is None or onset < 3:
+        # No pre-roll in this trace (or the step landed immediately): fall back to a zero baseline
+        # and the delivered command minus the trim.
+        onset, v0 = 0, 0.0
+        ds = float(s_cmd) if s_cmd is not None else (
+            (sum(tr.s) / len(tr.s)) - float(tr.config.get("trim", 0.0)))
+    else:
+        k = max(2, onset // 3)
+        v0 = sum(tr.vel[onset - k:onset]) / k         # settled baseline, measured
+        ds = float(tr.config["step_s"]) if "step_s" in tr.config else (
+            _median(tr.s[onset:]) - _median(tr.s[:onset]))
     if abs(ds) < 1e-6:
         return {"ok": False, "why": "step size is zero — nothing to identify"}
 
-    tail = tr.window(max(tr.duration * settle_frac, 1e-9))
+    post = list(range(onset, len(tr)))
+    t_on = tr.t[onset]
+    tail_cut = tr.t[-1] - max((tr.t[-1] - t_on) * settle_frac, 1e-9)
+    tail = [i for i in post if tr.t[i] >= tail_cut]
     v_inf = sum(tr.vel[i] for i in tail) / len(tail)
-    if abs(v_inf) < 1e-6:
-        return {"ok": False, "why": "no steady velocity — the pod never moved"}
+    dv = v_inf - v0
+    if abs(dv) < 1e-6:
+        return {"ok": False, "why": "no velocity change across the step — the pod never responded"}
 
-    t0 = tr.t[0]
     xs, ys = [], []
-    for i in range(len(tr)):
-        r = tr.vel[i] / v_inf
+    for i in post:
+        r = (tr.vel[i] - v0) / dv
         if 0.02 < r < 0.92:                    # skip the noisy foot and the flat top
-            xs.append(tr.t[i] - t0)
+            xs.append(tr.t[i] - t_on)
             ys.append(math.log(1.0 - r))       # = -t/tau
     if len(xs) < 4:
         return {"ok": False, "why": f"only {len(xs)} usable points on the rise — step too short?"}
@@ -249,8 +302,8 @@ def fit_step(tr: AzTrace, s_cmd=None, settle_frac=0.25) -> dict:
     ss_tot = sum((y - my) ** 2 for y in ys)
     ss_res = sum((y - (slope * x + inter)) ** 2 for x, y in zip(xs, ys))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return {"ok": True, "tau": tau, "gain": v_inf / ds, "v_inf": v_inf,
-            "step_s": ds, "r2": r2, "n_fit": n}
+    return {"ok": True, "tau": tau, "gain": dv / ds, "v_inf": v_inf, "v0": v0,
+            "step_s": ds, "r2": r2, "n_fit": n, "onset_s": t_on - tr.t[0]}
 
 
 def suggest_gains(fit: dict, zeta=1.0, kd=0.3) -> dict:
