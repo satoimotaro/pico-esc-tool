@@ -209,6 +209,25 @@ Report these three separately, over the last 5 s, and nothing else:
 | limit cycle | peak-to-peak of `pos` | the failure mode |
 | steady-state error | `mean(err)` | secondary — this is what I is for |
 
+### 2026-08-14 — RAW `thrust` IS ZEROED AFTER 500 ms. Read this before any bench work.
+
+`esc_session.h:50/301`: `SPIN_DEADMAN_MS = 500`, and `spinPoll()` sets the target to 0 once that
+long has passed since the last command. A one-shot `thrust i v` from the host therefore holds for
+half a second, after which the motor is commanded to zero and falls out of 6-step into forced
+sine — where telemetry honestly reports **0 rpm** and `s` has almost no azimuth authority.
+
+Every raw-drive test on 2026-08-14 slept 1.5-3 s before reading, so all of them measured a motor
+that had already been zeroed. That manufactured a whole afternoon of false hardware conclusions —
+"neither motor turns", "the azimuth axis does not move at any s", "an ESC has failed" — on a rig
+that was fine. `bench.py check` (byte-identical), `esctool read` (`layout_revision: 226`,
+`sine_cross_up: 36`) and the RPM submode (2431 rpm held) all confirmed the hardware independently.
+
+The `az` loop and the RPM submode refresh every tick and are unaffected, so the on-device results
+stand. Host-side raw driving must go through `azimuth.py:_raw_hold()`, never a bare `d.cmd`.
+
+**Still open, and NOT answered by any of the above:** whether carrier |600| is still in 6-step
+under the current (heavier) propeller at 15.2 V. Measure it with a keepalive, at low speed.
+
 ### Order of work — steps 1 and 4 are now BUILT, bench-ready
 
 1. **`az dump`** — ✅ built. A 2048-sample ring of `(t, pos, vel, s, ivel)` recorded inside `poll()`

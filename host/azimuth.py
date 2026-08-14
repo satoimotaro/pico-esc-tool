@@ -511,6 +511,27 @@ def _az_push_config(d, args):
     d.cmd(f"az log {args.decim}", timeout=5)
 
 
+def _raw_hold(d, cmds, secs, period=0.1):
+    """Drive raw `thrust` for `secs`, REFRESHING every `period`.
+
+    THE FIRMWARE ZEROES A RAW COMMAND AFTER 500 ms. esc_session.h:301 —
+        else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;
+    with SPIN_DEADMAN_MS = 500. A one-shot `thrust i v` therefore holds for half a second and then
+    the ESC is commanded to zero, which drops the motor out of 6-step back into forced sine, where
+    telemetry honestly reports 0 rpm and `s` has almost no azimuth authority.
+
+    On 2026-08-14 that produced an entire afternoon of false hardware findings — "neither motor
+    turns", "the azimuth axis does not move", "the ESCs have failed" — from a rig that was working.
+    The `az` loop and the RPM submode both refresh every tick and were never affected. Any raw
+    driving from the host MUST go through this, never through a bare d.cmd("thrust ...").
+    """
+    t_end = time.time() + secs
+    while time.time() < t_end:
+        for i, v in cmds.items():
+            d.cmd(f"thrust {i} {int(round(v))}", timeout=3)
+        time.sleep(min(period, max(0.0, t_end - time.time())))
+
+
 def _az_safe(d):
     """Stop everything, in the order that leaves nothing spinning if a step raises."""
     for fn in (lambda: d.cmd("az off", timeout=5),):
