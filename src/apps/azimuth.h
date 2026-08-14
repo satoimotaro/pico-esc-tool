@@ -50,7 +50,20 @@ public:
 	// nothing could supply the 5-30 counts of null bias, by EITHER path. ki and vmax size together
 	// (ki 0.5 + vmax 200 converged; ki 0.05 + vmax 200 ran away; ki 0 + vmax 2000 is merely bounded).
 	// Try kp 3 / ki 0.5 / kd 0.3 / vmax 200 / verr_clamp 0 first, with a trace running.
-	float kp = 8.0f, ki = 0.1f, kd = 0.6f;
+	// DEFAULTS ARE THE MEASURED BEST, 2026-08-15, at spin_rpm 800 in rpm-space actuation — chosen on
+	// the DISTRIBUTION of 3 runs each across 7 configurations, not on a single run (the same config
+	// has given pos pk-pk 89 and 447 deg back to back, and picking on one run is how this thread
+	// went wrong before). Medians of pos pk-pk:
+	//     kp 0.5 ki 0.3 lpf 1     ->  135   <- this
+	//     kp 0.5 ki 0.3 lpf 2     ->  366
+	//     kp 0.5 ki 0.3 lpf 0.5   ->  382      (over-filtering costs phase)
+	//     kp 1.0 ki 0.3 lpf 1     ->  334
+	//     kp 0.5 ki 0.15 lpf 1    ->  479
+	//     kp 0.5 ki 0.3 lpf 0     ->  460      (and err mean swung -226..+13)
+	//     kp 0.5 ki 0.3 kd 0.3+   ->  766      (kd is destabilising even filtered)
+	// kd is DELIBERATELY ZERO: the disturbance sits at ~8 Hz and the velocity estimate's own lag
+	// puts the derivative term in phase to reinforce it.
+	float kp = 0.5f, ki = 0.3f, kd = 0.0f;
 	float kff       = 1.0f / (7.26f * 6.0f);   // 1 / (deg/s per unit s), measured
 	float s_trim    = -29.8f;                  // s that holds still; the integral trims around it
 	float smax      = 40.0f;                   // azimuth authority, command counts
@@ -68,6 +81,15 @@ public:
 	// 400 deg/s ceiling aborts before the loop ever runs.
 	float verr_clamp = 50.0f;   // bound on the velocity error fed to the integral; 50 measured best
 	float max_rate  = 4000.0f;                 // deg/s abort threshold (debounced over 3 ticks)
+	// LOW-PASS THE VELOCITY THE CONTROL LAW SEES — not the one the rate guard sees.
+	// MEASURED 2026-08-14/15: the azimuth carries a ~8 Hz disturbance whose frequency barely moves
+	// with loop gain (7.4 / 8.0 / 9.3 Hz at ki 0.1 / 0.3 / 0.9) while its amplitude changes a lot,
+	// and the inner speed loops do not pass it at all — so it is a disturbance, not something the
+	// loop creates. Feeding it raw into kd*vel put it straight back into the command (kd 0.15 took
+	// pk-pk from 89 to 555 deg), and the integral chases it through (vsp - vel) just the same.
+	// Filtering below it lets kd do its job again. The guard keeps the RAW velocity so a real
+	// runaway is never hidden behind a filter.
+	float vel_lpf_hz = 1.0f;                   // 0 disables; 1 Hz measured best (see above)
 	// --- carrier transition (see spinProfile_) ---
 	float spin_secs = 4.0f;                    // 0 -> carrier; the loop is closed throughout
 	float spin_smax = 55.0f;                   // authority during it, capped by the seam
@@ -93,6 +115,15 @@ public:
 	float spin_rpm      = 1200.0f;   // matched target for BOTH motors during the transition
 	float spin_rpm_ok   = 400.0f;    // both must report at least this, FRESH, to count as past the seam
 	float spin_rpm_secs = 8.0f;      // give up if they never get there
+	// THE VELOCITY LOOPS' SLEW HAS TO BE PHASE-DEPENDENT, because one number cannot serve both
+	// jobs. During the transition it sets how gently the pair comes up (high slew = a violent
+	// azimuth kick while they are still unmatched); during the hold it sets how fast the azimuth
+	// loop can move its authority (low slew = the loop cannot chase the disturbance and the pod
+	// walks away). MEASURED 2026-08-15: at slew 1500 every run aborted on the rate guard within
+	// 1-2 s; at 300 they survived to ~4 s but then drifted off monotonically because the loop had
+	// no bandwidth left. The host has separated these phases since 8/11; the firmware had not.
+	float spin_slew = 300.0f;        // rpm/s while coming up
+	float hold_slew = 3000.0f;       // rpm/s once both motors are past the seam
 	// Telem.rpm is UNSIGNED and KEEPS ITS LAST 6-STEP VALUE after the ESC drops back to forced sine,
 	// so the value alone cannot tell "spinning" from "was spinning". Freshness is what distinguishes
 	// them (see the Telem comment in esc_session.h), and skipping it would read a stale rpm as proof
@@ -140,7 +171,7 @@ public:
 		if (!enc_ || !enc_->present()) return false;
 		base_   = enc_->accum();
 		target_ = target_deg;
-		ivel_ = 0.0f; vel_ = 0.0f; pos_ = 0.0f; over_ = 0;
+		ivel_ = 0.0f; vel_ = 0.0f; velf_ = 0.0f; pos_ = 0.0f; over_ = 0;
 		traceClear();
 		last_us_ = t0_us_ = micros();
 		spinning_ = true;
@@ -174,7 +205,7 @@ public:
 		carrier = carrier_cmd;
 		base_   = enc_->accum();
 		target_ = 0.0f;
-		ivel_ = 0.0f; vel_ = 0.0f; pos_ = 0.0f; over_ = 0;
+		ivel_ = 0.0f; vel_ = 0.0f; velf_ = 0.0f; pos_ = 0.0f; over_ = 0;
 		traceClear();
 		step_s_       = constrain(s_cmd, -smax, smax);
 		step_armed_   = false; step_base_u_ = 0.0f;
@@ -234,8 +265,10 @@ public:
 			           && (uint32_t)(ms - tb.rpmStampMs) < TELE_FRESH_MS;
 			if (oka && okb) {
 				rpm_phase_ = false;
-				base_ = enc_->accum(); pos_ = 0.0f; ivel_ = 0.0f;
+				base_ = enc_->accum(); pos_ = 0.0f; ivel_ = 0.0f; velf_ = 0.0f;
 				t0_us_ = now; spinning_ = false;
+				a_->vc.slew_rpm_s = hold_slew;      // hand the loop its bandwidth back
+				b_->vc.slew_rpm_s = hold_slew;
 				if (mode_ == STEP) { step_begin_us_ = now + step_pre_us_;
 				                     step_end_us_   = step_begin_us_ + step_run_us_; }
 			} else if ((uint32_t)(now - rpm_t0_) > (uint32_t)(spin_rpm_secs * 1e6f)) { stop(); return; }
@@ -254,8 +287,11 @@ public:
 		float u_max  = rpm_drive ? (rpm_offset_max / fmaxf(rpm_per_count, 1e-3f))
 		                         : fmaxf(1.0f, fminf(spinning_ ? spin_smax : smax, room_u));
 
+		float a_lp = (vel_lpf_hz > 0.0f) ? (1.0f - expf(-2.0f * 3.14159265f * vel_lpf_hz * dt)) : 1.0f;
+		velf_ += a_lp * (vel_ - velf_);
+
 		float err = target_ - pos_;
-		float vsp = kp * err - kd * vel_;
+		float vsp = kp * err - kd * velf_;
 		vsp = constrain(vsp, -vmax, vmax);
 
 		float uff = kff * vsp;
@@ -265,7 +301,7 @@ public:
 		// of VELOCITY, slamming to the rail in milliseconds. Bounding the error keeps the integral
 		// doing its actual job (cancelling the drifting null) instead of chasing a transient it
 		// cannot influence. verr_clamp <= 0 disables, restoring the old behaviour for comparison.
-		float verr = vsp - vel_;
+		float verr = vsp - velf_;
 		if (verr_clamp > 0.0f) verr = constrain(verr, -verr_clamp, verr_clamp);
 		// NO INTEGRAL BELOW THE SEAM. There `s` has almost no authority over the azimuth, so the
 		// loop can see an error it cannot act on; an integrator left running there winds up and
@@ -380,6 +416,8 @@ private:
 
 	void beginRpmSpinup_() {
 		rpm_phase_ = true; rpm_t0_ = micros();
+		if (a_) a_->vc.slew_rpm_s = spin_slew;
+		if (b_) b_->vc.slew_rpm_s = spin_slew;
 		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
 		if (a_) a_->setRpm(sgn * spin_rpm);
 		if (b_) b_->setRpm(sgn * spin_rpm);
@@ -410,7 +448,7 @@ private:
 	int32_t  base_ = 0;
 	uint32_t last_us_ = 0, t0_us_ = 0, step_begin_us_ = 0, step_end_us_ = 0;
 	uint8_t  over_ = 0;
-	float    target_ = 0, pos_ = 0, vel_ = 0, ivel_ = 0, s_ = 0, c_ = 0;
+	float    target_ = 0, pos_ = 0, vel_ = 0, velf_ = 0, ivel_ = 0, s_ = 0, c_ = 0;
 	float    step_s_ = 0, step_base_u_ = 0;
 	bool     step_armed_ = false, spinning_ = false, rpm_phase_ = false;
 	uint32_t rpm_t0_ = 0, step_pre_us_ = 0, step_run_us_ = 0;

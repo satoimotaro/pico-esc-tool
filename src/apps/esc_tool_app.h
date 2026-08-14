@@ -852,6 +852,9 @@ private:
 							else if(!strcmp(k,"rpmpercount")) az_.rpm_per_count=f;
 							else if(!strcmp(k,"rpmoffmax")) az_.rpm_offset_max=f;
 							else if(!strcmp(k,"rpmtrim")) az_.rpm_trim=f;
+							else if(!strcmp(k,"vellpf")) az_.vel_lpf_hz=f;
+							else if(!strcmp(k,"spinslew")) az_.spin_slew=f;
+							else if(!strcmp(k,"holdslew")) az_.hold_slew=f;
 						else { Serial.println("err az: unknown gain"); continue; }
 						Serial.println("ok"); } }
 					// az step <carrier> <s> <ms> — OPEN LOOP, for plant identification. No feedback:
@@ -890,12 +893,12 @@ private:
 							uint16_t n = az_.traceCount();
 							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
-							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f|spinrpm=%.0f|rpmdrive=%d|rpmpercount=%.2f|rpmoffmax=%.0f|rpmtrim=%.0f"
+							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f|spinrpm=%.0f|rpmdrive=%d|rpmpercount=%.2f|rpmoffmax=%.0f|rpmtrim=%.0f|vellpf=%.2f|spinslew=%.0f|holdslew=%.0f"
 							              "|step_s=%.1f|step_ms=%.1f\n",
 							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
 							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
 							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target(),
-							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.spin_rpm, az_.rpm_drive?1:0, az_.rpm_per_count, az_.rpm_offset_max, az_.rpm_trim, az_.stepS(),
+							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.spin_rpm, az_.rpm_drive?1:0, az_.rpm_per_count, az_.rpm_offset_max, az_.rpm_trim, az_.vel_lpf_hz, az_.spin_slew, az_.hold_slew, az_.stepS(),
 							              n ? (double)(int32_t)(az_.stepBeginUs() - az_.traceAt(0).t_us) / 1000.0
 							                : 0.0);
 							Serial.println("t_ms,pos,vel,s,ivel,carrier,rpm_a,rpm_b");

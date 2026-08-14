@@ -491,7 +491,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
 _AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
-             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim")
+             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew")
 
 
 def _az_host(args):
@@ -510,7 +510,8 @@ def _az_push_config(d, args):
             "spinrpm": args.spin_rpm, "spinrpmok": args.spin_rpm_ok,
             "rpmdrive": 1 if args.rpm_drive else 0,
             "rpmpercount": args.rpm_per_count, "rpmoffmax": args.rpm_off_max,
-            "rpmtrim": args.rpm_trim}
+            "rpmtrim": args.rpm_trim, "vellpf": args.vel_lpf,
+            "spinslew": args.spin_slew, "holdslew": args.hold_slew}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -575,13 +576,47 @@ def _az_pull(d, name, quiet=False):
 
 
 def cmd_trace(args):
-    """Run the ON-DEVICE hold and read its own trace back. This is the measurement, not `az status`."""
+    """Run the ON-DEVICE hold N times and report the DISTRIBUTION of the metrics.
+
+    One run is not a result. On 2026-08-15 the same configuration gave pos pk-pk 89 deg and then
+    447 deg back to back, and a single-run reading of the first was reported as the session best.
+    Run-to-run spread is itself the thing being tuned here — the disturbance is the two motors'
+    speed mismatch, which settles somewhere different on every spin-up — so `--repeat` is the
+    default way in, and the summary prints the spread, not just the middle.
+    """
+    all_runs = [_trace_once(args, k) for k in range(max(1, args.repeat))]
+    # A RUN THAT ABORTED IS NOT A RESULT. The rate guard stops the loop and both motors, so the
+    # trace ends early and the metrics window then covers the SPIN-UP TRANSIENT instead of a hold.
+    # On 2026-08-15 twenty-one runs across seven configurations were compared this way before the
+    # operator noticed the pod was stopping after a second — every "improvement" was noise in
+    # transient data. Aborted runs are excluded and counted, loudly.
+    runs = [m for m in all_runs if m.get("n") and m.get("completed")]
+    aborted = len(all_runs) - len(runs)
+    if aborted:
+        print(f"#   !! {aborted}/{len(all_runs)} runs ABORTED before {args.secs:.0f}s "
+              f"(rate guard) — excluded from the summary")
+    if not runs:
+        print("#   !! NO COMPLETED RUNS — nothing here is a measurement of a hold")
+        return
+    if len(runs) > 1:
+        print(f"\n# ==== {len(runs)} runs, spin_rpm {args.spin_rpm:.0f}, "
+              f"kp {args.kp} ki {args.ki} kd {args.kd} lpf {args.vel_lpf} ====")
+        for key, label, unit in (("vel_rms", "convergence rms(vel)", "deg/s"),
+                                 ("pos_pkpk", "limit cycle  pos pk-pk", "deg"),
+                                 ("err_mean", "steady state err mean", "deg")):
+            v = sorted(m[key] for m in runs)
+            mid = v[len(v) // 2]
+            print(f"#   {label:24s} median {mid:9.1f}  worst {max(v, key=abs):9.1f}  "
+                  f"spread {min(v):.1f}..{max(v):.1f} {unit}")
+
+
+def _trace_once(args, k=0):
     d = _az_host(args)
     try:
         _az_push_config(d, args)
         for i in (args.idx_a, args.idx_b):
             d.cmd(f"arm {i} bidir", timeout=10)
-        print(f"# spinning up {args.spinup_secs:.1f}s, then az on carrier={args.carrier} tgt={args.deg}")
+        print(f"# run {k+1}: spin-up {args.spinup_secs:.1f}s, az on carrier={args.carrier} tgt={args.deg}")
         time.sleep(args.spinup_secs)
         print(d.cmd(f"az on {args.carrier} {args.deg}", timeout=8)[0])
         t0 = time.time()
@@ -594,15 +629,16 @@ def cmd_trace(args):
         time.sleep(max(0.0, args.secs - (time.time() - t0)))
     finally:
         _az_safe(d)
-    tr, _ = _az_pull(d, args.name)
+    tr, _ = _az_pull(d, f"{args.name}{k}" if args.repeat > 1 else args.name, quiet=True)
     m = metrics(tr, window=args.window)
-    print(f"\n# last {m.get('secs', 0):.1f}s  ({m['n']} samples)")
-    print(f"#   convergence  rms(vel) {m['vel_rms']:8.1f} deg/s   peak |vel| {m['vel_peak']:8.1f}")
-    print(f"#   limit cycle  pos pk-pk {m['pos_pkpk']:7.1f} deg")
-    print(f"#   steady state err mean {m['err_mean']:+8.2f} deg  (sd {m['err_std']:.2f})")
-    print(f"#   actuator     s mean {m['s_mean']:+7.1f}  seam margin min {m['seam_margin_min']:.1f} "
-          f"counts  saturated {100*m['sat_frac']:.0f}%")
-    print(f"# => {verdict(m)}")
+    # The device stops on its own rate guard, so a short trace means the run did not hold.
+    m["completed"] = tr.duration >= 0.85 * args.secs
+    m["dur"] = tr.duration
+    tag = "held" if m["completed"] else "ABORTED"
+    print(f"#   [{tag:7s} {m['dur']:5.1f}s] rms(vel) {m['vel_rms']:8.1f}  pk-pk {m['pos_pkpk']:7.1f}"
+          f"  err {m['err_mean']:+7.2f}  peak|vel| {m['vel_peak']:7.0f}")
+    time.sleep(args.rest)
+    return m
     if m["seam_margin_min"] < 20:
         print(f"# WARNING: a motor came within {m['seam_margin_min']:.0f} counts of the 6-step seam. "
               f"Every excursion in the 8/11 host trace was preceded by exactly this. "
@@ -675,6 +711,14 @@ def add_ondevice(p):
                    help="the old raw-carrier actuation, for comparison")
     p.add_argument("--rpm-per-count", type=float, default=7.26,
                    help="1/(gain*kff); measured gain is 6.0 deg/s per rpm of offset")
+    p.add_argument("--spin-slew", type=float, default=300.0,
+                   help="velocity-loop slew (rpm/s) while coming up — gentle")
+    p.add_argument("--hold-slew", type=float, default=3000.0,
+                   help="slew once both motors are past the seam — this is the azimuth "
+                        "loop's actuator bandwidth")
+    p.add_argument("--vel-lpf", type=float, default=1.0,
+                   help="low-pass (Hz) on the velocity the CONTROL LAW sees; the rate "
+                        "guard keeps the raw signal. 0 disables")
     p.add_argument("--rpm-trim", type=float, default=-137.0,
                    help="rpm offset that holds the azimuth still (measured)")
     p.add_argument("--rpm-off-max", type=float, default=400.0,
@@ -698,9 +742,11 @@ def add_ondevice(p):
                         "the bidir-DShot arming sequence; 1.0 s is NOT enough (measured)")
     p.add_argument("--decim", type=int, default=5, help="trace every Nth poll (5 ~= 200 Hz)")
     p.add_argument("--name", default="trace", help="report filename stem")
-    p.add_argument("--kp", type=float, default=3.0)
-    p.add_argument("--ki", type=float, default=0.5)
-    p.add_argument("--kd", type=float, default=0.3)
+    p.add_argument("--kp", type=float, default=0.5)
+    p.add_argument("--ki", type=float, default=0.3)
+    p.add_argument("--kd", type=float, default=0.0,
+                   help="0 on purpose: the ~8 Hz disturbance plus the velocity estimate's "
+                        "own lag puts the derivative in phase to reinforce it")
     p.add_argument("--kff", type=float, default=1.0 / (AZIMUTH_RPM_PER_S * 6.0))
     p.add_argument("--s-trim", type=float, default=AZIMUTH_NULL_S)
     p.add_argument("--smax", type=float, default=40.0)
@@ -833,6 +879,10 @@ def main():
     tc.add_argument("--deg", type=float, default=0.0)
     tc.add_argument("--secs", type=float, default=20.0)
     tc.add_argument("--window", type=float, default=5.0, help="metrics window, seconds from the end")
+    tc.add_argument("--repeat", type=int, default=3,
+                    help="runs per configuration. ONE RUN IS NOT A RESULT — the same config has "
+                         "given pk-pk 89 and 447 deg back to back")
+    tc.add_argument("--rest", type=float, default=6.0, help="seconds between runs")
     tc.add_argument("--poke-at", type=float, default=0.0,
                     help="prompt for a hand disturbance this many seconds in (0 = no prompt)")
     add_ondevice(tc)
