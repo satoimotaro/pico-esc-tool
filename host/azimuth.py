@@ -491,7 +491,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
 _AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
-             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold")
+             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim")
 
 
 def _az_host(args):
@@ -506,7 +506,11 @@ def _az_push_config(d, args):
             "smax": args.smax, "vmax": args.vmax, "maxrate": args.max_rate,
             "verrclamp": args.verr_clamp, "signb": args.sign_b,
             "spinsecs": args.spin_secs, "spinsmax": args.spin_smax,
-            "seamkeep": args.seam_keep, "spinhold": args.spin_hold}
+            "seamkeep": args.seam_keep, "spinhold": args.spin_hold,
+            "spinrpm": args.spin_rpm, "spinrpmok": args.spin_rpm_ok,
+            "rpmdrive": 1 if args.rpm_drive else 0,
+            "rpmpercount": args.rpm_per_count, "rpmoffmax": args.rpm_off_max,
+            "rpmtrim": args.rpm_trim}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -561,10 +565,10 @@ def _az_pull(d, name, quiet=False):
     path = os.path.join(REPORT_DIR, f"az_{name}_{time.strftime('%Y%m%d-%H%M%S')}.csv")
     with open(path, "w") as f:
         f.write("# " + "|".join(f"{k}={v}" for k, v in tr.config.items()) + "\n")
-        f.write("t_s,pos,vel,s,ivel,carrier\n")
+        f.write("t_s,pos,vel,s,ivel,carrier,rpm_a,rpm_b\n")
         for i in range(len(tr)):
             f.write(f"{tr.t[i]:.4f},{tr.pos[i]:.2f},{tr.vel[i]:.1f},{tr.s[i]:.1f},"
-                    f"{tr.ivel[i]:.1f},{tr.carrier[i]:.0f}\n")
+                    f"{tr.ivel[i]:.1f},{tr.carrier[i]:.0f},{tr.rpm_a[i]:.0f},{tr.rpm_b[i]:.0f}\n")
     if not quiet:
         print(f"# wrote {path}  ({len(tr)} samples, {tr.duration:.1f} s at {tr.rate_hz:.0f} Hz)")
     return tr, path
@@ -664,6 +668,23 @@ def add_ondevice(p):
                         "the authority rail; -600 leaves 15 (docs/azimuth-closed-loop.md)")
     p.add_argument("--spin-secs", type=float, default=4.0,
                    help="ON-DEVICE carrier transition (two-stage, loop closed throughout)")
+    p.add_argument("--rpm-drive", action="store_true", default=True,
+                   help="actuate in RPM space: thrust = --spin-rpm, azimuth = the rpm difference. "
+                        "The ESC velocity loops absorb the seam and the motor mismatch (default)")
+    p.add_argument("--raw-drive", dest="rpm_drive", action="store_false",
+                   help="the old raw-carrier actuation, for comparison")
+    p.add_argument("--rpm-per-count", type=float, default=7.26,
+                   help="1/(gain*kff); measured gain is 6.0 deg/s per rpm of offset")
+    p.add_argument("--rpm-trim", type=float, default=-137.0,
+                   help="rpm offset that holds the azimuth still (measured)")
+    p.add_argument("--rpm-off-max", type=float, default=400.0,
+                   help="azimuth authority in mech rpm")
+    p.add_argument("--spin-rpm", type=float, default=1200.0,
+                   help="matched closed-loop speed target for BOTH motors during the transition — "
+                        "this is what stops two independent ramps dumping a whole motor of "
+                        "mismatch into the azimuth")
+    p.add_argument("--spin-rpm-ok", type=float, default=400.0,
+                   help="both must report at least this (fresh) to count as past the seam")
     p.add_argument("--spin-hold", type=float, default=0.8,
                    help="seconds at the snap carrier with s forced to 0, so both motors cross the "
                         "seam together instead of straddling it")

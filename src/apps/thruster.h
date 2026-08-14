@@ -109,6 +109,17 @@ public:
 	}
 	// RPM target: engage the closed loop. Reset the step clock so the first dt is sane.
 	void setRpm(float rpm) { submode_ = RPM; vc.setTarget(rpm); lastStepUs_ = micros(); }
+	// RETARGET WITHOUT RESETTING THE STEP CLOCK. setRpm() deliberately reseeds lastStepUs_ so a fresh
+	// engagement starts with a sane dt — but a caller that retargets at LOOP RATE (the azimuth loop
+	// does, at ~1 kHz) reseeds it immediately before poll() reads it, so dt comes out ~0 on every
+	// tick and the velocity loop's integral and derivative silently contribute nothing. Measured
+	// 2026-08-14: the two motors then wandered independently under a weak proportional term alone,
+	// and the differential turned that wander straight into azimuth motion the position loop could
+	// not counter at any gain. Retarget through here; engage through setRpm().
+	void setRpmTarget(float rpm) {
+		if (submode_ != RPM) { submode_ = RPM; lastStepUs_ = micros(); }
+		vc.setTarget(rpm);
+	}
 	// Stopping ends the only condition under which the soft-sensor is meaningful, so the validity flag
 	// has to fall with it: poll() returns early when not in RPM mode, so the gate would otherwise keep
 	// its last value and `sense` would report a stale vest as valid on a motionless motor.

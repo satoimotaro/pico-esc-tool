@@ -83,6 +83,41 @@ public:
 	// and a pair straddling the seam is a whole motor of mismatch (~1500 rpm) that no azimuth
 	// authority can cancel — measured at -944 deg/s on 2026-08-14.
 	float spin_hold = 0.8f;
+	// --- RPM-SUBMODE SPIN-UP. The differential's azimuth is driven by the DIFFERENCE of the two
+	// motors, so two independent open-loop ramps put a whole motor of mismatch (~1500 rpm) into the
+	// azimuth faster than any trim can cancel — measured 2026-08-14, every raw spin-up aborted on
+	// the rate guard at 3800-4300 deg/s within 1.4 s. Giving both motors the SAME closed-loop speed
+	// target instead makes each ESC regulate its own speed, so the mismatch is cancelled at its
+	// source rather than trimmed afterwards. It is also the only path that reliably crosses the
+	// seam at all: raw drive could not start a motor from rest, the RPM submode held 2431 rpm.
+	float spin_rpm      = 1200.0f;   // matched target for BOTH motors during the transition
+	float spin_rpm_ok   = 400.0f;    // both must report at least this, FRESH, to count as past the seam
+	float spin_rpm_secs = 8.0f;      // give up if they never get there
+	// Telem.rpm is UNSIGNED and KEEPS ITS LAST 6-STEP VALUE after the ESC drops back to forced sine,
+	// so the value alone cannot tell "spinning" from "was spinning". Freshness is what distinguishes
+	// them (see the Telem comment in esc_session.h), and skipping it would read a stale rpm as proof
+	// the motor is up.
+	static const uint32_t TELE_FRESH_MS = 150;
+	// --- RPM-SPACE ACTUATION. The raw carrier drives each ESC open-loop, so the azimuth sees the
+	// DIFFERENCE of two uncontrolled speeds: the seam cliff, the motor mismatch and the drifting
+	// null are all consequences of that. Commanding the two SPEEDS instead makes each ESC regulate
+	// its own, so the azimuth channel is (R + r) - (R - r) = 2r and the mismatch is cancelled by
+	// the speed loops rather than trimmed by the position loop.
+	//   thrust  = spin_rpm   (raise this to push harder)
+	//   azimuth = r          (what the position loop commands)
+	// Measured on this pod 2026-08-14: the two velocity loops were configured differently — slew
+	// 200 vs 2000 rpm/s — so the same target ramped one motor ten times faster than the other, and
+	// that difference went straight into the azimuth. That, not physics, was the "whole motor of
+	// mismatch" the spin-up notes had treated as unavoidable since 8/11.
+	bool  rpm_drive     = true;
+	// MEASURED 2026-08-14 in rpm space (each point approached from r = 0, R = -800):
+	//   r = -200 -> -371 deg/s, +100 -> +1251, +200 -> +2011  =>  slope +6.0 deg/s per rpm,
+	//   null at r ~ -137 rpm. Chosen so the feedforward is exact: rate = 6.0 * (kff*vsp) *
+	//   rpm_per_count must equal vsp, i.e. rpm_per_count = 1/(6.0*kff) = 7.26.
+	float rpm_per_count = 7.26f;
+	float rpm_trim      = -137.0f;   // rpm offset that holds the azimuth still — the integral trims
+	                                 // around it, exactly as s_trim does for the raw path
+	float rpm_offset_max = 400.0f;   // authority, mech rpm
 
 	// --- trace ring -------------------------------------------------------------------------
 	// WHY THIS EXISTS. Every azimuth result on record was read by polling `az status` from the host
@@ -92,7 +127,11 @@ public:
 	// keep its own history; there is no host tick fast enough to stand in for it.
 	// 16 bytes/sample: at the default decimation of 5 (~200 Hz) the ring holds the last ~10 s,
 	// which is the window the convergence metrics are defined over.
-	struct Sample { uint32_t t_us; float pos; float vel; int16_t s_q; int16_t ivel_q; int16_t c_q; };
+	// ra/rb are the MEASURED motor speeds. Without them a trace cannot say whether the plant did what
+	// the loop asked — every remaining question on 2026-08-14 was of that form, and answering it by
+	// polling `tele` from the host at 0.8 s aliased a pod moving at thousands of deg/s.
+	struct Sample { uint32_t t_us; float pos; float vel;
+	                int16_t s_q; int16_t ivel_q; int16_t c_q; int16_t ra; int16_t rb; };
 	static const uint16_t TRACE_N = 2048;
 
 	void bind(Thruster* a, Thruster* b, As5600Tracker* enc) { a_ = a; b_ = b; enc_ = enc; }
@@ -106,6 +145,7 @@ public:
 		last_us_ = t0_us_ = micros();
 		spinning_ = true;
 		mode_ = HOLD; on_ = true;
+		beginRpmSpinup_();
 		return true;
 	}
 
@@ -141,13 +181,15 @@ public:
 		last_us_ = t0_us_ = micros();
 		spinning_ = true;
 		// pre_ms is settle time AFTER the carrier transition, not counted from the very start.
-		step_begin_us_ = last_us_ + (uint32_t)(spin_secs * 1e6f) + pre_ms * 1000UL;
-		step_end_us_   = step_begin_us_ + ms * 1000UL;
+		step_pre_us_ = (uint32_t)(spin_secs * 1e6f) + pre_ms * 1000UL;
+		step_run_us_ = ms * 1000UL;
+		step_begin_us_ = last_us_ + step_pre_us_;      // re-based when the RPM spin-up hands over
+		step_end_us_   = step_begin_us_ + step_run_us_;
 		mode_ = STEP; on_ = true;
 		return true;
 	}
 
-	void stop() { on_ = false; mode_ = OFF; ivel_ = 0.0f; step_armed_ = false;
+	void stop() { on_ = false; mode_ = OFF; ivel_ = 0.0f; step_armed_ = false; rpm_phase_ = false;
 	              if (a_) a_->setRaw(0); if (b_) b_->setRaw(0); }   // NOTE: keeps the trace — it is
 	                                                               // read back after the run stops.
 	void setTarget(float deg) { target_ = deg; }
@@ -180,6 +222,25 @@ public:
 		if (fabsf(vel_) > max_rate) { if (++over_ >= 3) { stop(); return; } }
 		else over_ = 0;
 
+		// The loop runs from the first tick — including through the spin-up, which is the whole
+		// point (the host reached the same conclusion in 5d59aea). What the spin-up window gates is
+		// only WHEN the heading is zeroed: drift accrued before both motors are actually up is a
+		// transition artefact, not tracking error.
+		if (rpm_phase_) {
+			escs::Telem ta, tb; uint32_t ms = millis();
+			bool oka = a_->tele(ta) && ta.valid && ta.rpm >= (uint32_t)spin_rpm_ok
+			           && (uint32_t)(ms - ta.rpmStampMs) < TELE_FRESH_MS;
+			bool okb = b_->tele(tb) && tb.valid && tb.rpm >= (uint32_t)spin_rpm_ok
+			           && (uint32_t)(ms - tb.rpmStampMs) < TELE_FRESH_MS;
+			if (oka && okb) {
+				rpm_phase_ = false;
+				base_ = enc_->accum(); pos_ = 0.0f; ivel_ = 0.0f;
+				t0_us_ = now; spinning_ = false;
+				if (mode_ == STEP) { step_begin_us_ = now + step_pre_us_;
+				                     step_end_us_   = step_begin_us_ + step_run_us_; }
+			} else if ((uint32_t)(now - rpm_t0_) > (uint32_t)(spin_rpm_secs * 1e6f)) { stop(); return; }
+		}
+
 		// --- carrier transition. NOT a jump; see spinProfile_(). ---
 		float c_now = spinProfile_(now);
 		bool  below = fabsf(c_now) < (float)SEAM_CMD;
@@ -187,7 +248,11 @@ public:
 		// |u| <= |carrier| - seam - |s_trim|. During the transition the loop is fighting a mismatch
 		// of up to a whole motor, so it gets all the room that leaves; afterwards it uses smax.
 		float room_u = fabsf(c_now) - (float)SEAM_CMD - fabsf(s_trim) - seam_keep;
-		float u_max  = fmaxf(1.0f, fminf(spinning_ ? spin_smax : smax, room_u));
+		// In rpm space the seam is the ESC's problem, not ours: each velocity loop keeps its own
+		// motor wherever it needs to be. So the authority is bounded by rpm_offset_max, not by the
+		// carrier's headroom above the seam.
+		float u_max  = rpm_drive ? (rpm_offset_max / fmaxf(rpm_per_count, 1e-3f))
+		                         : fmaxf(1.0f, fminf(spinning_ ? spin_smax : smax, room_u));
 
 		float err = target_ - pos_;
 		float vsp = kp * err - kd * vel_;
@@ -221,7 +286,7 @@ public:
 		// spin-up aborted on the rate guard every time. Holding the DELIVERED s at zero makes both
 		// motors identical, so they cross together and the only mismatch left is the intrinsic one
 		// the trim exists to cancel. The trim (and the loop) come back once both are clear.
-		if (spinning_ && (int32_t)(now - t0_us_) < (int32_t)(spin_hold * 1e6f)) {
+		if (!rpm_drive && spinning_ && (int32_t)(now - t0_us_) < (int32_t)(spin_hold * 1e6f)) {
 			ivel_ = 0.0f;
 			u = -s_trim;                       // => apply_ delivers s = u + s_trim = 0
 		}
@@ -231,13 +296,14 @@ public:
 			u = constrain(step_base_u_ + step_s_, -u_max, u_max);
 		}
 
-		apply_(u, c_now);
+		if (rpm_drive) applyRpm_(u); else apply_(u, c_now);
 		record_(now);
 		if (mode_ == STEP && (int32_t)(now - step_end_us_) >= 0) stop();
 	}
 
 	bool  on()     const { return on_; }
 	bool  stepping() const { return mode_ == STEP; }
+	bool  spinningRpm() const { return rpm_phase_; }
 	float stepS()  const { return step_s_; }
 	uint32_t stepBeginUs() const { return step_begin_us_; }   // AFTER the +/-smax clamp — the step the plant saw,
 	                                           // which is what the gain fit must divide by.
@@ -297,6 +363,28 @@ private:
 		return past + (carrier - past) * f;
 	}
 
+	// (R + r) and (R - r): the sum is thrust, the difference is azimuth. s_ / c_ are still recorded
+	// in COMMAND units so one set of metrics reads both actuation modes.
+	void applyRpm_(float u) {
+		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
+		float r   = constrain(u * rpm_per_count + rpm_trim, -rpm_offset_max, rpm_offset_max);
+		// PARALLEL TO THE RAW MIX, and the parallel has to be exact: raw is a = c + s, b = c - s,
+		// so with a NEGATIVE carrier a more negative s makes |a| LARGER. Writing sgn*(R + r) puts
+		// the sign outside and inverts that — the loop then drives the error instead of correcting
+		// it. Measured 2026-08-14: u pinned at its -28.6 rail while pos ran 85 -> 599 deg and
+		// accelerated to 4048 deg/s. Same class of error as the sign_b placeholder, new coordinate.
+		a_->setRpmTarget(sgn * spin_rpm + r);
+		b_->setRpmTarget(sgn * spin_rpm - r);
+		s_ = u; c_ = spin_rpm;
+	}
+
+	void beginRpmSpinup_() {
+		rpm_phase_ = true; rpm_t0_ = micros();
+		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
+		if (a_) a_->setRpm(sgn * spin_rpm);
+		if (b_) b_->setRpm(sgn * spin_rpm);
+	}
+
 	void record_(uint32_t now) {
 		if (++dec_n_ < decim_) return;
 		dec_n_ = 0;
@@ -307,6 +395,9 @@ private:
 		x.s_q    = (int16_t)lroundf(constrain(s_    * 10.0f, -32000.0f, 32000.0f));
 		x.ivel_q = (int16_t)lroundf(constrain(ivel_ * 10.0f, -32000.0f, 32000.0f));
 		x.c_q    = (int16_t)lroundf(constrain(c_,           -32000.0f, 32000.0f));
+		escs::Telem ta, tb;
+		x.ra = (a_ && a_->tele(ta) && ta.valid) ? (int16_t)min<uint32_t>(ta.rpm, 32000) : -1;
+		x.rb = (b_ && b_->tele(tb) && tb.valid) ? (int16_t)min<uint32_t>(tb.rpm, 32000) : -1;
 		tr_head_ = (uint16_t)((tr_head_ + 1) % TRACE_N);
 		if (tr_count_ < TRACE_N) tr_count_++;
 	}
@@ -321,7 +412,8 @@ private:
 	uint8_t  over_ = 0;
 	float    target_ = 0, pos_ = 0, vel_ = 0, ivel_ = 0, s_ = 0, c_ = 0;
 	float    step_s_ = 0, step_base_u_ = 0;
-	bool     step_armed_ = false, spinning_ = false;
+	bool     step_armed_ = false, spinning_ = false, rpm_phase_ = false;
+	uint32_t rpm_t0_ = 0, step_pre_us_ = 0, step_run_us_ = 0;
 
 	Sample   trace_[TRACE_N];
 	uint16_t tr_head_ = 0, tr_count_ = 0, decim_ = 5, dec_n_ = 0;

@@ -45,6 +45,8 @@ class AzTrace:
     s: list[float] = field(default_factory=list)      # delivered azimuth command, counts (trim in)
     ivel: list[float] = field(default_factory=list)   # integral state, counts
     carrier: list[float] = field(default_factory=list)  # LIVE carrier — varies through the spin-up
+    rpm_a: list[float] = field(default_factory=list)    # MEASURED motor speeds (magnitude), -1 = no
+    rpm_b: list[float] = field(default_factory=list)    # telemetry that tick
 
     def __len__(self):
         return len(self.t)
@@ -106,7 +108,7 @@ def parse_dump(lines) -> AzTrace:
         if ln.startswith("err "):
             raise ValueError(f"device refused the dump: {ln}")
         parts = ln.split(",")
-        if len(parts) not in (5, 6):          # 6 since the live carrier was added
+        if len(parts) not in (5, 6, 8):       # 6 = + live carrier, 8 = + measured motor rpm
             continue
         try:
             rows.append(tuple(float(p) for p in parts))
@@ -123,6 +125,8 @@ def parse_dump(lines) -> AzTrace:
         tr.s.append(s)
         tr.ivel.append(ivel)
         tr.carrier.append(row[5] if len(row) > 5 else float(tr.config.get("carrier", 0.0)))
+        tr.rpm_a.append(row[6] if len(row) > 7 else float("nan"))
+        tr.rpm_b.append(row[7] if len(row) > 7 else float("nan"))
     if seen_header and not rows and cfg.get("n", 0):
         raise ValueError(f"header claims n={cfg['n']} but no rows parsed")
     return tr
