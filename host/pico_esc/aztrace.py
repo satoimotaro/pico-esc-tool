@@ -147,6 +147,11 @@ def seam_margin(tr: AzTrace) -> list[float]:
     return [abs(c) - abs(sv) - seam for c, sv in zip(cs, tr.s)]
 
 
+def _wrap_deg(d: float) -> float:
+    """Fold a heading error into (-180, +180]."""
+    return (d + 180.0) % 360.0 - 180.0
+
+
 def metrics(tr: AzTrace, window=5.0, target=None) -> dict:
     """Score the last `window` seconds. Three independent answers, deliberately not combined.
 
@@ -159,7 +164,11 @@ def metrics(tr: AzTrace, window=5.0, target=None) -> dict:
     tgt = float(tr.config.get("tgt", 0.0)) if target is None else float(target)
     vel = [tr.vel[i] for i in idx]
     pos = [tr.pos[i] for i in idx]
-    err = [tgt - p for p in pos]
+    # WRAP, to match what the loop servos. The azimuth is a continuously rotating axis and `pos`
+    # is an UNWRAPPED accumulator, so an unwrapped err reports "2500 deg off" for a pod that is
+    # physically 20 deg off after seven revolutions. The firmware wraps (Azimuth::wrap_err); a
+    # metric that does not is measuring a different quantity from the one being controlled.
+    err = [_wrap_deg(tgt - p) for p in pos]
     sv = [tr.s[i] for i in idx]
     marg = [seam_margin(tr)[i] for i in idx]
     n = len(idx)
@@ -178,6 +187,14 @@ def metrics(tr: AzTrace, window=5.0, target=None) -> dict:
         # --- limit cycle: is it oscillating? ---
         "pos_pkpk": max(pos) - min(pos),
         # --- steady-state error: where did it stop? (what the integral is for) ---
+        # MEAN OF A WRAPPED ERROR IS NOT EVIDENCE OF A HOLD. On a continuously rotating axis the
+        # wrapped error sweeps the whole circle, so its mean tends to ZERO however fast the pod is
+        # spinning. MEASURED 2026-08-15: two runs reported err_mean -11.2 and -30.8 deg while the
+        # pod turned +1997 and +1155 deg net and sat at mean|err| 82-85 — i.e. the 90 deg a free
+        # spin gives. Judge a hold on `err_abs_mean` (small) AND `net_rot` (near zero); err_mean
+        # only tells you which side of the target it favours ONCE those two say it is holding.
+        "err_abs_mean": sum(abs(e) for e in err) / n,
+        "net_rot": pos[-1] - pos[0],
         "err_mean": mean_err,
         "err_std": math.sqrt(sum((e - mean_err) ** 2 for e in err) / n),
         # --- actuator health ---

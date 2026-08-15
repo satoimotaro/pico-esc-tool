@@ -491,7 +491,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
 _AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
-             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew")
+             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew", "spinmaxrate", "spinguard", "wraperr", "rpmfloor", "crosszero", "thrustrpm", "thrustsecs", "oversecs", "hardrate", "mixswap", "nullratio", "kipos", "iposmax", "spinokfrac", "trimsecs")
 
 
 def _az_host(args):
@@ -511,7 +511,15 @@ def _az_push_config(d, args):
             "rpmdrive": 1 if args.rpm_drive else 0,
             "rpmpercount": args.rpm_per_count, "rpmoffmax": args.rpm_off_max,
             "rpmtrim": args.rpm_trim, "vellpf": args.vel_lpf,
-            "spinslew": args.spin_slew, "holdslew": args.hold_slew}
+            "spinslew": args.spin_slew, "holdslew": args.hold_slew,
+            "spinmaxrate": args.spin_max_rate, "spinguard": args.spin_guard,
+            "wraperr": 1 if args.wrap_err else 0, "rpmfloor": args.rpm_floor,
+            "crosszero": 1 if args.cross_zero else 0,
+            "thrustrpm": args.thrust_rpm, "thrustsecs": args.thrust_secs,
+            "oversecs": args.over_secs, "hardrate": args.hard_rate,
+            "mixswap": 1 if args.mix_swap else 0, "nullratio": args.null_ratio,
+            "kipos": args.ki_pos, "iposmax": args.ipos_max,
+            "spinokfrac": args.spin_ok_frac, "trimsecs": args.trim_secs}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -594,14 +602,18 @@ def cmd_trace(args):
     aborted = len(all_runs) - len(runs)
     if aborted:
         print(f"#   !! {aborted}/{len(all_runs)} runs ABORTED before {args.secs:.0f}s "
-              f"(rate guard) — excluded from the summary")
+              f"(the DEVICE stopped its own loop) — excluded from the summary")
     if not runs:
         print("#   !! NO COMPLETED RUNS — nothing here is a measurement of a hold")
         return
     if len(runs) > 1:
         print(f"\n# ==== {len(runs)} runs, spin_rpm {args.spin_rpm:.0f}, "
               f"kp {args.kp} ki {args.ki} kd {args.kd} lpf {args.vel_lpf} ====")
-        for key, label, unit in (("vel_rms", "convergence rms(vel)", "deg/s"),
+        # err_abs_mean and net_rot FIRST: they are the two that say whether it held at all. A free
+        # spin gives err_abs_mean ~90 deg however small err_mean happens to average out to.
+        for key, label, unit in (("err_abs_mean", "HOLD?  mean|err| (90=free)", "deg"),
+                                 ("net_rot", "HOLD?  net rotation", "deg"),
+                                 ("vel_rms", "convergence rms(vel)", "deg/s"),
                                  ("pos_pkpk", "limit cycle  pos pk-pk", "deg"),
                                  ("err_mean", "steady state err mean", "deg")):
             v = sorted(m[key] for m in runs)
@@ -627,16 +639,34 @@ def _trace_once(args, k=0):
             time.sleep(min(args.poke_at, args.secs))
             print(f"### POKE THE POD BY HAND NOW ({args.secs - args.poke_at:.0f}s of recording left)")
         time.sleep(max(0.0, args.secs - (time.time() - t0)))
+        # ASK THE DEVICE, do not infer from the trace length. `az status` field 1 is `on()`, so it
+        # answers "did the loop stop itself" directly — and it has to be read BEFORE `_az_safe`
+        # turns the loop off. The old test was `tr.duration >= 0.85 * secs`, which is wrong for any
+        # run longer than the ring: TRACE_N 2048 at decim 5 saturates around 11.7 s, so on
+        # 2026-08-15 three runs that held the full 14 s with peak |vel| 2735-2946 against a 4000
+        # guard were all reported ABORTED. A metric that calls a success a failure is worse than no
+        # metric — this thread has already discarded good runs once.
+        still_on = None
+        try:
+            for line in d.cmd("az status", timeout=5):
+                f = line.strip().split("|")
+                if f[0] == "az" and len(f) > 1:
+                    still_on = (f[1] == "1")
+        except Exception:
+            pass
     finally:
         _az_safe(d)
     tr, _ = _az_pull(d, f"{args.name}{k}" if args.repeat > 1 else args.name, quiet=True)
     m = metrics(tr, window=args.window)
-    # The device stops on its own rate guard, so a short trace means the run did not hold.
-    m["completed"] = tr.duration >= 0.85 * args.secs
+    # Fall back to the length test only if the device could not be asked.
+    m["completed"] = still_on if still_on is not None else (tr.duration >= 0.85 * args.secs)
     m["dur"] = tr.duration
     tag = "held" if m["completed"] else "ABORTED"
-    print(f"#   [{tag:7s} {m['dur']:5.1f}s] rms(vel) {m['vel_rms']:8.1f}  pk-pk {m['pos_pkpk']:7.1f}"
-          f"  err {m['err_mean']:+7.2f}  peak|vel| {m['vel_peak']:7.0f}")
+    # `dur` is the RING's span, not the run's — say so, so a 14 s hold reading 11.7 s is not read
+    # as an early stop.
+    print(f"#   [{tag:7s} ring {m['dur']:5.1f}s] mean|err| {m['err_abs_mean']:6.1f}  "
+          f"net_rot {m['net_rot']:+8.0f}  rms(vel) {m['vel_rms']:7.1f}  pk-pk {m['pos_pkpk']:7.1f}"
+          f"  peak|vel| {m['vel_peak']:6.0f}")
     time.sleep(args.rest)
     return m
     if m["seam_margin_min"] < 20:
@@ -721,12 +751,34 @@ def add_ondevice(p):
                         "guard keeps the raw signal. 0 disables")
     p.add_argument("--rpm-trim", type=float, default=-137.0,
                    help="rpm offset that holds the azimuth still (measured)")
+    p.add_argument("--thrust-rpm", type=float, default=0.0,
+                   help="final thrust. 0 = stay at --spin-rpm. Otherwise the pair crosses the seam "
+                        "at --spin-rpm (survivable), the loop captures, and only THEN does the "
+                        "thrust ramp to this over --thrust-secs. The azimuth authority grows with "
+                        "it, since rLimit = min(rpm_off_max, thrust - rpm_floor).")
+    p.add_argument("--thrust-secs", type=float, default=6.0,
+                   help="seconds for the spin_rpm -> thrust_rpm ramp, started at the handover")
+    p.add_argument("--cross-zero", dest="cross_zero", action="store_true", default=True,
+                   help="deliver r = 0 until BOTH motors report up, so the pair crosses the 6-step "
+                        "seam on identical commands (default; the raw path has always done this)")
+    p.add_argument("--no-cross-zero", dest="cross_zero", action="store_false")
+    p.add_argument("--rpm-floor", type=float, default=800.0,
+                   help="neither motor may be commanded below this (mech rpm). The azimuth "
+                        "authority is min(--rpm-off-max, spin_rpm - this), so it scales with thrust "
+                        "instead of being a hand-set constant that lands the low motor on the seam.")
     p.add_argument("--rpm-off-max", type=float, default=400.0,
                    help="azimuth authority in mech rpm")
     p.add_argument("--spin-rpm", type=float, default=1200.0,
                    help="matched closed-loop speed target for BOTH motors during the transition — "
                         "this is what stops two independent ramps dumping a whole motor of "
                         "mismatch into the azimuth")
+    p.add_argument("--trim-secs", type=float, default=0.5,
+                   help="seconds to fade the null feedforward in after the handover. Stepping it "
+                        "(the pair splits ~4:1 in one tick) is itself a disturbance.")
+    p.add_argument("--spin-ok-frac", type=float, default=0.0,
+                   help="handover needs each motor at this fraction of ITS OWN target. At the null "
+                        "the pair is split ~4:1, so an absolute floor the low motor cannot reach "
+                        "would keep the loop in rpm_phase_ forever.")
     p.add_argument("--spin-rpm-ok", type=float, default=400.0,
                    help="both must report at least this (fresh) to count as past the seam")
     p.add_argument("--spin-hold", type=float, default=0.8,
@@ -751,7 +803,44 @@ def add_ondevice(p):
     p.add_argument("--s-trim", type=float, default=AZIMUTH_NULL_S)
     p.add_argument("--smax", type=float, default=40.0)
     p.add_argument("--vmax", type=float, default=200.0)
-    p.add_argument("--max-rate", type=float, default=4000.0)
+    p.add_argument("--max-rate", type=float, default=4000.0,
+                   help="deg/s abort threshold for the HOLD (debounced over 3 ticks)")
+    # A single threshold cannot serve both phases. MEASURED 2026-08-15: with the position loop given
+    # zero authority (--kp 0 --ki 0 --kd 0 --rpm-trim 0 --rpm-off-max 0, i.e. both motors on the
+    # identical target) 3/3 runs still aborted at 3896-4231 deg/s crossing the seam, so 4000 stops
+    # every run before the hold it is meant to protect has begun. See src/apps/azimuth.h.
+    # A brief fast transient is acceptable; turning fast for a WHILE is not. The old guard aborted
+    # after three ticks (~3 ms) above the threshold, which killed every seam crossing.
+    p.add_argument("--ki-pos", type=float, default=0.0,
+                   help="integral action on POSITION (the outer loop becomes PI). `--ki` integrates "
+                        "the VELOCITY error and removes a rate bias; nothing removed a heading bias, "
+                        "so the pod stopped drifting but stopped in the wrong place. 0 disables.")
+    p.add_argument("--ipos-max", type=float, default=500.0,
+                   help="bound on the position integrator, deg-seconds")
+    p.add_argument("--null-ratio", type=float, default=0.0,
+                   help="|A|/|B| that holds the azimuth (MEASURED 4.2-4.3 on this pod). The trim is "
+                        "then thrust*(1-ratio)/(1+ratio), which SCALES WITH THRUST — a fixed "
+                        "--rpm-trim is only right at one thrust setting. 0 = use --rpm-trim.")
+    p.add_argument("--mix-swap", dest="mix_swap", action="store_true", default=False,
+                   help="put the AZIMUTH on the common mode and the THRUST on the opposition, which "
+                        "is what the CAD says the differential does (docs §12). Default OFF; it "
+                        "commands one ESC in reverse. Verify with `encwatch.py --rpm -800 "
+                        "--rpm-b 800` first: opposite commands must give spinning props, still pod.")
+    p.add_argument("--over-secs", type=float, default=0.5,
+                   help="how long |vel| may stay above --max-rate before aborting (leaky budget)")
+    p.add_argument("--hard-rate", type=float, default=12000.0,
+                   help="instantaneous ceiling, debounced over 3 ticks — the real runaway stop")
+    p.add_argument("--spin-max-rate", type=float, default=6000.0,
+                   help="deg/s abort threshold WHILE crossing the seam, where 4300 is normal")
+    p.add_argument("--spin-guard", type=float, default=0.6,
+                   help="seconds the wide guard outlasts the pair reporting up")
+    # The azimuth is a continuously rotating axis: "hold this heading" is modulo 360, but pos comes
+    # from an UNWRAPPED accumulator. Unwrapped, a pod that has drifted seven revolutions presents a
+    # 2500 deg error and any kp > 0 rails the loop. See src/apps/azimuth.h.
+    p.add_argument("--wrap-err", dest="wrap_err", action="store_true", default=True,
+                   help="wrap the position error to +/-180 deg (default)")
+    p.add_argument("--no-wrap-err", dest="wrap_err", action="store_false",
+                   help="servo the raw unwrapped accumulator — for comparison only")
     p.add_argument("--verr-clamp", type=float, default=0.0,
                    help="0 disables. Non-zero turns the integral into a fixed-rate ramp whenever "
                         "|vsp-vel| exceeds it; the config that converged had no clamp")

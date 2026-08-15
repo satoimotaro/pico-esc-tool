@@ -805,6 +805,25 @@ private:
 				else { uint8_t st=enc_.status();
 					Serial.printf("encv|%ld|%.2f|%lu|%d\n", (long)enc_.accum(), (double)enc_.rpm(),
 					             (unsigned long)enc_.samples(), (st>>5)&1); Serial.println("ok"); } }
+			// encd [reset] — the tracker's ALIASING diagnostics. `encv` reports a velocity; this
+			// reports whether that velocity can be believed. The unwrap in As5600Tracker::poll folds
+			// each step into +/-2048 counts, so any stall longer than half a revolution of travel
+			// silently subtracts a whole turn — no error, no `miss`, and barely a dent in the mean
+			// sample rate. On 2026-08-15 the mean rate (1004 at rest -> 626/s under load) was read as
+			// proof the tracker was healthy; it is not, and this is the number that decides.
+			//   encd|samples|miss|maxgap_us|maxstep|alias_margin
+			// alias_margin = 2048/maxstep: how many times the worst observed step would have to grow
+			// before the accumulator starts losing revolutions. Below ~2 the data is suspect.
+			else if (!strcmp(cmd,"encd")) {
+				if(!enc_.present()) Serial.println("err no-encoder");
+				else { char* r=strtok(nullptr," ");
+					uint16_t ms=enc_.maxStep();
+					Serial.printf("encd|%lu|%lu|%lu|%u|%.2f\n",
+					              (unsigned long)enc_.samples(), (unsigned long)enc_.misses(),
+					              (unsigned long)enc_.maxGapUs(), ms,
+					              ms ? 2048.0 / (double)ms : 999.0);
+					if(r && !strcmp(r,"reset")) enc_.resetDiag();
+					Serial.println("ok"); } }
 			// i2cscan — what is ACTUALLY on I2C0, and is the bus even usable?
 			// `enc` only ever probes 0x36, so a silent sensor and a shorted bus look identical from it.
 			// This separates them: it reports the IDLE LEVELS of SDA/SCL first (both must read HIGH — a
@@ -840,6 +859,21 @@ private:
 						else if(!strcmp(k,"trim")) az_.s_trim=f; else if(!strcmp(k,"smax")) az_.smax=f;
 						else if(!strcmp(k,"vmax")) az_.vmax=f; else if(!strcmp(k,"carrier")) az_.carrier=f;
 						else if(!strcmp(k,"maxrate")) az_.max_rate=f;
+						else if(!strcmp(k,"spinmaxrate")) az_.spin_max_rate=f;
+						else if(!strcmp(k,"spinguard")) az_.spin_guard_secs=f;
+						else if(!strcmp(k,"wraperr")) az_.wrap_err=(f>0.5f);
+						else if(!strcmp(k,"rpmfloor")) az_.rpm_floor=f;
+						else if(!strcmp(k,"crosszero")) az_.cross_zero_offset=(f>0.5f);
+						else if(!strcmp(k,"thrustrpm")) az_.thrust_rpm=f;
+						else if(!strcmp(k,"thrustsecs")) az_.thrust_secs=f;
+						else if(!strcmp(k,"oversecs")) az_.over_secs=f;
+						else if(!strcmp(k,"hardrate")) az_.hard_rate=f;
+						else if(!strcmp(k,"mixswap")) az_.mix_swap=(f>0.5f);
+						else if(!strcmp(k,"nullratio")) az_.null_ratio=f;
+						else if(!strcmp(k,"kipos")) az_.ki_pos=f;
+						else if(!strcmp(k,"spinokfrac")) az_.spin_ok_frac=f;
+						else if(!strcmp(k,"trimsecs")) az_.trim_secs=f;
+						else if(!strcmp(k,"iposmax")) az_.ipos_max=f;
 						else if(!strcmp(k,"verrclamp")) az_.verr_clamp=f;
 						else if(!strcmp(k,"signb")) az_.sign_b=(f<0)?-1:1;
 						else if(!strcmp(k,"spinsecs")) az_.spin_secs=f;
@@ -894,11 +928,11 @@ private:
 							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
 							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f|spinrpm=%.0f|rpmdrive=%d|rpmpercount=%.2f|rpmoffmax=%.0f|rpmtrim=%.0f|vellpf=%.2f|spinslew=%.0f|holdslew=%.0f"
-							              "|step_s=%.1f|step_ms=%.1f\n",
+							              "|spinmaxrate=%.0f|spinguard=%.2f|wraperr=%d|rpmfloor=%.0f|crosszero=%d|thrustrpm=%.0f|thrustsecs=%.1f|oversecs=%.2f|hardrate=%.0f|mixswap=%d|nullratio=%.2f|kipos=%.4f|step_s=%.1f|step_ms=%.1f\n",
 							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
 							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
 							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target(),
-							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.spin_rpm, az_.rpm_drive?1:0, az_.rpm_per_count, az_.rpm_offset_max, az_.rpm_trim, az_.vel_lpf_hz, az_.spin_slew, az_.hold_slew, az_.stepS(),
+							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.spin_rpm, az_.rpm_drive?1:0, az_.rpm_per_count, az_.rpm_offset_max, az_.rpm_trim, az_.vel_lpf_hz, az_.spin_slew, az_.hold_slew, az_.spin_max_rate, az_.spin_guard_secs, az_.wrap_err?1:0, az_.rpm_floor, az_.cross_zero_offset?1:0, az_.thrust_rpm, az_.thrust_secs, az_.over_secs, az_.hard_rate, az_.mix_swap?1:0, az_.null_ratio, az_.ki_pos, az_.stepS(),
 							              n ? (double)(int32_t)(az_.stepBeginUs() - az_.traceAt(0).t_us) / 1000.0
 							                : 0.0);
 							Serial.println("t_ms,pos,vel,s,ivel,carrier,rpm_a,rpm_b");
