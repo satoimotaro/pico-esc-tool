@@ -911,6 +911,7 @@ private:
 						else if(!strcmp(k,"spinrmax")) az_.spin_r_max=f;
 						else if(!strcmp(k,"spincorrmargin")) az_.spin_corr_margin=f;
 						else if(!strcmp(k,"spinasymsecs")) az_.spin_asym_secs=f;
+						else if(!strcmp(k,"tgtslew")) az_.tgt_slew=f;
 						else if(!strcmp(k,"rpmfloor")) az_.rpm_floor=f;
 						else if(!strcmp(k,"crosszero")) az_.cross_zero_offset=(f>0.5f);
 						else if(!strcmp(k,"thrustrpm")) az_.thrust_rpm=f;

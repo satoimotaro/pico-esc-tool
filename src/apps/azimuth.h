@@ -189,6 +189,17 @@ public:
 	// Seconds of ONE-MOTOR-ONLY running that ends the run. 0 disables. Default is well under the
 	// 0.7 s of the measured failure and well over anything a healthy pair shows.
 	float spin_asym_secs = 0.5f;
+	// 2-DOF: SHAPE THE SETPOINT AND FEED ITS RATE FORWARD, instead of stepping the target and
+	// letting the feedback invent the trajectory. A step target makes kp*err enormous, the
+	// velocity setpoint slams into vmax, and the integrator then has to be protected from what is
+	// really just a badly posed command. Ramping the target at a rate the actuator can actually
+	// deliver (authority is rLimit/rpm_per_count * 6.0*rpm_per_count = 360 deg/s here) and adding
+	// that rate to vsp means the FEEDFORWARD does the travelling and the loop only trims the
+	// residue — the classical two-degree-of-freedom split.
+	// The gain of this term is 1: it is a velocity, in the same units as vsp. It carries NO plant
+	// model beyond the kinematics already in kff, which is why it is safe to keep when the pod
+	// goes in the water — nothing here is fitted to the air bench.
+	float tgt_slew = 0.0f;           // deg/s, 0 = step the target (old behaviour)
 	// SNAP THROUGH THE SEAM INSTEAD OF RAMPING THROUGH IT.
 	// Ramping the rpm target makes each ESC cross at the moment ITS OWN command reaches 515, and the
 	// two are not calibrated identically (vscale 1.0000 vs 0.9225 on this pod), so the pair straddles
@@ -363,7 +374,7 @@ public:
 		// absolute encoder reports right now instead of being pinned to "here is zero".
 		base_   = absolute ? enc_->accum() - (int32_t)lrintf(heading() * COUNTS_PER_REV / 360.0f)
 		                   : enc_->accum();
-		target_ = target_deg;
+		target_ = target_cmd_ = target_deg;
 		ivel_ = 0.0f; vel_ = 0.0f; velf_ = 0.0f; pos_ = 0.0f; over_ = 0; over_s_ = 0.0f; hand_us_ = 0;
 		ipos_ = 0.0f;
 		// poll() recomputes pos_ on its first tick anyway; set it here so `az status` between `az on`
@@ -422,7 +433,8 @@ public:
 	void stop() { on_ = false; mode_ = OFF; ivel_ = 0.0f; step_armed_ = false; rpm_phase_ = false;
 	              if (a_) a_->setRaw(0); if (b_) b_->setRaw(0); }   // NOTE: keeps the trace — it is
 	                                                               // read back after the run stops.
-	void setTarget(float deg) { target_ = deg; }
+	void setTarget(float deg) { target_cmd_ = deg; if (tgt_slew <= 0.0f) target_ = deg; }
+	float targetCmd() const { return target_cmd_; }
 
 	// --- trace readout (oldest first) ---
 	void     traceClear()            { tr_head_ = 0; tr_count_ = 0; dec_n_ = 0; }
@@ -482,6 +494,12 @@ public:
 				// and the filtered velocity — and the heading survives the handover.
 				if (!absolute) { base_ = enc_->accum(); pos_ = 0.0f; }
 				ivel_ = 0.0f; velf_ = 0.0f; ipos_ = 0.0f;
+				// START THE TRAJECTORY FROM WHERE THE POD ACTUALLY IS. Handing the loop the full
+				// capture error as a step is the same badly posed command tgt_slew exists to avoid —
+				// and it is the DOMINANT transient, since the spin-up ends wherever it ends (67-119
+				// deg from target in the campaign runs). With shaping on, the setpoint walks from
+				// pos_ to the commanded heading at a rate the actuator can deliver.
+				if (tgt_slew > 0.0f) target_ = pos_;
 				t0_us_ = now; spinning_ = false;
 				a_->vc.slew_rpm_s = hold_slew;      // hand the loop its bandwidth back
 				b_->vc.slew_rpm_s = hold_slew;
@@ -529,6 +547,17 @@ public:
 		float a_lp = (vel_lpf_hz > 0.0f) ? (1.0f - expf(-2.0f * 3.14159265f * vel_lpf_hz * dt)) : 1.0f;
 		velf_ += a_lp * (vel_ - velf_);
 
+		// Walk the working setpoint toward the commanded one and remember the rate we are walking
+		// at — that rate IS the feedforward.
+		float tgt_rate = 0.0f;
+		if (tgt_slew > 0.0f && !rpm_phase_) {
+			float d    = wrapDeg(target_cmd_ - target_);
+			float step = tgt_slew * dt;
+			if (fabsf(d) <= step) { target_ = target_cmd_; }
+			else { float sg = (d > 0.0f) ? 1.0f : -1.0f; target_ += sg * step; tgt_rate = sg * tgt_slew; }
+		} else if (tgt_slew <= 0.0f) {
+			target_ = target_cmd_;
+		}
 		float err = wrap_err ? wrapDeg(target_ - pos_) : (target_ - pos_);
 		// Hold the integrator while the pair is still crossing the seam: the heading there is a
 		// transition artefact, exactly as the rebase at the handover assumes.
@@ -547,7 +576,7 @@ public:
 		// the standing bias and learns nothing from a saturated transient.
 		float ipos_was = ipos_;
 		if (ki_pos > 0.0f && !rpm_phase_) ipos_ = constrain(ipos_ + err * dt, -ipos_max, ipos_max);
-		float vsp_raw = kp * err + ki_pos * ipos_ - kd * velf_;
+		float vsp_raw = tgt_rate + kp * err + ki_pos * ipos_ - kd * velf_;
 		float vsp = constrain(vsp_raw, -vmax, vmax);
 		if (ki_pos > 0.0f && vsp != vsp_raw && err * vsp_raw > 0.0f) ipos_ = ipos_was;
 
@@ -850,6 +879,7 @@ private:
 	float    step_s_ = 0, step_base_u_ = 0;
 	bool     step_armed_ = false, spinning_ = false, rpm_phase_ = false;
 	uint32_t rpm_t0_ = 0, step_pre_us_ = 0, step_run_us_ = 0;
+	float    target_cmd_ = 0.0f;                 // what the operator asked for; target_ chases it
 	uint8_t  stop_why_ = STOP_NONE;
 	float    asym_s_ = 0.0f;                     // seconds of one-motor-only running
 	uint32_t snap_us_ = 0;                       // when the pre-seam dwell began; 0 = still ramping

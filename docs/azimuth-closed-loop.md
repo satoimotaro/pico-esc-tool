@@ -1679,3 +1679,68 @@ before all samples are inside 1 deg. In that window the loop asks for 0.5-1.0 co
 offset out of 1200**, at the very bottom of what an integer DShot command and the ESC's own velocity
 loop can resolve, with stiction on top. The remaining "settle time" is that floor, not the
 controller. The levers there are command resolution or a deliberate dither, not tuning.
+
+---
+
+## 25. THRUST IS A NON-EVENT, AND FOUR TRANSIENT LEVERS ARE ELIMINATED BY MEASUREMENT.
+
+**2026-08-17.**
+
+### 25a. Hold quality does not care about thrust, and the null really is r = 0
+
+Fixed absolute heading, propeller speed varied, 3 runs each, encoder-only metrics:
+
+| spin_rpm | mean\|err\| median | worst | null, mean `s` |
+|---:|---:|---:|---:|
+| 700 | 0.35 deg | 0.38 | **+0.01 counts** |
+| 900 | 0.48 | 0.48 | −0.05 |
+| 1200 | 0.24 | 0.32 | −0.08 |
+| 1600 | 0.25 | 0.33 | −0.07 |
+| 2000 | 0.32 | 0.39 | −0.09 |
+
+**The pod holds heading from 700 to 2000 rpm with the same 0.1-0.4 deg quality**, and the null sits
+within a tenth of a count of zero at every level. §18 predicted a thrust-independent null at r = 0
+from the repaired kinematics and had only ever been tested at 1200; it now holds across a 2.9x speed
+range. Everything §13-§16 said about a drifting, thrust-dependent null is dead.
+
+### 25b. Four levers for the transient, all eliminated
+
+The step transient sits at ~0.7 s to within 5 deg of target. Each candidate was implemented or swept
+and measured on 90 deg absolute steps:
+
+| lever | result |
+|---|---|
+| **2-DOF setpoint shaping** (`tgt_slew`, ramp the target and feed its rate forward) | **no change** — 0.71-0.85 s at slew 0 / 200 / 400 deg/s, overshoot ~19 deg in all |
+| **Azimuth authority** `rpm_off_max` 60 → 120 → 200 (360 → 1200 deg/s) | **no change** — 0.68-0.82 s, and peak velocity never exceeded 392 deg/s |
+| **`vmax`** 400 → 800 → 1500 deg/s | 0.07 s faster, and **overshoot 15-20 → 26-38 deg, settle 5.5-7 → 8.8-10.5 s, hold 0.2-0.3 → 0.5-0.7 deg**. A net loss |
+| **eRPM feedback rate** (the DShot600 / EDT-trimming plan of §20a) | **refuted before it was built** — see below |
+
+The 2-DOF result has a clean explanation, and it is not "2-DOF is wrong": the shaped setpoint is a
+VELOCITY STEP, and the plant needs 0.35 s (t90) just to reach speed, so the setpoint outruns it, the
+error grows, and the feedback saturates exactly as it did with a stepped target — `s` sits on the
+±8.30 rail for the first 0.4 s in both cases. A trajectory that would help must be
+**acceleration-limited** (~1000 deg/s^2, i.e. the authority divided by the plant's rise), and it only
+starts paying once the move is long compared with 0.35 s. Kept, default off (`tgt_slew 0`).
+
+### 25c. The feedback path is NOT rate-starved — measured, and it retires §20a's plan
+
+`az trace --decim 1` samples at the loop rate, so the eRPM arrival rate can be counted directly
+instead of assumed:
+
+    loop 852 Hz    eRPM updates 758 / 770 per second    median gap 1.17 ms    worst gap 4.7 ms
+
+**That is 250:1 against a 350 ms plant.** DShot600 would halve each frame's air time, not raise a
+rate that is already effectively one update per control tick, and EDT is costing only the occasional
+4.7 ms gap. Neither is a control-bandwidth lever, and the ESCs are `A_H_30` anyway — the layout our
+own notes flag as DShot300-only.
+
+So §20a's conclusion stands (raising the inner velocity gains DOES cut t90 27 %) while its proposed
+levers do not: the inner loop is limited by its own **gain against the motor's electromechanical
+response and the eRPM's noise**, not by how often that eRPM arrives. What is left, in order:
+
+1. **§20b's feedforward hybrid** — feed the throttle step the velocity loop is going to arrive at
+   anyway (it knows the calibrated `SpeedProfile`), so the transient stops waiting for the loop to
+   integrate up. Still the one untried idea with a mechanism behind it.
+2. **Torque authority** — the pod uses ~2 % of what the drivetrain can do; more current headroom is
+   the only thing that makes a rotor change speed faster.
+3. Accept it: 0.7 s to within 5 deg, 0.25 deg hold, over a 700-2000 rpm thrust range.

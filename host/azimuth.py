@@ -491,7 +491,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
 _AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
-             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew", "spinmaxrate", "spinguard", "wraperr", "rpmfloor", "crosszero", "thrustrpm", "thrustsecs", "oversecs", "hardrate", "mixswap", "nullratio", "kipos", "iposmax", "spinokfrac", "trimsecs", "absolute", "snaprpm", "snaphold", "spinrmax", "spincorrmargin")
+             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew", "spinmaxrate", "spinguard", "wraperr", "rpmfloor", "crosszero", "thrustrpm", "thrustsecs", "oversecs", "hardrate", "mixswap", "nullratio", "kipos", "iposmax", "spinokfrac", "trimsecs", "absolute", "snaprpm", "snaphold", "spinrmax", "spincorrmargin", "tgtslew")
 
 
 def _az_host(args):
@@ -522,7 +522,8 @@ def _az_push_config(d, args):
             "spinokfrac": args.spin_ok_frac, "trimsecs": args.trim_secs,
             "absolute": 1 if args.absolute else 0,
             "snaprpm": args.snap_rpm, "snaphold": args.snap_hold,
-            "spinrmax": args.spin_r_max, "spincorrmargin": args.spin_corr_margin}
+            "spinrmax": args.spin_r_max, "spincorrmargin": args.spin_corr_margin,
+            "tgtslew": args.tgt_slew}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -905,6 +906,8 @@ def add_ondevice(p):
                         "can never straddle the seam")
     p.add_argument("--spin-corr-margin", type=float, default=0.80,
                    help="fraction of the profile's 6-step floor at which --spin-r-max stops")
+    p.add_argument("--tgt-slew", type=float, default=0.0,
+                   help="2-DOF: ramp the target at this rate (deg/s) and feed the rate forward, instead of stepping it. 0 = step (old). The authority here is ~360 deg/s")
     p.add_argument("--verr-clamp", type=float, default=0.0,
                    help="0 disables. Non-zero turns the integral into a fixed-rate ramp whenever "
                         "|vsp-vel| exceeds it; the config that converged had no clamp")
