@@ -1618,3 +1618,64 @@ The fast phase covers most of the step in ~0.5 s and the last degree takes secon
 position integrator of §20's structural gap 2, unchanged and still the next real gain.
 Graphs: the artifact published 2026-08-16 (transient, steady state, guard before/after, and every
 configuration tried).
+
+---
+
+## 24. THE SLOW TAIL WAS A STALE ANTI-WINDUP RESIDUE, NOT THE POSITION INTEGRAL.
+
+**2026-08-16.** §20's structural gap 2 blamed the slow approach on the PI zero sitting at 0.33 rad/s
+"by construction". The traces say otherwise.
+
+### What the trace actually showed
+
+At `err = +11.95 deg` the proportional path alone asks for `kff*kp*err = +1.65` counts. **The loop was
+delivering `s = 0.00`.** Something was cancelling P, and the `ivel` column names it:
+
+    t+0.1 s   err +96.2   s +8.20   ivel -0.90     <- fast phase, command at the u_max rail
+    t+2.0 s   err +17.0   s -0.10   ivel -0.90
+    t+3.0 s   err +13.1   s +0.00   ivel -0.90     <- 13 deg off, commanding nothing
+    t+4.0 s   err  +9.3   s +0.90   ivel +0.00     <- residue clears, error collapses in ~1 s
+
+**`ivel` is the velocity integrator and `ki` is 0 in the shipped config.** With no integration it can
+never unwind — but the anti-windup back-calculation still WRITES it: `ivel_ = uc - uff` whenever the
+command clamps. The fast phase saturates against `u_max`, parks −0.90 counts there (−6.5 rpm of
+offset, ~−39 deg/s of standing command bias), and that residue then cancels the proportional term for
+the rest of the run.
+
+**Back-calculation is only valid while the integrator is live.** With `ki == 0` the clamp residue now
+goes nowhere: `ivel_ = (ki > 0) ? constrain(uc - uff, ±u_max) : 0`.
+
+### The position integrator had the same trap, in principle
+
+`ipos_` was also back-calculated against the `vmax` clamp: at `err` 97 deg, `kp*err` = 582 against
+`vmax` 400, so it solves for `ipos_ ≈ -91 deg-s` — an integrator holding a charge that cancels P.
+Replaced with **conditional integration**: integrate only when the output is not clamped, or when the
+error drives out of the clamp. The integrator keeps what it has learned about the standing bias and
+learns nothing from a saturated transient.
+
+### Measured, on the same 90 deg absolute steps
+
+| | time to reach \|err\| < 5 deg |
+|---|---|
+| before | 0.72 / 4.19 / 4.25 / 4.35 / 4.36 / 4.43 s — **median 4.30** |
+| after | 0.62 / 0.67 / 0.67 / 0.70 / 0.72 / 0.73 / 0.74 / 0.75 / 0.75 / 0.79 / 0.80 / 5.01 s — **median 0.74** |
+
+**5.8x faster to the target**, with the hold unchanged (mean\|err\| median 0.25 deg). The step itself
+now looks like the plant: 89.7 → 43.4 → −5.9 deg in 0.8 s.
+
+### Diagnosis discipline worth repeating
+
+Two hypotheses were tested and REFUTED before the right one:
+- "`vmax` saturation and its back-calculation are the cause" — then a step small enough never to
+  saturate should have no tail. 30 deg steps settled in 5.8-6.7 s, no better. Refuted.
+- "`ki_pos` is simply too slow" — with `ki_pos` 0 the same step is inside 2 deg in **2.0 s**, so the
+  integrator is not too slow, it is holding the wrong value. (It is still needed: that run left a
+  0.5 deg standing offset, and one of three left 66 deg.)
+
+### What is left, and it is not a gain
+
+After the fix the run reaches the target in 0.8 s and then **dithers ±1-3 deg** for a few seconds
+before all samples are inside 1 deg. In that window the loop asks for 0.5-1.0 counts — **4-8 rpm of
+offset out of 1200**, at the very bottom of what an integer DShot command and the ESC's own velocity
+loop can resolve, with stiction on top. The remaining "settle time" is that floor, not the
+controller. The levers there are command resolution or a deliberate dither, not tuning.

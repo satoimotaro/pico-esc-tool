@@ -532,16 +532,24 @@ public:
 		float err = wrap_err ? wrapDeg(target_ - pos_) : (target_ - pos_);
 		// Hold the integrator while the pair is still crossing the seam: the heading there is a
 		// transition artefact, exactly as the rebase at the handover assumes.
+		// FREEZE THE POSITION INTEGRATOR WHILE THE SETPOINT IS CLAMPED — do not back-calculate it.
+		// Back-calculation solves for the ipos_ that would reproduce the CLAMPED vsp, and on a large
+		// step that number is hugely NEGATIVE: at err 97 deg, kp*err = 582 against vmax 400, so it
+		// writes ipos_ ~ -91 deg-s. The step then finishes with an integrator holding a charge that
+		// cancels the proportional term, and the approach is whatever rate ki_pos can unwind it at.
+		// MEASURED 2026-08-16: at t+2 s the pod sat 13 deg off with the loop delivering s = 0.00
+		// while kff*kp*err asked for 1.8 counts, and 3/6 runs needed 5-9.5 s to get inside 1 deg.
+		// With ki_pos 0 entirely, the same step is inside 2 deg in 2.0 s (and then keeps a 0.5 deg
+		// standing offset, which is what ki_pos is for — so the integrator is wanted, its windup
+		// is not).
+		// Conditional integration instead: integrate only when the output is not clamped, or when
+		// the error is driving OUT of the clamp. The integrator keeps whatever it had learned about
+		// the standing bias and learns nothing from a saturated transient.
+		float ipos_was = ipos_;
 		if (ki_pos > 0.0f && !rpm_phase_) ipos_ = constrain(ipos_ + err * dt, -ipos_max, ipos_max);
-		float vsp = kp * err + ki_pos * ipos_ - kd * velf_;
-		vsp = constrain(vsp, -vmax, vmax);
-		// Back-calculate the position integrator against the SAME clamp, so a saturated vsp does not
-		// keep winding it (the velocity path already does this against u_max).
-		if (ki_pos > 0.0f) {
-			float unsat = kp * err + ki_pos * ipos_ - kd * velf_;
-			if (unsat != vsp) ipos_ = constrain((vsp - kp * err + kd * velf_) / ki_pos,
-			                                    -ipos_max, ipos_max);
-		}
+		float vsp_raw = kp * err + ki_pos * ipos_ - kd * velf_;
+		float vsp = constrain(vsp_raw, -vmax, vmax);
+		if (ki_pos > 0.0f && vsp != vsp_raw && err * vsp_raw > 0.0f) ipos_ = ipos_was;
 
 		float uff = kff * vsp;
 		// CLAMP THE VELOCITY ERROR BEFORE INTEGRATING IT. vsp is bounded by vmax but vel_ is the raw
@@ -560,7 +568,19 @@ public:
 		if (rpm_drive && cross_zero_offset && rpm_phase_) ivel_ = 0.0f;
 		float u = uff + ivel_;
 		float uc = constrain(u, -u_max, u_max);
-		if (u != uc) { ivel_ = constrain(uc - uff, -u_max, u_max); u = uc; }   // back-calculation
+		// BACK-CALCULATION IS ONLY VALID WHILE THE INTEGRATOR IS LIVE.
+		// It parks the clamp residue in `ivel_` so the integral stops winding — correct when `ki`
+		// can later unwind it, and a trap when `ki == 0`, because then NOTHING ever changes `ivel_`
+		// again. MEASURED 2026-08-16 at the shipped ki 0: the fast phase saturates, the residue
+		// lands at -0.90 counts (-6.5 rpm of offset, i.e. -39 deg/s of standing command bias) and
+		// STAYS there. At t+2..3 s the pod sat 13-17 deg off with the loop delivering s = 0.00,
+		// because uff +1.8..2.3 was being cancelled by that stale -0.90. When it finally cleared,
+		// the remaining 9 deg closed in about a second. That residue IS the slow tail everything
+		// upstream has been blaming on the position integrator.
+		if (u != uc) {
+			ivel_ = (ki > 0.0f) ? constrain(uc - uff, -u_max, u_max) : 0.0f;
+			u = uc;
+		}
 
 		// STEP mode: the pre-roll above ran the CLOSED loop (see beginStep); from step_begin_us_ the
 		// loop is frozen at whatever command it had settled on and the step is added open-loop.
