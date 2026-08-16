@@ -143,6 +143,17 @@ public:
 	// actually do — and kff is sized so that uff = kff*vsp delivers exactly vsp, so the feedforward
 	// stays self-consistent at the smaller numbers.
 	bool  wrap_err = true;
+	// ABSOLUTE HEADING. Off, the target is "+X from wherever the spin-up happened to end", because
+	// poll() re-zeroes `base_` at the handover; the pod wanders +/-10 deg (once 102) before the loop
+	// captures, so that origin is not a heading at all. The AS5600 is an ABSOLUTE encoder within one
+	// turn and that information was being thrown away — which is fine on a bench and useless on a
+	// vehicle, where "hold 90" has to mean the same direction on every power cycle.
+	// On, `zero_raw` (a persisted RAW_ANGLE count, settings::azLoadZero) defines 0 deg, begin()
+	// REFUSES without one, and the handover no longer re-zeroes the heading — only the integrators,
+	// which really are transition artefacts. The error is still wrapped, so the worst move the pod
+	// can be asked for at capture is 180 deg, at `vmax` and inside the same rate guards.
+	bool    absolute = false;
+	int32_t zero_raw = -1;               // RAW count that reads as 0 deg; <0 = not calibrated
 	// --- carrier transition (see spinProfile_) ---
 	float spin_secs = 4.0f;                    // 0 -> carrier; the loop is closed throughout
 	float spin_smax = 55.0f;                   // authority during it, capped by the seam
@@ -175,6 +186,31 @@ public:
 	float spin_rpm_ok   = 400.0f;    // both must report at least this, FRESH, to count as past the seam
 	float spin_ok_frac  = 0.0f;      // 0 = absolute gate only. Kept so the experiment is repeatable.
 	float spin_rpm_secs = 8.0f;      // give up if they never get there
+	// Seconds of ONE-MOTOR-ONLY running that ends the run. 0 disables. Default is well under the
+	// 0.7 s of the measured failure and well over anything a healthy pair shows.
+	float spin_asym_secs = 0.5f;
+	// SNAP THROUGH THE SEAM INSTEAD OF RAMPING THROUGH IT.
+	// Ramping the rpm target makes each ESC cross at the moment ITS OWN command reaches 515, and the
+	// two are not calibrated identically (vscale 1.0000 vs 0.9225 on this pod), so the pair straddles
+	// the seam — one in 6-step at ~560 rpm, the other still in forced sine — for however long the
+	// ramp takes to cover the difference. That straddle is a whole-motor mismatch and no authority
+	// can cancel it, because the offset is forced to zero through the crossing (cross_zero_offset).
+	// MEASURED 2026-08-16, pre-handover excursion vs ramp rate (encoder only — sub-seam eRPM does
+	// not exist, so the rpm columns say nothing here):
+	//     slew  150: 4.8 / 8.0 / 10.5 deg   (t_hand 2.90 s — slower ramp, longer to drift)
+	//     slew  300: 2.4 / 2.6 / 4.5 deg    (t_hand 1.51 s)  <- the shipped default, and an optimum
+	//     slew  900: 1.7 / 16.7 / 32.3 deg  (t_hand 1.13 s)
+	//     slew 2000: 0.6 / 32.1 / 33.8 deg  (t_hand 1.15 s)
+	// so the rate itself is not the lever: faster shortens the window but enlarges the straddle.
+	// Dwell just BELOW the seam instead, then command both motors past it in the SAME poll() tick,
+	// so the two DShot frames leave microseconds apart and the straddle is one command edge rather
+	// than a ramp interval.
+	float snap_rpm  = 0.0f;          // 0 = off. Dwell speed, must be below the seam (~560 rpm here)
+	float snap_hold = 0.4f;          // seconds to settle at snap_rpm before the step
+	// Bounded azimuth authority BELOW the seam, where the loop used to have none. See spinCorr_().
+	float spin_r_max = 0.0f;         // mech rpm, 0 = off (the old "zero through the whole ramp")
+	float spin_corr_margin = 0.80f;  // stop correcting once the pair reaches this fraction of the
+	                                 // 6-step floor — the crossing itself stays untouched
 	// THE VELOCITY LOOPS' SLEW HAS TO BE PHASE-DEPENDENT, because one number cannot serve both
 	// jobs. During the transition it sets how gently the pair comes up (high slew = a violent
 	// azimuth kick while they are still unmatched); during the hold it sets how fast the azimuth
@@ -300,12 +336,39 @@ public:
 
 	void bind(Thruster* a, Thruster* b, As5600Tracker* enc) { a_ = a; b_ = b; enc_ = enc; }
 
+	// Declare the pod's CURRENT physical heading to be `deg`. The caller persists the returned raw
+	// count; nothing here writes to flash. Not `deg = 0` only, because the calibration pose is
+	// whatever the rig can be held at repeatably, which is rarely dead ahead.
+	bool setZeroHere(float deg) {
+		if (!enc_ || !enc_->present()) return false;
+		int32_t c = (int32_t)COUNTS_PER_REV;
+		int32_t z = (int32_t)enc_->raw() - (int32_t)lrintf(deg * COUNTS_PER_REV / 360.0f);
+		zero_raw = ((z % c) + c) % c;
+		return true;
+	}
+
+	// The hull-referenced heading right now, in (-180,+180]. NAN when there is no reference — a
+	// caller must never substitute 0 for it.
+	float heading() const {
+		if (zero_raw < 0 || !enc_ || !enc_->present()) return NAN;
+		return wrapDeg(((float)((int32_t)enc_->raw() - zero_raw)) * 360.0f / COUNTS_PER_REV);
+	}
+	bool  absoluteReady() const { return !absolute || zero_raw >= 0; }
+
 	bool begin(float target_deg) {
 		if (!enc_ || !enc_->present()) return false;
-		base_   = enc_->accum();
+		if (!absoluteReady()) return false;           // no reference => refuse, never fall back
+		// pos_ has to READ as the hull heading and then stay UNWRAPPED (the rate guard and the drift
+		// accounting count revolutions), so the accumulator's origin is biased by the heading the
+		// absolute encoder reports right now instead of being pinned to "here is zero".
+		base_   = absolute ? enc_->accum() - (int32_t)lrintf(heading() * COUNTS_PER_REV / 360.0f)
+		                   : enc_->accum();
 		target_ = target_deg;
 		ivel_ = 0.0f; vel_ = 0.0f; velf_ = 0.0f; pos_ = 0.0f; over_ = 0; over_s_ = 0.0f; hand_us_ = 0;
 		ipos_ = 0.0f;
+		// poll() recomputes pos_ on its first tick anyway; set it here so `az status` between `az on`
+		// and that tick reports the heading rather than a 0 that would read as "already on target".
+		pos_ = (enc_->accum() - base_) * 360.0f / COUNTS_PER_REV;
 		traceClear();
 		last_us_ = t0_us_ = micros();
 		spinning_ = true;
@@ -394,8 +457,8 @@ public:
 		float rate_lim = in_spin ? fmaxf(max_rate, spin_max_rate) : max_rate;
 		if (fabsf(vel_) > rate_lim) over_s_ += dt;
 		else                        over_s_ = fmaxf(0.0f, over_s_ - dt);
-		if (over_s_ > over_secs) { stop(); return; }
-		if (fabsf(vel_) > hard_rate) { if (++over_ >= 3) { stop(); return; } }
+		if (over_s_ > over_secs) { stop_why_ = STOP_RATE; stop(); return; }
+		if (fabsf(vel_) > hard_rate) { if (++over_ >= 3) { stop_why_ = STOP_HARD_RATE; stop(); return; } }
 		else over_ = 0;
 
 		// The loop runs from the first tick — including through the spin-up, which is the whole
@@ -403,6 +466,7 @@ public:
 		// only WHEN the heading is zeroed: drift accrued before both motors are actually up is a
 		// transition artefact, not tracking error.
 		if (rpm_phase_) {
+			snapPoll_(now);
 			escs::Telem ta, tb; uint32_t ms = millis();
 			bool oka = a_->tele(ta) && ta.valid && ta.rpm >= (uint32_t)spin_rpm_ok
 			           && (uint32_t)(ms - ta.rpmStampMs) < TELE_FRESH_MS;
@@ -411,13 +475,40 @@ public:
 			if (oka && okb) {
 				rpm_phase_ = false;
 				hand_us_ = now ? now : 1u;          // 0 is the "never handed over" sentinel
-				base_ = enc_->accum(); pos_ = 0.0f; ivel_ = 0.0f; velf_ = 0.0f; ipos_ = 0.0f;
+				// THE REBASE IS WHAT MAKES THE TARGET RELATIVE. Re-zeroing `base_` here declares
+				// "wherever the spin-up ended is 0 deg", which is why `--deg 90` meant +90 from an
+				// origin that itself wandered +/-10 deg run to run. In absolute mode the origin is
+				// the hull, so only the genuine transition artefacts are cleared — the integrators
+				// and the filtered velocity — and the heading survives the handover.
+				if (!absolute) { base_ = enc_->accum(); pos_ = 0.0f; }
+				ivel_ = 0.0f; velf_ = 0.0f; ipos_ = 0.0f;
 				t0_us_ = now; spinning_ = false;
 				a_->vc.slew_rpm_s = hold_slew;      // hand the loop its bandwidth back
 				b_->vc.slew_rpm_s = hold_slew;
 				if (mode_ == STEP) { step_begin_us_ = now + step_pre_us_;
 				                     step_end_us_   = step_begin_us_ + step_run_us_; }
-			} else if ((uint32_t)(now - rpm_t0_) > (uint32_t)(spin_rpm_secs * 1e6f)) { stop(); return; }
+			} else if ((uint32_t)(now - rpm_t0_) > (uint32_t)(spin_rpm_secs * 1e6f)) {
+				stop_why_ = STOP_SPIN_TIMEOUT; stop(); return;
+			}
+			// ONE MOTOR RUNNING WHILE THE OTHER HAS NOT CAUGHT is the only spin-up failure that
+			// matters, and no gain can answer it: through the crossing the offset is forced to zero,
+			// so a whole-motor mismatch turns the pod at will. MEASURED 2026-08-16 — B reported 0
+			// while A ran 197-449 rpm for ~0.7 s, and the pod went to -737 deg (two revolutions) at
+			// ~1000 deg/s before B caught up. Below the seam there is NO eRPM, so this is a coarse
+			// test on the little telemetry that exists: one side clearly turning, the other
+			// reporting nothing, for longer than a start normally takes to become symmetric (good
+			// runs track within ~20 rpm the whole way).
+			bool a_run  = ta.valid && (uint32_t)(ms - ta.rpmStampMs) < TELE_FRESH_MS
+			              && ta.rpm >= (uint32_t)(spin_rpm_ok * 0.5f);
+			bool b_run  = tb.valid && (uint32_t)(ms - tb.rpmStampMs) < TELE_FRESH_MS
+			              && tb.rpm >= (uint32_t)(spin_rpm_ok * 0.5f);
+			bool a_dead = !(ta.valid && (uint32_t)(ms - ta.rpmStampMs) < TELE_FRESH_MS) || ta.rpm < 100;
+			bool b_dead = !(tb.valid && (uint32_t)(ms - tb.rpmStampMs) < TELE_FRESH_MS) || tb.rpm < 100;
+			if ((a_run && b_dead) || (b_run && a_dead)) asym_s_ += dt;
+			else                                        asym_s_ = 0.0f;
+			if (spin_asym_secs > 0.0f && asym_s_ > spin_asym_secs) {
+				stop_why_ = STOP_ASYMMETRIC; stop(); return;
+			}
 		}
 
 		// --- carrier transition. NOT a jump; see spinProfile_(). ---
@@ -503,6 +594,17 @@ public:
 	float stepS()  const { return step_s_; }
 	uint32_t stepBeginUs() const { return step_begin_us_; }   // AFTER the +/-smax clamp — the step the plant saw,
 	                                           // which is what the gain fit must divide by.
+	// WHEN THE PAIR REPORTED UP. Everything before it is open-loop drift (the offset is forced to
+	// zero through the crossing) and everything after is the loop tracking, so a trace that cannot
+	// say where the boundary is cannot separate "the pod wandered" from "the pod was slewing to
+	// target" — which is exactly the mistake made on 2026-08-16. 0 = never handed over.
+	uint32_t handUs() const { return hand_us_; }
+	uint8_t  stopWhy() const { return stop_why_; }
+	static const char* stopWhyName(uint8_t w) {
+		switch (w) { case STOP_RATE: return "rate"; case STOP_HARD_RATE: return "hardrate";
+		            case STOP_SPIN_TIMEOUT: return "spintimeout"; case STOP_ASYMMETRIC: return "asymstart";
+		            case STOP_COMMAND: return "command"; default: return "none"; }
+	}
 	float pos()    const { return pos_; }
 	float target() const { return target_; }
 	float vel()    const { return vel_; }
@@ -512,6 +614,10 @@ public:
 
 private:
 	enum Mode : uint8_t { OFF, HOLD, STEP };
+	// WHY THE RUN ENDED. A stop with no reason attached made every abort look the same from the
+	// host, and "it just stopped" is the one thing a bench log must never say.
+	enum StopWhy : uint8_t { STOP_NONE, STOP_RATE, STOP_HARD_RATE, STOP_SPIN_TIMEOUT,
+	                        STOP_ASYMMETRIC, STOP_COMMAND };
 
 	// Mix. The carrier is what keeps BOTH motors past the seam, so it is never shed; u is.
 	// NOTE the asymmetry this leaves, which the docs got wrong for a while: `s_trim` is added
@@ -561,6 +667,24 @@ private:
 
 	// (R + r) and (R - r): the sum is thrust, the difference is azimuth. s_ / c_ are still recorded
 	// in COMMAND units so one set of metrics reads both actuation modes.
+	// THE OFFSET IS FORCED TO ZERO THROUGH THE CROSSING — but only the CROSSING needs it.
+	// Below the seam the ESC is in forced sine and there is NO eRPM at all, so each velocity loop is
+	// running on its feed-forward curve and neither motor's actual speed is regulated. That is where
+	// the pre-handover drift comes from, and on a late/asymmetric start it reached -737 deg
+	// (measured 2026-08-16, handover 2.23 s). The one sensor that works in that window is the
+	// azimuth encoder, so let the loop use it — bounded, and ONLY while both motors stay clear of
+	// the seam, so the pair can never straddle it (the -944 deg/s failure of 2026-08-14).
+	// `senseRpmFloor()` is the profile's own 6-step landing, so this scales with the motor/voltage
+	// instead of hard-coding 560 rpm.
+	float spinCorr_(float u) const {
+		if (spin_r_max <= 0.0f || !a_ || !b_) return 0.0f;
+		float floor_rpm = a_->senseRpmFloor();
+		if (floor_rpm <= 0.0f) return 0.0f;
+		float hi = fmaxf(fabsf(a_->vc.setpoint()), fabsf(b_->vc.setpoint()));
+		if (hi + spin_r_max >= floor_rpm * spin_corr_margin) return 0.0f;   // too close to the seam
+		return constrain(u * rpm_per_count, -spin_r_max, spin_r_max);
+	}
+
 	void applyRpm_(float u) {
 		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
 		// THE TRIM IS THE OPERATING POINT; THE CLAMP BOUNDS THE LOOP AROUND IT.
@@ -587,7 +711,7 @@ private:
 		// trim splits the pair ~4:1, the low motor sits at ~270 rpm, and the handover gate needs it
 		// at 400. The pair never reports up honestly, and net rotation went from 17 deg to ~1400.
 		// The pod does rotate through the crossing; `trim_secs` is what shortens the recovery.
-		if (cross_zero_offset && rpm_phase_) r = 0.0f;
+		if (cross_zero_offset && rpm_phase_) r = spinCorr_(u);
 		if (mix_swap) {
 			// r is the COMMON offset (zero holds the angle); the thrust is the opposition.
 			// Note this makes cross_zero_offset exactly right for the crossing: r = 0 gives pure
@@ -632,13 +756,35 @@ private:
 
 	void beginRpmSpinup_() {
 		rpm_phase_ = true; rpm_t0_ = micros();
+		snap_us_ = 0; snap_done_ = (snap_rpm <= 0.0f); asym_s_ = 0.0f; stop_why_ = STOP_NONE;
 		if (a_) a_->vc.slew_rpm_s = spin_slew;
 		if (b_) b_->vc.slew_rpm_s = spin_slew;
 		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
 		// Matched, because that is the only state the handover gate can honestly detect (see
 		// spin_rpm_ok). The pod does rotate during this window; `trim_secs` is what keeps it short.
-		if (a_) a_->setRpm(sgn * spin_rpm);
-		if (b_) b_->setRpm(mix_swap ? -sgn * spin_rpm : sgn * spin_rpm);
+		float tgt = snap_done_ ? spin_rpm : snap_rpm;      // dwell below the seam first, if enabled
+		if (a_) a_->setRpm(sgn * tgt);
+		if (b_) b_->setRpm(mix_swap ? -sgn * tgt : sgn * tgt);
+	}
+
+	// The seam snap, driven from poll() while rpm_phase_ is still true. Timed rather than gated on
+	// telemetry ON PURPOSE: below the seam the ESC is in forced sine and there IS no eRPM, so no
+	// reading from that window can say when the dwell has settled. The ramp is slew-limited and
+	// therefore deterministic — snap_rpm/spin_slew seconds — which is a thing the Pico knows.
+	void snapPoll_(uint32_t now) {
+		if (snap_done_) return;
+		float ramp_us = (spin_slew > 1.0f ? snap_rpm / spin_slew : 0.0f) * 1e6f;
+		if (!snap_us_) {
+			if ((float)(uint32_t)(now - rpm_t0_) >= ramp_us) snap_us_ = now ? now : 1u;
+			return;
+		}
+		if ((float)(uint32_t)(now - snap_us_) < snap_hold * 1e6f) return;
+		// BOTH IN THIS TICK. The slew is raised first, so neither ESC's own ramp re-introduces the
+		// difference the dwell just removed.
+		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
+		if (a_) { a_->vc.slew_rpm_s = hold_slew; a_->setRpm(sgn * spin_rpm); }
+		if (b_) { b_->vc.slew_rpm_s = hold_slew; b_->setRpm(mix_swap ? -sgn * spin_rpm : sgn * spin_rpm); }
+		snap_done_ = true;
 	}
 
 	// -1 when the number would not be a MEASUREMENT. Telem.rpm is unsigned and KEEPS its last 6-step
@@ -684,6 +830,10 @@ private:
 	float    step_s_ = 0, step_base_u_ = 0;
 	bool     step_armed_ = false, spinning_ = false, rpm_phase_ = false;
 	uint32_t rpm_t0_ = 0, step_pre_us_ = 0, step_run_us_ = 0;
+	uint8_t  stop_why_ = STOP_NONE;
+	float    asym_s_ = 0.0f;                     // seconds of one-motor-only running
+	uint32_t snap_us_ = 0;                       // when the pre-seam dwell began; 0 = still ramping
+	bool     snap_done_ = true;                  // true also when the snap is disabled (snap_rpm 0)
 	uint32_t hand_us_ = 0;                       // when the pair reported up; 0 = not yet
 	float    thr_ = 0.0f;                        // live thrust, see thrustNow_()
 	float    ipos_ = 0.0f;                       // position integrator, deg-seconds

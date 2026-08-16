@@ -177,6 +177,14 @@ public:
 			Serial.printf("# cfg: IGNORED a stored config written as v%u (this build wants v%u) — "
 			              "gains/vcal are at compile-time defaults; re-save with `cfg save`\n",
 			              storedVer, settings::CFG_VERSION);
+		// The azimuth's hull reference, from its own blob. Absent is not an error — it only means
+		// `az gain absolute 1` will refuse until `az zero` has been run against the rig.
+		// Bind at boot, not on the first `az on`: `az status` / `az zero show` read the encoder
+		// through the same pointers, and unbound they reported the heading as "inf".
+		if (n_ >= 2) az_.bind(th_[0], th_[1], &enc_);
+		az_.zero_raw = settings::azLoadZero();
+		if (az_.zero_raw >= 0)
+			Serial.printf("# az: heading zero restored (raw %ld)\n", (long)az_.zero_raw);
 
 		// Wi-Fi routes: lambdas capturing `this` bind each HTTP path to a member handler.
 		server_.on("/", [this]{ hIndex(); });
@@ -835,18 +843,53 @@ private:
 				char* sub=strtok(nullptr," ");
 				if(!sub || !strcmp(sub,"status")) {
 					Serial.printf("az|%d|tgt=%.2f|pos=%.2f|err=%.2f|vel=%.1f|s=%.1f|kp=%.2f|ki=%.2f|kd=%.2f|"
-					              "kff=%.4f|trim=%.1f|smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f\n",
+					              "kff=%.4f|trim=%.1f|smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
+					              "absolute=%d|zeroraw=%ld|head=%.2f|stop=%s\n",
 					              az_.on()?1:0, az_.target(), az_.pos(), az_.target()-az_.pos(), az_.vel(),
 					              az_.s(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim, az_.smax, az_.vmax,
-					              az_.carrier, az_.max_rate, az_.verr_clamp);
+					              az_.carrier, az_.max_rate, az_.verr_clamp,
+					              az_.absolute?1:0, (long)az_.zero_raw,
+					              az_.zero_raw < 0 ? 0.0 : (double)az_.heading(),
+					              Azimuth::stopWhyName(az_.stopWhy()));
 					Serial.println("ok"); }
+				// az zero [<deg>|show|clear] — the HULL heading reference. `az zero` declares the pod's
+				// current physical heading to be 0 (or <deg>), and persists it as a RAW_ANGLE count so
+				// it survives a power cycle. Without it, `absolute` mode refuses to start.
+				else if(!strcmp(sub,"zero")) {
+					char* g=strtok(nullptr," ");
+					az_.bind(th_[0], n_>1?th_[1]:th_[0], &enc_);
+					if(g && !strcmp(g,"show")) {
+						// A missing reference prints as `unset`, never as a number: `%f` of NAN reads
+						// as "inf"/"nan" and both look like a heading that was measured.
+						if(az_.zero_raw < 0)
+							Serial.printf("az|zero|raw=-1|stored=%d|head=unset|absolute=%d\n",
+							              settings::azZeroStored()?1:0, az_.absolute?1:0);
+						else
+							Serial.printf("az|zero|raw=%ld|stored=%d|head=%.2f|absolute=%d\n",
+							              (long)az_.zero_raw, settings::azZeroStored()?1:0,
+							              (double)az_.heading(), az_.absolute?1:0);
+						Serial.println("ok"); }
+					else if(g && !strcmp(g,"clear")) {
+						az_.zero_raw = -1; settings::azClearZero();
+						Serial.println("ok"); }
+					else if(az_.on()) Serial.println("err az: stop the loop before re-zeroing");
+					else if(!enc_.present()) Serial.println("err az: no encoder");
+					else if(!az_.setZeroHere(g?atof(g):0.0f)) Serial.println("err az: no encoder");
+					else if(!settings::azSaveZero(az_.zero_raw)) Serial.println("err az: zero not saved");
+					else { Serial.printf("az|zero|raw=%ld|head=%.2f\n",
+					                     (long)az_.zero_raw, (double)az_.heading());
+					       Serial.println("ok"); } }
 				else if(!strcmp(sub,"on")) {
 					char* c=strtok(nullptr," "); char* g=strtok(nullptr," ");
 					if(n_<2) { Serial.println("err az: needs two ESCs"); }
 					else if(!th_[0]->armed()||!th_[1]->armed()) Serial.println("err az: arm 0 and arm 1 first");
 					else { if(c) az_.carrier=atof(c);
 						az_.bind(th_[0], th_[1], &enc_);
-						if(!az_.begin(g?atof(g):0.0f)) Serial.println("err az: no encoder");
+						// Name the refusal: "no encoder" for a missing reference sent the operator
+						// looking at the I2C bus for a calibration that was simply never taken.
+						if(az_.absolute && az_.zero_raw < 0)
+							Serial.println("err az: absolute mode has no heading zero — run `az zero` first");
+						else if(!az_.begin(g?atof(g):0.0f)) Serial.println("err az: no encoder");
 						else { Serial.printf("az|on|carrier=%.0f|tgt=%.2f\n", az_.carrier, az_.target()); Serial.println("ok"); } } }
 				else if(!strcmp(sub,"off")) { az_.stop(); Serial.println("ok"); }
 				else if(!strcmp(sub,"tgt")) { char* g=strtok(nullptr," ");
@@ -862,6 +905,12 @@ private:
 						else if(!strcmp(k,"spinmaxrate")) az_.spin_max_rate=f;
 						else if(!strcmp(k,"spinguard")) az_.spin_guard_secs=f;
 						else if(!strcmp(k,"wraperr")) az_.wrap_err=(f>0.5f);
+						else if(!strcmp(k,"absolute")) az_.absolute=(f>0.5f);
+						else if(!strcmp(k,"snaprpm")) az_.snap_rpm=f;
+						else if(!strcmp(k,"snaphold")) az_.snap_hold=f;
+						else if(!strcmp(k,"spinrmax")) az_.spin_r_max=f;
+						else if(!strcmp(k,"spincorrmargin")) az_.spin_corr_margin=f;
+						else if(!strcmp(k,"spinasymsecs")) az_.spin_asym_secs=f;
 						else if(!strcmp(k,"rpmfloor")) az_.rpm_floor=f;
 						else if(!strcmp(k,"crosszero")) az_.cross_zero_offset=(f>0.5f);
 						else if(!strcmp(k,"thrustrpm")) az_.thrust_rpm=f;
@@ -928,13 +977,16 @@ private:
 							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
 							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f|spinrpm=%.0f|rpmdrive=%d|rpmpercount=%.2f|rpmoffmax=%.0f|rpmtrim=%.0f|vellpf=%.2f|spinslew=%.0f|holdslew=%.0f"
-							              "|spinmaxrate=%.0f|spinguard=%.2f|wraperr=%d|rpmfloor=%.0f|crosszero=%d|thrustrpm=%.0f|thrustsecs=%.1f|oversecs=%.2f|hardrate=%.0f|mixswap=%d|nullratio=%.2f|kipos=%.4f|step_s=%.1f|step_ms=%.1f\n",
+							              "|spinmaxrate=%.0f|spinguard=%.2f|wraperr=%d|rpmfloor=%.0f|crosszero=%d|thrustrpm=%.0f|thrustsecs=%.1f|oversecs=%.2f|hardrate=%.0f|mixswap=%d|nullratio=%.2f|kipos=%.4f|absolute=%d|zeroraw=%ld|step_s=%.1f|step_ms=%.1f|hand_ms=%.1f\n",
 							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
 							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
 							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target(),
-							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.spin_rpm, az_.rpm_drive?1:0, az_.rpm_per_count, az_.rpm_offset_max, az_.rpm_trim, az_.vel_lpf_hz, az_.spin_slew, az_.hold_slew, az_.spin_max_rate, az_.spin_guard_secs, az_.wrap_err?1:0, az_.rpm_floor, az_.cross_zero_offset?1:0, az_.thrust_rpm, az_.thrust_secs, az_.over_secs, az_.hard_rate, az_.mix_swap?1:0, az_.null_ratio, az_.ki_pos, az_.stepS(),
+							              az_.spin_secs, az_.spin_smax, az_.seam_keep, az_.spin_rpm, az_.rpm_drive?1:0, az_.rpm_per_count, az_.rpm_offset_max, az_.rpm_trim, az_.vel_lpf_hz, az_.spin_slew, az_.hold_slew, az_.spin_max_rate, az_.spin_guard_secs, az_.wrap_err?1:0, az_.rpm_floor, az_.cross_zero_offset?1:0, az_.thrust_rpm, az_.thrust_secs, az_.over_secs, az_.hard_rate, az_.mix_swap?1:0, az_.null_ratio, az_.ki_pos, az_.absolute?1:0, (long)az_.zero_raw, az_.stepS(),
 							              n ? (double)(int32_t)(az_.stepBeginUs() - az_.traceAt(0).t_us) / 1000.0
-							                : 0.0);
+							                : 0.0,
+							              (n && az_.handUs())
+							                ? (double)(int32_t)(az_.handUs() - az_.traceAt(0).t_us) / 1000.0
+							                : -1.0);
 							Serial.println("t_ms,pos,vel,s,ivel,carrier,rpm_a,rpm_b");
 							uint32_t t0 = n ? az_.traceAt(0).t_us : 0;
 							for (uint16_t i = 0; i < n; i++) {

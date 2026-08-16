@@ -1392,3 +1392,229 @@ stops waiting for the loop.
 
 Note this only pays off under branch (1) above. Under branch (2) the velocity loop was never the
 delay, and the feedforward would be anticipating a step the rotor cannot follow any faster anyway.
+
+---
+
+## 21. §20a IS ANSWERED — FEEDBACK-LIMITED. And §20's plant numbers were fitted to a limit cycle.
+
+**2026-08-16, later the same session.** Running the §20a test found the test's own instrument broken
+first, so this section retires two numbers §20 rests on before it answers the question.
+
+### The plant ID was measuring its own pre-roll oscillation
+
+`az step` runs a CLOSED-loop pre-roll and then freezes the loop and adds the step open-loop
+(`azimuth.h:490`), so the fit's baseline `v0` is the pre-roll's velocity. **The pre-roll was never
+settled**: `az step`'s defaults are `kp 0.5 / ki 0.3 / vel_lpf 1.0 / rpm_off_max 200` — the
+pre-repair gain set — which on the repaired plant limit-cycles at **±1000 deg/s**. `v0` was therefore
+whatever phase the capture happened to land on, and the same is true of `step_base_u_`.
+
+Re-running the identical command reproduced the failure and its randomness:
+
+| run | pre-roll | base_u | delivered u | v_inf | fit said |
+|---|---|---:|---:|---:|---|
+| §20 (`az_lag_id`) | limit cycle | +7.5 | +27.5 | +1183 | tau 0.0819, gain **59.14** |
+| 2026-08-16 (`az_lag_a1`) | limit cycle | −25.1 | −5.1 | −218 | tau 3.58, gain **−11.16** |
+
+Both are v_inf/u = **43 deg/s per count**. The fits disagree because `dv = v_inf − v0` was taken
+against a meaningless `v0`.
+
+### The plant, measured with a pre-roll that actually holds
+
+Same `az step`, but with the §20 hold gains pushed for the pre-roll
+(`--kp 6.0 --ki 0 --kd 0.5 --ki-pos 2.0 --vel-lpf 0 --vmax 400 --rpm-off-max 100 --step-s 10`),
+so the pod is genuinely still when the step lands (`v0` −2 / 0 / 0 deg/s, pre-roll rms 3-4 deg/s):
+
+    3/3 runs:  gain 43.74 / 43.54 / 43.48 deg/s per count      t63 0.257 / 0.256 / 0.262 s
+               tau  0.153 / 0.165 / 0.158 s (first-order)      t90 0.348 / 0.347 / 0.340 s
+                                                               overshoot +31 / +34 / +35 %
+
+**The gain is the mechanism's own number**: `6.0 deg/s per rpm × 7.26 rpm/count = 43.56`. §18 measured
+that plant exactly, and the step now agrees with it to 0.4 %.
+
+**So `kff` = 1/43.6 = 0.02296 — the ORIGINAL static value. §20's "`kff` was 36 % too high, use
+0.01691" is withdrawn**; it was the bogus 59.14 inverted. A/B on the repaired pod, back to back,
+`--deg 90`, 3 runs each, everything else at the §20 best config:
+
+| | `kff` 0.01691 (§20) | **`kff` 0.02296** |
+|---|---:|---:|
+| mean\|err\| (median / worst) | 0.8 / 1.0 deg | **0.2 / 0.2 deg** |
+| pos pk-pk | 1.7-2.2 deg | **0.9-1.0 deg** |
+| net rotation, 13 s | +1.4 .. +1.8 deg | **−0.3 .. +0.4 deg** |
+| steady-state error | +0.7 .. +1.0 deg | **−0.2 .. +0.1 deg** |
+| time to \|err\| < 1 deg after a 90 deg step | 7.4 / 8.1 / 9.0 s | **5.2 / 4.7 / 4.0 s** |
+
+The fast part of the 90 deg step is identical (both reach ~78 deg in ~0.45 s); the under-sized
+feedforward showed up entirely as the long tail and the standing error. **Use `kff 0.02296.**
+
+**And the response is not first-order.** It overshoots ~30 % and settles back — the inner velocity
+PI's own overshoot. A single `tau` is an idealisation, which is part of why the historical taus
+spread 0.082 / 0.096 / 0.167 / 0.185. Compare runs with **t63 / t90 / overshoot**, now printed by
+`az step`.
+
+### 21a. THE ANSWER: the 0.35 s is FEEDBACK-limited, and the gain lever is nearly exhausted
+
+The §20a test, run as specified — identical step, inner velocity gains raised (`gain <i> kp|ki`):
+
+| inner `kp`/`ki` | t63 | t90 | pre-roll | notes |
+|---|---:|---:|---|---|
+| 0.06 / 0.25 (as configured) | 0.257 / 0.256 / 0.262 s | 0.348 / 0.347 / 0.340 s | settled, rms 3-4 | 3/3 repeatable |
+| **0.12 / 0.50 (2×)** | **0.188 / 0.189 s** | **0.269 / 0.252 s** | settled, rms 10-19 | **t90 −27 %** |
+| 0.18 / 0.75 (3×) | 0.328 / 0.394 s | 0.402 / 0.449 s | **NOT settled** | reverses at onset, plateau wanders, steady rate down to ~320 |
+
+**tau falls when the inner loop is made faster ⇒ FEEDBACK-LIMITED, not rotor mechanics.** The rotor
+inertia branch (2) of §20a is refuted: a mechanical time constant does not care what `vel_control`'s
+gains are.
+
+But the headroom in *gain alone* is one doubling: 3× reverses the pod at the step onset and its
+pre-roll no longer holds, which is the loop running out of phase margin against a noisy, delayed
+eRPM. That is exactly the picture §20a branch (1) predicted, so the remaining levers are the ones
+that improve the FEEDBACK rather than push against it:
+
+1. **DShot600** — `esc_config.h:29` is still 300.
+2. **Trim EDT** — every VOLTAGE/CURRENT/TEMPERATURE/STRESS/STATUS frame is an eRPM frame that did
+   not arrive (`esc_session.h:305`).
+3. **§20b's feedforward hybrid** — now known to pay off, since branch (1) is the live one.
+
+### Tooling: the instrument now fails closed
+
+`fit_step` (`host/pico_esc/aztrace.py`) had two defects that let all of this through silently, both
+now fixed and covered by tests (`403 passed`):
+
+- **It trusted the configured `step_s`.** `poll()` clamps a second time,
+  `u = constrain(step_base_u_ + step_s_, ±u_max)` with `u_max = rpm_off_max/rpm_per_count`, and that
+  clamp never reaches the host. The step is now read from the delivered command column.
+- **It accepted any baseline.** It now REFUSES the fit when the pre-roll's velocity rms exceeds 10 %
+  of the step response, naming the reason. Re-fitting this session's traces: the §20-style runs and
+  both 3× runs are refused; the settled runs pass. `t63`, `t90` and `overshoot` are returned and
+  printed alongside `tau`.
+
+**The lesson, and it is the same one as §18 in a different costume:** a measurement whose *baseline*
+is an oscillation returns a number, not a measurement — and the number was believed for a whole
+tuning campaign because nothing in the tool asked whether the pod was actually still.
+
+---
+
+## 22. THE HEADING IS ABSOLUTE NOW — opt-in, persisted, and it refuses rather than guesses.
+
+**2026-08-16.** §20's structural gap 1 is closed. `poll()` re-zeroed `base_` at the handover, so
+`--deg 90` meant "+90 from wherever the spin-up ended" — an origin that is not a heading at all,
+since the pod wanders during the RPM ramp (measured below: up to ~90 deg). The AS5600 is an
+**absolute** encoder within one turn and that information was being discarded.
+
+### What was added
+
+- **`az zero [<deg>|show|clear]`** — park the pod, declare its current physical heading (default 0),
+  and the reference is persisted. It is stored as the **RAW_ANGLE count**, not the tracker's
+  accumulator: `accum_` starts at 0 on every boot and is meaningful only within a session, whereas
+  RAW_ANGLE is absolute within a turn and therefore the only part that survives a power cycle.
+- **Its own blob, `/cfg/azimuth.bin`** (magic + version + CRC), NOT a field in the per-ESC `Record`.
+  The reference is a property of the rig, so storing it per-ESC would keep one copy per ESC and make
+  "which is authoritative" a question; a separate file also means a heading calibration never bumps
+  `CFG_VERSION`, i.e. never costs the operator their gains.
+- **`az gain absolute 0|1`** / **`azimuth.py --absolute`**. Default OFF, so every existing recipe
+  behaves exactly as before.
+- **It refuses without a reference.** `az on` with `absolute=1` and no stored zero prints
+  `err az: absolute mode has no heading zero — run az zero first` rather than silently falling back
+  to relative (which would point "forward" at the magnet's arbitrary mounting angle). `az zero show`
+  prints `head=unset`, never a number — `%f` of NAN reads as "inf" and looks like a measurement.
+- The handover now clears only the genuine transition artefacts (`ivel_`, `velf_`, `ipos_`); the
+  heading survives it. `az status` and the trace header carry `absolute` and `zeroraw`.
+
+### Verified on the pod, 2026-08-16
+
+    az zero              -> raw 2043 = 0.00 deg
+    --absolute --deg 90  -> ended raw 3072 = 90.44 deg     (hold: mean|err| 0.2, pk-pk 1.0)
+    --absolute --deg 0   -> came BACK to raw 2045 = 0.18 deg
+
+The second run is the whole point: under the old behaviour "0" meant "stay where you are", because
+the handover had just declared the pod's current position to be zero. Refusal path checked too:
+with the zero cleared, `az on` errors instead of starting.
+
+### Two things this exposes, both operational
+
+1. ~~**The spin-up wander is much bigger than the ±10 deg the hold traces suggested.**~~
+   **WITHDRAWN — see §23.** That claim came from reading 176.9 deg off a trace whose ring had
+   WRAPPED, so its `t = 0` was already ~1 s into the run and past the handover: the pod was being
+   *slewed to target*, not wandering. Written one paragraph below the gotcha that explains exactly
+   this failure. The measured pre-handover excursion is 2.4–4.9 deg at the shipped ramp rate.
+   What survives: a wrapped error always takes the shorter path *from where the pod is now*, so a
+   large excursion before capture would flip the direction of travel — it just never gets large.
+2. **Read the heading while the loop HOLDS it, not after `az off`.** One run held 88.7 deg and read
+   77.3 deg after shutdown — the pod settles when the motors brake.
+
+### Gotcha found while measuring this: the trace ring drops the START of a long run
+
+`TRACE_N` is 2048 samples, oldest-overwritten, so at `decim 5` (~155 Hz) a run longer than **~13 s**
+silently loses its beginning — `az on`, the spin-up and the handover — and `t=0` in the dump is then
+a mid-run sample. That is exactly how a 176.9 deg mid-slew sample was first read as "the heading the
+run started from". A full ring (`n = 2048`) is the only tell, and `_az_pull` now says so out loud.
+The §21 traces are unaffected (n = 2012-2013, i.e. not full).
+
+---
+
+## 23. THE SPIN-UP: the typical drift is 3-5 deg and already optimal. The TAIL was the real fault.
+
+**2026-08-16.** §22's next step was "bound the spin-up wander". Measuring it first retired the
+premise and moved the target.
+
+**Wander is defined from the ENCODER ALONE**: `pos(hand_ms) − pos(0)`, where `hand_ms` is the new
+handover stamp in the trace header. It has to be, because **below the seam the ESC is in forced sine
+and there is no eRPM at all** — the `rpm_a/rpm_b` columns in that window are not measurements and
+nothing here rests on them. (`hand_ms` exists because without it a trace cannot separate "the pod
+wandered" from "the pod was slewing to target" — which is exactly the mistake §22 made.)
+
+### The ramp rate is already at its optimum, in both directions
+
+Each run targets the pod's CURRENT heading, so the commanded move is ~0 and anything before the
+handover is drift:
+
+| `spin_slew` | t_hand | pre-handover excursion, per run |
+|---|---:|---|
+| 150 rpm/s | 2.90 s | 4.8 / 8.0 / 10.5 deg |
+| **300 (shipped default)** | **1.51 s** | **2.4 / 2.6 / 3.4 / 4.5 / 4.5 / 4.9 deg** |
+| 900 | 1.13 s | 1.7 / 16.7 / 32.3 deg |
+| 2000 | 1.15 s | 0.6 / 32.1 / 33.8 deg |
+
+Slower drifts for longer; faster enlarges the disturbance at the crossing faster than it shortens the
+window. **300 is not a leftover — it is the measured optimum.**
+
+### Two engineered fixes, both REFUTED by measurement
+
+Both are implemented, default OFF, and kept because a ruled-out fix is worth more than an untried one:
+
+- **Synchronised seam crossing** (`snap_rpm`/`snap_hold`): dwell below the seam, then command both
+  motors past it in ONE `poll()` tick, so the two DShot frames leave microseconds apart instead of
+  the pair straddling the seam for however long the ramp takes to cover their `vscale` difference
+  (1.0000 vs 0.9225). Measured: **0.4 / 3.2 / 14.2 deg at 450 rpm, 13.4 / 22.2 / 46.8 at 480** —
+  worse. At 480 the dwell itself sits on the seam, i.e. it *holds* the straddle it was meant to
+  remove.
+- **Bounded authority below the seam** (`spin_r_max`, gated by `senseRpmFloor()` so the pair can
+  never straddle the seam): the offset had been forced to zero for the entire ramp, and the encoder
+  is the one sensor that works down there. Measured: **8.0 / 9.8 / 9.8 / 11.0 deg at 40 rpm,
+  4.4 / 9.8 / 20.9 / 28.1 at 80** — worse. In forced sine the azimuth's response to an rpm offset is
+  not the 6-step plant the gains were sized against, so the "correction" mostly adds excursion.
+
+### The tail was the real fault, and it is now caught
+
+Across the heading sweep two runs went to **−93 deg and −737 deg** (two full revolutions). The trace
+says exactly what happened: **B reported 0 while A ran 197-449 rpm for ~0.7 s** — one motor had not
+caught in forced sine. Through the crossing the offset is zero by construction, so a whole-motor
+mismatch turns the pod at ~1000 deg/s until the laggard arrives and the handover finally fires (2.23 s
+instead of 1.51 s). No gain can answer that, and no eRPM exists to catch it early.
+
+**`spin_asym_secs` (default 0.5 s, ON) ends the run after that long of one-motor-only running**, and
+`az status` now names why a run stopped (`stop=rate|hardrate|spintimeout|asymstart|command`) — "it
+just stopped" is the one thing a bench log must never say. It fired once in the 8-run campaign:
+
+    before the guard:  ran to -737 deg over 2.2 s, then recovered and held
+    after  the guard:  stopped at 1.31 s with the pod 5.9 deg off
+
+### Where the loop stands, 8 runs, ~95 deg absolute steps (7 completed, 1 guard-aborted)
+
+    error at capture   67-103 deg      settle to <1 deg   2.1 / 3.7 / 4.4 / 4.5 / 4.7 / 6.9 / 7.6 s
+    hold mean |err|    0.11-1.06 deg (median 0.25)        hold pk-pk  0.5-2.1 deg
+
+The fast phase covers most of the step in ~0.5 s and the last degree takes seconds — the slow
+position integrator of §20's structural gap 2, unchanged and still the next real gain.
+Graphs: the artifact published 2026-08-16 (transient, steady state, guard before/after, and every
+configuration tried).

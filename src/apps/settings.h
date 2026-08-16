@@ -282,4 +282,58 @@ inline int load(Thruster** th, uint8_t n, uint16_t* storedVersion = nullptr) {
 inline bool exists() { return LittleFS.exists(CFG_PATH); }
 inline bool clear()  { return LittleFS.remove(CFG_PATH); }
 
+// --- THE AZIMUTH ZERO, in its own blob ---------------------------------------------------------
+// The heading reference is a property of the RIG (where the magnet sits relative to the hull), not
+// of an ESC, so it does not belong in the per-Thruster Record: that would store one copy per ESC and
+// make "which one is authoritative" a question nobody should have to answer. Its own file also means
+// a heading calibration never bumps CFG_VERSION, i.e. never costs the operator their gains.
+//
+// Stored as an AS5600 RAW_ANGLE count, NOT as the tracker's accumulator: `accum_` starts at 0 at
+// boot and is only meaningful within one session, while RAW_ANGLE is absolute within a turn and is
+// therefore the only part of the encoder that survives a power cycle.
+static const char*    AZ_PATH    = "/cfg/azimuth.bin";
+static const uint32_t AZ_MAGIC   = 0x545A4150;   // 'PAZT'
+static const uint16_t AZ_VERSION = 1;
+static const int32_t  AZ_COUNTS  = 4096;         // == Azimuth::COUNTS_PER_REV
+
+struct AzZero {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t pad;
+	int32_t  zeroRaw;      // the RAW_ANGLE count that reads as 0 deg
+	uint32_t crc;          // over zeroRaw
+};
+
+inline bool azSaveZero(int32_t zeroRaw) {
+	if (zeroRaw < 0 || zeroRaw >= AZ_COUNTS) return false;
+	LittleFS.mkdir(CFG_DIR);
+	AzZero z;
+	memset(&z, 0, sizeof(z));
+	z.magic = AZ_MAGIC; z.version = AZ_VERSION; z.zeroRaw = zeroRaw;
+	z.crc = crc32((const uint8_t*)&z.zeroRaw, sizeof(z.zeroRaw));
+	File f = LittleFS.open(AZ_PATH, "w");
+	if (!f) return false;
+	bool ok = f.write((const uint8_t*)&z, sizeof(z)) == sizeof(z);
+	f.close();
+	return ok;
+}
+
+// -1 means "no absolute reference stored", and every caller must treat that as REFUSE — never as
+// "the zero is at raw 0", which would silently point the pod's idea of forward at the magnet's
+// arbitrary mounting angle.
+inline int32_t azLoadZero() {
+	File f = LittleFS.open(AZ_PATH, "r");
+	if (!f) return -1;
+	AzZero z;
+	bool ok = f.read((uint8_t*)&z, sizeof(z)) == (int)sizeof(z);
+	f.close();
+	if (!ok || z.magic != AZ_MAGIC || z.version != AZ_VERSION) return -1;
+	if (crc32((const uint8_t*)&z.zeroRaw, sizeof(z.zeroRaw)) != z.crc) return -1;
+	if (z.zeroRaw < 0 || z.zeroRaw >= AZ_COUNTS) return -1;
+	return z.zeroRaw;
+}
+
+inline bool azZeroStored() { return LittleFS.exists(AZ_PATH); }
+inline bool azClearZero()  { return LittleFS.remove(AZ_PATH); }
+
 }  // namespace settings

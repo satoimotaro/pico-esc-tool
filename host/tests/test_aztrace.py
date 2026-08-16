@@ -198,6 +198,38 @@ def test_fit_subtracts_the_measured_pre_roll_velocity():
     assert f["onset_s"] == pytest.approx(300 * 0.005, abs=0.01)
 
 
+def test_fit_step_refuses_an_unsettled_pre_roll():
+    """MEASURED 2026-08-16, and it cost the file its plant model.
+
+    The pre-roll runs the CLOSED loop. With gains that limit-cycle (kp 0.5 / ki 0.3, inherited from
+    the slipping-coupling era) the pod swung +/-1000 deg/s, so `v0` was whatever phase the capture
+    landed on, and the fit returned gain 59.14 against a true 43.6 and tau 0.0819 against ~0.16.
+    Both were believed. A baseline is not a baseline unless the pre-roll settled."""
+    rows, dt, tau, gain, ds = [], 0.005, 0.15, 43.6, 20.0
+    for i in range(300):                                   # 1.4 Hz limit cycle, +/-1000 deg/s
+        rows.append((i * dt * 1000.0, 0.0, 1000.0 * math.sin(2 * math.pi * 1.37 * i * dt),
+                     -29.8, 0.0))
+    for j in range(700):
+        rows.append(((300 + j) * dt * 1000.0, 0.0, gain * ds * (1 - math.exp(-j * dt / tau)),
+                     -29.8 + ds, 0.0))
+    f = fit_step(parse_dump(_dump(rows)))
+    assert not f["ok"]
+    assert "not settled" in f["why"]
+
+
+def test_fit_step_reads_the_step_the_plant_ACTUALLY_got():
+    """`poll()` clamps a second time — u = constrain(step_base_u_ + step_s_, +/-u_max) with
+    u_max = rpm_off_max/rpm_per_count — and that clamp never reaches the host. Trusting the
+    configured `step_s` therefore over-states the step and under-states the gain."""
+    ds_delivered = 12.0
+    tr = _synth_prestep(300, 700, 0.005, 0.15, 43.6, ds_delivered)
+    tr.config["step_s"] = "20.0"                          # what was ASKED for, and clamped away
+    f = fit_step(tr)
+    assert f["ok"], f
+    assert f["step_s"] == pytest.approx(ds_delivered, rel=1e-9)
+    assert f["gain"] == pytest.approx(43.6, rel=0.05)
+
+
 def test_fit_step_is_independent_of_s_trim():
     """The step is read as (post - pre) off the command column, so whatever trim is in force
     cancels. A fit that divided by the delivered `s` would be wrong by the trim."""

@@ -491,7 +491,7 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 # `az off` / `az on`, and a sweep that set only some of them once inherited vmax=120 from the
 # previous trial and filed the result against the wrong number. Never trust what is already there.
 _AZ_GAINS = ("kp", "ki", "kd", "kff", "trim", "smax", "vmax", "maxrate", "verrclamp",
-             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew", "spinmaxrate", "spinguard", "wraperr", "rpmfloor", "crosszero", "thrustrpm", "thrustsecs", "oversecs", "hardrate", "mixswap", "nullratio", "kipos", "iposmax", "spinokfrac", "trimsecs")
+             "signb", "spinsecs", "spinsmax", "seamkeep", "spinhold", "spinrpm", "spinrpmok", "rpmdrive", "rpmpercount", "rpmoffmax", "rpmtrim", "vellpf", "spinslew", "holdslew", "spinmaxrate", "spinguard", "wraperr", "rpmfloor", "crosszero", "thrustrpm", "thrustsecs", "oversecs", "hardrate", "mixswap", "nullratio", "kipos", "iposmax", "spinokfrac", "trimsecs", "absolute", "snaprpm", "snaphold", "spinrmax", "spincorrmargin")
 
 
 def _az_host(args):
@@ -519,7 +519,10 @@ def _az_push_config(d, args):
             "oversecs": args.over_secs, "hardrate": args.hard_rate,
             "mixswap": 1 if args.mix_swap else 0, "nullratio": args.null_ratio,
             "kipos": args.ki_pos, "iposmax": args.ipos_max,
-            "spinokfrac": args.spin_ok_frac, "trimsecs": args.trim_secs}
+            "spinokfrac": args.spin_ok_frac, "trimsecs": args.trim_secs,
+            "absolute": 1 if args.absolute else 0,
+            "snaprpm": args.snap_rpm, "snaphold": args.snap_hold,
+            "spinrmax": args.spin_r_max, "spincorrmargin": args.spin_corr_margin}
     for k in _AZ_GAINS:
         d.cmd(f"az gain {k} {vals[k]}", timeout=5)
     d.cmd(f"az log {args.decim}", timeout=5)
@@ -566,6 +569,9 @@ def _az_safe(d):
             pass
 
 
+TRACE_RING_N = 2048          # == Azimuth::TRACE_N (src/apps/azimuth.h)
+
+
 def _az_pull(d, name, quiet=False):
     """`az dump` -> AzTrace, and a CSV alongside it. Refused while the loop runs, so stop first."""
     lines = d.cmd("az dump", timeout=90)
@@ -580,6 +586,15 @@ def _az_pull(d, name, quiet=False):
                     f"{tr.ivel[i]:.1f},{tr.carrier[i]:.0f},{tr.rpm_a[i]:.0f},{tr.rpm_b[i]:.0f}\n")
     if not quiet:
         print(f"# wrote {path}  ({len(tr)} samples, {tr.duration:.1f} s at {tr.rate_hz:.0f} Hz)")
+    # THE RING IS 2048 SAMPLES AND IT DROPS THE OLDEST, so a run longer than
+    # 2048*decim/rate (~13 s at decim 5) SILENTLY LOSES ITS BEGINNING — including `az on`, the
+    # spin-up and the handover. A full ring is the only tell, and read without it a mid-slew sample
+    # looks like the starting heading (measured 2026-08-16: 176.9 deg read as the start of a run
+    # that began at 90.4).
+    if len(tr) >= TRACE_RING_N:
+        print(f"# !! the trace ring is FULL ({TRACE_RING_N} samples = {tr.duration:.1f} s): this run "
+              f"was LONGER than that, so its beginning — `az on`, the spin-up, the handover — was "
+              f"overwritten and t=0 is NOT the start. Raise --decim or shorten the run.")
     return tr, path
 
 
@@ -675,6 +690,33 @@ def _trace_once(args, k=0):
               f"Raise |--carrier|.")
 
 
+def cmd_zero(args):
+    """Set / show / clear the HULL heading reference.
+
+    Park the pod where you can say what heading it is at, then run this. The device stores the
+    AS5600 RAW_ANGLE count (absolute within a turn, so it survives a power cycle) — NOT the
+    tracker's accumulator, which restarts at 0 on every boot.
+
+    THE POD MUST NOT BE MOVING and the loop must be off: this is a photograph of where the axis is,
+    and one taken mid-rotation is simply wrong.
+    """
+    d = _az_host(args)
+    try:
+        if args.clear:
+            d.cmd("az zero clear", timeout=5)
+            print("# heading reference cleared — `--absolute` will refuse until it is set again")
+            return
+        if args.show:
+            for line in d.cmd("az zero show", timeout=5):
+                print(line)
+            return
+        for line in d.cmd(f"az zero {args.deg}", timeout=5):
+            print(line)
+        print(f"# stored. `--absolute --deg X` now means hull heading X, across power cycles.")
+    finally:
+        d.close()
+
+
 def cmd_step(args):
     """OPEN-LOOP step, to identify the plant. No feedback — this measures tau and the gain."""
     d = _az_host(args)
@@ -705,6 +747,10 @@ def cmd_step(args):
         return
     print(f"\n# PLANT, MEASURED (first-order fit over {f['n_fit']} points, R^2 {f['r2']:.4f})")
     print(f"#   tau  {f['tau']:.4f} s          <- every gain so far ASSUMED 0.1-0.2 s")
+    # Model-free, and print it FIRST-CLASS: the response overshoots, so tau is an idealisation.
+    if f.get("t63") is not None and f.get("t90") is not None:
+        print(f"#   t63  {f['t63']:.3f} s   t90 {f['t90']:.3f} s   overshoot {100*f['overshoot']:+.0f} %"
+              f"   (model-free; compare RUNS with these, not with tau)")
     print(f"#   gain {f['gain']:.2f} deg/s per command count   (step {f['step_s']:+.1f} counts, "
           f"v {f['v0']:+.0f} -> {f['v_inf']:+.0f} deg/s)")
     if abs(f["v0"]) > 30:
@@ -841,6 +887,24 @@ def add_ondevice(p):
                    help="wrap the position error to +/-180 deg (default)")
     p.add_argument("--no-wrap-err", dest="wrap_err", action="store_false",
                    help="servo the raw unwrapped accumulator — for comparison only")
+    p.add_argument("--absolute", action="store_true", default=False,
+                   help="--deg is a HULL heading, not '+X from wherever the spin-up ended'. Needs a "
+                        "stored zero (`azimuth.py zero`) and the device REFUSES to start without "
+                        "one. Off, the handover re-zeroes the heading (azimuth.h) and the origin "
+                        "wanders +/-10 deg run to run")
+    p.add_argument("--snap-rpm", type=float, default=0.0,
+                   help="0 = off. Dwell at this speed (BELOW the ~560 rpm seam), then command both "
+                        "motors past it in ONE tick, so they cross together instead of whenever "
+                        "each ESC's own command happens to reach 515 (their vscale differs)")
+    p.add_argument("--snap-hold", type=float, default=0.4,
+                   help="seconds to settle at --snap-rpm before the step")
+    p.add_argument("--spin-r-max", type=float, default=0.0,
+                   help="mech rpm of azimuth authority BELOW the seam, where the loop had none "
+                        "(the offset was forced to zero for the whole ramp). 0 = old behaviour. "
+                        "Stops automatically as the pair approaches the 6-step floor, so the pair "
+                        "can never straddle the seam")
+    p.add_argument("--spin-corr-margin", type=float, default=0.80,
+                   help="fraction of the profile's 6-step floor at which --spin-r-max stops")
     p.add_argument("--verr-clamp", type=float, default=0.0,
                    help="0 disables. Non-zero turns the integral into a fixed-rate ramp whenever "
                         "|vsp-vel| exceeds it; the config that converged had no clamp")
@@ -977,6 +1041,15 @@ def main():
     add_ondevice(tc)
     tc.set_defaults(fn=cmd_trace)
 
+    zr = sub.add_parser("zero", help="set/show/clear the HULL heading reference (persisted)")
+    zr.add_argument("--deg", type=float, default=0.0,
+                    help="the heading the pod is AT right now (default 0). Park it there first")
+    zr.add_argument("--show", action="store_true", help="print the stored zero and current heading")
+    zr.add_argument("--clear", action="store_true", help="forget it; --absolute then refuses")
+    zr.add_argument("--port")
+    zr.add_argument("--dry-run", action="store_true", help="rejected: the sim host has no `az`")
+    zr.set_defaults(fn=cmd_zero)
+
     st = sub.add_parser("step", help="OPEN-LOOP step to identify the plant (tau + gain)")
     st.add_argument("--step-s", type=float, default=20.0, help="azimuth command step, counts")
     st.add_argument("--step-secs", type=float, default=3.0)
@@ -988,7 +1061,7 @@ def main():
     st.set_defaults(fn=cmd_step)
 
     args = ap.parse_args()
-    if args.subcmd in ("trace", "step"):
+    if args.subcmd in ("trace", "step", "zero"):
         args.fn(args)                      # _validate() belongs to the host-side servo, not these
         return
     try:

@@ -285,14 +285,19 @@ def fit_step(tr: AzTrace, s_cmd=None, settle_frac=0.25) -> dict:
     if onset is None or onset < 3:
         # No pre-roll in this trace (or the step landed immediately): fall back to a zero baseline
         # and the delivered command minus the trim.
-        onset, v0 = 0, 0.0
+        onset, v0, pre_rms = 0, 0.0, 0.0
         ds = float(s_cmd) if s_cmd is not None else (
             (sum(tr.s) / len(tr.s)) - float(tr.config.get("trim", 0.0)))
     else:
         k = max(2, onset // 3)
-        v0 = sum(tr.vel[onset - k:onset]) / k         # settled baseline, measured
-        ds = float(tr.config["step_s"]) if "step_s" in tr.config else (
-            _median(tr.s[onset:]) - _median(tr.s[:onset]))
+        base = tr.vel[onset - k:onset]
+        v0 = sum(base) / k                            # settled baseline, measured
+        pre_rms = math.sqrt(sum((x - v0) ** 2 for x in base) / k)
+        # THE DELIVERED STEP, NOT THE ASKED ONE. `beginStep` clamps to +/-smax, but poll() clamps
+        # AGAIN at apply time — `u = constrain(step_base_u_ + step_s_, +/-u_max)` with
+        # u_max = rpm_off_max/rpm_per_count — and that second clamp never reaches the host.
+        # Reading the command column off the trace is the only way to see what the plant got.
+        ds = _median(tr.s[onset:]) - _median(tr.s[onset - k:onset])
     if abs(ds) < 1e-6:
         return {"ok": False, "why": "step size is zero — nothing to identify"}
 
@@ -304,6 +309,33 @@ def fit_step(tr: AzTrace, s_cmd=None, settle_frac=0.25) -> dict:
     dv = v_inf - v0
     if abs(dv) < 1e-6:
         return {"ok": False, "why": "no velocity change across the step — the pod never responded"}
+
+    # A BASELINE IS ONLY A BASELINE IF THE PRE-ROLL SETTLED, and this fails closed because the
+    # alternative already happened: on 2026-08-16 the pre-roll gains (kp 0.5 / ki 0.3, inherited
+    # from the broken plant) limit-cycled at +/-1000 deg/s, `v0` was captured at a random phase of
+    # that oscillation, and the fit returned gain 59.14 instead of the true 43.6 (= 6.0 deg/s per
+    # rpm x 7.26 rpm/count) with tau 0.0819 s instead of ~0.16. Both numbers were then trusted, and
+    # kff was "corrected" 36 % the wrong way. The step itself is OPEN LOOP — only the PRE-ROLL needs
+    # gains that hold still.
+    if pre_rms > 0.10 * abs(dv):
+        return {"ok": False,
+                "why": f"pre-roll not settled: baseline rms {pre_rms:.0f} deg/s is "
+                       f"{100.0 * pre_rms / abs(dv):.0f} % of the {dv:+.0f} deg/s response, so v0 "
+                       f"is a random phase of an oscillation and BOTH tau and gain would be fitted "
+                       f"to it. Re-run with pre-roll gains that hold the angle still."}
+
+    # MODEL-FREE RISE, reported alongside tau because tau ALONE HIDES THE SHAPE. The 350KV pod's
+    # open-loop response overshoots ~30 % and settles back (the inner velocity PI's own overshoot,
+    # measured 2026-08-16 on 3/3 runs), so a first-order tau is an idealisation of a second-order
+    # response and the historical spread of "tau" (0.082 / 0.096 / 0.167 / 0.185) is partly that.
+    # t63/t90/overshoot are what one run can actually be compared against another with.
+    def _cross(frac):
+        want = v0 + frac * dv
+        return next((tr.t[i] - t_on for i in post
+                     if (tr.vel[i] - want) * (1.0 if dv > 0 else -1.0) >= 0.0), None)
+    t63, t90 = _cross(0.632), _cross(0.90)
+    v_peak = (max if dv > 0 else min)(tr.vel[i] for i in post)
+    overshoot = (v_peak - v_inf) / dv
 
     xs, ys = [], []
     for i in post:
@@ -329,7 +361,8 @@ def fit_step(tr: AzTrace, s_cmd=None, settle_frac=0.25) -> dict:
     ss_res = sum((y - (slope * x + inter)) ** 2 for x, y in zip(xs, ys))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
     return {"ok": True, "tau": tau, "gain": dv / ds, "v_inf": v_inf, "v0": v0,
-            "step_s": ds, "r2": r2, "n_fit": n, "onset_s": t_on - tr.t[0]}
+            "step_s": ds, "pre_rms": pre_rms, "t63": t63, "t90": t90, "overshoot": overshoot,
+            "r2": r2, "n_fit": n, "onset_s": t_on - tr.t[0]}
 
 
 def suggest_gains(fit: dict, zeta=1.0, kd=0.3) -> dict:
