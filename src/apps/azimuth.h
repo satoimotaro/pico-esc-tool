@@ -433,6 +433,18 @@ public:
 	void stop() { on_ = false; mode_ = OFF; ivel_ = 0.0f; step_armed_ = false; rpm_phase_ = false;
 	              if (a_) a_->setRaw(0); if (b_) b_->setRaw(0); }   // NOTE: keeps the trace — it is
 	                                                               // read back after the run stops.
+	// A REPEATABLE DISTURBANCE. `--poke-at` prompts for a hand push, which cannot be repeated,
+	// cannot be sized, and lands at a different phase every time — so disturbance rejection has
+	// never actually been measured on this pod. This injects a KNOWN offset in counts for a known
+	// number of ms, ON TOP of whatever the loop is commanding and AFTER its authority clamp, so it
+	// is a true input disturbance the loop has to fight rather than a setpoint it can track.
+	bool kick(float counts, uint32_t ms) {
+		if (!on_ || mode_ != HOLD || ms == 0 || ms > 2000) return false;
+		kick_r_ = counts; kick_us_ = last_us_ ? last_us_ : micros();
+		kick_end_us_ = kick_us_ + ms * 1000UL;
+		return true;
+	}
+	uint32_t kickUs() const { return kick_us_; }
 	void setTarget(float deg) { target_cmd_ = deg; if (tgt_slew <= 0.0f) target_ = deg; }
 	float targetCmd() const { return target_cmd_; }
 
@@ -761,6 +773,11 @@ private:
 		// at 400. The pair never reports up honestly, and net rotation went from 17 deg to ~1400.
 		// The pod does rotate through the crossing; `trim_secs` is what shortens the recovery.
 		if (cross_zero_offset && rpm_phase_) r = spinCorr_(u);
+		// AFTER the clamp on purpose: a disturbance does not respect the loop's own authority.
+		if (kick_end_us_) {
+			if ((int32_t)(now_us_ - kick_end_us_) < 0) r += kick_r_ * rpm_per_count;
+			else kick_end_us_ = 0;
+		}
 		if (mix_swap) {
 			// r is the COMMON offset (zero holds the angle); the thrust is the opposition.
 			// Note this makes cross_zero_offset exactly right for the crossing: r = 0 gives pure
@@ -806,6 +823,7 @@ private:
 	void beginRpmSpinup_() {
 		rpm_phase_ = true; rpm_t0_ = micros();
 		snap_us_ = 0; snap_done_ = (snap_rpm <= 0.0f); asym_s_ = 0.0f; stop_why_ = STOP_NONE;
+		kick_us_ = kick_end_us_ = 0;
 		if (a_) a_->vc.slew_rpm_s = spin_slew;
 		if (b_) b_->vc.slew_rpm_s = spin_slew;
 		float sgn = (carrier < 0.0f) ? -1.0f : 1.0f;
@@ -879,6 +897,8 @@ private:
 	float    step_s_ = 0, step_base_u_ = 0;
 	bool     step_armed_ = false, spinning_ = false, rpm_phase_ = false;
 	uint32_t rpm_t0_ = 0, step_pre_us_ = 0, step_run_us_ = 0;
+	uint32_t kick_us_ = 0, kick_end_us_ = 0;     // repeatable input disturbance
+	float    kick_r_ = 0.0f;
 	float    target_cmd_ = 0.0f;                 // what the operator asked for; target_ chases it
 	uint8_t  stop_why_ = STOP_NONE;
 	float    asym_s_ = 0.0f;                     // seconds of one-motor-only running

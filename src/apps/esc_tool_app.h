@@ -892,6 +892,15 @@ private:
 						else if(!az_.begin(g?atof(g):0.0f)) Serial.println("err az: no encoder");
 						else { Serial.printf("az|on|carrier=%.0f|tgt=%.2f\n", az_.carrier, az_.target()); Serial.println("ok"); } } }
 				else if(!strcmp(sub,"off")) { az_.stop(); Serial.println("ok"); }
+				// az kick <counts> <ms> — inject a KNOWN disturbance while the loop runs, so rejection
+				// can be measured instead of hand-poked.
+				else if(!strcmp(sub,"kick")) {
+					char* c=strtok(nullptr," "); char* m=strtok(nullptr," ");
+					if(!c||!m) Serial.println("err az: kick <counts> <ms>");
+					else if(!az_.kick(atof(c), (uint32_t)atol(m)))
+						Serial.println("err az: kick needs the hold running, 0 < ms <= 2000");
+					else { Serial.printf("az|kick|s=%.1f|ms=%ld\n", atof(c), atol(m));
+					       Serial.println("ok"); } }
 				else if(!strcmp(sub,"tgt")) { char* g=strtok(nullptr," ");
 					if(!g) Serial.println("err az: tgt <deg>"); else { az_.setTarget(atof(g)); Serial.println("ok"); } }
 				else if(!strcmp(sub,"gain")) { char* k=strtok(nullptr," "); char* v=strtok(nullptr," ");
@@ -978,7 +987,7 @@ private:
 							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
 							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f|spinrpm=%.0f|rpmdrive=%d|rpmpercount=%.2f|rpmoffmax=%.0f|rpmtrim=%.0f|vellpf=%.2f|spinslew=%.0f|holdslew=%.0f"
-							              "|spinmaxrate=%.0f|spinguard=%.2f|wraperr=%d|rpmfloor=%.0f|crosszero=%d|thrustrpm=%.0f|thrustsecs=%.1f|oversecs=%.2f|hardrate=%.0f|mixswap=%d|nullratio=%.2f|kipos=%.4f|absolute=%d|zeroraw=%ld|step_s=%.1f|step_ms=%.1f|hand_ms=%.1f\n",
+							              "|spinmaxrate=%.0f|spinguard=%.2f|wraperr=%d|rpmfloor=%.0f|crosszero=%d|thrustrpm=%.0f|thrustsecs=%.1f|oversecs=%.2f|hardrate=%.0f|mixswap=%d|nullratio=%.2f|kipos=%.4f|absolute=%d|zeroraw=%ld|step_s=%.1f|step_ms=%.1f|hand_ms=%.1f|kick_ms=%.1f\n",
 							              n, az_.decim(), az_.kp, az_.ki, az_.kd, az_.kff, az_.s_trim,
 							              az_.smax, az_.vmax, az_.carrier, az_.max_rate, az_.verr_clamp,
 							              az_.sign_a, az_.sign_b, Azimuth::SEAM_CMD, az_.target(),
@@ -987,6 +996,9 @@ private:
 							                : 0.0,
 							              (n && az_.handUs())
 							                ? (double)(int32_t)(az_.handUs() - az_.traceAt(0).t_us) / 1000.0
+							                : -1.0,
+							              (n && az_.kickUs())
+							                ? (double)(int32_t)(az_.kickUs() - az_.traceAt(0).t_us) / 1000.0
 							                : -1.0);
 							Serial.println("t_ms,pos,vel,s,ivel,carrier,rpm_a,rpm_b");
 							uint32_t t0 = n ? az_.traceAt(0).t_us : 0;

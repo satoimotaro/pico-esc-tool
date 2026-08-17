@@ -648,7 +648,11 @@ def _trace_once(args, k=0):
         time.sleep(args.spinup_secs)
         print(d.cmd(f"az on {args.carrier} {args.deg}", timeout=8)[0])
         t0 = time.time()
-        if args.poke_at:
+        if getattr(args, "kick_at", 0.0):
+            time.sleep(min(args.kick_at, args.secs))
+            print(d.cmd(f"az kick {args.kick_counts} {args.kick_ms}", timeout=5)[0])
+            time.sleep(max(0.0, args.secs - args.kick_at))
+        elif args.poke_at:
             # A hand disturbance is the only direct evidence of closed-loop stiffness, and the one
             # observation from 8/11 that was never captured as data. Prompt for it, then let the
             # ring record the recovery.
@@ -1039,6 +1043,12 @@ def main():
                     help="runs per configuration. ONE RUN IS NOT A RESULT — the same config has "
                          "given pk-pk 89 and 447 deg back to back")
     tc.add_argument("--rest", type=float, default=6.0, help="seconds between runs")
+    tc.add_argument("--kick-at", type=float, default=0.0,
+                    help="inject a REPEATABLE disturbance this many seconds after `az on` "
+                         "(0 = none). Unlike --poke-at this is sized, timed and reproducible")
+    tc.add_argument("--kick-counts", type=float, default=6.0,
+                    help="disturbance size, command counts (1 count = 43.6 deg/s of azimuth rate)")
+    tc.add_argument("--kick-ms", type=int, default=200, help="how long the disturbance lasts")
     tc.add_argument("--poke-at", type=float, default=0.0,
                     help="prompt for a hand disturbance this many seconds in (0 = no prompt)")
     add_ondevice(tc)

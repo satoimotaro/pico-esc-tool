@@ -1744,3 +1744,57 @@ response and the eRPM's noise**, not by how often that eRPM arrives. What is lef
 2. **Torque authority** — the pod uses ~2 % of what the drivetrain can do; more current headroom is
    the only thing that makes a rotor change speed faster.
 3. Accept it: 0.7 s to within 5 deg, 0.25 deg hold, over a 700-2000 rpm thrust range.
+
+---
+
+## 26. DISTURBANCE REJECTION, MEASURED AT LAST — and `ki_pos` had been 4x too small.
+
+**2026-08-17.** §20 listed stiffness as "still not measured" and `--poke-at` prompts for a hand push,
+which cannot be sized, timed or repeated. So rejection was never a number. It is now.
+
+### A repeatable disturbance: `az kick <counts> <ms>`
+
+A known offset, injected for a known time, **on top of what the loop is commanding and AFTER its
+authority clamp** — a true input disturbance the loop has to fight, not a setpoint it can track.
+The trace header carries `kick_ms` so the analysis can find it. Repeatability, two runs each:
+
+| kick | peak excursion | half-recovered | back inside 1 deg |
+|---|---:|---:|---:|
+| 3 counts (131 deg/s) | 9.76 / 9.40 deg | 0.16 s | 1.06 / 1.01 s |
+| 6 counts (262 deg/s) | 20.04 / 20.04 deg | 0.16 s | 4.48 / 5.08 s |
+| 10 counts (436 deg/s) | 33.84 / 34.01 deg | 0.15 s | 5.83 / 5.02 s |
+
+Peak excursions repeat to better than 1 %, which is what a hand push could never give.
+
+**The fast half of rejection was never the problem: the loop halves any disturbance in 0.16 s,
+independent of size.** What was slow is the last degree — the same actuator-resolution floor that
+makes the last degree of a step slow (§24).
+
+### `ki_pos` is the term that beats that floor, and it was set below its own rule
+
+§20 derived `ki_pos ≈ 0.6·kp` (the PI zero at ~ω_c/5). At `kp` 6 that is **3.6**, yet the shipped
+configuration ran **2.0** — the value measured back at `kp` 0.5 and never re-derived when `kp` went
+up. Sweeping it against the 6-count kick:
+
+| `ki_pos` | PI zero | back inside 1 deg | hold before the kick |
+|---:|---:|---:|---:|
+| 2.0 | 0.33 rad/s | 5.00 / 4.98 s | 1.85 / 1.14 deg |
+| 4.0 | 0.67 | 3.85 / 3.77 s | 0.75 / 1.43 |
+| **8.0** | **1.33** | **2.14 / 3.07 s** | **0.49 / 0.44** |
+| 12.0 | 2.00 | 2.09 / 2.11 s | 0.73 / 0.54, pk-pk 4.1-6.5 |
+| 16.0 | 2.67 | 3.07 / 2.97 s | 0.96 / 1.15, pk-pk 8.9-11.4 |
+
+8 is the knee: 12 buys nothing and costs ripple, 16 is worse everywhere.
+
+### Validation at `ki_pos` 8.0 — step, hold and kick in one run, 3 runs
+
+    step 58-100 deg -> within 5 deg   0.66 / 0.70 / 0.73 s     (was 0.68-0.82)
+    hold mean|err|                    0.11 / 0.18 / 0.16 deg   (was ~0.25 median)
+    hold pk-pk                        0.62 / 0.79 / 0.97 deg   (was ~1.0)
+    6-count kick, back inside 1 deg   2.08 / 2.09 / 2.75 s     (was 5.0)
+
+**Recovery 2.4x faster, the hold ~40 % tighter, and the step unchanged.** No code, no new term — a
+gain that had simply never been re-derived after `kp` moved. **Use `--ki-pos 8.0`.**
+
+The lesson is §21's in another costume: when one gain changes, every gain *tied to it by a rule*
+changes with it, and a value carried across without re-deriving is not a tuned value.
