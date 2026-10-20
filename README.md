@@ -33,7 +33,9 @@ python host/esctool.py set 0 motor_direction=Reversed
 python host/esctool.py flash 0 firmware.hex --yes             # flash matching BLHeli-S/Bluejay firmware
 ```
 
-The Pico is auto-detected (USB VID 2E8A). Wiring — signal pins, mode pin, Wi-Fi, motor poles — lives
+The Pico is auto-detected (USB VID 2E8A). For a board with no USB host, `pio run -e main_uart` puts
+the same CLI on UART0 (GP0 TX / GP1 RX, 921600); behind a TCP relay, every host tool takes
+`--port socket://<ip>:<port>`. Wiring — signal pins, mode pin, Wi-Fi, motor poles — lives
 in one file, `src/apps/esc_config.h`; see `construction/wiring/`.
 
 ## The firmware: declare your ESCs in `main.cpp`
