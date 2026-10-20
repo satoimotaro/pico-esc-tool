@@ -17,6 +17,7 @@
 #pragma once
 #include <Arduino.h>
 #include "esc_config.h"
+#include "console.h"
 #include "esc_session.h"
 #include "vel_control.h"
 #include "motor_model.h"
@@ -378,7 +379,7 @@ public:
 		vel::Status st = vc.step(dt);
 		if (st != vel::Status::OK) {
 			stop();
-			Serial.printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
+			console::out().printf("# ESC %u RPM abort status=%d (1=overspeed 2=stall 3=temp) — stopped\n",
 			              index_, (int)st);
 			return;   // stop() already reset the gate; do NOT re-open it on a dead motor's last frame
 		}

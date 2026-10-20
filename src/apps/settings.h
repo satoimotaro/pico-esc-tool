@@ -177,7 +177,7 @@ inline void apply(Thruster& t, const Record& r) {
 			// motorSet_ (only setMotor() does), so capture() would still write hasMotor=0 and the next
 			// boot's apply() would skip setMotor entirely — kv/pp/v never restored and the soft-sensor
 			// duty map silently back on the MotorModel defaults, under a measured curve that loads fine.
-			Serial.printf("# cfg: no parametric curve at cross_up %.0f (kv=%.0f pp=%u) — keeping the "
+			console::out().printf("# cfg: no parametric curve at cross_up %.0f (kv=%.0f pp=%u) — keeping the "
 			              "current curve; `motor` is NOT marked configured, so re-run `motor` with a "
 			              "cross_up in %d..%d before the next `cfg save` (a measured curve fixes the FF "
 			              "but not the persisted motor identity)\n",
@@ -199,7 +199,7 @@ inline void apply(Thruster& t, const Record& r) {
 		// Report a rejection: setCurve() correctly keeps the existing curve, but silently falling back
 		// to the parametric one after a reset looks identical to "the save never happened".
 		if (!t.setCurve(pts, r.curveN, (int)r.polePairs, r.crossUpErpm, r.crossDnErpm, regs))
-			Serial.printf("# cfg: stored curve REJECTED (%u points, pp=%u) — keeping the current curve\n",
+			console::out().printf("# cfg: stored curve REJECTED (%u points, pp=%u) — keeping the current curve\n",
 			              (unsigned)r.curveN, (unsigned)r.polePairs);
 	}
 	t.vc.kp = r.kp; t.vc.ki = r.ki; t.vc.kd = r.kd; t.vc.d_tau = r.dTau;
@@ -274,7 +274,7 @@ inline int load(Thruster** th, uint8_t n, uint16_t* storedVersion = nullptr) {
 		apply(*th[i], r);
 	}
 	if (h.version != CFG_VERSION)
-		Serial.printf("# cfg: migrated a v%u config to v%u — `cfg save` to store it in the new format\n",
+		console::out().printf("# cfg: migrated a v%u config to v%u — `cfg save` to store it in the new format\n",
 		              (unsigned)h.version, (unsigned)CFG_VERSION);
 	return (int)h.count;
 }

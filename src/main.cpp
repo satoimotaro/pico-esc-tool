@@ -74,7 +74,15 @@ void setup() {
 	esc1.vc.stop_below_rpm = 0.0f;   // only an exact rpm 0 stops (sine low-speed still runs); raise to
 	                                 // cut off a marginal low band and treat it as stop.
 
-	tool.begin();
+#if ESC_CONSOLE_UART
+	Serial1.setTX(ESC_UART_TX);
+	Serial1.setRX(ESC_UART_RX);
+	Serial1.setFIFOSize(ESC_UART_FIFO);
+	Serial1.begin(ESC_UART_BAUD);
+	tool.begin(Serial1);                    // CLI over UART0 (see esc_config.h)
+#else
+	tool.begin();                           // CLI over USB CDC
+#endif
 }
 void loop()   { tool.poll(); }        // serial + Wi-Fi + each Thruster's RPM loop + shared spinPoll
 void setup1() {}

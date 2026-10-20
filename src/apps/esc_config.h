@@ -21,6 +21,20 @@
 // switch anytime with the `mode` command).
 #define ESC_MODE_PIN      22
 
+// --- CLI transport -----------------------------------------------------------------------------
+// 0 = USB CDC (default; host/esctool.py on a laptop). 1 = UART0 on the pins below, for a board with
+// no USB host — the ROV's Pi, or the thrust bench's fixture Pico relaying the CLI over Wi-Fi. Same
+// line protocol either way; the `#` boot notices follow the CLI to the chosen transport.
+#ifndef ESC_CONSOLE_UART
+#define ESC_CONSOLE_UART  0
+#endif
+#define ESC_UART_TX       0                // GP0 -> peer RX
+#define ESC_UART_RX       1                // GP1 <- peer TX
+#define ESC_UART_BAUD     921600
+// The CLI is polled once per core0 loop and a flash step holds the loop, so the RX side needs more
+// than the 32-byte default to take a full 600-char command line without dropping bytes.
+#define ESC_UART_FIFO     1024
+
 // --- Wi-Fi Access Point (esc_tool SETUP mode) -------------------------------------------------
 #define ESC_AP_SSID       "pico-esc-tool"
 #define ESC_AP_PASS       "esctool1234"    // >= 8 chars (WPA2); change before real use

@@ -30,7 +30,7 @@
 
 // ---- small helpers (unchanged from esc_tool.cpp) ----
 static void printHex(const uint8_t* p, uint16_t n) {
-	for (uint16_t i = 0; i < n; i++) { Serial.print("0123456789ABCDEF"[p[i] >> 4]); Serial.print("0123456789ABCDEF"[p[i] & 0xF]); }
+	for (uint16_t i = 0; i < n; i++) { console::out().print("0123456789ABCDEF"[p[i] >> 4]); console::out().print("0123456789ABCDEF"[p[i] & 0xF]); }
 }
 static int hexVal(char c) { if (c>='0'&&c<='9') return c-'0'; if (c>='A'&&c<='F') return c-'A'+10; if (c>='a'&&c<='f') return c-'a'+10; return -1; }
 static int parseHex(const char* s, uint8_t* buf, int cap) {
@@ -171,8 +171,11 @@ public:
 	// sets their per-motor gains BEFORE calling begin()). n = how many.
 	EscTool(Thruster** thrusters, uint8_t n) : th_(thrusters), n_(n) {}
 
-	void begin() {
+	// io = where the CLI lives (see console.h). USB CDC by default; pass an already-begun UART for a
+	// board with no USB host. USB is started either way so a laptop can still watch the boot.
+	void begin(Stream& io = Serial) {
 		Serial.begin(115200);
+		console::io = &io;
 #if ESC_MODE_PIN >= 0
 		pinMode(ESC_MODE_PIN, INPUT_PULLUP);
 #endif
@@ -187,9 +190,9 @@ public:
 		uint16_t storedVer = 0;
 		int restored = settings::load(th_, n_, &storedVer);
 		if (restored > 0)
-			Serial.printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
+			console::out().printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
 		else if (storedVer && storedVer != settings::CFG_VERSION)
-			Serial.printf("# cfg: IGNORED a stored config written as v%u (this build wants v%u) — "
+			console::out().printf("# cfg: IGNORED a stored config written as v%u (this build wants v%u) — "
 			              "gains/vcal are at compile-time defaults; re-save with `cfg save`\n",
 			              storedVer, settings::CFG_VERSION);
 		// The azimuth's hull reference, from its own blob. Absent is not an error — it only means
@@ -199,7 +202,7 @@ public:
 		if (n_ >= 2) az_.bind(th_[0], th_[1], &enc_);
 		az_.zero_raw = settings::azLoadZero();
 		if (az_.zero_raw >= 0)
-			Serial.printf("# az: heading zero restored (raw %ld)\n", (long)az_.zero_raw);
+			console::out().printf("# az: heading zero restored (raw %ld)\n", (long)az_.zero_raw);
 
 		// Wi-Fi routes: lambdas capturing `this` bind each HTTP path to a member handler.
 		server_.on("/", [this]{ hIndex(); });
@@ -261,7 +264,7 @@ private:
 			if (!tempNoneSince_[i]) tempNoneSince_[i] = millis();
 			else if (!tempNoneSaid_[i] && millis() - tempNoneSince_[i] > THERMAL_NONE_WARN_MS) {
 				tempNoneSaid_[i] = true;
-				Serial.printf("# ESC %u no EDT temperature after %lus of closed-loop drive — NO thermal "
+				console::out().printf("# ESC %u no EDT temperature after %lus of closed-loop drive — NO thermal "
 				              "protection (limiter idle). Re-arm to retry EDT enable.\n",
 				              i, (unsigned long)(THERMAL_NONE_WARN_MS / 1000));
 			}
@@ -272,14 +275,14 @@ private:
 		if ((uint8_t)s == tempSeen_[i]) return;
 		tempSeen_[i] = (uint8_t)s;
 		if (s == vel::TempState::DERATE)
-			Serial.printf("# ESC %u thermal DERATE: ESC MCU %.0fC (warn %.0f, abort %.0f) — command ceiling %.0f%%\n",
+			console::out().printf("# ESC %u thermal DERATE: ESC MCU %.0fC (warn %.0f, abort %.0f) — command ceiling %.0f%%\n",
 			              i, th_[i]->vc.temp(), th_[i]->vc.warn_temp, th_[i]->vc.max_temp,
 			              th_[i]->vc.tempLimit() * 100.0f);
 		else if (s == vel::TempState::STALE)
-			Serial.printf("# ESC %u thermal telemetry LOST (last %.0fC) — limiter released, NO thermal protection\n",
+			console::out().printf("# ESC %u thermal telemetry LOST (last %.0fC) — limiter released, NO thermal protection\n",
 			              i, th_[i]->vc.temp());
 		else if (s == vel::TempState::OK)
-			Serial.printf("# ESC %u thermal ok: ESC MCU %.0fC, full command authority\n", i, th_[i]->vc.temp());
+			console::out().printf("# ESC %u thermal ok: ESC MCU %.0fC, full command authority\n", i, th_[i]->vc.temp());
 	}
 	uint8_t  tempSeen_[escs::COUNT] = {0};       // last ANNOUNCED TempState per ESC (0 == TempState::NONE)
 	uint32_t tempNoneSince_[escs::COUNT] = {0};  // millis() this ESC started driving with no temperature
@@ -522,82 +525,82 @@ private:
 	// `esc.` facade calls are retargeted to th_[i]->/escs::, and NEW commands (rpm, gain) are appended.
 	void handleSerial() {
 		static char line[600]; static uint16_t len = 0; static uint8_t flbuf[256];
-		while (Serial.available()) {
-			int c = Serial.read();
+		while (console::out().available()) {
+			int c = console::out().read();
 			if (c == '\r') continue;
 			if (c != '\n') { if (len < sizeof(line)-1) line[len++]=(char)c; continue; }
 			line[len]='\0'; len=0;
 			char* cmd = strtok(line, " "); if (!cmd) continue;
 			auto argi = []() { char* a=strtok(nullptr," "); return a?atoi(a):-1; };
 
-			if (!strcmp(cmd,"ping")) { Serial.println("id esc_tool v1"); Serial.println("ok"); }
-			else if (!strcmp(cmd,"pins")) { Serial.printf("pins %u", n_); for(uint8_t i=0;i<n_;i++)Serial.printf(" %u",Esc::pin(i)); Serial.println(); Serial.println("ok"); }
+			if (!strcmp(cmd,"ping")) { console::out().println("id esc_tool v1"); console::out().println("ok"); }
+			else if (!strcmp(cmd,"pins")) { console::out().printf("pins %u", n_); for(uint8_t i=0;i<n_;i++)console::out().printf(" %u",Esc::pin(i)); console::out().println(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"fwlist")) { Dir dir=LittleFS.openDir(FW_DIR); int n=0;   // list on-device firmware library
 				while(dir.next()){ String fn=dir.fileName(); int sl=fn.lastIndexOf('/'); if(sl>=0)fn=fn.substring(sl+1);
-					if(fn.endsWith(".hex")){ Serial.printf("fw| %s  %u bytes\n", fn.c_str(), (unsigned)dir.fileSize()); n++; } }
-				Serial.printf("fwlist %d\n", n); Serial.println("ok"); }
+					if(fn.endsWith(".hex")){ console::out().printf("fw| %s  %u bytes\n", fn.c_str(), (unsigned)dir.fileSize()); n++; } }
+				console::out().printf("fwlist %d\n", n); console::out().println("ok"); }
 			else if (!strcmp(cmd,"mode")) { char* a=strtok(nullptr," ");
 				if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
-				Serial.printf("mode %s (wifi %s)\n", mode_==SETUP?"setup":"drive", wifiUp_?"on":"off"); Serial.println("ok"); }
+				console::out().printf("mode %s (wifi %s)\n", mode_==SETUP?"setup":"drive", wifiUp_?"on":"off"); console::out().println("ok"); }
 			else if (!strcmp(cmd,"scan")) { for(uint8_t i=0;i<n_;i++){ escs::Info in;
-				if(!th_[i]->scan(in)) Serial.printf("esc|%u|%u|0\n",i,Esc::pin(i));
-				else Serial.printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } Serial.println("ok"); }
+				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,Esc::pin(i));
+				else console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } console::out().println("ok"); }
 			else if (!strcmp(cmd,"read")) { int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
-				if(i<0||i>=n_) Serial.println("err bad-index");
-				else if(!th_[i]->readConfig(cfg)) Serial.println("err no-connect");
-				else { Serial.print("cfg|"); printHex(cfg,esc_setup::kEepromLen); Serial.println(); Serial.println("ok"); } }
+				if(i<0||i>=n_) console::out().println("err bad-index");
+				else if(!th_[i]->readConfig(cfg)) console::out().println("err no-connect");
+				else { console::out().print("cfg|"); printHex(cfg,esc_setup::kEepromLen); console::out().println(); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"enter")) { int i=argi(); escs::Info in;
-				if(i<0||i>=n_) Serial.println("err bad-index");
-				else if(!th_[i]->connect(in)) Serial.println("err no-connect");
-				else { Serial.printf("dev|%04X|%u|%u\n",in.sig,in.bootVer,in.bootPages); Serial.println("ok"); } }
-			else if (!strcmp(cmd,"run")||!strcmp(cmd,"disconnect")) { escs::release(); Serial.println("ok"); }
+				if(i<0||i>=n_) console::out().println("err bad-index");
+				else if(!th_[i]->connect(in)) console::out().println("err no-connect");
+				else { console::out().printf("dev|%04X|%u|%u\n",in.sig,in.bootVer,in.bootPages); console::out().println("ok"); } }
+			else if (!strcmp(cmd,"run")||!strcmp(cmd,"disconnect")) { escs::release(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"editpage")) { int i=argi(); char* ovr=strtok(nullptr," ");
-				if(i<0||i>=n_||!ovr){ Serial.println("err bad-args"); continue; }
+				if(i<0||i>=n_||!ovr){ console::out().println("err bad-args"); continue; }
 				uint16_t offs[160]; uint8_t vals[160]; int n=0; bool bad=false;
 				for(char* tok=strtok(ovr,",");tok&&!bad;tok=strtok(nullptr,",")){ char* col=strchr(tok,':');
 					if(!col||n>=160){bad=true;break;} *col='\0'; long off=strtol(tok,nullptr,16),val=strtol(col+1,nullptr,16);
 					if(off<0||off>=(long)esc_setup::kPageLen||val<0||val>255){bad=true;break;} offs[n]=(uint16_t)off; vals[n]=(uint8_t)val; n++; }
-				if(bad){ Serial.println("err bad-override"); continue; }
+				if(bad){ console::out().println("err bad-override"); continue; }
 				bool ch=false; int r=th_[i]->editConfig(offs,vals,n,ch);
-				if(r==-1)Serial.println("err no-connect"); else if(r==-2)Serial.println("err read-failed");
-				else if(r==-3)Serial.println("err bad-override"); else if(r==-4)Serial.println("err write-verify-failed");
-				else if(r==0){ Serial.println("unchanged (flash write skipped)"); Serial.println("ok"); }
-				else { Serial.printf("edited %d byte(s)\n",n); Serial.println("ok"); } }
+				if(r==-1)console::out().println("err no-connect"); else if(r==-2)console::out().println("err read-failed");
+				else if(r==-3)console::out().println("err bad-override"); else if(r==-4)console::out().println("err write-verify-failed");
+				else if(r==0){ console::out().println("unchanged (flash write skipped)"); console::out().println("ok"); }
+				else { console::out().printf("edited %d byte(s)\n",n); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"erase")) { int i=argi(); char* ad=strtok(nullptr," ");
-				if(i<0||i>=n_||!ad) Serial.println("err bad-args");
-				else Serial.println(th_[i]->erasePage((uint16_t)strtol(ad,nullptr,16))?"ok":"err erase-failed"); }
+				if(i<0||i>=n_||!ad) console::out().println("err bad-args");
+				else console::out().println(th_[i]->erasePage((uint16_t)strtol(ad,nullptr,16))?"ok":"err erase-failed"); }
 			else if (!strcmp(cmd,"writeflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* hx=strtok(nullptr," ");
-				if(i<0||i>=n_||!ad||!hx){ Serial.println("err bad-args"); continue; }
+				if(i<0||i>=n_||!ad||!hx){ console::out().println("err bad-args"); continue; }
 				int n=parseHex(hx,flbuf,sizeof(flbuf));
-				if(n<=0)Serial.println("err bad-hex");
-				else Serial.println(th_[i]->writeFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)n)?"ok":"err write-failed"); }
+				if(n<=0)console::out().println("err bad-hex");
+				else console::out().println(th_[i]->writeFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)n)?"ok":"err write-failed"); }
 			else if (!strcmp(cmd,"readflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* ln=strtok(nullptr," ");
 				int rl=ln?atoi(ln):-1;
-				if(i<0||i>=n_||!ad||rl<1||rl>(int)sizeof(flbuf)) Serial.println("err bad-args");
-				else if(!th_[i]->readFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) Serial.println("err read-failed");
-				else { Serial.print("data|"); printHex(flbuf,rl); Serial.println(); Serial.println("ok"); } }
+				if(i<0||i>=n_||!ad||rl<1||rl>(int)sizeof(flbuf)) console::out().println("err bad-args");
+				else if(!th_[i]->readFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) console::out().println("err read-failed");
+				else { console::out().print("data|"); printHex(flbuf,rl); console::out().println(); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"arm")) { int i=argi(); char* m=strtok(nullptr," ");   // arm <i> [normal|bidir]
-				if(i<0||i>=n_) Serial.println("err bad-index");
+				if(i<0||i>=n_) console::out().println("err bad-index");
 				else { escs::Drive md=escs::Drive::AUTO;
 					if(m&&!strcmp(m,"normal"))md=escs::Drive::NORMAL; else if(m&&!strcmp(m,"bidir"))md=escs::Drive::BIDIR;
 					th_[i]->arm(md);
-					if(!th_[i]->initOk()) { Serial.println("err dshot-init-failed (no free PIO SM?)"); continue; }
-					Serial.printf("arming ~3s (mode %s, %s)\n",th_[i]->spinMode(),th_[i]->reversible()?"reversible":"one-way");
-					Serial.println("ok"); } }
+					if(!th_[i]->initOk()) { console::out().println("err dshot-init-failed (no free PIO SM?)"); continue; }
+					console::out().printf("arming ~3s (mode %s, %s)\n",th_[i]->spinMode(),th_[i]->reversible()?"reversible":"one-way");
+					console::out().println("ok"); } }
 			else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");  // 0..2000
-				if(i<0||i>=n_||!v) Serial.println("err bad-args");
-				else if(!th_[i]->armed()) Serial.println("err not-armed");
-				else { th_[i]->setRaw(atoi(v)); Serial.println("ok"); } }
+				if(i<0||i>=n_||!v) console::out().println("err bad-args");
+				else if(!th_[i]->armed()) console::out().println("err not-armed");
+				else { th_[i]->setRaw(atoi(v)); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D)
-				if(i<0||i>=n_||!v) Serial.println("err bad-args");
-				else if(!th_[i]->armed()) Serial.println("err not-armed");
-				else { th_[i]->setRaw(atoi(v)); Serial.println("ok"); } }
+				if(i<0||i>=n_||!v) console::out().println("err bad-args");
+				else if(!th_[i]->armed()) console::out().println("err not-armed");
+				else { th_[i]->setRaw(atoi(v)); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"rpm")) { int i=argi(); char* v=strtok(nullptr," ");   // NEW: closed-loop velocity target (mech RPM, signed)
-				if(i<0||i>=n_||!v) Serial.println("err bad-args");
-				else if(!th_[i]->armed()) Serial.println("err not-armed");
-				else { th_[i]->setRpm(atof(v)); Serial.println("ok"); } }
+				if(i<0||i>=n_||!v) console::out().println("err bad-args");
+				else if(!th_[i]->armed()) console::out().println("err not-armed");
+				else { th_[i]->setRpm(atof(v)); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"gain")) { int i=argi(); char* g=strtok(nullptr," "); char* v=strtok(nullptr," ");   // gain <i> <kp|ki|kd|dtau|trim|slew> <v>
-				if(i<0||i>=n_||!g||!v) Serial.println("err bad-args");
+				if(i<0||i>=n_||!g||!v) console::out().println("err bad-args");
 				else { float fv=atof(v);
 					if(!strcmp(g,"kp")) th_[i]->vc.kp=fv; else if(!strcmp(g,"ki")) th_[i]->vc.ki=fv;
 					else if(!strcmp(g,"kd")) th_[i]->vc.kd=fv; else if(!strcmp(g,"dtau")) th_[i]->vc.d_tau=fv;
@@ -617,19 +620,19 @@ private:
 					// the temp check entirely. NOT persisted by `cfg save` on purpose (src/main.cpp): a
 					// power cycle always restores the conservative compile-time band.
 					else if(!strcmp(g,"warntemp")) th_[i]->vc.warn_temp=fv; else if(!strcmp(g,"maxtemp")) th_[i]->vc.max_temp=fv;
-					else { Serial.println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle|"
+					else { console::out().println("err bad-gain (kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle|"
 						"fbmax|trackfrac|warntemp|maxtemp)"); continue; }
-					Serial.println("ok"); } }
+					console::out().println("ok"); } }
 			else if (!strcmp(cmd,"motor")) { int i=argi(); char* kv=strtok(nullptr," "); char* pp=strtok(nullptr," "); char* vv=strtok(nullptr," ");   // motor <i> <kv> <pp> <v>: regenerate the FF curve parametrically (MotorModel)
 				float kvf=kv?atof(kv):0.0f, vvf=vv?atof(vv):0.0f; int ppi=pp?atoi(pp):0;   // [#6.2] validate VALUES not token presence
-					if(i<0||i>=n_||kvf<=0.0f||ppi<1||vvf<=0.0f) Serial.println("err bad-args (motor <i> <kv> <pp> <v>): need kv>0 pp>=1 v>0");   // kv/pp/v=0 -> div-by-zero -> NaN into the live FF curve
-					else if(th_[i]->armed()) Serial.println("err motor: disarm first (replaces the FF curve)");
+					if(i<0||i>=n_||kvf<=0.0f||ppi<1||vvf<=0.0f) console::out().println("err bad-args (motor <i> <kv> <pp> <v>): need kv>0 pp>=1 v>0");   // kv/pp/v=0 -> div-by-zero -> NaN into the live FF curve
+					else if(th_[i]->armed()) console::out().println("err motor: disarm first (replaces the FF curve)");
 				// Optional 4th arg = the ESC's `sine_cross_up`. The shape constants were fitted at 34, and
 				// Cross_Up shifts the 6-step duty by a constant, so leaving it wrong silently biases the FF
 				// (up to +44% at low cmd, measured) AND the soft-sensor that inverts the same map. Omitted
 				// => keep the current value, so an existing `motor kv pp v` behaves exactly as before.
 				else { char* cu=strtok(nullptr," "); float cuf=cu?atof(cu):0.0f;
-					if(cu && (cuf < 1.0f || cuf > 255.0f)) { Serial.println("err motor: cross_up out of range (1..255)"); continue; }
+					if(cu && (cuf < 1.0f || cuf > 255.0f)) { console::out().println("err motor: cross_up out of range (1..255)"); continue; }
 					// false = no parametric curve exists for this cross_up (its handoff is refused, or is
 					// above the cmd 700 the curve is sampled to — cross_up >= 48). The PREVIOUS curve is
 					// kept and the seam metadata is still updated, so the soft-sensor gate stays correct;
@@ -640,23 +643,23 @@ private:
 					// touched — so a pp change in the same failing command leaves tele scaled by the old
 					// one. Advice mirrors host/pico_esc/motor_model.py:to_profile()'s ValueError.
 					if(!th_[i]->setMotor(kvf, ppi, vvf, cuf)) {
-						Serial.printf("err motor: no 6-step curve at cross_up %.0f (its handoff is refused, or "
+						console::out().printf("err motor: no 6-step curve at cross_up %.0f (its handoff is refused, or "
 							"above the cmd 700 the curve is sampled to). FF curve UNCHANGED and still on the "
 							"old pole count; soft-sensor duty map + seam DID move to kv=%s pp=%s v=%s. Use "
 							"cross_up %d..%d (above that it hands off past the cmd 700 this curve is sampled "
 							"to; below it the ESC never hands off), or push a measured curve "
 							"(host/curvepush.py)\n", th_[i]->motorCrossUp(), kv, pp, vv,
 							vel::minHandoffCrossUp(), vel::maxEmittableCrossUp(700.0f)); continue; }
-					Serial.printf("motor|%d|kv=%s|pp=%s|v=%s|cross_up=%.0f\n", i, kv, pp, vv,
-						th_[i]->motorCrossUp()); Serial.println("ok"); } }
+					console::out().printf("motor|%d|kv=%s|pp=%s|v=%s|cross_up=%.0f\n", i, kv, pp, vv,
+						th_[i]->motorCrossUp()); console::out().println("ok"); } }
 			// crossup <i> <v>: the ESC's sine_cross_up, WITHOUT replacing the feed-forward curve.
 			// It shifts the parametric 6-step duty map, which the soft-sensor inverts — so it matters
 			// even when a MEASURED curve is driving the FF, and `motor` (which discards that curve) is
 			// the wrong place to set it. Refused while armed: it can regenerate the parametric curve.
 			else if (!strcmp(cmd,"crossup")) { int i=argi(); char* v=strtok(nullptr," ");
-				if(i<0||i>=n_||!v) Serial.println("err bad-args (crossup <i> <sine_cross_up>)");
-				else if(th_[i]->armed()) Serial.println("err crossup: disarm first");
-				else if(!th_[i]->setCrossUp(atof(v))) Serial.println("err crossup: out of range (1..255)");
+				if(i<0||i>=n_||!v) console::out().println("err bad-args (crossup <i> <sine_cross_up>)");
+				else if(th_[i]->armed()) console::out().println("err crossup: disarm first");
+				else if(!th_[i]->setCrossUp(atof(v))) console::out().println("err crossup: out of range (1..255)");
 				// The curve field has to distinguish four outcomes, because three of them are NOT a fresh
 				// parametric curve and the operator cannot tell from the outside: a measured curve is
 				// kept as-is, no `motor` has ever run (the compile-time profile is live), the parametric
@@ -667,7 +670,7 @@ private:
 				                      : !th_[i]->motorConfigured() ? "compile-time (run `motor` to generate one)"
 				                      : th_[i]->curveStale()       ? "parametric (STALE)"
 				                                                   : "parametric (regenerated)";
-					Serial.printf("crossup|%d|cross_up=%.0f|curve=%s (persist with: cfg save)\n", i,
+					console::out().printf("crossup|%d|cross_up=%.0f|curve=%s (persist with: cfg save)\n", i,
 					th_[i]->motorCrossUp(), cs);
 					// Gated on motorConfigured() TOO, not on curveStale() alone: after a first-ever `motor`
 					// that failed, motorSet_ stays false while curveStale_ is true, so the bare gate made
@@ -678,7 +681,7 @@ private:
 					// one needs it lowered. 34..47 is the band that can actually emit a curve — 48..67 can
 					// hand off but does it above the cmd 700 fillProfile samples to.
 					if(th_[i]->curveStale() && th_[i]->motorConfigured())
-						Serial.printf("# WARNING: no 6-step curve exists at cross_up %.0f, so the FF is still the "
+						console::out().printf("# WARNING: no 6-step curve exists at cross_up %.0f, so the FF is still the "
 							"one generated at the PREVIOUS cross_up — it under-commands and the loop may never "
 							"reach 6-step. Push a measured curve (host/curvepush.py), or use cross_up %d..%d\n",
 							th_[i]->motorCrossUp(), vel::minHandoffCrossUp(),
@@ -686,23 +689,23 @@ private:
 					// The duty map moved by ~0.042/unit, and `sense vcal` is a MULTIPLICATIVE scale on the
 					// estimate that inverts it — so a stored vbattScale calibrated at the old cross_up is
 					// now wrong by the same shift. Say so; it is not recoverable by inspection.
-					Serial.println("# note: soft-sensor duty map moved — re-run `sense <i> vcal <V>`");
-					Serial.println("ok"); } }
+					console::out().println("# note: soft-sensor duty map moved — re-run `sense <i> vcal <V>`");
+					console::out().println("ok"); } }
 			else if (!strcmp(cmd,"sense")) { int i=argi(); char* sub=strtok(nullptr," ");   // sense <i>: soft-sensor — infer supply V + relative load from eRPM (no voltage/current/force sensor)
-				if(i<0||i>=n_) Serial.println("err bad-args (sense <i> [zero|vcal <V>])");
+				if(i<0||i>=n_) console::out().println("err bad-args (sense <i> [zero|vcal <V>])");
 					// [B.6] the refusal now NAMES the blocking condition (why=): the gate is stricter than
 					// the old rpm-only test, so "not BEMF-live" alone would send an operator hunting the
 					// wrong thing. The captured COMMAND is echoed because `load` is only comparable within
 					// a band around it — the caller has to know where the baseline was taken.
-					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseZero()) Serial.printf("err sense-zero: soft-sensor not valid here (why=%s, need |cmd|>=%.0f) — spin steady into 6-step first\n", th_[i]->senseWhy(), th_[i]->senseCmdFloor()); else { Serial.printf("sense|%d|zeroed vref=%.2f|zerocmd=%.0f\n", i, th_[i]->senseVref(), th_[i]->senseZeroCmd()); Serial.println("ok"); } }
+					else if(sub && !strcmp(sub,"zero")) { if(!th_[i]->senseZero()) console::out().printf("err sense-zero: soft-sensor not valid here (why=%s, need |cmd|>=%.0f) — spin steady into 6-step first\n", th_[i]->senseWhy(), th_[i]->senseCmdFloor()); else { console::out().printf("sense|%d|zeroed vref=%.2f|zerocmd=%.0f\n", i, th_[i]->senseVref(), th_[i]->senseZeroCmd()); console::out().println("ok"); } }
 					else if(sub && !strcmp(sub,"vcal")) { char* v=strtok(nullptr," "); float kv=v?atof(v):0.0f;   // [vbatt] calibration to a known battery voltage (per power cycle unless `cfg save`d)
-						if(kv<=0.0f) Serial.println("err sense-vcal: need a known battery voltage (sense <i> vcal 11.2)");
+						if(kv<=0.0f) console::out().println("err sense-vcal: need a known battery voltage (sense <i> vcal 11.2)");
 						// [#7] parity with `sense zero`: refuse instead of silently no-op'ing when there is no
 						// rolling-max estimate yet to calibrate against (the CLI used to print ok + vbatt=0.00).
 						// [B.6] the rolling max only advances inside the gate's LIGHT-LOAD tier (vbok), so
 						// "no estimate yet" now specifically means that tier never opened — say which one.
-						else if(!th_[i]->senseVcal(kv)) Serial.printf("err sense-vcal: no vbatt estimate yet — the light-load tier (vbok) has never opened (vbok=%d why=%s); spin steady, lightly loaded, above the 6-step floor first\n", th_[i]->senseVbattOk()?1:0, th_[i]->senseWhy());
-						else { Serial.printf("sense|%d|vcal to %.2f V -> vbatt=%.2f (persist with: cfg save)\n", i, kv, th_[i]->senseVbatt()); Serial.println("ok"); } }
+						else if(!th_[i]->senseVcal(kv)) console::out().printf("err sense-vcal: no vbatt estimate yet — the light-load tier (vbok) has never opened (vbok=%d why=%s); spin steady, lightly loaded, above the 6-step floor first\n", th_[i]->senseVbattOk()?1:0, th_[i]->senseWhy());
+						else { console::out().printf("sense|%d|vcal to %.2f V -> vbatt=%.2f (persist with: cfg save)\n", i, kv, th_[i]->senseVbatt()); console::out().println("ok"); } }
 				else {
 					// [B.8] The four gated fields print `n/a`, never `0.00`, when they have no reading —
 					// see optNum() above for why the two had to stop being the same token. Each carries
@@ -733,7 +736,7 @@ private:
 					//   temp/tpeak/tlim/tstate = the thermal limiter: last ESC MCU temperature (NOT the
 					//              winding), its high-water mark, the command-ceiling scale it is applying
 					//              (1.00 = none) and its state (none=never seen, ok, derate, stale=lost it).
-					Serial.printf("sense|%d|vest=%s|vref=%s|load=%s|vbatt=%s|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d"
+					console::out().printf("sense|%d|vest=%s|vref=%s|load=%s|vbatt=%s|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d"
 					              "|why=%s|cmdfloor=%.0f|loadok=%d|vbok=%d|temp=%.0f|tpeak=%.0f|tlim=%.2f|tstate=%s\n",
 						i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor(),
 						th_[i]->vc.dhat(), th_[i]->vc.settled(),
@@ -741,7 +744,7 @@ private:
 						th_[i]->senseWhy(), th_[i]->senseCmdFloor(),
 						th_[i]->senseLoadOk()?1:0, th_[i]->senseVbattOk()?1:0,
 						th_[i]->vc.temp(), th_[i]->vc.peakTemp(), th_[i]->vc.tempLimit(),
-						vel::tempStateName(th_[i]->vc.tempState())); Serial.println("ok"); } }
+						vel::tempStateName(th_[i]->vc.tempState())); console::out().println("ok"); } }
 			// curve: upload a MEASURED feed-forward curve (velcal/sysid -> host/curvepush.py), replacing
 			// the parametric `motor` prediction. Sent ONE POINT PER LINE on purpose: the input buffer is
 			// 600 B and silently truncates past it, so a whole table on one line would be a data-loss
@@ -749,46 +752,46 @@ private:
 			//   curve <i> begin <n> | curve <i> add <thrust> <rpm> [s|l] | curve <i> commit <pp> <up> <dn>
 			//   curve <i>            -> dump the live curve for readback
 			else if (!strcmp(cmd,"curve")) { int i=argi(); char* sub=strtok(nullptr," ");
-				if(i<0||i>=n_) Serial.println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])");
+				if(i<0||i>=n_) console::out().println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])");
 				// [#11-1] report the pp the LIVE CURVE carries, not the parametric model's — otherwise a
 				// commit/model mismatch is invisible to the host's read-back check, which is the one
 				// place it could have been caught.
-				else if(!sub) { Serial.printf("curve|%d|n=%d|measured=%d|pp=%d|up=%.0f|dn=%.0f\n", i, th_[i]->curveCount(),
+				else if(!sub) { console::out().printf("curve|%d|n=%d|measured=%d|pp=%d|up=%.0f|dn=%.0f\n", i, th_[i]->curveCount(),
 						th_[i]->curveMeasured()?1:0, th_[i]->curvePolePairs(), th_[i]->crossUpErpm(), th_[i]->crossDnErpm());
-					for(int k=0;k<th_[i]->curveCount();k++) Serial.printf("pt|%d|%.1f|%.1f|%c\n", k,
+					for(int k=0;k<th_[i]->curveCount();k++) console::out().printf("pt|%d|%.1f|%.1f|%c\n", k,
 						th_[i]->curvePoint(k).thrust, th_[i]->curvePoint(k).rpm,
 						th_[i]->curveRegime(k)==vel::Regime::LINE?'l':'s');
-					Serial.println("ok"); }
+					console::out().println("ok"); }
 				else if(!strcmp(sub,"begin")) { char* v=strtok(nullptr," "); int want=v?atoi(v):0;
-					if(want<2||want>CURVE_STAGE_CAP) Serial.printf("err curve-begin: need 2..%d points\n", CURVE_STAGE_CAP);
+					if(want<2||want>CURVE_STAGE_CAP) console::out().printf("err curve-begin: need 2..%d points\n", CURVE_STAGE_CAP);
 					else { stageIdx_=i; stageWant_=want; stageN_=0; stageTagged_=true;
-						Serial.printf("curve|%d|staging %d point(s)\n", i, want); Serial.println("ok"); } }
+						console::out().printf("curve|%d|staging %d point(s)\n", i, want); console::out().println("ok"); } }
 				else if(!strcmp(sub,"add")) { char* t=strtok(nullptr," "); char* r=strtok(nullptr," "); char* g=strtok(nullptr," ");
-					if(stageIdx_!=i||stageWant_<=0) Serial.println("err curve-add: run `curve <i> begin <n>` first");
-					else if(stageN_>=stageWant_) Serial.println("err curve-add: more points than begin declared");
-					else if(!t||!r) Serial.println("err curve-add: need <thrust> <rpm>");
+					if(stageIdx_!=i||stageWant_<=0) console::out().println("err curve-add: run `curve <i> begin <n>` first");
+					else if(stageN_>=stageWant_) console::out().println("err curve-add: more points than begin declared");
+					else if(!t||!r) console::out().println("err curve-add: need <thrust> <rpm>");
 					else { stage_[stageN_].thrust=atof(t); stage_[stageN_].rpm=atof(r);
 						// regime tag optional: 'l'/'s' from the profile YAML, else derived at commit
 						stageReg_[stageN_] = (g && (*g=='l'||*g=='L')) ? vel::Regime::LINE : vel::Regime::SINE;
 						if(!g) stageTagged_=false;
-						stageN_++; Serial.println("ok"); } }
+						stageN_++; console::out().println("ok"); } }
 				else if(!strcmp(sub,"commit")) { char* pp=strtok(nullptr," "); char* up=strtok(nullptr," "); char* dn=strtok(nullptr," ");
 					int ppi=pp?atoi(pp):0; float upf=up?atof(up):0.0f, dnf=dn?atof(dn):0.0f;
-					if(stageIdx_!=i||stageWant_<=0) Serial.println("err curve-commit: nothing staged");
-					else if(stageN_!=stageWant_) Serial.printf("err curve-commit: staged %d of %d points\n", stageN_, stageWant_);
-					else if(ppi<1||upf<=0.0f) Serial.println("err curve-commit: need <pole_pairs> <up_erpm> <dn_erpm>");
-					else if(th_[i]->armed()) Serial.println("err curve-commit: disarm first (replaces the FF curve)");
+					if(stageIdx_!=i||stageWant_<=0) console::out().println("err curve-commit: nothing staged");
+					else if(stageN_!=stageWant_) console::out().printf("err curve-commit: staged %d of %d points\n", stageN_, stageWant_);
+					else if(ppi<1||upf<=0.0f) console::out().println("err curve-commit: need <pole_pairs> <up_erpm> <dn_erpm>");
+					else if(th_[i]->armed()) console::out().println("err curve-commit: disarm first (replaces the FF curve)");
 					else if(!th_[i]->setCurve(stage_, stageN_, ppi, upf, dnf, stageTagged_?stageReg_:nullptr))
-						Serial.println("err curve-commit: rejected (need >=2 points, thrust strictly increasing, rpm non-decreasing)");
-					else { Serial.printf("curve|%d|installed %d point(s) pp=%d up=%.0f dn=%.0f\n", i, stageN_, ppi, upf, dnf);
+						console::out().println("err curve-commit: rejected (need >=2 points, thrust strictly increasing, rpm non-decreasing)");
+					else { console::out().printf("curve|%d|installed %d point(s) pp=%d up=%.0f dn=%.0f\n", i, stageN_, ppi, upf, dnf);
 						// [#11-1] A motor has ONE pole count, so a curve committed at a different pp than
 						// `motor` configured is an operator error (usually curvepush without --motor).
 						// The curve's pp wins from here on; say so rather than letting it diverge quietly.
 						if(th_[i]->motorConfigured() && th_[i]->motorPolePairs()!=ppi)
-							Serial.printf("# warn: curve pp=%d differs from `motor` pp=%d — the curve's wins\n",
+							console::out().printf("# warn: curve pp=%d differs from `motor` pp=%d — the curve's wins\n",
 							              ppi, th_[i]->motorPolePairs());
-						stageWant_=0; stageN_=0; stageIdx_=-1; stageTagged_=true; Serial.println("ok"); } }
-				else Serial.println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])"); }
+						stageWant_=0; stageN_=0; stageIdx_=-1; stageTagged_=true; console::out().println("ok"); } }
+				else console::out().println("err bad-args (curve <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>])"); }
 			// cfg: persist / restore the RUNTIME config (motor identity, gains, DOB, vbatt scale) on the
 			// Pico's LittleFS. Whole-config, EXPLICIT — there is no autosave (flash wear) and no per-ESC
 			// slice (one blob keeps the CRC meaningful). `cfg load` replaces the live FF curve, so it is
@@ -797,22 +800,22 @@ private:
 				if(!sub || !strcmp(sub,"show")) {
 					// [B.7] warntemp/maxtemp are APPENDED (host `cfg` parsers are key=value) and are
 					// deliberately NOT part of the persisted Record — see the note in src/main.cpp.
-					for(uint8_t i=0;i<n_;i++) Serial.printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f|cross_up=%.0f|warntemp=%.0f|maxtemp=%.0f\n",
+					for(uint8_t i=0;i<n_;i++) console::out().printf("cfg|%u|motor=%d|kv=%.0f|pp=%d|v=%.2f|kp=%.3f|ki=%.3f|kd=%.4f|trim=%.0f|slew=%.0f|dob=%.2f|dobtau=%.3f|dobmax=%.0f|dobsettle=%.2f|vscale=%.4f|cross_up=%.0f|warntemp=%.0f|maxtemp=%.0f\n",
 						i, th_[i]->motorConfigured()?1:0, th_[i]->motorKv(), th_[i]->motorPolePairs(), th_[i]->motorVolts(),
 						th_[i]->vc.kp, th_[i]->vc.ki, th_[i]->vc.kd, th_[i]->vc.trim_max, th_[i]->vc.slew_rpm_s,
 						th_[i]->vc.dob, th_[i]->vc.dob_tau, th_[i]->vc.dob_max, th_[i]->vc.dob_settle_secs,
 						th_[i]->vbattScale(), th_[i]->motorCrossUp(),
 						th_[i]->vc.warn_temp, th_[i]->vc.max_temp);
-					Serial.printf("cfg|stored=%d\n", settings::exists()?1:0); Serial.println("ok"); }
-				else if(!strcmp(sub,"save")) { if(settings::save(th_,n_)) { Serial.printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); Serial.println("ok"); }
-					else Serial.println("err cfg-save: filesystem write failed"); }
+					console::out().printf("cfg|stored=%d\n", settings::exists()?1:0); console::out().println("ok"); }
+				else if(!strcmp(sub,"save")) { if(settings::save(th_,n_)) { console::out().printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); console::out().println("ok"); }
+					else console::out().println("err cfg-save: filesystem write failed"); }
 				else if(!strcmp(sub,"load")) { bool anyArmed=false; for(uint8_t i=0;i<n_;i++) if(th_[i]->armed()) anyArmed=true;
-					if(anyArmed) Serial.println("err cfg-load: disarm first (replaces the FF curve)");
-					else { uint16_t sv=0; int k=settings::load(th_,n_,&sv); if(k>0) { Serial.printf("cfg|restored %d ESC(s)\n", k); Serial.println("ok"); }
-						else if(sv && sv!=settings::CFG_VERSION) Serial.printf("err cfg-load: stored config is v%u, this build wants v%u — re-save\n", sv, settings::CFG_VERSION);
-						else Serial.println("err cfg-load: no valid stored config (magic/size/CRC)"); } }
-				else if(!strcmp(sub,"clear")) { if(settings::clear()) Serial.println("ok"); else Serial.println("err cfg-clear: nothing stored"); }
-				else Serial.println("err bad-args (cfg [show|save|load|clear])"); }
+					if(anyArmed) console::out().println("err cfg-load: disarm first (replaces the FF curve)");
+					else { uint16_t sv=0; int k=settings::load(th_,n_,&sv); if(k>0) { console::out().printf("cfg|restored %d ESC(s)\n", k); console::out().println("ok"); }
+						else if(sv && sv!=settings::CFG_VERSION) console::out().printf("err cfg-load: stored config is v%u, this build wants v%u — re-save\n", sv, settings::CFG_VERSION);
+						else console::out().println("err cfg-load: no valid stored config (magic/size/CRC)"); } }
+				else if(!strcmp(sub,"clear")) { if(settings::clear()) console::out().println("ok"); else console::out().println("err cfg-clear: nothing stored"); }
+				else console::out().println("err bad-args (cfg [show|save|load|clear])"); }
 			// Stop-all goes through each Thruster rather than escs::spinStopAll() alone: the engine call
 			// silences the DShot frames but leaves the objects' submode / soft-sensor validity untouched,
 			// so a bare `disarm` used to leave `sense` reporting a stale estimate as valid. The trailing
@@ -821,24 +824,24 @@ private:
 			else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi();
 				if(i<0) { for(uint8_t k=0;k<n_;k++) th_[k]->stop(); escs::spinStopAll(); }
 				else if(i<n_) th_[i]->stop();
-				Serial.println("ok"); }
+				console::out().println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
-				if(i<0||i>=n_||!v) Serial.println("err bad-args");
-				else if(!strcmp(v,"stop")){ analogWrite(Esc::pin(i),0); pinMode(Esc::pin(i),INPUT); Serial.println("ok pwm-stop (reboot to use DShot again)"); }
+				if(i<0||i>=n_||!v) console::out().println("err bad-args");
+				else if(!strcmp(v,"stop")){ analogWrite(Esc::pin(i),0); pinMode(Esc::pin(i),INPUT); console::out().println("ok pwm-stop (reboot to use DShot again)"); }
 				else { th_[i]->stop(); escs::release();          // free DShot + run the ESC app
 					int us=atoi(v); if(us<900)us=900; if(us>2100)us=2100;
 					analogWriteFreq(50); analogWriteRange(20000); analogWrite(Esc::pin(i),(uint32_t)us);   // 20000us period => value=us
-					Serial.printf("pwm|%d|%dus\n",i,us); Serial.println("ok"); } }
+					console::out().printf("pwm|%d|%dus\n",i,us); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"enc")) {   // AS5600 read: enc|raw|ang|deg|md|ml|mh|agc|mag  (err if no sensor)
-				if(!enc_.present()) Serial.println("err no-encoder");
+				if(!enc_.present()) console::out().println("err no-encoder");
 				else { uint8_t st=enc_.status(); int raw=enc_.raw();
-					Serial.printf("enc|%d|%d|%.1f|%d|%d|%d|%d|%d\n", raw, raw, raw*360.0f/4096.0f,
-					             (st>>5)&1,(st>>4)&1,(st>>3)&1, enc_.agc(), enc_.mag()); Serial.println("ok"); } }
+					console::out().printf("enc|%d|%d|%.1f|%d|%d|%d|%d|%d\n", raw, raw, raw*360.0f/4096.0f,
+					             (st>>5)&1,(st>>4)&1,(st>>3)&1, enc_.agc(), enc_.mag()); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"encv")) {  // de-aliased encoder velocity: encv|accum|rpm|samples|md (err if none)
-				if(!enc_.present()) Serial.println("err no-encoder");
+				if(!enc_.present()) console::out().println("err no-encoder");
 				else { uint8_t st=enc_.status();
-					Serial.printf("encv|%ld|%.2f|%lu|%d\n", (long)enc_.accum(), (double)enc_.rpm(),
-					             (unsigned long)enc_.samples(), (st>>5)&1); Serial.println("ok"); } }
+					console::out().printf("encv|%ld|%.2f|%lu|%d\n", (long)enc_.accum(), (double)enc_.rpm(),
+					             (unsigned long)enc_.samples(), (st>>5)&1); console::out().println("ok"); } }
 			// encd [reset] — the tracker's ALIASING diagnostics. `encv` reports a velocity; this
 			// reports whether that velocity can be believed. The unwrap in As5600Tracker::poll folds
 			// each step into +/-2048 counts, so any stall longer than half a revolution of travel
@@ -849,15 +852,15 @@ private:
 			// alias_margin = 2048/maxstep: how many times the worst observed step would have to grow
 			// before the accumulator starts losing revolutions. Below ~2 the data is suspect.
 			else if (!strcmp(cmd,"encd")) {
-				if(!enc_.present()) Serial.println("err no-encoder");
+				if(!enc_.present()) console::out().println("err no-encoder");
 				else { char* r=strtok(nullptr," ");
 					uint16_t ms=enc_.maxStep();
-					Serial.printf("encd|%lu|%lu|%lu|%u|%.2f\n",
+					console::out().printf("encd|%lu|%lu|%lu|%u|%.2f\n",
 					              (unsigned long)enc_.samples(), (unsigned long)enc_.misses(),
 					              (unsigned long)enc_.maxGapUs(), ms,
 					              ms ? 2048.0 / (double)ms : 999.0);
 					if(r && !strcmp(r,"reset")) enc_.resetDiag();
-					Serial.println("ok"); } }
+					console::out().println("ok"); } }
 			// i2cscan — what is ACTUALLY on I2C0, and is the bus even usable?
 			// `enc` only ever probes 0x36, so a silent sensor and a shorted bus look identical from it.
 			// This separates them: it reports the IDLE LEVELS of SDA/SCL first (both must read HIGH — a
@@ -868,7 +871,7 @@ private:
 			else if (!strcmp(cmd,"az")) {   // az on <carrier> <deg> | off | tgt <deg> | gain <k> <v> | status
 				char* sub=strtok(nullptr," ");
 				if(!sub || !strcmp(sub,"status")) {
-					Serial.printf("az|%d|tgt=%.2f|pos=%.2f|err=%.2f|vel=%.1f|s=%.1f|kp=%.2f|ki=%.2f|kd=%.2f|"
+					console::out().printf("az|%d|tgt=%.2f|pos=%.2f|err=%.2f|vel=%.1f|s=%.1f|kp=%.2f|ki=%.2f|kd=%.2f|"
 					              "kff=%.4f|trim=%.1f|smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
 					              "absolute=%d|zeroraw=%ld|head=%.2f|stop=%s\n",
 					              az_.on()?1:0, az_.target(), az_.pos(), az_.target()-az_.pos(), az_.vel(),
@@ -877,7 +880,7 @@ private:
 					              az_.absolute?1:0, (long)az_.zero_raw,
 					              az_.zero_raw < 0 ? 0.0 : (double)az_.heading(),
 					              Azimuth::stopWhyName(az_.stopWhy()));
-					Serial.println("ok"); }
+					console::out().println("ok"); }
 				// az zero [<deg>|show|clear] — the HULL heading reference. `az zero` declares the pod's
 				// current physical heading to be 0 (or <deg>), and persists it as a RAW_ANGLE count so
 				// it survives a power cycle. Without it, `absolute` mode refuses to start.
@@ -888,49 +891,49 @@ private:
 						// A missing reference prints as `unset`, never as a number: `%f` of NAN reads
 						// as "inf"/"nan" and both look like a heading that was measured.
 						if(az_.zero_raw < 0)
-							Serial.printf("az|zero|raw=-1|stored=%d|head=unset|absolute=%d\n",
+							console::out().printf("az|zero|raw=-1|stored=%d|head=unset|absolute=%d\n",
 							              settings::azZeroStored()?1:0, az_.absolute?1:0);
 						else
-							Serial.printf("az|zero|raw=%ld|stored=%d|head=%.2f|absolute=%d\n",
+							console::out().printf("az|zero|raw=%ld|stored=%d|head=%.2f|absolute=%d\n",
 							              (long)az_.zero_raw, settings::azZeroStored()?1:0,
 							              (double)az_.heading(), az_.absolute?1:0);
-						Serial.println("ok"); }
+						console::out().println("ok"); }
 					else if(g && !strcmp(g,"clear")) {
 						az_.zero_raw = -1; settings::azClearZero();
-						Serial.println("ok"); }
-					else if(az_.on()) Serial.println("err az: stop the loop before re-zeroing");
-					else if(!enc_.present()) Serial.println("err az: no encoder");
-					else if(!az_.setZeroHere(g?atof(g):0.0f)) Serial.println("err az: no encoder");
-					else if(!settings::azSaveZero(az_.zero_raw)) Serial.println("err az: zero not saved");
-					else { Serial.printf("az|zero|raw=%ld|head=%.2f\n",
+						console::out().println("ok"); }
+					else if(az_.on()) console::out().println("err az: stop the loop before re-zeroing");
+					else if(!enc_.present()) console::out().println("err az: no encoder");
+					else if(!az_.setZeroHere(g?atof(g):0.0f)) console::out().println("err az: no encoder");
+					else if(!settings::azSaveZero(az_.zero_raw)) console::out().println("err az: zero not saved");
+					else { console::out().printf("az|zero|raw=%ld|head=%.2f\n",
 					                     (long)az_.zero_raw, (double)az_.heading());
-					       Serial.println("ok"); } }
+					       console::out().println("ok"); } }
 				else if(!strcmp(sub,"on")) {
 					char* c=strtok(nullptr," "); char* g=strtok(nullptr," ");
-					if(n_<2) { Serial.println("err az: needs two ESCs"); }
-					else if(!th_[0]->armed()||!th_[1]->armed()) Serial.println("err az: arm 0 and arm 1 first");
+					if(n_<2) { console::out().println("err az: needs two ESCs"); }
+					else if(!th_[0]->armed()||!th_[1]->armed()) console::out().println("err az: arm 0 and arm 1 first");
 					else { if(c) az_.carrier=atof(c);
 						az_.bind(th_[0], th_[1], &enc_);
 						// Name the refusal: "no encoder" for a missing reference sent the operator
 						// looking at the I2C bus for a calibration that was simply never taken.
 						if(az_.absolute && az_.zero_raw < 0)
-							Serial.println("err az: absolute mode has no heading zero — run `az zero` first");
-						else if(!az_.begin(g?atof(g):0.0f)) Serial.println("err az: no encoder");
-						else { Serial.printf("az|on|carrier=%.0f|tgt=%.2f\n", az_.carrier, az_.target()); Serial.println("ok"); } } }
-				else if(!strcmp(sub,"off")) { az_.stop(); Serial.println("ok"); }
+							console::out().println("err az: absolute mode has no heading zero — run `az zero` first");
+						else if(!az_.begin(g?atof(g):0.0f)) console::out().println("err az: no encoder");
+						else { console::out().printf("az|on|carrier=%.0f|tgt=%.2f\n", az_.carrier, az_.target()); console::out().println("ok"); } } }
+				else if(!strcmp(sub,"off")) { az_.stop(); console::out().println("ok"); }
 				// az kick <counts> <ms> — inject a KNOWN disturbance while the loop runs, so rejection
 				// can be measured instead of hand-poked.
 				else if(!strcmp(sub,"kick")) {
 					char* c=strtok(nullptr," "); char* m=strtok(nullptr," ");
-					if(!c||!m) Serial.println("err az: kick <counts> <ms>");
+					if(!c||!m) console::out().println("err az: kick <counts> <ms>");
 					else if(!az_.kick(atof(c), (uint32_t)atol(m)))
-						Serial.println("err az: kick needs the hold running, 0 < ms <= 2000");
-					else { Serial.printf("az|kick|s=%.1f|ms=%ld\n", atof(c), atol(m));
-					       Serial.println("ok"); } }
+						console::out().println("err az: kick needs the hold running, 0 < ms <= 2000");
+					else { console::out().printf("az|kick|s=%.1f|ms=%ld\n", atof(c), atol(m));
+					       console::out().println("ok"); } }
 				else if(!strcmp(sub,"tgt")) { char* g=strtok(nullptr," ");
-					if(!g) Serial.println("err az: tgt <deg>"); else { az_.setTarget(atof(g)); Serial.println("ok"); } }
+					if(!g) console::out().println("err az: tgt <deg>"); else { az_.setTarget(atof(g)); console::out().println("ok"); } }
 				else if(!strcmp(sub,"gain")) { char* k=strtok(nullptr," "); char* v=strtok(nullptr," ");
-					if(!k||!v) { Serial.println("err az: gain <kp|ki|kd|kff|trim|smax|vmax|carrier|maxrate|verrclamp|signb|spinsecs|spinsmax> <v>"); }
+					if(!k||!v) { console::out().println("err az: gain <kp|ki|kd|kff|trim|smax|vmax|carrier|maxrate|verrclamp|signb|spinsecs|spinsmax> <v>"); }
 					else { float f=atof(v);
 						if(!strcmp(k,"kp")) az_.kp=f; else if(!strcmp(k,"ki")) az_.ki=f;
 						else if(!strcmp(k,"kd")) az_.kd=f; else if(!strcmp(k,"kff")) az_.kff=f;
@@ -974,32 +977,32 @@ private:
 							else if(!strcmp(k,"vellpf")) az_.vel_lpf_hz=f;
 							else if(!strcmp(k,"spinslew")) az_.spin_slew=f;
 							else if(!strcmp(k,"holdslew")) az_.hold_slew=f;
-						else { Serial.println("err az: unknown gain"); continue; }
-						Serial.println("ok"); } }
+						else { console::out().println("err az: unknown gain"); continue; }
+						console::out().println("ok"); } }
 					// az step <carrier> <s> <ms> — OPEN LOOP, for plant identification. No feedback:
 					// both motors carried, a known s applied, the trace recording. Self-terminates.
 					else if(!strcmp(sub,"step")) {
 						char* c=strtok(nullptr," "); char* v=strtok(nullptr," "); char* t=strtok(nullptr," ");
 						char* pr=strtok(nullptr," ");            // pre-roll at s=0, default 3000 ms
-						if(!c||!v||!t) Serial.println("err az: step <carrier> <s> <ms> [pre_ms]");
-						else if(n_<2) Serial.println("err az: needs two ESCs");
-						else if(!th_[0]->armed()||!th_[1]->armed()) Serial.println("err az: arm 0 and arm 1 first");
+						if(!c||!v||!t) console::out().println("err az: step <carrier> <s> <ms> [pre_ms]");
+						else if(n_<2) console::out().println("err az: needs two ESCs");
+						else if(!th_[0]->armed()||!th_[1]->armed()) console::out().println("err az: arm 0 and arm 1 first");
 						else { az_.bind(th_[0], th_[1], &enc_);
 							if(!az_.beginStep(atof(c), atof(v), (uint32_t)atol(t),
 							                  pr?(uint32_t)atol(pr):3000UL))
-								Serial.println("err az: step needs an encoder, 0 < ms <= 10000, pre_ms <= 10000");
+								console::out().println("err az: step needs an encoder, 0 < ms <= 10000, pre_ms <= 10000");
 							// Report the CLAMPED step, not what was asked for: beginStep holds it inside
 							// +/-smax, and a gain fit that divides by the requested value instead of the
 							// delivered one is wrong by exactly that ratio.
-							else { Serial.printf("az|step|carrier=%.0f|s=%.1f|asked=%.1f|ms=%ld|pre_ms=%ld\n",
+							else { console::out().printf("az|step|carrier=%.0f|s=%.1f|asked=%.1f|ms=%ld|pre_ms=%ld\n",
 							                     az_.carrier, (double)az_.stepS(), (double)atof(v), atol(t),
 							                     pr?atol(pr):3000L);
-							       Serial.println("ok"); } } }
+							       console::out().println("ok"); } } }
 					// az log [decim] — how often poll() writes to the trace ring (1 = every tick).
 					else if(!strcmp(sub,"log")) { char* d=strtok(nullptr," ");
 						if(d) az_.setDecim((uint16_t)atoi(d));
-						Serial.printf("az|log|decim=%u|n=%u|cap=%u\n", az_.decim(), az_.traceCount(),
-						              (unsigned)Azimuth::TRACE_N); Serial.println("ok"); }
+						console::out().printf("az|log|decim=%u|n=%u|cap=%u\n", az_.decim(), az_.traceCount(),
+						              (unsigned)Azimuth::TRACE_N); console::out().println("ok"); }
 					// az dump — the whole ring, oldest first. REFUSED while the loop is running: this
 					// prints thousands of lines and poll() does not run meanwhile, which would both
 					// freeze the loop and trip the spin deadman. Stop first, then read.
@@ -1007,10 +1010,10 @@ private:
 					// vmax=120 from a previous trial and the result was recorded against the wrong
 					// number; a trace that cannot say what produced it is not evidence.
 					else if(!strcmp(sub,"dump")) {
-						if(az_.on()) { Serial.println("err az: stop the loop first (az off) — dump blocks poll()"); }
+						if(az_.on()) { console::out().println("err az: stop the loop first (az off) — dump blocks poll()"); }
 						else {
 							uint16_t n = az_.traceCount();
-							Serial.printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
+							console::out().printf("azd|n=%u|decim=%u|kp=%.3f|ki=%.3f|kd=%.3f|kff=%.5f|trim=%.1f|"
 							              "smax=%.0f|vmax=%.0f|carrier=%.0f|maxrate=%.0f|verrclamp=%.0f|"
 							              "signa=%d|signb=%d|seam=%d|tgt=%.2f|spinsecs=%.2f|spinsmax=%.0f|seamkeep=%.0f|spinrpm=%.0f|rpmdrive=%d|rpmpercount=%.2f|rpmoffmax=%.0f|rpmtrim=%.0f|vellpf=%.2f|spinslew=%.0f|holdslew=%.0f"
 							              "|spinmaxrate=%.0f|spinguard=%.2f|wraperr=%d|rpmfloor=%.0f|crosszero=%d|thrustrpm=%.0f|thrustsecs=%.1f|oversecs=%.2f|hardrate=%.0f|mixswap=%d|nullratio=%.2f|kipos=%.4f|absolute=%d|zeroraw=%ld|step_s=%.1f|step_ms=%.1f|hand_ms=%.1f|kick_ms=%.1f\n",
@@ -1026,18 +1029,18 @@ private:
 							              (n && az_.kickUs())
 							                ? (double)(int32_t)(az_.kickUs() - az_.traceAt(0).t_us) / 1000.0
 							                : -1.0);
-							Serial.println("t_ms,pos,vel,s,ivel,carrier,rpm_a,rpm_b");
+							console::out().println("t_ms,pos,vel,s,ivel,carrier,rpm_a,rpm_b");
 							uint32_t t0 = n ? az_.traceAt(0).t_us : 0;
 							for (uint16_t i = 0; i < n; i++) {
 								const Azimuth::Sample& x = az_.traceAt(i);
-								Serial.printf("%.3f,%.2f,%.1f,%.1f,%.1f,%d,%d,%d\n",
+								console::out().printf("%.3f,%.2f,%.1f,%.1f,%.1f,%d,%d,%d\n",
 								              (double)(uint32_t)(x.t_us - t0) / 1000.0,
 								              (double)x.pos, (double)x.vel,
 								              (double)x.s_q / 10.0, (double)x.ivel_q / 10.0, (int)x.c_q,
 								              (int)x.ra, (int)x.rb);
 							}
-							Serial.println("ok"); } }
-					else Serial.println("err az: on|off|tgt|gain|status|log|dump|step"); }
+							console::out().println("ok"); } }
+					else console::out().println("err az: on|off|tgt|gain|status|log|dump|step"); }
 			else if (!strcmp(cmd,"i2cscan")) {
 				// Probe the lines against an INTERNAL PULL-DOWN, not a bare input. Wire.begin() enables
 				// the RP2040's internal pull-UPs on these pads and Wire.end() does not undo them, so a
@@ -1050,48 +1053,48 @@ private:
 				pinMode(16, INPUT_PULLDOWN); pinMode(17, INPUT_PULLDOWN);
 				delay(2);                                     // let the RC of the bus settle
 				int sda = digitalRead(16), scl = digitalRead(17);
-				Serial.printf("i2c|pulldown|sda=%d|scl=%d\n", sda, scl);
-				if (sda && scl) Serial.println("i2c|external pull-ups PRESENT and powered on both lines");
-				else if (!sda && !scl) Serial.println("i2c|NO external pull-up on either line — the sensor "
+				console::out().printf("i2c|pulldown|sda=%d|scl=%d\n", sda, scl);
+				if (sda && scl) console::out().println("i2c|external pull-ups PRESENT and powered on both lines");
+				else if (!sda && !scl) console::out().println("i2c|NO external pull-up on either line — the sensor "
 				                                      "board is unplugged, unpowered, or neither line is landed");
 				else {
 					// Both pull-ups sit on the SAME VCC on an AS5600 breakout, so one line up and the
 					// other down cannot be a power fault — the board HAS power and the dead line is
 					// simply not landed. Worth calling out because SCL open makes every address fail to
 					// ACK, which looks exactly like a dead part.
-					Serial.printf("i2c|only %s has an external pull-up — %s is OPEN, and both pull-ups "
+					console::out().printf("i2c|only %s has an external pull-up — %s is OPEN, and both pull-ups "
 					              "share one VCC, so the board IS powered and that line is just not "
 					              "connected\n", sda ? "SDA" : "SCL", sda ? "SCL (GP17, physical pin 22)"
 					                                                     : "SDA (GP16, physical pin 21)");
-					if (!scl) Serial.println("i2c|SCL is the clock: with it open NOTHING can ever ACK. "
+					if (!scl) console::out().println("i2c|SCL is the clock: with it open NOTHING can ever ACK. "
 					                         "Check GP17 = PHYSICAL PIN 22 (physical 17 is GP13).");
 				}
 				// then the idle levels with the pull-down removed: a line stuck LOW here is being held
 				pinMode(16, INPUT); pinMode(17, INPUT);
 				delayMicroseconds(200);
-				Serial.printf("i2c|float|sda=%d|scl=%d\n", digitalRead(16), digitalRead(17));
+				console::out().printf("i2c|float|sda=%d|scl=%d\n", digitalRead(16), digitalRead(17));
 				Wire.setSDA(16); Wire.setSCL(17); Wire.begin(); Wire.setClock(100000);
 				int found = 0;
 				for (uint8_t a = 0x08; a <= 0x77; a++) {
 					Wire.beginTransmission(a);
-					if (Wire.endTransmission() == 0) { Serial.printf("i2c|found|0x%02X\n", a); found++; }
+					if (Wire.endTransmission() == 0) { console::out().printf("i2c|found|0x%02X\n", a); found++; }
 				}
-				Serial.printf("i2c|devices=%d\n", found);
+				console::out().printf("i2c|devices=%d\n", found);
 				if (!found && sda && scl)
-					Serial.println("i2c|pull-ups are powered but NOTHING answers — the part is dead, or it "
+					console::out().println("i2c|pull-ups are powered but NOTHING answers — the part is dead, or it "
 					               "is a different device than expected.");
 				else if (!found && !sda && !scl)
-					Serial.println("i2c|nothing answers and there is no external pull-up — check 3V3/GND at "
+					console::out().println("i2c|nothing answers and there is no external pull-up — check 3V3/GND at "
 					               "the sensor and that SDA=GP16 (physical 21) / SCL=GP17 (physical 22).");
 				else if (!found)
-					Serial.println("i2c|nothing answers, but that is expected while a line is open — fix "
+					console::out().println("i2c|nothing answers, but that is expected while a line is open — fix "
 					               "the wiring above and re-run before suspecting the part.");
 				Wire.setClock(400000);                        // restore the tracker's rate
-				Serial.println("ok"); }
+				console::out().println("ok"); }
 			else if (!strcmp(cmd,"tele")) { int i=argi(); escs::Telem t;
-				if(i<0||i>=n_||!th_[i]->tele(t)) Serial.println("err no-telem");
-				else { Serial.printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); Serial.println("ok"); } }
-			else Serial.println("err unknown-cmd");
+				if(i<0||i>=n_||!th_[i]->tele(t)) console::out().println("err no-telem");
+				else { console::out().printf("tele|%lu|%.2f|%lu|%lu|%lu\n",(unsigned long)t.rpm,t.voltage,(unsigned long)t.current,(unsigned long)t.tempC,(unsigned long)t.stress); console::out().println("ok"); } }
+			else console::out().println("err unknown-cmd");
 		}
 	}
 };
