@@ -40,7 +40,7 @@ V_eff = rpm / (KV · duty(cmd)) = V_supply − I·R / duty
 ## The `sense` command
 
 ```
-sense <i>            -> sense|<i>|vest=<V>|vref=<V>|load=<V>|vbatt=<V>|valid=<0|1>|floor=<rpm>
+sense <i>            -> sense|<i>|vest=<V|n/a>|vref=<V|n/a>|load=<V|n/a>|vbatt=<V|n/a>|valid=<0|1>|floor=<rpm>
                         |dhat=<rpm>|settled=<0..1>|trim=<cmd units>|cmd=<int>
                         |why=<str>|cmdfloor=<cmd>|loadok=<0|1>|vbok=<0|1>
                         |temp=<C>|tpeak=<C>|tlim=<0..1>|tstate=<str>
@@ -53,11 +53,32 @@ New keys are always **appended**; the prefix and the existing key order are a co
 tools (`host/driftsoak.py`, `host/vbatt.py`, `host/loadtest.py`), pinned by
 `host/tests/test_sense_line.py`.
 
+### `n/a` — the four gated fields have no zero
+
+`vest`, `vref`, `load` and `vbatt` each print the literal **`n/a`** when they have no reading, and a
+number only when they do. They used to print `0.00` in both cases, and that is unreadable: **every one
+of those zeros is also a plausible measurement** — 0 V is a dead supply, 0 V of droop is an unloaded
+prop. On 2026-08-18 a `vbatt=0.00` from a motor that simply was not spinning was quoted on the bench as
+evidence the supply was off; `valid=0` and `vbok=0` sat in the same line and were not read, because a
+field that reads as a number gets believed on its own. Each field has its own condition:
+
+| field | reads a number only when |
+|---|---|
+| `vest`  | the validity window is open (`valid=1`) |
+| `vref`  | `sense <i> zero` has run this arm |
+| `load`  | both of the above, **and** `loadok=1` (still near the point the reference was captured at) |
+| `vbatt` | the light-load tier has opened at least once this arm (`vbok`) — it only advances while the motor SPINS |
+
+Everything else on the line (`dhat`, `trim`, `cmd`, `temp`…) is a live number whose zero **is** a
+measurement, so those stay numeric. Hosts parse `key=value`, so no key moved — but a host that
+`float()`s these must tolerate a non-number (`_f()` in `host/driftsoak.py` and `host/loadtest.py`).
+
 | field   | meaning |
 |---------|---------|
-| `vest`  | low-passed `V_eff` estimate (gated to the validity window). ≈ supply at light load, *before* calibration it may be biased (see below). |
-| `vref`  | the **learned reference**, captured by `sense <i> zero`. `0` until you baseline it. |
-| `load`  | `vref − vest` — `0` until baselined, `0` when `loadok=0`, `≈0` at the zeroing condition, and **grows positive under load** (droop). |
+| `vest`  | low-passed `V_eff` estimate (gated to the validity window). ≈ supply at light load, *before* calibration it may be biased (see below). `n/a` when the window is shut. |
+| `vref`  | the **learned reference**, captured by `sense <i> zero`. `n/a` until you baseline it. |
+| `load`  | `vref − vest` — `≈0` at the zeroing condition, **grows positive under load** (droop). `n/a` until baselined and whenever `loadok=0`. |
+| `vbatt` | calibrated rolling-max of `vest` ≈ supply. `n/a` until the light-load tier (`vbok`) has opened this arm. |
 | `valid` | `1` only inside the validity window below; `0` in forced sine / startup / stopped / saturation. |
 | `why`   | which condition is closing the window: `ok`, `notlive`, `cmdlow`, `dutyhigh`, `rpmlow`, `settling`. |
 | `cmdfloor` | the `\|command\|` needed to open the window, **derived** from the configured seam (not typed). |
@@ -68,6 +89,9 @@ tools (`host/driftsoak.py`, `host/vbatt.py`, `host/loadtest.py`), pinned by
 
 Firmware API (per `Thruster`, `src/apps/thruster.h`): `senseVoltage()`, `senseLoad()`, `senseVref()`,
 `senseValid()`, `senseZero()`, `senseLoadOk()`, `senseVbattOk()`, `senseWhy()`, `senseCmdFloor()`.
+The value accessors still return `0.0f` when their gate is shut (a numeric API needs a number) — it is
+the **printer** that must not lie, so pair them with `senseValid()` / `senseVrefHas()` /
+`senseLoadHas()` / `senseVbattHas()` anywhere the value reaches a human or a log.
 `arm()` resets the reference **and** the window, so each run re-baselines; `stop()` resets the window
 (a motionless motor must never report a stale `vest` as valid).
 

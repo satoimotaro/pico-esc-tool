@@ -38,6 +38,21 @@ static int parseHex(const char* s, uint8_t* buf, int cap) {
 }
 static String jesc(const char* s) { String o; for (; *s; s++) { if (*s=='"'||*s=='\\') o+='\\'; o+=*s; } return o; }
 
+// [B.8] Print an OPTIONAL soft-sensor field: the value, or the literal `n/a` when there is no reading.
+// The soft-sensor's accessors fall back to 0.0f when their gate is shut, and every one of those zeros
+// is also a plausible MEASUREMENT — 0 V is a dead supply, 0 V of droop is an unloaded prop. So on the
+// wire "no reading" and "I measured zero" were the same token, and on 2026-08-18 a `vbatt=0.00` from a
+// motor that simply was not spinning got quoted as evidence the supply was off (`valid=0`/`vbok=0` sat
+// in the same line and were not read — which is the point: a field that reads as a number is believed
+// on its own). Making the absent case unprintable as a number is the fix; documenting it harder is not.
+// Hosts parse key=value so no key moves, but anything float()ing these must tolerate a non-number
+// (`_f()` in host/driftsoak.py and host/loadtest.py). Caller supplies the buffer — one PER FIELD:
+// printf's arguments are unsequenced, so a shared buffer would race between them.
+static const char* optNum(char* buf, size_t n, bool has, float v) {
+	if (has) snprintf(buf, n, "%.2f", v); else snprintf(buf, n, "n/a");
+	return buf;
+}
+
 // writable settings exposed in the web UI (raw byte per config offset) — verbatim from esc_tool.cpp
 struct Field { const char* name; uint16_t off; };
 static const Field FIELDS[] = {
@@ -688,7 +703,18 @@ private:
 						// "no estimate yet" now specifically means that tier never opened — say which one.
 						else if(!th_[i]->senseVcal(kv)) Serial.printf("err sense-vcal: no vbatt estimate yet — the light-load tier (vbok) has never opened (vbok=%d why=%s); spin steady, lightly loaded, above the 6-step floor first\n", th_[i]->senseVbattOk()?1:0, th_[i]->senseWhy());
 						else { Serial.printf("sense|%d|vcal to %.2f V -> vbatt=%.2f (persist with: cfg save)\n", i, kv, th_[i]->senseVbatt()); Serial.println("ok"); } }
-				else { float ve=th_[i]->senseVoltage(), vr=th_[i]->senseVref(), ld=th_[i]->senseLoad(), vb=th_[i]->senseVbatt();
+				else {
+					// [B.8] The four gated fields print `n/a`, never `0.00`, when they have no reading —
+					// see optNum() above for why the two had to stop being the same token. Each carries
+					// its OWN predicate, because they open at different times: vest needs the validity
+					// window, vref needs `sense zero` to have run, load needs both plus the off-point
+					// band, and vbatt needs the light-load tier. Everything below this line (dhat, trim,
+					// cmd, temp…) is a genuine live number whose zero IS a measurement — those stay numeric.
+					char b0[12], b1[12], b2[12], b3[12];
+					const char* ve = optNum(b0, sizeof b0, th_[i]->senseValid(),    th_[i]->senseVoltage());
+					const char* vr = optNum(b1, sizeof b1, th_[i]->senseVrefHas(),  th_[i]->senseVref());
+					const char* ld = optNum(b2, sizeof b2, th_[i]->senseLoadHas(),  th_[i]->senseLoad());
+					const char* vb = optNum(b3, sizeof b3, th_[i]->senseVbattHas(), th_[i]->senseVbatt());
 					// dhat = the DOB's load estimate in rpm (0 when the observer is off or gated). Exposed
 					// alongside `load` because it is the same physical quantity in different units, and it
 					// is what an upper layer (attitude / allocation) actually wants per thruster.
@@ -707,7 +733,7 @@ private:
 					//   temp/tpeak/tlim/tstate = the thermal limiter: last ESC MCU temperature (NOT the
 					//              winding), its high-water mark, the command-ceiling scale it is applying
 					//              (1.00 = none) and its state (none=never seen, ok, derate, stale=lost it).
-					Serial.printf("sense|%d|vest=%.2f|vref=%.2f|load=%.2f|vbatt=%.2f|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d"
+					Serial.printf("sense|%d|vest=%s|vref=%s|load=%s|vbatt=%s|valid=%d|floor=%.0f|dhat=%.1f|settled=%.2f|trim=%.1f|cmd=%d"
 					              "|why=%s|cmdfloor=%.0f|loadok=%d|vbok=%d|temp=%.0f|tpeak=%.0f|tlim=%.2f|tstate=%s\n",
 						i, ve, vr, ld, vb, th_[i]->senseValid()?1:0, th_[i]->senseRpmFloor(),
 						th_[i]->vc.dhat(), th_[i]->vc.settled(),

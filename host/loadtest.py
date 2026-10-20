@@ -71,6 +71,22 @@ def _fields(dev, cmd, prefix):
     return None
 
 
+def _f(d, k):
+    """float(d[k]) but NaN for absent OR non-numeric.
+
+    `sense` prints `n/a` for a gated field with no reading (vest/vref/load/vbatt) so the absence
+    cannot be mistaken for the number 0.00 — see docs/soft-sensor.md. The loop below waits for
+    valid=1 before it starts, but the gate can shut MID-RUN (that is exactly what `valid` in the row
+    records), so a plain float() would abort a load test in progress on a field it does not even
+    guard on. NaN is inert here: the overspeed / stall aborts are `rpm`-based and guard themselves
+    with `rpm == rpm`.
+    """
+    try:
+        return float(d.get(k, "nan"))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _tele_rpm(dev, idx):
     try:
         for ln in dev.cmd(f"tele {idx}", timeout=4):
@@ -92,7 +108,7 @@ def run(dev, opts, state):
     t_wait = time.time()
     while True:
         s = _fields(dev, f"sense {idx}", "sense|") or {}
-        if s.get("valid") == "1" and float(s.get("settled", 0)) >= 1.0:
+        if s.get("valid") == "1" and _f(s, "settled") >= 1.0:
             break
         if time.time() - t_wait > opts.settle_timeout:
             raise Aborted(f"no settled 6-step lock in {opts.settle_timeout:g}s (valid={s.get('valid')})")
@@ -133,11 +149,11 @@ def run(dev, opts, state):
             time.sleep(opts.period)
             continue
         blind = 0
-        trim = float(s.get("trim", "nan"))
+        trim = _f(s, "trim")
         row = {"clock": time.strftime("%H:%M:%S", time.localtime(now)), "t": now - t0,
-               "trim": trim, "cmd": float(s.get("cmd", "nan")), "tele_rpm": rpm,
-               "vest": float(s.get("vest", "nan")), "load": float(s.get("load", "nan")),
-               "dhat": float(s.get("dhat", "nan")), "valid": s.get("valid", "0")}
+               "trim": trim, "cmd": _f(s, "cmd"), "tele_rpm": rpm,
+               "vest": _f(s, "vest"), "load": _f(s, "load"),
+               "dhat": _f(s, "dhat"), "valid": s.get("valid", "0")}
         state["rows"].append(row)
 
         if rpm == rpm and abs(rpm) > opts.rpm_ceiling:

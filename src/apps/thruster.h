@@ -277,7 +277,8 @@ public:
 	// ESC perception (soft-sensor): infer effective supply voltage + a relative load signal from the
 	// LIVE command + measured 6-step tele rpm — no voltage/current/force sensor. senseVoltage ~= battery
 	// V at light load; senseLoad = (Vref - Vest) grows with current => torque => thrust (relative). 0
-	// outside 6-step (needs live BEMF tele). Set the motor first with setMotor()/`motor`.
+	// outside 6-step (needs live BEMF tele) — that 0 means NO READING, not zero volts; see the *Has()
+	// predicates below. Set the motor first with setMotor()/`motor`.
 	float senseVoltage() { return gate_.valid() ? vestFilt_ : 0.0f; }       // gated + low-passed
 	// [#7.1] load = deviation from the LEARNED light-load reference (0 until it settles), not the typed V.
 	// [B.6] ...and only while we are still NEAR the operating point that reference was captured at: the
@@ -285,6 +286,15 @@ public:
 	// water), so a difference taken somewhere else is two different biases subtracted, not a load.
 	float senseLoad()    { return (gate_.loadOk() && senseVref_ > 0.0f) ? (senseVref_ - vestFilt_) : 0.0f; }
 	float senseVref()    { return senseVref_; }                             // learned no-load V_eff (0 = not yet)
+	// [B.8] "is there a reading at all?" for the three fields above, so a caller can print n/a instead
+	// of the 0.0f they fall back to. Each of those zeros is ALSO a plausible measurement — 0 V is a dead
+	// supply, 0 V of droop is an unloaded prop — so on the wire the absence and the measurement are the
+	// same token. That cost a misread on the bench (2026-08-18; vbatt, same shape). The accessors keep
+	// returning 0.0f because a numeric API needs a number; it is the PRINTER that must not lie, so
+	// anything formatting these for a human or a log pairs them with the matching predicate here.
+	// vest's predicate is senseValid() itself, already public above — no second name for one condition.
+	bool  senseVrefHas() const { return senseVref_ > 0.0f; }                // `sense <i> zero` has run
+	bool  senseLoadHas() const { return gate_.loadOk() && senseVref_ > 0.0f; }
 	// Re-baseline the reference on command. Refused unless the gate is valid — a reference captured on an
 	// invalid estimate poisons every `load` reading taken against it. Records the COMMAND it was captured
 	// at, which is what the off-point band is measured against afterwards.
@@ -316,11 +326,18 @@ public:
 	// itself is per-session (arm() clears it — see #5 there). Returns false when there is no estimate to
 	// calibrate against yet, so the caller can report it instead of silently no-op'ing.
 	float senseVbatt()   { return vbattScale_ * vbattMax_; }
+	// [B.8] "is there an estimate at all?", so a caller can print n/a instead of a NUMBER. An ungated
+	// vbatt reads exactly 0.00, and 0.00 is a plausible measurement — a dead supply — so the two are
+	// indistinguishable on the wire. That misread happened on the bench (2026-08-18): the motors were
+	// not spinning, vbatt was 0.00 for that reason alone, and it was quoted as evidence the supply was
+	// off. valid=0/vbok=0 said so in the same line and were not read. The fix is to make the absent
+	// case UNPRINTABLE as a number rather than to document it harder.
+	bool  senseVbattHas() const { return vbattMax_ > 0.1f; }
 	// [B.6] vbattMax_ only ever advances while the gate's LIGHT-LOAD tier is open (see poll()), so "there
 	// is an estimate" now also means "it was taken where vcal's multiplicative scale can actually cancel
 	// the residual deficit". Refusing here is what keeps that true for the stored scale.
 	bool  senseVcal(float knownV) {
-		if (vbattMax_ <= 0.1f) return false;
+		if (!senseVbattHas()) return false;
 		vbattScale_ = knownV / vbattMax_;
 		return true;
 	}

@@ -12,7 +12,10 @@ violation of it fail here rather than silently on the bench, in three directions
    simply read as absent, never as a wrong value;
 3. a MISSING or `err` reply yields NaNs / zeros, never a plausible-looking healthy row. driftsoak's
    guards compare with `>=`, and every such test on a NaN is False, so a row that silently reads
-   "healthy" would switch the temperature / overspeed / stall aborts off for an unattended run.
+   "healthy" would switch the temperature / overspeed / stall aborts off for an unattended run;
+4. a NON-NUMERIC value parses as NaN rather than raising. `vbatt=n/a` (no estimate yet) is the
+   deliberate case — it exists so the absence stops looking like the number 0.00 — and a soak must
+   survive any other field going non-numeric too rather than dying mid-run.
 
 No serial port, no firmware: the `dev` here is a stub that returns canned lines.
 """
@@ -74,6 +77,39 @@ def test_a_thermal_derate_is_visible_in_the_row():
     line = NEW.replace("tlim=1.00", "tlim=0.62").replace("tstate=ok", "tstate=derate")
     s = driftsoak.sample(StubDev(line), 1)
     assert s["tlim"] == 0.62 and s["tstate"] == "derate"
+
+
+def test_a_gated_field_with_no_reading_parses_as_nan_not_as_zero():
+    """`n/a` reads as UNKNOWN, never as the number 0 — for every gated field, not just vbatt.
+
+    This is the whole point of the firmware printing `n/a`: `vbatt=0.00` is a plausible reading (a
+    dead supply) and `load=0.00` is a plausible reading (an unloaded prop), so the absent case had to
+    stop being a number. If it landed back here as 0.0 the CSV would re-create the trap the wire
+    format just removed.
+    """
+    # vref is the fourth gated field on the wire; driftsoak does not sample it, so it is not listed.
+    for key, val in (("vest", "9.14"), ("load", "0.06"), ("vbatt", "11.30")):
+        s = driftsoak.sample(StubDev(NEW.replace(f"{key}={val}", f"{key}=n/a")), 1)
+        assert math.isnan(s[key]), f"{key}=n/a should be NaN, not {s[key]}"
+
+
+def test_a_field_going_na_does_not_take_the_rest_of_the_row_with_it():
+    """The worst case on the wire: the whole gated group shut at once, everything else still live."""
+    line = (NEW.replace("vest=9.14", "vest=n/a").replace("vref=9.20", "vref=n/a")
+               .replace("load=0.06", "load=n/a").replace("vbatt=11.30", "vbatt=n/a")
+               .replace("valid=1", "valid=0").replace("why=ok", "why=notlive"))
+    s = driftsoak.sample(StubDev(line), 1)
+    assert math.isnan(s["vest"]) and math.isnan(s["load"]) and math.isnan(s["vbatt"])
+    # the covariates that say WHY are exactly what an operator must still be able to read
+    assert s["valid"] == 0 and s["why"] == "notlive"
+    assert s["trim"] == 11.6 and s["tstate"] == "ok" and s["tele_rpm"] == 1596.0
+
+
+def test_a_non_numeric_field_never_raises():
+    """Any field can go non-numeric without killing an unattended soak mid-run."""
+    line = NEW.replace("tlim=1.00", "tlim=n/a").replace("dhat=-15.0", "dhat=???")
+    s = driftsoak.sample(StubDev(line), 1)
+    assert math.isnan(s["tlim"]) and math.isnan(s["dhat"])
 
 
 def test_old_format_line_still_parses():

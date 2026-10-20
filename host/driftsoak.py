@@ -54,6 +54,21 @@ def _fields(dev, cmd, prefix):
     return None
 
 
+def _f(d, k):
+    """float(d[k]) but NaN for absent OR non-numeric.
+
+    The firmware prints `vbatt=n/a` when the rolling max has never been fed, precisely so the
+    absence cannot be read as the number 0.00 (see docs/soft-sensor.md). A plain float() would
+    raise on it and take the soak down mid-run, so the tolerance belongs here, not at each site.
+    NaN is the right landing: every guard below compares with >=, and >= on a NaN is False, so an
+    unparseable field disables its guard rather than faking a healthy value.
+    """
+    try:
+        return float(d.get(k, "nan"))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _sense(dev, idx):
     return _fields(dev, f"sense {idx}", "sense|")
 
@@ -102,13 +117,15 @@ def sample(dev, idx):
     s = _sense(dev, idx) or {}
     t = _tele(dev, idx) or {}
     return {
-        "trim":    float(s.get("trim", "nan")),
-        "cmd":     float(s.get("cmd", "nan")),
-        "dhat":    float(s.get("dhat", "nan")),
-        "settled": float(s.get("settled", "nan")),
-        "vest":    float(s.get("vest", "nan")),
-        "vbatt":   float(s.get("vbatt", "nan")),
-        "load":    float(s.get("load", "nan")),
+        "trim":    _f(s, "trim"),
+        "cmd":     _f(s, "cmd"),
+        "dhat":    _f(s, "dhat"),
+        "settled": _f(s, "settled"),
+        "vest":    _f(s, "vest"),
+        # `n/a` (no vbatt estimate yet) lands as NaN here — NOT as 0.0, which would put the same
+        # 0.00-is-not-a-measurement trap back into the CSV the firmware just removed from the wire.
+        "vbatt":   _f(s, "vbatt"),
+        "load":    _f(s, "load"),
         "valid":   int(float(s.get("valid", 0))),
         # Soft-sensor validity window (firmware vel::SenseGate). `why` is the whole point of logging
         # these: the gate is deliberately stricter than the old rpm-only test, so a valid=0 row has to
@@ -121,7 +138,7 @@ def sample(dev, idx):
         # Firmware thermal limiter: tlim = the command-ceiling scale it is applying (1.00 = none),
         # tstate = none|ok|derate|stale. A derate means the firmware is withholding command, so `trim`
         # and `cmd` stop being a pure drift signal — the soak has to be read differently from there on.
-        "tlim":    float(s.get("tlim", "nan")),
+        "tlim":    _f(s, "tlim"),
         "tstate":  s.get("tstate", ""),
         "tele_rpm": t.get("rpm", float("nan")),
         "tempC":    t.get("tempC", float("nan")),
