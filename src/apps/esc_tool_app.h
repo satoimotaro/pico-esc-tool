@@ -240,6 +240,7 @@ public:
 			for (uint8_t i = 0; i < n_; i++) { th_[i]->poll(); thermalNotice(i); }   // RPM submode closes the loop
 			escs::spinPoll();                                          // keep DShot frames flowing
 		}
+		linkWatch();
 		if (wifiUp_) server_.handleClient();
 	}
 
@@ -247,6 +248,25 @@ public:
 	void pollCore1() { escs::core1Poll(); }
 
 private:
+	// HOST-LINK DEADMAN (`link <ms>`, 0 = off, the default). escs::'s own 500 ms deadman cannot see a
+	// lost host in RPM submode: the closed loop itself re-sends throttle every tick, so a host that
+	// sets `rpm 1 2000` and then dies leaves the motor at 2000 rpm indefinitely. This watches the CLI
+	// instead — ANY complete command line counts as alive, so a soak that polls `sense` once a second
+	// keeps it fed without resending its target — and stops every ESC once when the silence outlasts
+	// the timeout while something is spinning. Opt-in so the existing bench scripts keep their
+	// behaviour; NOT persisted, so a power cycle always comes back with it off.
+	uint32_t linkTimeoutMs_ = 0, linkLastMs_ = 0;
+	bool     linkTripped_   = false;
+	void linkWatch() {
+		if (!linkTimeoutMs_ || linkTripped_ || !escs::spinning()) return;
+		if (millis() - linkLastMs_ <= linkTimeoutMs_) return;
+		for (uint8_t k = 0; k < n_; k++) th_[k]->stop();
+		escs::spinStopAll();
+		linkTripped_ = true;
+		console::out().printf("# link: no command for %lu ms (limit %lu) — all ESCs stopped\n",
+		                      (unsigned long)(millis() - linkLastMs_), (unsigned long)linkTimeoutMs_);
+	}
+
 	// [B.7] One-shot serial notice whenever the thermal limiter CHANGES state. The two states worth
 	// waking an operator for are DERATE (the firmware is now withholding command — a `rpm` that no longer
 	// tracks is protection, not a fault) and STALE (temperature was being observed and is not any more,
@@ -530,6 +550,7 @@ private:
 			if (c == '\r') continue;
 			if (c != '\n') { if (len < sizeof(line)-1) line[len++]=(char)c; continue; }
 			line[len]='\0'; len=0;
+			linkLastMs_ = millis(); linkTripped_ = false;   // any command line = the host is alive
 			char* cmd = strtok(line, " "); if (!cmd) continue;
 			auto argi = []() { char* a=strtok(nullptr," "); return a?atoi(a):-1; };
 
@@ -825,6 +846,9 @@ private:
 				if(i<0) { for(uint8_t k=0;k<n_;k++) th_[k]->stop(); escs::spinStopAll(); }
 				else if(i<n_) th_[i]->stop();
 				console::out().println("ok"); }
+			else if (!strcmp(cmd,"link")) { char* v=strtok(nullptr," ");   // link [<ms>|off] — host-link deadman, see linkWatch()
+				if(v) linkTimeoutMs_ = strcmp(v,"off") ? (uint32_t)atol(v) : 0;
+				console::out().printf("link|timeout_ms=%lu\n", (unsigned long)linkTimeoutMs_); console::out().println("ok"); }
 			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
 				else if(!strcmp(v,"stop")){ analogWrite(Esc::pin(i),0); pinMode(Esc::pin(i),INPUT); console::out().println("ok pwm-stop (reboot to use DShot again)"); }
