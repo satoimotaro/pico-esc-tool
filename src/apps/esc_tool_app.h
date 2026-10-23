@@ -181,7 +181,9 @@ public:
 #endif
 		delay(50);
 		if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }   // firmware library store
-		enc_.begin();                                                    // AS5600 encoder (I2C0, GP16/17)
+		{ static const uint8_t pins[] = ESC_SIGNAL_PINS;                  // GP16/17 wired as an ESC signal:
+		  for (uint8_t p : pins) if (p == 16 || p == 17) encOff_ = true; } // the encoder's I2C would take it
+		if (!encOff_) enc_.begin();                                      // AS5600 encoder (I2C0, GP16/17)
 		LittleFS.mkdir("/fw");
 		// Restore the saved runtime config (motor identity, gains, DOB, vbatt scale) — so `sense vcal`
 		// and `motor` are no longer per-power-cycle. main.cpp has already applied the compile-time
@@ -233,7 +235,7 @@ public:
 	// core0 loop.
 	void poll() {
 		handleSerial();
-		enc_.poll();                                            // high-rate AS5600 sampling (self-gated)
+		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
@@ -317,6 +319,7 @@ private:
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
 	uint8_t         n_;          // how many
 	As5600Tracker   enc_;
+	bool            encOff_ = false;    // an ESC signal sits on GP16/17, so the encoder stays off
 	Azimuth         az_;
 	Mode            mode_   = SETUP;
 	bool            wifiUp_ = false;
