@@ -598,6 +598,11 @@ private:
 				int n=parseHex(hx,flbuf,sizeof(flbuf));
 				if(n<=0)console::out().println("err bad-hex");
 				else console::out().println(th_[i]->writeFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)n)?"ok":"err write-failed"); }
+			else if (!strcmp(cmd,"blprobe")) { int i=argi(); char* h=strtok(nullptr," ");   // blprobe <i> [holdMs]
+				if(i<0||i>=n_){ console::out().println("err bad-index"); continue; }
+				uint8_t raw[8]; uint32_t e,l,t; int n=escs::probe((uint8_t)i, h?(uint32_t)atoi(h):2600, raw, e, l, t);
+				console::out().printf("blprobe|n=%d|raw=",n); printHex(raw,8);
+				console::out().printf("|edges=%lu|low=%lu/%lu\n",(unsigned long)e,(unsigned long)l,(unsigned long)t); console::out().println("ok"); }
 			else if (!strcmp(cmd,"readflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* ln=strtok(nullptr," ");
 				int rl=ln?atoi(ln):-1;
 				if(i<0||i>=n_||!ad||rl<1||rl>(int)sizeof(flbuf)) console::out().println("err bad-args");

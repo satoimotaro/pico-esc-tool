@@ -58,16 +58,19 @@ static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc
 enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
 
 namespace detail {
-	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500, HIGH_HOLD_MS = 1000;
+	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500, HIGH_HOLD_MS = 1000,
+	                      AM32_HOLD_MS = 4000;
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
 	static blheli_bl::Bootloader  bl({ .signalPin = PINS[0], .baud = 0 });    // core1 only
 
-	enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, ERASE, WRITEFLASH, READFLASH, RUN };
+	enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, ERASE, WRITEFLASH, READFLASH, RUN, PROBE };
 	static volatile Op       op = Op::NONE;
 	static volatile bool     opDone = false, opOk = false;
 	static volatile uint8_t  opPin = PINS[0];
 	static volatile uint8_t  sig[2] = {0, 0};
 	static volatile uint8_t  bootVer = 0, bootPages = 0;
+	static uint32_t prHoldMs = 0, prEdges = 0, prLows = 0, prTotal = 0;   // Op::PROBE in/out
+	static uint8_t  prRaw[8] = {0}; static int prN = 0;
 	static uint8_t  cfg[esc_setup::kEepromLen];
 	static uint8_t  page[esc_setup::kPageLen];
 	static uint8_t  flBuf[256];
@@ -116,11 +119,16 @@ namespace detail {
 	}
 	static bool enterBootloader(uint8_t pin) {      // DShot-prime -> signal-loss -> connect (retry)
 		for (int a = 0; a < 3; a++) {
-			dsh = new BidirDShotX1(pin, DSHOT_KBAUD);
-			uint32_t t0 = millis();
-			while (millis() - t0 < PRIME_MS) { dsh->sendThrottle(0); delayMicroseconds(300); }
-			delete dsh; dsh = nullptr;
-			pinMode(pin, OUTPUT); digitalWrite(pin, HIGH); delay(HIGH_HOLD_MS);
+			// AM32 only reboots into its bootloader after ~2 s without a valid frame, plus its startup
+			// tune, and its bootloader bails back to the app on garbage. So prime only on the first
+			// (BLHeli-S) try; later tries just hold the line high long enough to straddle that reboot.
+			if (a == 0) {
+				dsh = new BidirDShotX1(pin, DSHOT_KBAUD);
+				uint32_t t0 = millis();
+				while (millis() - t0 < PRIME_MS) { dsh->sendThrottle(0); delayMicroseconds(300); }
+				delete dsh; dsh = nullptr;
+			}
+			pinMode(pin, OUTPUT); digitalWrite(pin, HIGH); delay(a == 0 ? HIGH_HOLD_MS : AM32_HOLD_MS);
 			if (runOp(Op::CONNECT, pin)) return true;
 		}
 		return false;
@@ -205,6 +213,19 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 	flAddr = addr; flLen = len;
 	if (!runOp(Op::READFLASH, PINS[idx])) return false;
 	memcpy(out, flBuf, len); return true;
+}
+
+// Bring-up diagnostic, no session: drive the line high for holdMs (straddles an ESC reboot into its
+// bootloader), then send BootInit and report the raw reply bytes and the line activity after a
+// second BootInit. Tells "ESC never answers" apart from "answers but we mis-decode".
+inline int probe(uint8_t idx, uint32_t holdMs, uint8_t raw[8], uint32_t& edges, uint32_t& lows, uint32_t& total) {
+	using namespace detail;
+	if (idx >= COUNT) return -1;
+	if (drvActive(idx)) drvFree(idx);
+	if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; }
+	prHoldMs = holdMs;
+	runOp(Op::PROBE, PINS[idx]);
+	memcpy(raw, prRaw, 8); edges = prEdges; lows = prLows; total = prTotal; return prN;
 }
 
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
@@ -335,7 +356,9 @@ inline void core1Poll() {
 			uint8_t raw[8] = {0};
 			int n = bl.connectRawProbe(raw, 15);
 			if (n >= 8 && raw[0] == '4' && raw[1] == '7' && raw[2] == '1') {
-				if (bl.connect()) {
+				// AM32 answers only the FIRST BootInit of a session, so a second hello from connect()
+				// gets silence. Adopt the probe's reply as the session instead of re-sending.
+				if (bl.adoptReply(raw)) {
 					const auto& d = bl.lastDevice();
 					sig[0] = d.signature[0]; sig[1] = d.signature[1];
 					bootVer = d.bootVersion; bootPages = d.bootPages; ok = true;
@@ -349,6 +372,9 @@ inline void core1Poll() {
 	else if (o == Op::WRITEFLASH)  { ok = bl.writeFlash(flAddr, flBuf, flLen); }
 	else if (o == Op::READFLASH)   { ok = bl.readFlash(flAddr, flBuf, flLen); }
 	else if (o == Op::RUN)         { ok = bl.run(); }
+	else if (o == Op::PROBE)       { bl.setSignalPin(opPin); bl.begin(); bl.holdIdleHigh(prHoldMs); bl.begin();
+	                                 memset(prRaw, 0, sizeof(prRaw)); prN = bl.connectRawProbe(prRaw, 40);
+	                                 bl.probeReplyActivity(200, prEdges, prLows, prTotal); ok = true; }
 	opOk = ok; opDone = true;
 }
 

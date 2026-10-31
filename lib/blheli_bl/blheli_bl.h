@@ -30,6 +30,7 @@ enum class McuType : uint8_t { UNKNOWN, SILABS_EFM8, ATMEL_AVR, ARM_BB51 };
 struct DeviceInfo {
 	bool        valid = false;
 	uint8_t     signature[2] = {0, 0};   // [0]=sigHi [1]=sigLo; EFM8BB21 => E8 B2
+	bool        am32 = false;            // reply carried AM32's trailing ACK (then [3]=pin code, [4]=flash size)
 	uint8_t     bootVersion  = 0;
 	uint8_t     bootPages    = 0;
 	uint8_t     bootInfo[8]  = {0};      // raw connect reply
@@ -70,6 +71,11 @@ public:
 	// SiLabs power-up window. Returns the number of bytes actually received (0..8).
 	// A valid bootloader reply starts with '4','7','1'; out[4]/out[5] = signature.
 	int connectRawProbe(uint8_t out[8], uint32_t perByteTimeoutMs = 40);
+
+	// Take a reply already read by connectRawProbe() as this session's hello — for AM32, whose
+	// bootloader ignores a second BootInit. Frames carry CRC afterwards, as after connect().
+	bool adoptReply(const uint8_t info[8]) { return adoptReply(info, lastProbeAm32_); }
+	bool adoptReply(const uint8_t info[8], bool am32);
 
 	// Send the 17-byte BootInit hello WITHOUT reading a reply (leaves line in RX).
 	void sendBootInit();
@@ -143,6 +149,7 @@ private:
 	void setRx();                    // input, pull-up
 	void txByte(uint8_t b, bool releaseForRx = false);
 	bool rxByte(uint8_t& out, uint32_t timeoutMs);
+	bool lastProbeAm32_ = false;
 
 	// --- framing ---
 	// Send payload, appending the 2-byte CRC iff connected_ (stateful, per BF-AVR).

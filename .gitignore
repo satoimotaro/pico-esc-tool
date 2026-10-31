@@ -61,3 +61,4 @@ host/tests/data/plant_fixtures.json
 host/profiles/*.yaml
 !host/profiles/blheli-s-default.yaml
 !host/profiles/vel_*.yaml
+host/am32_backups/
