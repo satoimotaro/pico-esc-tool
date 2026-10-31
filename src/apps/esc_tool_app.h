@@ -27,6 +27,9 @@
 #include "thruster.h"
 #include "azimuth.h"
 #include "settings.h"
+#if ESC_LCD
+#include "lcd1602.h"
+#endif
 
 // ---- small helpers (unchanged from esc_tool.cpp) ----
 static void printHex(const uint8_t* p, uint16_t n) {
@@ -176,6 +179,12 @@ public:
 	void begin(Stream& io = Serial) {
 		Serial.begin(115200);
 		console::io = &io;
+#if ESC_LCD
+		lcd_.begin();
+		lcd_.row(0, "pico-esc-tool");
+		lcd_.row(1, "booting...");
+		for (uint8_t k = 0; k < 16; k++) lcd_.poll(4);
+#endif
 #if ESC_MODE_PIN >= 0
 		pinMode(ESC_MODE_PIN, INPUT_PULLUP);
 #endif
@@ -244,6 +253,9 @@ public:
 		}
 		linkWatch();
 		if (wifiUp_) server_.handleClient();
+#if ESC_LCD
+		lcdPoll();
+#endif
 	}
 
 	// core1 loop.
@@ -314,6 +326,49 @@ private:
 	// second; 5 s is generous enough that a slow first frame is not mistaken for a dead channel, and short
 	// enough that the operator hears about it near the start of a run rather than after it.
 	static const uint32_t THERMAL_NONE_WARN_MS = 5000;
+
+#if ESC_LCD
+	// STATUS LCD. With an ESC armed (or arming) it shows the lowest-index one in detail:
+	//   0A T 600 R 1115       index, a=arming / A=armed, DShot value sent, rpm (--- once stale > 0.5 s)
+	//   11.2V c 11  32C       EDT volts, raw current code (the AM32 fork's code x0.05 A), ESC temp
+	// otherwise every ESC's state (off / BL = in its bootloader / FL = flashing) and the mode.
+	// The text is rebuilt at 5 Hz; Lcd1602::poll() trickles the changed characters out.
+	static constexpr uint8_t LCD_D_[8] = ESC_LCD_D;
+	Lcd1602  lcd_{ESC_LCD_RS, ESC_LCD_RW, ESC_LCD_E, LCD_D_};
+	uint32_t lcdMs_ = 0;
+
+	void lcdPoll() {
+		lcd_.poll();
+		if (millis() - lcdMs_ < 200) return;
+		lcdMs_ = millis();
+		char r0[24], r1[24];
+		int shown = -1;
+		for (uint8_t i = 0; i < n_ && shown < 0; i++) if (escs::spinArmed(i) || escs::spinArming(i)) shown = i;
+		if (shown >= 0) {
+			uint8_t i = (uint8_t)shown;
+			escs::Telem t;
+			bool tele = escs::spinTele(i, t);
+			bool fresh = tele && t.valid && millis() - t.rpmStampMs < 500;
+			if (fresh) snprintf(r0, sizeof r0, "%u%c T%4u R%5lu", i, escs::spinArmed(i) ? 'A' : 'a',
+			                    escs::spinTarget(i), (unsigned long)t.rpm);
+			else       snprintf(r0, sizeof r0, "%u%c T%4u R  ---", i, escs::spinArmed(i) ? 'A' : 'a',
+			                    escs::spinTarget(i));
+			if (tele) snprintf(r1, sizeof r1, "%4.1fV c%3lu %3luC", t.voltage, (unsigned long)t.current,
+			                   (unsigned long)t.tempC);
+			else      snprintf(r1, sizeof r1, "no telemetry");
+		} else {
+			int k = 0;
+			for (uint8_t i = 0; i < n_ && i < 3; i++) {
+				bool fl = (fl_ == FL_START || fl_ == FL_RUN) && flIdx_ == i;
+				k += snprintf(r0 + k, sizeof r0 - k, "%u:%-3s ", i,
+				              fl ? "FL" : escs::inBootloader(i) ? "BL" : "off");
+			}
+			snprintf(r1, sizeof r1, "%s%s", mode_ == DRIVE ? "DRIVE" : "SETUP", wifiUp_ ? "  wifi" : "");
+		}
+		lcd_.row(0, r0);
+		lcd_.row(1, r1);
+	}
+#endif
 
 	// ---- members (were esc_tool.cpp file-scope globals) ----
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in

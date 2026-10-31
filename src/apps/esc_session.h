@@ -299,6 +299,9 @@ inline const char* spinMode(uint8_t idx) {
 	return drvB[idx] ? "bidir" : (drvN[idx] ? "normal" : "none");
 }
 inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::drvInitFail[idx]; }
+inline bool spinArming(uint8_t idx)     { return idx < COUNT && detail::drvActive(idx) && !detail::drvArmed[idx]; }
+inline uint16_t spinTarget(uint8_t idx) { return idx < COUNT ? detail::drvTarget[idx] : 0; }   // DShot value being sent
+inline bool inBootloader(uint8_t idx)   { return detail::session == (int8_t)idx; }
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;

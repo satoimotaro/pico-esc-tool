@@ -13,7 +13,27 @@
 // One GPIO per ESC. Each line carries BOTH the 1-wire bootloader (config/flash) AND DShot
 // (drive/telemetry) for that ESC. List them in ESC-index order; add/remove entries to match how
 // many ESCs you wired. See construction/wiring/.
+// ESC_BOARD_PANEL (env:main_panel) is the old prayer-wheel display board reused as a bench panel:
+// Pico W + SC1602 LCD + PWM1..4 headers on GP16..19. Its LCD bus takes GP5..15, so GP10/11 are not
+// free there.
+#ifndef ESC_BOARD_PANEL
+#define ESC_BOARD_PANEL   0
+#endif
+#if ESC_BOARD_PANEL
+#define ESC_SIGNAL_PINS   { 16, 17 }       // PWM1, PWM2
+#else
 #define ESC_SIGNAL_PINS   { 10, 11 }
+#endif
+
+// --- Status LCD (16x2 HD44780, 8-bit bus, write-only) -------------------------------------------
+// Shows each ESC's state, and for the armed one throttle / rpm / volts / current code / temp.
+#ifndef ESC_LCD
+#define ESC_LCD           ESC_BOARD_PANEL
+#endif
+#define ESC_LCD_RS        15
+#define ESC_LCD_RW        14               // held LOW: the 5 V LCD never drives the bus
+#define ESC_LCD_E         13
+#define ESC_LCD_D         { 12, 11, 10, 9, 8, 7, 6, 5 }   // D0..D7
 
 // --- Mode-select GPIO (esc_tool only) ---------------------------------------------------------
 // Read once at boot: tie LOW for DRIVE (Wi-Fi off), or leave UNCONNECTED (internal pull-up => HIGH)
