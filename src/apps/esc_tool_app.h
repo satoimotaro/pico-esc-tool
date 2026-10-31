@@ -30,6 +30,10 @@
 #if ESC_LCD
 #include "lcd1602.h"
 #endif
+#if ESC_WIFI_STA
+#include "net_console.h"
+#include "wifi_secrets.h"
+#endif
 
 // ---- small helpers (unchanged from esc_tool.cpp) ----
 static void printHex(const uint8_t* p, uint16_t n) {
@@ -185,6 +189,10 @@ public:
 		lcd_.row(1, "booting...");
 		for (uint8_t k = 0; k < 16; k++) lcd_.poll(4);
 #endif
+#if ESC_WIFI_STA
+		net_.begin(io, WIFI_SSID, WIFI_PASS, ESC_HOSTNAME);   // CLI on USB and TCP from here on
+		console::io = &net_;
+#endif
 #if ESC_MODE_PIN >= 0
 		pinMode(ESC_MODE_PIN, INPUT_PULLUP);
 #endif
@@ -243,6 +251,9 @@ public:
 
 	// core0 loop.
 	void poll() {
+#if ESC_WIFI_STA
+		net_.poll();
+#endif
 		handleSerial();
 		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
@@ -363,7 +374,14 @@ private:
 				k += snprintf(r0 + k, sizeof r0 - k, "%u:%-3s ", i,
 				              fl ? "FL" : escs::inBootloader(i) ? "BL" : "off");
 			}
+#if ESC_WIFI_STA
+			// S/D = mode, then the LAN address to point the host at; * = a TCP client is attached
+			if (net_.connected()) snprintf(r1, sizeof r1, "%c %s%s", mode_ == DRIVE ? 'D' : 'S',
+			                               net_.ip().toString().c_str(), net_.hasClient() ? "*" : "");
+			else snprintf(r1, sizeof r1, "%s  joining...", mode_ == DRIVE ? "DRIVE" : "SETUP");
+#else
 			snprintf(r1, sizeof r1, "%s%s", mode_ == DRIVE ? "DRIVE" : "SETUP", wifiUp_ ? "  wifi" : "");
+#endif
 		}
 		lcd_.row(0, r0);
 		lcd_.row(1, r1);
@@ -402,8 +420,15 @@ private:
 	char     flMsg_[140] = {0};
 
 	// ---- Wi-Fi lifecycle ----
+#if ESC_WIFI_STA
+	// The station link belongs to net_ and stays up; SETUP/DRIVE only open/close the web UI on it.
+	void wifiStart() { if (wifiUp_) return; server_.begin(); wifiUp_ = true; }
+	void wifiStop()  { if (!wifiUp_) return; server_.stop(); wifiUp_ = false; }
+	NetConsole net_{ESC_TCP_PORT};
+#else
 	void wifiStart() { if (wifiUp_) return; WiFi.mode(WIFI_AP); WiFi.softAP(ESC_AP_SSID, ESC_AP_PASS); server_.begin(); wifiUp_ = true; }
 	void wifiStop()  { if (!wifiUp_) return; server_.stop(); WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF); wifiUp_ = false; }
+#endif
 	void setMode(Mode m) {
 		mode_ = m;
 		if (m == SETUP) wifiStart();
@@ -618,6 +643,11 @@ private:
 				while(dir.next()){ String fn=dir.fileName(); int sl=fn.lastIndexOf('/'); if(sl>=0)fn=fn.substring(sl+1);
 					if(fn.endsWith(".hex")){ console::out().printf("fw| %s  %u bytes\n", fn.c_str(), (unsigned)dir.fileSize()); n++; } }
 				console::out().printf("fwlist %d\n", n); console::out().println("ok"); }
+#if ESC_WIFI_STA
+			else if (!strcmp(cmd,"net")) { console::out().printf("net|%s|%s|%s:%u|%s\n", net_.ssid(),
+				net_.connected() ? "up" : "down", net_.ip().toString().c_str(), net_.port(),
+				net_.hasClient() ? "client" : "-"); console::out().println("ok"); }
+#endif
 			else if (!strcmp(cmd,"mode")) { char* a=strtok(nullptr," ");
 				if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
 				console::out().printf("mode %s (wifi %s)\n", mode_==SETUP?"setup":"drive", wifiUp_?"on":"off"); console::out().println("ok"); }

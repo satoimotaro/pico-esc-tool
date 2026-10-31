@@ -62,3 +62,6 @@ host/profiles/*.yaml
 !host/profiles/blheli-s-default.yaml
 !host/profiles/vel_*.yaml
 host/am32_backups/
+
+# home Wi-Fi credentials (src/apps/wifi_secrets.h.example is the template)
+src/apps/wifi_secrets.h

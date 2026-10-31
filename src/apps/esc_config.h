@@ -59,6 +59,21 @@
 #define ESC_AP_SSID       "pico-esc-tool"
 #define ESC_AP_PASS       "esctool1234"    // >= 8 chars (WPA2); change before real use
 
+// --- Home Wi-Fi + CLI over TCP (net_console.h) ---------------------------------------------------
+// The Pico joins the LAN as a station and serves the same CLI on ESC_TCP_PORT, next to USB:
+// host tools take `--port socket://<ip>:2323`. Needs src/apps/wifi_secrets.h (gitignored; copy
+// wifi_secrets.h.example). With it on, the web UI is served on the LAN address in SETUP mode
+// instead of from the pico-esc-tool access point, and the radio stays on in DRIVE.
+#ifndef ESC_WIFI_STA
+#if ESC_BOARD_PANEL && __has_include("wifi_secrets.h")
+#define ESC_WIFI_STA      1
+#else
+#define ESC_WIFI_STA      0
+#endif
+#endif
+#define ESC_TCP_PORT      2323
+#define ESC_HOSTNAME      "pico-esc"
+
 // --- DShot / motor ----------------------------------------------------------------------------
 #define ESC_DSHOT_KBAUD   300              // DShot bitrate in kbaud  [TEST: A_H_30 ESCs may need 300, not 600]
 #define ESC_MOTOR_POLES   14               // motor magnet poles (for eRPM -> RPM); motor-dependent
