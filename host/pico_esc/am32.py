@@ -22,6 +22,8 @@ EEPROM_OFFSET = {
 }
 EEPROM_LEN = 192
 NAME_LEN = 32           # firmware FILE_NAME, NUL padded, just below the settings block
+APP_START = 0x1000      # FIRMWARE_RELATIVE_START for <=64 KB parts
+PAGE = 0x400            # the bootloader erases a page when a write lands on its first byte
 
 # (offset, name, note). Names follow Inc/eeprom.h. Bytes 0..4 are identity, not settings.
 FIELDS = [
@@ -93,6 +95,30 @@ DEFAULTS = {
 }
 
 
+def read_hex(path: str) -> dict[int, int]:
+    """Intel HEX -> {flash offset from 0x08000000: byte}."""
+    mem, base = {}, 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith(":"):
+                continue
+            n, addr, typ = int(line[1:3], 16), int(line[3:7], 16), int(line[7:9], 16)
+            data = bytes.fromhex(line[9:9 + 2 * n])
+            if typ == 4:
+                base = int.from_bytes(data, "big") << 16
+            elif typ == 0:
+                for i, b in enumerate(data):
+                    mem[base + addr + i - 0x08000000] = b
+    return mem
+
+
+def image(mem: dict[int, int], start: int, end: int) -> bytes:
+    """The bytes of [start, end) from a read_hex() map, padded with 0xFF to an even length."""
+    out = bytes(mem.get(a, 0xFF) for a in range(start, end))
+    return out + b"\xff" if len(out) % 2 else out
+
+
 def eeprom_offset(flash_code: int) -> int:
     if flash_code not in EEPROM_OFFSET:
         raise ValueError(f"unknown AM32 flash-size code 0x{flash_code:02X}")
@@ -160,5 +186,33 @@ class Am32:
             raise RuntimeError("read-back differs from what was written")
         return back
 
+    def flash_app(self, mem: dict[int, int], progress=print) -> int:
+        """Write the application part of a read_hex() map and verify it. Leaves the settings
+        block alone. Returns the number of bytes written."""
+        name_at = eeprom_offset(self.flash_code) - NAME_LEN
+        app = sorted(a for a in mem if APP_START <= a < name_at)
+        if not app:
+            raise ValueError("hex has no application bytes")
+        end = app[-1] + 1
+        data = image(mem, APP_START, end)
+        # Write in 256-byte chunks from the page start, so every page is erased by its first write.
+        for off in range(0, len(data), 256):
+            chunk = data[off:off + 256]
+            self.host.cmd(f"writeflash {self.idx} {APP_START + off:X} {chunk.hex()}", 30)
+            if off % 0x1000 == 0:
+                progress(f"  wrote 0x{APP_START + off:04X}")
+        back = self.read(APP_START, len(data))
+        if back != data:
+            bad = next(i for i in range(len(data)) if back[i] != data[i])
+            raise RuntimeError(f"verify failed at 0x{APP_START + bad:04X}")
+        return len(data)
+
     def run(self):
         self.host.cmd("run", 5)
+
+
+def edt_current_amps(code: int) -> float:
+    """Decode the companded EDT current of our AM32 fork (am32 branch uwr/edt-current):
+    0..199 = 0.05 A steps, 200..255 = 10 A + 0.5 A steps (255 = saturated, >= 37.5 A).
+    Stock AM32 sends whole amps instead; this is only valid on the fork."""
+    return code * 0.05 if code < 200 else 10.0 + (code - 200) * 0.5

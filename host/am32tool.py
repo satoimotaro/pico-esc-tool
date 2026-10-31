@@ -8,6 +8,7 @@
   python am32tool.py set 0 bi_direction=1 input_type=1
   python am32tool.py defaults 0                 # write pico_esc.am32.DEFAULTS (keeps kv/poles)
   python am32tool.py restore 0 aria.bin
+  python am32tool.py flash 0 AM32_ARIA_RAMP_F051_2.21.hex     # app only; settings are kept
 
 Every write saves the block it replaces to host/am32_backups/ first and is read back. The ESC is
 left running its app afterwards (`run`), so it beeps its startup tune when this exits.
@@ -21,7 +22,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pico_esc.am32 import Am32, DEFAULTS, FIELDS, decode, encode, kv  # noqa: E402
+from pico_esc.am32 import (  # noqa: E402
+    Am32, DEFAULTS, FIELDS, NAME_LEN, decode, encode, eeprom_offset, kv, read_hex)
 from pico_esc.link import EscHost  # noqa: E402
 
 BACKUPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "am32_backups")
@@ -70,6 +72,10 @@ def main() -> int:
     rs = sub.add_parser("restore")
     rs.add_argument("idx", type=int)
     rs.add_argument("file")
+    fl = sub.add_parser("flash")
+    fl.add_argument("idx", type=int)
+    fl.add_argument("hex")
+    fl.add_argument("--force", action="store_true", help="flash even if the target name differs")
     a = ap.parse_args()
 
     esc = Am32(EscHost(a.port), a.idx)
@@ -82,6 +88,20 @@ def main() -> int:
                 with open(a.out, "wb") as f:
                     f.write(raw)
                 print("saved", a.out)
+            return 0
+        if a.cmd == "flash":
+            mem = read_hex(a.hex)
+            name_at = eeprom_offset(esc.flash_code) - NAME_LEN
+            new_name = bytes(mem.get(name_at + i, 0) for i in range(NAME_LEN)).split(b"\0")[0].decode()
+            old_name = esc.read_name()
+            print(f"on ESC: {old_name}   in hex: {new_name}")
+            if new_name != old_name and not a.force:
+                print("refused: target differs (wrong pinout can't drive this board); --force overrides")
+                return 1
+            if new_name != old_name:
+                print("note: the name block is not rewritten; reflash it with the configurator")
+            print(f"flashed {esc.flash_app(mem)} bytes, verified")
+            show(esc, esc.read_eeprom())
             return 0
         if a.cmd == "restore":
             with open(a.file, "rb") as f:
