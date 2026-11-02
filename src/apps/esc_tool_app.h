@@ -27,6 +27,7 @@
 #include "thruster.h"
 #include "azimuth.h"
 #include "settings.h"
+#include "fourway.h"
 #if ESC_LCD
 #include "lcd1602.h"
 #endif
@@ -367,6 +368,10 @@ private:
 			if (tele) snprintf(r1, sizeof r1, "%4.1fV c%3lu %3luC", t.voltage, (unsigned long)t.current,
 			                   (unsigned long)t.tempC);
 			else      snprintf(r1, sizeof r1, "no telemetry");
+		} else if (fw_.active()) {
+			snprintf(r0, sizeof r0, "4WAY passthrough");
+			if (fw_.selected() >= 0) snprintf(r1, sizeof r1, "ESC %d in BL", fw_.selected());
+			else                     snprintf(r1, sizeof r1, "configurator");
 		} else {
 			int k = 0;
 			for (uint8_t i = 0; i < n_ && i < 3; i++) {
@@ -389,6 +394,7 @@ private:
 #endif
 
 	// ---- members (were esc_tool.cpp file-scope globals) ----
+	FourWay         fw_;         // esc-configurator / AM32 configurator passthrough on the CLI stream
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
 	uint8_t         n_;          // how many
 	As5600Tracker   enc_;
@@ -630,6 +636,7 @@ private:
 		static char line[600]; static uint16_t len = 0; static uint8_t flbuf[256];
 		while (console::out().available()) {
 			int c = console::out().read();
+			if (fw_.feed((uint8_t)c, len == 0)) continue;   // stock configurator: MSP / 4-way passthrough
 			if (c == '\r') continue;
 			if (c != '\n') { if (len < sizeof(line)-1) line[len++]=(char)c; continue; }
 			line[len]='\0'; len=0;

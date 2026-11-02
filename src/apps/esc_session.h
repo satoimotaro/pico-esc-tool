@@ -63,7 +63,8 @@ namespace detail {
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
 	static blheli_bl::Bootloader  bl({ .signalPin = PINS[0], .baud = 0 });    // core1 only
 
-	enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, ERASE, WRITEFLASH, READFLASH, RUN, PROBE };
+	enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, ERASE, WRITEFLASH, READFLASH, RUN, PROBE,
+	                          FWSELECT, FWRUN };
 	static volatile Op       op = Op::NONE;
 	static volatile bool     opDone = false, opOk = false;
 	static volatile uint8_t  opPin = PINS[0];
@@ -76,6 +77,14 @@ namespace detail {
 	static uint8_t  flBuf[256];
 	static volatile uint16_t flAddr = 0, flLen = 0;
 	static volatile int8_t   session = -1;
+	static uint8_t  lastRaw[8] = {0}; static bool lastAm32 = false;   // the last CONNECT's raw reply
+	// 4-way passthrough (fourway.h): an ESC once connected stays in its bootloader while another is
+	// selected, so coming back to it re-adopts its cached reply instead of a second BootInit (which
+	// AM32 does not answer).
+	static bool     fwHave[COUNT] = { false };
+	static uint8_t  fwRaw[COUNT][8];
+	static bool     fwAm32[COUNT] = { false };
+	static volatile uint8_t fwIdx = 0;
 	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
 	static BidirDShotX1*     drvB[COUNT] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
 	static DShotX4*          drvN[COUNT] = { nullptr };   // normal DShot: idle LOW, throttle only
@@ -231,6 +240,7 @@ inline int probe(uint8_t idx, uint32_t holdMs, uint8_t raw[8], uint32_t& edges, 
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
 
+
 // Per-ESC drive config (call BEFORE spinArm; takes effect at the next arm). 0 restores the global
 // ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default. Lets a Thruster carry its own bitrate / pole count.
 inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < COUNT) detail::drvKbaud[idx] = kbaud; }
@@ -343,7 +353,62 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 	if (any) delayMicroseconds(200);
 }
 
+// ---- 4-way passthrough (fourway.h) -------------------------------------------------------------
+// fwBegin: stop driving, and hold every signal line high so each ESC drops into its bootloader
+// (what Betaflight's esc4wayInit does). fwSelect: make idx the session — the cached reply if it is
+// still in its bootloader, else a BootInit, else the full DShot-prime entry — and return its raw
+// 8-byte reply. Switching does NOT run the previous ESC; fwEnd runs every ESC that was entered.
+inline void fwBegin() {
+	using namespace detail;
+	spinStopAll(); release();
+	for (uint8_t i = 0; i < COUNT; i++) { fwHave[i] = false; pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
+}
+inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
+	using namespace detail;
+	if (idx >= COUNT) return false;
+	if (drvActive(idx)) drvFree(idx);
+	session = -1; fwIdx = idx;
+	bool ok = runOp(Op::FWSELECT, PINS[idx]) || enterBootloader(PINS[idx]);
+	fwHave[idx] = ok;
+	if (!ok) return false;
+	session = (int8_t)idx; infoKnown[idx] = false;
+	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
+	memcpy(raw, lastRaw, 8); am32 = lastAm32;
+	return true;
+}
+inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); forget its session
+	using namespace detail;
+	if (idx >= COUNT || !fwHave[idx]) return;
+	fwIdx = idx; runOp(Op::FWRUN, PINS[idx]);
+	fwHave[idx] = false; if (session == (int8_t)idx) session = -1;
+}
+inline void fwEnd() { for (uint8_t i = 0; i < COUNT; i++) fwRun(i); }
+inline uint8_t count() { return COUNT; }
+
 // ---- core1 worker: call once from loop1() ------------------------------------------------------
+namespace detail {
+// core1: BootInit on the current pin for up to 500 ms; on a reply, adopt it as the session.
+static bool connectHere() {
+	uint32_t t0 = millis();
+	while (millis() - t0 < 500) {
+		uint8_t raw[8] = {0};
+		int n = bl.connectRawProbe(raw, 15);
+		if (n >= 8 && raw[0] == '4' && raw[1] == '7' && raw[2] == '1') {
+			// AM32 answers only the FIRST BootInit of a session, so a second hello from connect()
+			// gets silence. Adopt the probe's reply as the session instead of re-sending.
+			if (bl.adoptReply(raw)) {
+				const auto& d = bl.lastDevice();
+				sig[0] = d.signature[0]; sig[1] = d.signature[1];
+				bootVer = d.bootVersion; bootPages = d.bootPages;
+				memcpy(lastRaw, d.bootInfo, 8); lastAm32 = d.am32;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+}  // namespace detail
+
 inline void core1Poll() {
 	using namespace detail;
 	if (op == Op::NONE || opDone) {
@@ -354,20 +419,15 @@ inline void core1Poll() {
 	Op o = op; bool ok = false;
 	if (o == Op::CONNECT) {
 		bl.setSignalPin(opPin); bl.begin();
-		uint32_t t0 = millis();
-		while (millis() - t0 < 500 && !ok) {
-			uint8_t raw[8] = {0};
-			int n = bl.connectRawProbe(raw, 15);
-			if (n >= 8 && raw[0] == '4' && raw[1] == '7' && raw[2] == '1') {
-				// AM32 answers only the FIRST BootInit of a session, so a second hello from connect()
-				// gets silence. Adopt the probe's reply as the session instead of re-sending.
-				if (bl.adoptReply(raw)) {
-					const auto& d = bl.lastDevice();
-					sig[0] = d.signature[0]; sig[1] = d.signature[1];
-					bootVer = d.bootVersion; bootPages = d.bootPages; ok = true;
-				}
-			}
-		}
+		ok = connectHere();
+	} else if (o == Op::FWSELECT) {
+		bl.setSignalPin(opPin); bl.begin();
+		if (fwHave[fwIdx] && bl.adoptReply(fwRaw[fwIdx], fwAm32[fwIdx]) && bl.keepAlive()) {
+			memcpy(lastRaw, fwRaw[fwIdx], 8); lastAm32 = fwAm32[fwIdx]; ok = true;
+		} else ok = connectHere();
+	} else if (o == Op::FWRUN) {
+		bl.setSignalPin(opPin); bl.begin();
+		ok = bl.adoptReply(fwRaw[fwIdx], fwAm32[fwIdx]) && bl.run();
 	} else if (o == Op::READCFG)   { esc_setup::Settings s; ok = esc_setup::read(bl, s); if (ok) memcpy(cfg, s.raw, esc_setup::kEepromLen); }
 	else if (o == Op::READPAGE)    { ok = esc_setup::readPage(bl, page); }
 	else if (o == Op::WRITEPAGE)   { ok = esc_setup::writePage(bl, page); }
