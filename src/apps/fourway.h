@@ -25,6 +25,10 @@ public:
 		uint32_t now = millis();
 		if (n_ && now - lastMs_ > FRAME_GAP_MS) n_ = 0;          // a stalled frame is dropped
 		lastMs_ = now;
+		// A configurator that closed the port without InterfaceExit leaves us in 4-way. Its next
+		// session opens with MSP, and a '$' can never start a 4-way frame (always 0x2F): end the
+		// old session, then take the byte as MSP.
+		if (fourWay_ && n_ == 0 && c == '$') { escs::fwEnd(); fourWay_ = false; sel_ = -1; }
 		if (fourWay_) { fourWayByte(c); return true; }
 		if (n_ == 0 && !(lineStart && c == '$')) return false;
 		mspByte(c);
@@ -92,8 +96,8 @@ private:
 			case 160: mspReply(cmd, d, 12); break;                                           // UID
 			case 214: case 217: mspReply(cmd, d, 0); break;                                  // SET_MOTOR / SET_3D: ignored
 			case 245:                                                                        // SET_PASSTHROUGH -> 4-way
+				d[0] = n; mspReply(cmd, d, 1);   // answer first: fwBegin primes the ESCs for 0.5 s
 				escs::fwBegin();
-				d[0] = n; mspReply(cmd, d, 1);
 				fourWay_ = true; sel_ = -1; mode_ = imSIL_BLB; n_ = 0;
 				break;
 			default:  mspReply(cmd, d, 0, true); break;

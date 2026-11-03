@@ -59,7 +59,7 @@ enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
 
 namespace detail {
 	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500, HIGH_HOLD_MS = 1000,
-	                      AM32_HOLD_MS = 4000;
+	                      AM32_HOLD_MS = 4000, FW_SETTLE_MS = 3000;   // FW_SETTLE: BLHeli-S with the stock tune
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
 	static blheli_bl::Bootloader  bl({ .signalPin = PINS[0], .baud = 0 });    // core1 only
 
@@ -92,6 +92,10 @@ namespace detail {
 	// Which of PINS have an ESC on them, as last found by a scan (EscTool keeps it in LittleFS).
 	// Only these are offered to a configurator. Bit i = PINS[i]; all set until something is known.
 	static uint32_t present = ~0u;
+	// Last seen as an ARM (AM32) bootloader, by its id: [5]=0x06 and a flash-size code in [4], the
+	// rule fourway's DeviceInfo uses. (Not bl's am32 flag: SiLabs BLHeli-S sends the trailing ACK too.)
+	static bool     armSeen[COUNT] = { false };
+	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
 	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
 	static BidirDShotX1*     drvB[COUNT] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
 	static DShotX4*          drvN[COUNT] = { nullptr };   // normal DShot: idle LOW, throttle only
@@ -165,6 +169,7 @@ inline bool connect(uint8_t idx, Info& out) {
 	using namespace detail;
 	out = Info{}; if (idx >= COUNT) return false; out.pin = PINS[idx];
 	if (!ensureConnected(idx)) return false;
+	armSeen[idx] = armId(lastRaw);   // a scan tells the passthrough how long this one takes to enter
 	esc_setup::Settings s;
 	bool cfgok = runOp(Op::READCFG, PINS[idx]);
 	if (cfgok) {
@@ -365,13 +370,29 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 // (what Betaflight's esc4wayInit does). fwSelect: make idx the session — the cached reply if it is
 // still in its bootloader, else a BootInit, else the full DShot-prime entry — and return its raw
 // 8-byte reply. Switching does NOT run the previous ESC; fwEnd runs every ESC that was entered.
-// The lines go high at fwBegin, so a running AM32 has rebooted into its bootloader by
-// fwBeginMs + AM32_HOLD_MS on its own. An ESC that is not in by then gets ONE DShot-prime entry
-// (what BLHeli-S needs), not the full retry ladder: a missing ESC costs ~2.5 s once, not ~12 s.
+// fwBegin primes every wired ESC with zero-throttle DShot for PRIME_MS, all at once, then holds
+// the lines high. Both firmwares take that signal loss as "go to the bootloader": BLHeli-S needs
+// the valid frames first (a bare high line leaves it waiting for signal), AM32 needs ~2 s without
+// them plus its reboot. So by fwBeginMs + AM32_HOLD_MS every ESC is in, in parallel, and the
+// configurator's first InitFlash of each costs at most that wait. One that still won't answer gets
+// the full entry ladder once, then stays failed for the session.
 inline void fwBegin() {
 	using namespace detail;
 	spinStopAll(); release();
-	for (uint8_t i = 0; i < COUNT; i++) { fwHave[i] = fwMiss[i] = false; pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
+	BidirDShotX1* pr[COUNT] = { nullptr };
+	for (uint8_t i = 0; i < COUNT; i++) {
+		fwHave[i] = fwMiss[i] = false;
+		if (present >> i & 1) pr[i] = new BidirDShotX1(PINS[i], DSHOT_KBAUD);
+	}
+	uint32_t t0 = millis();
+	while (millis() - t0 < PRIME_MS) {
+		for (uint8_t i = 0; i < COUNT; i++) if (pr[i]) pr[i]->sendThrottle(0);
+		delayMicroseconds(300);
+	}
+	for (uint8_t i = 0; i < COUNT; i++) {
+		delete pr[i];
+		pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);
+	}
 	fwBeginMs = millis();
 }
 inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
@@ -380,17 +401,22 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	if (drvActive(idx)) drvFree(idx);
 	if (fwMiss[idx]) return false;
 	session = -1; fwIdx = idx;
-	bool ok = runOp(Op::FWSELECT, PINS[idx]);
-	if (!ok && millis() - fwBeginMs < AM32_HOLD_MS) {           // still inside the high-hold window
-		pinMode(PINS[idx], OUTPUT); digitalWrite(PINS[idx], HIGH);
-		while (millis() - fwBeginMs < AM32_HOLD_MS) delay(5);
+	bool ok;
+	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: adopt the cached reply
+	else {
+		// Stay quiet until the hold has done its work: a BootInit while the ESC is still on its way
+		// into the bootloader is garbage to it, and sends it back to the app.
+		// AM32 reboots into its bootloader only ~2 s after the frames stop, plus its startup tune;
+		// BLHeli-S is in once its (short) tune is over. An ESC last seen as AM32 gets the longer wait.
+		uint32_t settle = armSeen[idx] ? AM32_HOLD_MS + 500 : FW_SETTLE_MS;
+		while (millis() - fwBeginMs < settle) delay(5);
 		ok = runOp(Op::CONNECT, PINS[idx]);
 	}
-	if (!ok) ok = enterBootloader(PINS[idx], 1);
+	if (!ok) ok = enterBootloader(PINS[idx]);
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
 	if (!ok) return false;
 	session = (int8_t)idx; infoKnown[idx] = false;
-	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
+	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32; armSeen[idx] = armId(lastRaw);
 	memcpy(raw, lastRaw, 8); am32 = lastAm32;
 	return true;
 }
