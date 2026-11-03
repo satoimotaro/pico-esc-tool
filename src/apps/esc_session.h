@@ -160,6 +160,25 @@ namespace detail {
 		if (enterBootloader(PINS[i])) { session = (int8_t)i; return true; }
 		return false;
 	}
+	// Learn firmware family / direction of the connected ESC i for spinArm. AM32 (an ARM bootloader
+	// id) always speaks bidir DShot, and keeps bi_direction in its own settings block; the BLHeli-S
+	// map at 0x1A00 is application code there, so reading it would make up a direction.
+	static bool learnInfo(uint8_t i) {
+		armSeen[i] = armId(lastRaw);
+		if (armSeen[i]) {
+			uint16_t eep = lastRaw[4] == 0x35 ? 0xF800 : 0x7C00;   // flash-size code: 64 KB / 32 KB parts
+			flAddr = eep + 18; flLen = 1;                          // bi_direction (host/pico_esc/am32.py)
+			if (!runOp(Op::READFLASH, PINS[i])) return false;
+			infoBidir[i] = true; infoRev[i] = flBuf[0] == 1; infoKnown[i] = true;
+			return true;
+		}
+		if (!runOp(Op::READCFG, PINS[i])) return false;
+		esc_setup::Settings s; esc_setup::decode(cfg, esc_setup::kEepromLen, s);
+		infoBidir[i] = strstr(s.name, "Bluejay") || strstr(s.name, "JESC");
+		infoRev[i]   = (cfg[0x0B] == 3 || cfg[0x0B] == 4);   // 1=Norm 2=Rev 3=3D 4=3D-Rev
+		infoKnown[i] = true;
+		return true;
+	}
 }
 
 // ---- transport-agnostic API (call from core0) --------------------------------------------------
@@ -169,19 +188,19 @@ inline bool connect(uint8_t idx, Info& out) {
 	using namespace detail;
 	out = Info{}; if (idx >= COUNT) return false; out.pin = PINS[idx];
 	if (!ensureConnected(idx)) return false;
-	armSeen[idx] = armId(lastRaw);   // a scan tells the passthrough how long this one takes to enter
+	learnInfo(idx);   // cache for spinArm; also tells the passthrough how long this one takes to enter
 	esc_setup::Settings s;
-	bool cfgok = runOp(Op::READCFG, PINS[idx]);
-	if (cfgok) {
-		esc_setup::decode(cfg, esc_setup::kEepromLen, s);
-		infoBidir[idx] = strstr(s.name, "Bluejay") || strstr(s.name, "JESC");   // cache for spinArm
-		infoRev[idx]   = (cfg[0x0B] == 3 || cfg[0x0B] == 4);
-		infoKnown[idx] = true;
-	}
+	bool cfgok = !armSeen[idx] && runOp(Op::READCFG, PINS[idx]);
+	if (cfgok) esc_setup::decode(cfg, esc_setup::kEepromLen, s);
 	out.present = true; out.sig = (uint16_t)((sig[0] << 8) | sig[1]);
 	out.bootVer = bootVer; out.bootPages = bootPages;
 	strncpy(out.layout, cfgok ? s.layoutTag : "", 16);
 	strncpy(out.name,   cfgok ? s.name      : "", 16);
+	if (armSeen[idx]) {                                    // AM32: FILE_NAME, 32 bytes below the settings
+		flAddr = (lastRaw[4] == 0x35 ? 0xF800 : 0x7C00) - 32; flLen = 15;
+		if (runOp(Op::READFLASH, PINS[idx])) { memcpy(out.name, flBuf, 15); out.name[15] = 0; }
+		strncpy(out.layout, "AM32", 16);
+	}
 	out.fwMain = s.mainRevision; out.fwSub = s.subRevision;
 	return true;
 }
@@ -272,12 +291,7 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	// unknown, or when already connected to this ESC (cheap — no bootloader re-entry). This keeps a
 	// post-scan arm fast; a cold arm (never scanned) pays one bootloader entry to detect.
 	if (!infoKnown[idx] || session == (int8_t)idx) {
-		if (ensureConnected(idx) && runOp(Op::READCFG, PINS[idx])) {
-			esc_setup::Settings s; esc_setup::decode(cfg, esc_setup::kEepromLen, s);
-			infoBidir[idx] = strstr(s.name, "Bluejay") || strstr(s.name, "JESC");
-			infoRev[idx]   = (cfg[0x0B] == 3 || cfg[0x0B] == 4);   // 1=Norm 2=Rev 3=3D 4=3D-Rev
-			infoKnown[idx] = true;
-		}
+		if (ensureConnected(idx)) learnInfo(idx);
 	}
 	if (mode == Drive::AUTO) mode = infoBidir[idx] ? Drive::BIDIR : Drive::NORMAL;
 	drvRev[idx] = infoRev[idx];
@@ -433,6 +447,8 @@ inline uint8_t count() { return COUNT; }
 inline uint32_t presentMask() { return detail::present & ((1u << COUNT) - 1); }
 inline void     setPresent(uint32_t m) { detail::present = m; }
 inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
+inline uint32_t armMask() { uint32_t m = 0; for (uint8_t i = 0; i < COUNT; i++) m |= (uint32_t)detail::armSeen[i] << i; return m; }
+inline void     setArmMask(uint32_t m) { for (uint8_t i = 0; i < COUNT; i++) detail::armSeen[i] = m >> i & 1; }
 inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i++) n += isPresent(i); return n; }
 // The k-th wired ESC's index (a configurator numbers them 0..presentCount()-1, gaps closed); -1 if none.
 inline int8_t   presentIndex(uint8_t k) {

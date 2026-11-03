@@ -258,6 +258,7 @@ public:
 #endif
 		handleSerial();
 		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
+		if (escs::armMask() != armSaved_) savePresent(escs::presentMask());   // a connect learned AM32
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
@@ -340,20 +341,25 @@ private:
 	// enough that the operator hears about it near the start of a run rather than after it.
 	static const uint32_t THERMAL_NONE_WARN_MS = 5000;
 
-	// Which ESCs are wired (escs::presentMask), kept across reboots. Set by `scan` or `escs`.
+	// Which ESCs are wired (escs::presentMask) and which of them run AM32 (escs::armMask), kept
+	// across reboots. Wired is set by `scan` or `escs`; AM32 is learned on every bootloader connect,
+	// and tells the passthrough how long to wait for that ESC right after a reboot.
 	static constexpr const char* PRESENT_PATH = "/cfg/present";
 	void loadPresent() {
 		File f = LittleFS.open(PRESENT_PATH, "r");
 		if (!f) return;
-		uint32_t m = 0;
+		uint32_t m = 0, a = 0;
 		if (f.read((uint8_t*)&m, sizeof m) == sizeof m) escs::setPresent(m);
+		if (f.read((uint8_t*)&a, sizeof a) == sizeof a) escs::setArmMask(a);   // absent in older files
 		f.close();
+		armSaved_ = escs::armMask();
 		console::out().print("# escs: "); printPresent();
 	}
 	void savePresent(uint32_t m) {
 		escs::setPresent(m);
+		uint32_t a = armSaved_ = escs::armMask();
 		File f = LittleFS.open(PRESENT_PATH, "w");
-		if (f) { f.write((const uint8_t*)&m, sizeof m); f.close(); }
+		if (f) { f.write((const uint8_t*)&m, sizeof m); f.write((const uint8_t*)&a, sizeof a); f.close(); }
 	}
 	void printPresent() {
 		console::out().printf("escs|%u/%u|", escs::presentCount(), n_);
@@ -422,6 +428,7 @@ private:
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
 	uint8_t         n_;          // how many
 	As5600Tracker   enc_;
+	uint32_t        armSaved_ = 0;      // escs::armMask() as last written to PRESENT_PATH
 	bool            encOff_ = false;    // an ESC signal sits on GP16/17, so the encoder stays off
 	Azimuth         az_;
 	Mode            mode_   = SETUP;
