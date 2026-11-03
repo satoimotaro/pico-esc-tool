@@ -259,6 +259,7 @@ public:
 		handleSerial();
 		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
 		if (escs::armMask() != armSaved_) savePresent(escs::presentMask());   // a connect learned AM32
+		motorTestPoll();
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
@@ -340,6 +341,71 @@ private:
 	// second; 5 s is generous enough that a slow first frame is not mistaken for a dead channel, and short
 	// enough that the operator hears about it near the start of a run rather than after it.
 	static const uint32_t THERMAL_NONE_WARN_MS = 5000;
+
+	// ---- configurator motor test (MSP_SET_MOTOR via fw_) ----------------------------------------
+	// Like Betaflight's motor_disarmed: the last slider value holds until the next one. It stops,
+	// disarming every ESC it armed, when
+	//   - the USB link drops (DTR falls: the browser closed the port), and the input still queued
+	//     for it is dropped, so a stale SET_MOTOR cannot restart a motor (Betaflight tasks.c,
+	//     checkUsbLinkLost);
+	//   - no MSP at all for MT_TIMEOUT_MS (esc-configurator polls BATTERY_STATE every 1 s while the
+	//     motor panel is open, so silence means it is gone or wedged);
+	//   - a passthrough starts. An ESC the CLI already armed is left alone, and a CLI `disarm` of
+	//     one the test armed hands it back.
+	// Spinning goes through Thruster::arm/setRaw like the CLI's `throttle`: the same 3 s arm, the
+	// same 500 ms deadman (fed here every loop), the same reversible handling.
+	static const uint32_t MT_TIMEOUT_MS = 2000;
+	uint32_t mtOwned_ = 0;          // ESCs this motor test armed
+	uint32_t mtArmedMs_ = 0;        // when an arm() returned: it can block for a bootloader visit
+	bool     mtDtr_ = false;
+	void motorTestStop(const char* why) {
+		for (uint8_t i = 0; i < n_; i++) if (mtOwned_ >> i & 1) th_[i]->stop();
+		// not during a passthrough: the line would land inside the configurator's 4-way replies
+		if (mtOwned_ && !fw_.active()) console::out().printf("# motor test stopped: %s\n", why);
+		mtOwned_ = 0; fw_.clearMotors();
+	}
+	void motorTestPoll() {
+		bool reversibleWired = false;
+		for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
+		fw_.setThreeD(reversibleWired);
+#if !ESC_CONSOLE_UART
+		bool dtr = Serial.dtr();
+		if (mtDtr_ && !dtr) {
+			if (mtOwned_ || fw_.motorWanted()) {
+				while (Serial.available()) Serial.read();
+				motorTestStop("USB link lost");
+			}
+		}
+		mtDtr_ = dtr;
+#endif
+		if (!mtOwned_ && !fw_.motorWanted()) return;
+		if (fw_.active())                              { motorTestStop("passthrough"); return; }
+		// Silence counts from the later of the last MSP and the last arm(): an arm that had to read
+		// the ESC's settings held this loop (and the configurator's queued polls) for seconds.
+		uint32_t heard = fw_.mspMs(); if ((int32_t)(mtArmedMs_ - heard) > 0) heard = mtArmedMs_;
+		if (millis() - heard > MT_TIMEOUT_MS)          { motorTestStop("configurator silent"); return; }
+		uint16_t stop = fw_.stopValue();
+		for (uint8_t ch = 0; ch < 8; ch++) {
+			int8_t e = FourWay::channel(ch);
+			if (e < 0 || e >= n_) continue;
+			uint8_t i = (uint8_t)e; Thruster* th = th_[i];
+			uint16_t v = fw_.motor(ch);
+			bool owned = mtOwned_ >> i & 1;
+			if (!owned) {
+				if (v <= stop) continue;
+				if (escs::spinArmed(i) || escs::spinArming(i)) continue;   // the CLI has it
+				th->arm(); mtOwned_ |= 1u << i; mtArmedMs_ = millis();
+				console::out().printf("# motor test: arming ESC %u (%s)\n", i, th->spinMode());
+			} else if (!escs::spinArmed(i) && !escs::spinArming(i)) {   // stopped elsewhere (CLI disarm)
+				mtOwned_ &= ~(1u << i); continue;
+			}
+			// 1000..2000 (stop 1000) or 3D 1000..1500..2000 -> the CLI's raw units
+			int raw;
+			if (th->reversible()) raw = fw_.threeD() ? (int(v) - 1500) * 2 : (v > 1000 ? (int(v) - 1000) : 0);
+			else                  raw = fw_.threeD() ? (v > 1500 ? (int(v) - 1500) * 4 : 0) : (v > 1000 ? (int(v) - 1000) * 2 : 0);
+			th->setRaw(raw);
+		}
+	}
 
 	// Which ESCs are wired (escs::presentMask) and which of them run AM32 (escs::armMask), kept
 	// across reboots. Wired is set by `scan` or `escs`; AM32 is learned on every bootloader connect,

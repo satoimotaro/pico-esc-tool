@@ -8,7 +8,8 @@
 //
 // Shares the CLI stream: no mode switch. A '$' at the start of a line opens an MSP frame (a CLI
 // command never starts with one); after SET_PASSTHROUGH every byte is 4-way until InterfaceExit.
-// The configurators' motor test (MSP_SET_MOTOR) is acknowledged and ignored: nothing spins from here.
+// The configurators' motor test (MSP_SET_MOTOR) is only recorded here; EscTool::motorTestPoll turns
+// it into spins through the same arm / deadman path as the CLI, and stops it when the link goes.
 #pragma once
 #include <Arduino.h>
 #include "console.h"
@@ -18,6 +19,19 @@ class FourWay {
 public:
 	bool active() const { return fourWay_; }   // in passthrough (the LCD shows it)
 	int8_t selected() const { return sel_; }   // escs:: index, not the configurator's channel
+
+	// Motor test: the last MSP_SET_MOTOR value per configurator channel (1000 = stop, or 1500 when
+	// 3D is reported), and when MSP was last heard. esc-configurator sends SET_MOTOR only when a
+	// slider moves, but polls BATTERY_STATE every second while the motor panel is open.
+	uint16_t motor(uint8_t ch) const { return ch < MAX_CH ? motor_[ch] : 0; }
+	uint32_t mspMs() const { return mspMs_; }
+	bool     motorWanted() const { for (uint16_t v : motor_) if (v > stopValue()) return true; return false; }
+	uint16_t stopValue() const { return threeD_ ? 1500 : 1000; }
+	void     clearMotors() { for (uint16_t& v : motor_) v = 0; }
+	void     setThreeD(bool on) { threeD_ = on; }   // report FEATURE_3D (a reversible ESC is wired)
+	bool     threeD() const { return threeD_; }
+	// A configurator channel -> escs:: index: the wired ESCs, numbered without gaps.
+	static int8_t channel(uint8_t ch) { return ch < MAX_CH ? escs::presentIndex(ch) : -1; }
 
 	// Feed one byte from the console. Returns true if it was consumed here; false hands it to the
 	// CLI line reader. lineStart = the CLI has no partial line pending.
@@ -46,10 +60,14 @@ private:
 
 	uint8_t  buf_[256 + 8];
 	uint16_t n_ = 0;
+	uint8_t  len_ = 0;                          // payload length of the MSP frame being handled
 	uint32_t lastMs_ = 0;
 	bool     fourWay_ = false;
 	int8_t   sel_ = -1;
 	uint8_t  mode_ = imSIL_BLB;
+	uint16_t motor_[8] = {0};
+	uint32_t mspMs_ = 0;
+	bool     threeD_ = false;
 
 	// ---------------------------------------------------------------- MSP v1: $ M < len cmd data ck
 	void mspByte(uint8_t c) {
@@ -62,7 +80,7 @@ private:
 		uint8_t ck = 0;
 		for (uint16_t i = 3; i < 5 + len; i++) ck ^= buf_[i];
 		uint8_t cmd = buf_[4];
-		n_ = 0;
+		len_ = len; n_ = 0;
 		if (ck == buf_[5 + len]) mspCommand(cmd);
 	}
 
@@ -78,6 +96,7 @@ private:
 
 	void mspCommand(uint8_t cmd) {
 		uint8_t d[32] = {0};
+		mspMs_ = millis();
 		uint8_t n = escs::presentCount();
 		if (n > MAX_CH) n = MAX_CH;
 		switch (cmd) {
@@ -86,7 +105,8 @@ private:
 			case 3:   d[0] = 4; d[1] = 5; d[2] = 0; mspReply(cmd, d, 3); break;              // FC_VERSION
 			case 4:   memcpy(d, "PICO", 4); mspReply(cmd, d, 6); break;                      // BOARD_INFO
 			case 5:   memcpy(d, __DATE__, 11); memcpy(d + 11, __TIME__, 8); mspReply(cmd, d, 19); break;  // BUILD_INFO
-			case 36:  mspReply(cmd, d, 4); break;                                            // FEATURE_CONFIG: no 3D
+			case 36:  if (threeD_) d[1] = 0x10;                                              // FEATURE_CONFIG: FEATURE_3D = 1<<12
+			          mspReply(cmd, d, 4); break;
 			case 101: d[15] = 0; d[16] = 1; d[17] = 0x04; mspReply(cmd, d, 22); break;      // STATUS: RX_FAILSAFE (radio off)
 			case 104: for (uint8_t i = 0; i < 8; i++) { uint16_t v = i < n ? 1000 : 0;      // MOTOR: >0 = an ESC is there
 			                                            d[2 * i] = v & 0xFF; d[2 * i + 1] = v >> 8; }
@@ -94,8 +114,12 @@ private:
 			case 130: mspReply(cmd, d, 11); break;                                           // BATTERY_STATE: none
 			case 131: d[6] = n; d[7] = 14; mspReply(cmd, d, 10); break;                      // MOTOR_CONFIG: count at [6]
 			case 160: mspReply(cmd, d, 12); break;                                           // UID
-			case 214: case 217: mspReply(cmd, d, 0); break;                                  // SET_MOTOR / SET_3D: ignored
+			case 214:                                                                        // SET_MOTOR: 8 x u16, 1000..2000
+				for (uint8_t i = 0; i < MAX_CH && 2 * i + 1 < len_; i++) motor_[i] = buf_[5 + 2 * i] | buf_[6 + 2 * i] << 8;
+				mspReply(cmd, d, 0); break;
+			case 217: mspReply(cmd, d, 0); break;                                            // SET_3D: ignored
 			case 245:                                                                        // SET_PASSTHROUGH -> 4-way
+				clearMotors();                    // EscTool stops a motor test when it sees passthrough
 				d[0] = n; mspReply(cmd, d, 1);   // answer first: fwBegin primes the ESCs for 0.5 s
 				escs::fwBegin();
 				fourWay_ = true; sel_ = -1; mode_ = imSIL_BLB; n_ = 0;
@@ -103,9 +127,6 @@ private:
 			default:  mspReply(cmd, d, 0, true); break;
 		}
 	}
-
-	// A configurator channel -> escs:: index: the wired ESCs, numbered without gaps.
-	static int8_t channel(uint8_t ch) { return ch < MAX_CH ? escs::presentIndex(ch) : -1; }
 
 	// ---------------------------------------------------------------- 4-way: 2F cmd aH aL len p.. crcH crcL
 	static uint16_t crcXmodem(uint16_t crc, uint8_t b) {

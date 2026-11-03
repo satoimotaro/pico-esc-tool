@@ -447,6 +447,8 @@ inline uint8_t count() { return COUNT; }
 inline uint32_t presentMask() { return detail::present & ((1u << COUNT) - 1); }
 inline void     setPresent(uint32_t m) { detail::present = m; }
 inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
+// Configured reversible (3D), as last read from the ESC (false while unknown).
+inline bool     knownReversible(uint8_t i) { return i < COUNT && detail::infoKnown[i] && detail::infoRev[i]; }
 inline uint32_t armMask() { uint32_t m = 0; for (uint8_t i = 0; i < COUNT; i++) m |= (uint32_t)detail::armSeen[i] << i; return m; }
 inline void     setArmMask(uint32_t m) { for (uint8_t i = 0; i < COUNT; i++) detail::armSeen[i] = m >> i & 1; }
 inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i++) n += isPresent(i); return n; }
