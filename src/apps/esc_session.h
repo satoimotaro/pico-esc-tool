@@ -95,6 +95,7 @@ namespace detail {
 	// Last seen as an ARM (AM32) bootloader, by its id: [5]=0x06 and a flash-size code in [4], the
 	// rule fourway's DeviceInfo uses. (Not bl's am32 flag: SiLabs BLHeli-S sends the trailing ACK too.)
 	static bool     armSeen[COUNT] = { false };
+	static uint16_t am32Eep[COUNT] = { 0 };     // AM32 settings block address (from the flash-size code)
 	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
 	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
 	static BidirDShotX1*     drvB[COUNT] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
@@ -166,7 +167,7 @@ namespace detail {
 	static bool learnInfo(uint8_t i) {
 		armSeen[i] = armId(lastRaw);
 		if (armSeen[i]) {
-			uint16_t eep = lastRaw[4] == 0x35 ? 0xF800 : 0x7C00;   // flash-size code: 64 KB / 32 KB parts
+			uint16_t eep = am32Eep[i] = lastRaw[4] == 0x35 ? 0xF800 : 0x7C00;   // flash-size code: 64 KB / 32 KB parts
 			flAddr = eep + 18; flLen = 1;                          // bi_direction (host/pico_esc/am32.py)
 			if (!runOp(Op::READFLASH, PINS[i])) return false;
 			infoBidir[i] = true; infoRev[i] = flBuf[0] == 1; infoKnown[i] = true;
@@ -449,6 +450,8 @@ inline void     setPresent(uint32_t m) { detail::present = m; }
 inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
 // Configured reversible (3D), as last read from the ESC (false while unknown).
 inline bool     knownReversible(uint8_t i) { return i < COUNT && detail::infoKnown[i] && detail::infoRev[i]; }
+// The AM32 settings block of ESC i, as found by its last connect (0 = not AM32 / not seen yet).
+inline uint16_t am32Eeprom(uint8_t i) { return i < COUNT && detail::armSeen[i] ? detail::am32Eep[i] : 0; }
 inline uint32_t armMask() { uint32_t m = 0; for (uint8_t i = 0; i < COUNT; i++) m |= (uint32_t)detail::armSeen[i] << i; return m; }
 inline void     setArmMask(uint32_t m) { for (uint8_t i = 0; i < COUNT; i++) detail::armSeen[i] = m >> i & 1; }
 inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i++) n += isPresent(i); return n; }

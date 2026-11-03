@@ -20,6 +20,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
+#include "presets.h"
 #include <Wire.h>
 #include "esc.h"
 #include "as5600.h"
@@ -341,6 +342,105 @@ private:
 	// second; 5 s is generous enough that a slow first frame is not mistaken for a dead channel, and short
 	// enough that the operator hears about it near the start of a run rather than after it.
 	static const uint32_t THERMAL_NONE_WARN_MS = 5000;
+
+	// ---- presets (presets.h): named settings per motor ------------------------------------------
+	//   preset                      list built-in and saved
+	//   preset show <name>          its bytes
+	//   preset apply <i> <name>     write it to ESC i (checks the firmware family first)
+	//   preset save <i> <name>      capture ESC i's current settings under <name>
+	//   preset rm <name>
+	// apply/save leave ESC i running its app again.
+	uint8_t presetFamily(uint8_t i) {   // connects ESC i; 0 = no answer / not a known settings map
+		escs::Info in;
+		if (!th_[i]->scan(in)) return 0;
+		if (escs::am32Eeprom(i)) return presets::AM32;
+		uint8_t cfg[esc_setup::kEepromLen];
+		if (!th_[i]->readConfig(cfg)) return 0;
+		return cfg[2] == 0xD0 ? presets::BLUEJAY : cfg[2] == 0xE2 ? presets::BLUEGILL : 0;
+	}
+	void presetCmd() {
+		auto& o = console::out();
+		char* sub = strtok(nullptr, " ");
+		if (!sub) {
+			for (const auto& p : presets::BUILTIN)
+				o.printf("preset|%s|%s|builtin|%u|%s\n", p.name, presets::familyName(p.family), p.n, p.note);
+			Dir d = LittleFS.openDir(presets::PRESET_DIR);
+			while (d.next()) { presets::Loaded l;
+				if (presets::find(d.fileName().c_str(), l)) o.printf("preset|%s|%s|saved|%u|\n", l.name, presets::familyName(l.family), l.n); }
+			o.println("ok"); return;
+		}
+		if (!strcmp(sub, "show") || !strcmp(sub, "rm")) {
+			char* name = strtok(nullptr, " "); presets::Loaded l;
+			if (!name || !presets::find(name, l)) { o.println("err no-preset"); return; }
+			if (sub[0] == 'r') { o.println(!l.builtin && presets::remove(name) ? "ok" : "err builtin"); return; }
+			o.printf("preset|%s|%s|%s|%s\n", l.name, presets::familyName(l.family), l.builtin ? "builtin" : "saved", l.note);
+			for (uint8_t k = 0; k < l.n; k++) o.printf("%s%02X:%02X", k ? "," : "bytes|", l.b[k].off, l.b[k].val);
+			o.println(); o.println("ok"); return;
+		}
+		bool apply = !strcmp(sub, "apply");
+		if (!apply && strcmp(sub, "save")) { o.println("err bad-args"); return; }
+		int i = -1; { char* a = strtok(nullptr, " "); if (a) i = atoi(a); }
+		char* name = strtok(nullptr, " ");
+		if (i < 0 || i >= n_ || !name) { o.println("err bad-args"); return; }
+		presets::Loaded l;
+		if (apply && !presets::find(name, l)) { o.println("err no-preset"); return; }
+		if (!apply && !presets::validName(name)) { o.println("err bad-name ([a-z0-9_-]{1,24})"); return; }
+		uint8_t fam = presetFamily((uint8_t)i);
+		if (!fam) { escs::release(); o.println("err no-connect or unknown firmware"); return; }
+		if (apply && fam != l.family) {
+			escs::release();
+			o.printf("err wrong-family (ESC %d runs %s, preset is %s)\n", i, presets::familyName(fam), presets::familyName(l.family));
+			return;
+		}
+		bool ok;
+		if (fam == presets::AM32) ok = apply ? presetApplyAm32((uint8_t)i, l) : presetSaveAm32((uint8_t)i, name);
+		else                      ok = apply ? presetApplyBj((uint8_t)i, l)   : presetSaveBj((uint8_t)i, name, fam);
+		escs::release();
+		o.println(ok ? "ok" : "err failed");
+	}
+	bool presetApplyBj(uint8_t i, const presets::Loaded& l) {
+		uint16_t offs[presets::MAX_BYTES]; uint8_t vals[presets::MAX_BYTES];
+		for (uint8_t k = 0; k < l.n; k++) { offs[k] = l.b[k].off; vals[k] = l.b[k].val; }
+		bool ch = false; int r = th_[i]->editConfig(offs, vals, l.n, ch);
+		if (r < 0) return false;
+		console::out().printf("preset|%s|esc %u|%s\n", l.name, i, ch ? "written, verified" : "already set");
+		return true;
+	}
+	bool presetSaveBj(uint8_t i, const char* name, uint8_t fam) {
+		uint8_t cfg[esc_setup::kEepromLen];
+		if (!th_[i]->readConfig(cfg)) return false;
+		presets::Byte b[presets::MAX_BYTES]; uint8_t n = 0;
+		for (uint8_t a = presets::BJ_FIRST; a <= presets::BJ_LAST; a++) b[n++] = { a, cfg[a] };
+		if (!presets::save(name, fam, b, n)) return false;
+		console::out().printf("preset|%s|saved %u bytes from esc %u (%s)\n", name, n, i, presets::familyName(fam));
+		return true;
+	}
+	// AM32: rewrite the whole 192-byte block from its page start (the bootloader erases the page on
+	// that write), then read it back. Byte 2 is the bootloader's own version, rewritten on every write.
+	bool presetApplyAm32(uint8_t i, const presets::Loaded& l) {
+		uint16_t eep = escs::am32Eeprom(i);
+		uint8_t blk[192], back[192];
+		if (!th_[i]->readFlash(eep, blk, 192)) return false;
+		if (blk[0] != 0x01) { console::out().println("# preset: AM32 block not initialised (byte 0 != 1); use host am32tool defaults"); return false; }
+		bool ch = false;
+		for (uint8_t k = 0; k < l.n; k++) if (l.b[k].off < 192 && blk[l.b[k].off] != l.b[k].val) { blk[l.b[k].off] = l.b[k].val; ch = true; }
+		if (ch) {
+			if (!th_[i]->writeFlash(eep, blk, 192) || !th_[i]->readFlash(eep, back, 192)) return false;
+			back[2] = blk[2];
+			if (memcmp(back, blk, 192)) { console::out().println("# preset: AM32 read-back differs"); return false; }
+		}
+		console::out().printf("preset|%s|esc %u|%s\n", l.name, i, ch ? "written, verified" : "already set");
+		return true;
+	}
+	bool presetSaveAm32(uint8_t i, const char* name) {
+		uint8_t blk[presets::AM_LAST + 1];
+		if (!th_[i]->readFlash(escs::am32Eeprom(i), blk, sizeof blk)) return false;
+		presets::Byte b[presets::MAX_BYTES]; uint8_t n = 0;
+		for (uint8_t a = presets::AM_FIRST; a <= presets::AM_LAST; a++) if (a < 14 || a > 16) b[n++] = { a, blk[a] };   // 14..16 reserved
+		if (!presets::save(name, presets::AM32, b, n)) return false;
+		console::out().printf("preset|%s|saved %u bytes from esc %u (am32)\n", name, n, i);
+		return true;
+	}
 
 	// ---- configurator motor test (MSP_SET_MOTOR via fw_) ----------------------------------------
 	// Like Betaflight's motor_disarmed: the last slider value holds until the next one. It stops,
@@ -760,6 +860,7 @@ private:
 				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,Esc::pin(i));
 				else { m|=1u<<i; console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } }
 				savePresent(m); printPresent(); console::out().println("ok"); }
+			else if (!strcmp(cmd,"preset")) presetCmd();
 			else if (!strcmp(cmd,"escs")) { char* a=strtok(nullptr," ");   // escs [all | <i> <i> ...]: which are wired
 				if (a) { uint32_t m=0; bool bad=false;
 					if (!strcmp(a,"all")) m=~0u;
