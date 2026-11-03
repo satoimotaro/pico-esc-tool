@@ -17,7 +17,7 @@
 class FourWay {
 public:
 	bool active() const { return fourWay_; }   // in passthrough (the LCD shows it)
-	int8_t selected() const { return sel_; }
+	int8_t selected() const { return sel_; }   // escs:: index, not the configurator's channel
 
 	// Feed one byte from the console. Returns true if it was consumed here; false hands it to the
 	// CLI line reader. lineStart = the CLI has no partial line pending.
@@ -33,6 +33,7 @@ public:
 
 private:
 	static const uint32_t FRAME_GAP_MS = 200;
+	static const uint8_t  MAX_CH = 8;           // MSP_MOTOR carries 8; so do the configurators
 	static constexpr const char* IF_NAME = "m4wFCIntf";
 	static const uint8_t PROTOCOL_VER = 108, IF_VER_HI = 200, IF_VER_LO = 6;   // 20006 -> 200, 06
 	enum : uint8_t { imSIL_BLB = 1, imATM_BLB = 2, imARM_BLB = 4 };
@@ -73,7 +74,8 @@ private:
 
 	void mspCommand(uint8_t cmd) {
 		uint8_t d[32] = {0};
-		uint8_t n = escs::count();
+		uint8_t n = escs::presentCount();
+		if (n > MAX_CH) n = MAX_CH;
 		switch (cmd) {
 			case 1:   d[0] = 0; d[1] = 1; d[2] = 46; mspReply(cmd, d, 3); break;             // API_VERSION 1.46
 			case 2:   memcpy(d, "BTFL", 4); mspReply(cmd, d, 4); break;                      // FC_VARIANT
@@ -97,6 +99,9 @@ private:
 			default:  mspReply(cmd, d, 0, true); break;
 		}
 	}
+
+	// A configurator channel -> escs:: index: the wired ESCs, numbered without gaps.
+	static int8_t channel(uint8_t ch) { return ch < MAX_CH ? escs::presentIndex(ch) : -1; }
 
 	// ---------------------------------------------------------------- 4-way: 2F cmd aH aL len p.. crcH crcL
 	static uint16_t crcXmodem(uint16_t crc, uint8_t b) {
@@ -132,19 +137,22 @@ private:
 			case 0x34: exit = true; break;                                                         // InterfaceExit
 			case 0x3F: if (p[0] == imSIL_BLB || p[0] == imATM_BLB || p[0] == imARM_BLB) mode_ = p[0];   // SetMode
 			           else ack = ACK_I_INVALID_PARAM; break;
-			case 0x35:                                                                             // DeviceReset
-				if (p[0] >= escs::count()) { ack = ACK_I_INVALID_CHANNEL; break; }
-				escs::fwRun(p[0]);
-				if (aL == 1) { pinMode(escs::PINS[p[0]], OUTPUT); digitalWrite(escs::PINS[p[0]], LOW);
-				               delay(300); digitalWrite(escs::PINS[p[0]], HIGH); }
-				if (sel_ == (int8_t)p[0]) sel_ = -1;
+			case 0x35: {                                                                           // DeviceReset
+				int8_t e = channel(p[0]);
+				if (e < 0) { ack = ACK_I_INVALID_CHANNEL; break; }
+				escs::fwRun(e);
+				if (aL == 1) { pinMode(escs::PINS[e], OUTPUT); digitalWrite(escs::PINS[e], LOW);
+				               delay(300); digitalWrite(escs::PINS[e], HIGH); }
+				if (sel_ == e) sel_ = -1;
 				break;
+			}
 			case 0x37: {                                                                           // DeviceInitFlash
-				if (p[0] >= escs::count()) { ack = ACK_I_INVALID_CHANNEL; break; }
+				int8_t e = channel(p[0]);
+				if (e < 0) { ack = ACK_I_INVALID_CHANNEL; break; }
 				uint8_t raw[8]; bool am32 = false;
 				sel_ = -1; olen = 4; memset(out, 0, 4);
-				if (!escs::fwSelect(p[0], raw, am32)) { ack = ACK_D_GENERAL_ERROR; break; }
-				sel_ = p[0];
+				if (!escs::fwSelect(e, raw, am32)) { ack = ACK_D_GENERAL_ERROR; break; }
+				sel_ = e;
 				// DeviceInfo as Betaflight's BL_ConnectEx packs it: [sigLo, sigHi, 4th id char, mode]
 				out[0] = raw[5]; out[1] = raw[4]; out[2] = raw[3];
 				uint16_t w = ((uint16_t)out[1] << 8) | out[0];

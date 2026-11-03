@@ -32,7 +32,13 @@
 static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // pin 10: RAW / uncalibrated
 static Thruster esc1(&profiles::M_930KV_12N14P_6STEP, /*dshotKbaud=*/300, /*motorPoles=*/14);  // pin 11: 930KV sine closed-loop
 
+#if ESC_BOARD_PANEL
+static Thruster esc2(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // PWM3: RAW / uncalibrated
+static Thruster esc3(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // PWM4: RAW / uncalibrated
+static Thruster*    THRUSTERS[] = { &esc0, &esc1, &esc2, &esc3 };
+#else
 static Thruster*    THRUSTERS[] = { &esc0, &esc1 };
+#endif
 static const uint8_t NTHR = sizeof(THRUSTERS) / sizeof(THRUSTERS[0]);
 
 // --- The tool surface over those ESCs (config/flash + serial CLI + Wi-Fi). Omit for a bare ROV. ---

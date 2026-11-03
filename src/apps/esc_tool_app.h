@@ -220,6 +220,7 @@ public:
 		// Bind at boot, not on the first `az on`: `az status` / `az zero show` read the encoder
 		// through the same pointers, and unbound they reported the heading as "inf".
 		if (n_ >= 2) az_.bind(th_[0], th_[1], &enc_);
+		loadPresent();
 		az_.zero_raw = settings::azLoadZero();
 		if (az_.zero_raw >= 0)
 			console::out().printf("# az: heading zero restored (raw %ld)\n", (long)az_.zero_raw);
@@ -339,6 +340,28 @@ private:
 	// enough that the operator hears about it near the start of a run rather than after it.
 	static const uint32_t THERMAL_NONE_WARN_MS = 5000;
 
+	// Which ESCs are wired (escs::presentMask), kept across reboots. Set by `scan` or `escs`.
+	static constexpr const char* PRESENT_PATH = "/cfg/present";
+	void loadPresent() {
+		File f = LittleFS.open(PRESENT_PATH, "r");
+		if (!f) return;
+		uint32_t m = 0;
+		if (f.read((uint8_t*)&m, sizeof m) == sizeof m) escs::setPresent(m);
+		f.close();
+		console::out().print("# escs: "); printPresent();
+	}
+	void savePresent(uint32_t m) {
+		escs::setPresent(m);
+		File f = LittleFS.open(PRESENT_PATH, "w");
+		if (f) { f.write((const uint8_t*)&m, sizeof m); f.close(); }
+	}
+	void printPresent() {
+		console::out().printf("escs|%u/%u|", escs::presentCount(), n_);
+		bool first = true;
+		for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i)) { console::out().printf(first ? "%u" : ",%u", i); first = false; }
+		console::out().println();
+	}
+
 #if ESC_LCD
 	// STATUS LCD. With an ESC armed (or arming) it shows the lowest-index one in detail:
 	//   0A T 600 R 1115       index, a=arming / A=armed, DShot value sent, rpm (--- once stale > 0.5 s)
@@ -374,10 +397,11 @@ private:
 			else                     snprintf(r1, sizeof r1, "configurator");
 		} else {
 			int k = 0;
-			for (uint8_t i = 0; i < n_ && i < 3; i++) {
+			// one cell per ESC: index + state (- idle, B bootloader, F flashing, x not wired)
+			for (uint8_t i = 0; i < n_ && k < 16; i++) {
 				bool fl = (fl_ == FL_START || fl_ == FL_RUN) && flIdx_ == i;
-				k += snprintf(r0 + k, sizeof r0 - k, "%u:%-3s ", i,
-				              fl ? "FL" : escs::inBootloader(i) ? "BL" : "off");
+				k += snprintf(r0 + k, sizeof r0 - k, "%u%c ", i,
+				              fl ? 'F' : escs::inBootloader(i) ? 'B' : escs::isPresent(i) ? '-' : 'x');
 			}
 #if ESC_WIFI_STA
 			// S/D = mode, then the LAN address to point the host at; * = a TCP client is attached
@@ -444,16 +468,17 @@ private:
 	// ================= Web UI handlers (SETUP mode) — ported from esc_tool.cpp =================
 	void hIndex() { server_.send_P(200, "text/html", INDEX_HTML); }
 	void hScan() {
-		String j = "[";
+		String j = "["; uint32_t m = 0;
 		for (uint8_t i = 0; i < n_; i++) {
 			escs::Info in; bool ok = th_[i]->scan(in); if (i) j += ",";
+			if (ok) m |= 1u << i;
 			if (!ok) { j += "{\"present\":false,\"pin\":"; j += Esc::pin(i); j += "}"; }
 			else { char sg[8]; snprintf(sg,sizeof(sg),"%04X",in.sig);
 				j += "{\"present\":true,\"pin\":"; j += in.pin; j += ",\"sig\":\""; j += sg;
 				j += "\",\"layout\":\""; j += jesc(in.layout); j += "\",\"name\":\""; j += jesc(in.name);
 				j += "\",\"fw\":\""; j += in.fwMain; j += "."; j += in.fwSub; j += "\"}"; }
 		}
-		j += "]"; server_.send(200, "application/json", j);
+		j += "]"; savePresent(m); server_.send(200, "application/json", j);
 	}
 	void hRead() {
 		int i = server_.arg("i").toInt(); uint8_t cfg[esc_setup::kEepromLen];
@@ -658,9 +683,17 @@ private:
 			else if (!strcmp(cmd,"mode")) { char* a=strtok(nullptr," ");
 				if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
 				console::out().printf("mode %s (wifi %s)\n", mode_==SETUP?"setup":"drive", wifiUp_?"on":"off"); console::out().println("ok"); }
-			else if (!strcmp(cmd,"scan")) { for(uint8_t i=0;i<n_;i++){ escs::Info in;
+			else if (!strcmp(cmd,"scan")) { uint32_t m=0; for(uint8_t i=0;i<n_;i++){ escs::Info in;
 				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,Esc::pin(i));
-				else console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } console::out().println("ok"); }
+				else { m|=1u<<i; console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } }
+				savePresent(m); printPresent(); console::out().println("ok"); }
+			else if (!strcmp(cmd,"escs")) { char* a=strtok(nullptr," ");   // escs [all | <i> <i> ...]: which are wired
+				if (a) { uint32_t m=0; bool bad=false;
+					if (!strcmp(a,"all")) m=~0u;
+					else for (; a; a=strtok(nullptr," ")) { int i=atoi(a); if(i<0||i>=n_) bad=true; else m|=1u<<i; }
+					if (bad) { console::out().println("err bad-index"); continue; }
+					savePresent(m); }
+				printPresent(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"read")) { int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
 				if(i<0||i>=n_) console::out().println("err bad-index");
 				else if(!th_[i]->readConfig(cfg)) console::out().println("err no-connect");

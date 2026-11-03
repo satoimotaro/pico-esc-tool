@@ -85,6 +85,13 @@ namespace detail {
 	static uint8_t  fwRaw[COUNT][8];
 	static bool     fwAm32[COUNT] = { false };
 	static volatile uint8_t fwIdx = 0;
+	// An ESC that never answered stays failed until the next fwBegin, so a configurator polling every
+	// reported channel pays the timeout once per session, not on every read.
+	static bool     fwMiss[COUNT] = { false };
+	static uint32_t fwBeginMs = 0;
+	// Which of PINS have an ESC on them, as last found by a scan (EscTool keeps it in LittleFS).
+	// Only these are offered to a configurator. Bit i = PINS[i]; all set until something is known.
+	static uint32_t present = ~0u;
 	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
 	static BidirDShotX1*     drvB[COUNT] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
 	static DShotX4*          drvN[COUNT] = { nullptr };   // normal DShot: idle LOW, throttle only
@@ -126,8 +133,8 @@ namespace detail {
 		while (!opDone) delay(1);
 		op = Op::NONE; return opOk;
 	}
-	static bool enterBootloader(uint8_t pin) {      // DShot-prime -> signal-loss -> connect (retry)
-		for (int a = 0; a < 3; a++) {
+	static bool enterBootloader(uint8_t pin, int tries = 3) {   // DShot-prime -> signal-loss -> connect (retry)
+		for (int a = 0; a < tries; a++) {
 			// AM32 only reboots into its bootloader after ~2 s without a valid frame, plus its startup
 			// tune, and its bootloader bails back to the app on garbage. So prime only on the first
 			// (BLHeli-S) try; later tries just hold the line high long enough to straddle that reboot.
@@ -358,18 +365,29 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 // (what Betaflight's esc4wayInit does). fwSelect: make idx the session — the cached reply if it is
 // still in its bootloader, else a BootInit, else the full DShot-prime entry — and return its raw
 // 8-byte reply. Switching does NOT run the previous ESC; fwEnd runs every ESC that was entered.
+// The lines go high at fwBegin, so a running AM32 has rebooted into its bootloader by
+// fwBeginMs + AM32_HOLD_MS on its own. An ESC that is not in by then gets ONE DShot-prime entry
+// (what BLHeli-S needs), not the full retry ladder: a missing ESC costs ~2.5 s once, not ~12 s.
 inline void fwBegin() {
 	using namespace detail;
 	spinStopAll(); release();
-	for (uint8_t i = 0; i < COUNT; i++) { fwHave[i] = false; pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
+	for (uint8_t i = 0; i < COUNT; i++) { fwHave[i] = fwMiss[i] = false; pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
+	fwBeginMs = millis();
 }
 inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	using namespace detail;
 	if (idx >= COUNT) return false;
 	if (drvActive(idx)) drvFree(idx);
+	if (fwMiss[idx]) return false;
 	session = -1; fwIdx = idx;
-	bool ok = runOp(Op::FWSELECT, PINS[idx]) || enterBootloader(PINS[idx]);
-	fwHave[idx] = ok;
+	bool ok = runOp(Op::FWSELECT, PINS[idx]);
+	if (!ok && millis() - fwBeginMs < AM32_HOLD_MS) {           // still inside the high-hold window
+		pinMode(PINS[idx], OUTPUT); digitalWrite(PINS[idx], HIGH);
+		while (millis() - fwBeginMs < AM32_HOLD_MS) delay(5);
+		ok = runOp(Op::CONNECT, PINS[idx]);
+	}
+	if (!ok) ok = enterBootloader(PINS[idx], 1);
+	fwHave[idx] = ok; fwMiss[idx] = !ok;
 	if (!ok) return false;
 	session = (int8_t)idx; infoKnown[idx] = false;
 	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
@@ -384,6 +402,17 @@ inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); fo
 }
 inline void fwEnd() { for (uint8_t i = 0; i < COUNT; i++) fwRun(i); }
 inline uint8_t count() { return COUNT; }
+
+// ---- which ESCs are wired ----------------------------------------------------------------------
+inline uint32_t presentMask() { return detail::present & ((1u << COUNT) - 1); }
+inline void     setPresent(uint32_t m) { detail::present = m; }
+inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
+inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i++) n += isPresent(i); return n; }
+// The k-th wired ESC's index (a configurator numbers them 0..presentCount()-1, gaps closed); -1 if none.
+inline int8_t   presentIndex(uint8_t k) {
+	for (uint8_t i = 0; i < COUNT; i++) if (isPresent(i) && k-- == 0) return (int8_t)i;
+	return -1;
+}
 
 // ---- core1 worker: call once from loop1() ------------------------------------------------------
 namespace detail {
