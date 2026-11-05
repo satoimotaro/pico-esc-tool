@@ -150,7 +150,9 @@ Where the code refines the design:
    at least 15 ms after the previous one (so they span 30 ms or more). LOST is no
    valid packet for 400 ms once the pin has answered on its current stream (the reboot gap after a
    read is expected). A bidir READY pin that never answers within 8 s stays READY and is reported
-   once (`# esc i: no telemetry within 8 s ...`); a pull is then not seen on it. RUNNING keeps the
+   once (`# esc i: no telemetry within 8 s ...`); a pull is then not seen on it. Its identity is then
+   unconfirmed: if it ever answers, the pin goes to PENDING and is read again before it is driven
+   (an ESC swapped before its first answer is never driven with the old identity). RUNNING keeps the
    "armed after 8 s anyway" rule for an ESC that never answers. The driver keeps only the newest
    telemetry word per read, and core0 polls every ~200 us: the 15 ms spacing is what makes 3 samples
    real evidence. A failed read is FAILED only if telemetry was fresh (under 400 ms old) when the read
@@ -189,7 +191,8 @@ lives now and how it meets the lifecycle states.
   answered is not judged. Under throttle its silence belongs to the stall watch, not to LOST
   (`lc::Pin::stallWatch`), because a failed start beeps without telemetry. Its verdicts:
   - ZERO: eRPM read 0 for 1.5 s. The clock starts only on an eRPM reading of 0, so forced sine (EDT
-    flowing, no eRPM) is never a stall.
+    flowing, no eRPM) is never a stall, as long as a valid EDT packet comes at least every 500 ms
+    (STALL_SILENT_MS); sparser EDT is judged as silence.
   - QUIET: not turned yet and no valid packet of any kind for 0.5 s (the failed start).
   - SILENT: the same total silence after it has turned. Under the tool policy that is LOST with the
     identity dropped (`lc::Pin::onStall`), so an ESC swapped in meanwhile is read before it is
@@ -203,7 +206,9 @@ lives now and how it meets the lifecycle states.
   the gap, and its stall clocks restart. Five gaps in a row are reported once
   (`# esc i: core0 loop slow ...`), because a loop slow on every pass keeps LOST, SILENT and the
   stall silence rule from firing. SILENT is not reported for a pin not polled in the last 50 ms.
-  `lc::stamp` replaces `millis()|1`.
+  A loop slower than 50 ms on every pass therefore disables LOST detection (and SILENT and the
+  stall silence rule) altogether; SLOW_LOOP is the only report of it. `lc::stamp` replaces
+  `millis()|1`.
 - PWM: `lc::pwmGate` drops widths sent during the arm and needs one stop width first. The IRQ
   deadman stays. Every sync bootloader visit (`runOp`, `enterBootloader`) sends the stop width
   while it waits, because pump() keeps PWM going. `pwmBusy` refuses CLI bootloader commands. A pin
@@ -223,6 +228,10 @@ lives now and how it meets the lifecycle states.
     was 3D and the new ESC is one-way, a forward command is then about 50 % throttle there, and
     "reverse" runs forward too. A pull after the motor has turned (SILENT) drops the identity
     (tool policy).
+  - A jam while the motor is running may show up as total silence (SILENT) rather than as eRPM 0
+    readings (ZERO), depending on what Bluejay sends as it drops out of its run. Under the tool
+    policy that ESC then goes LOST and is read again through its bootloader instead of being
+    re-armed. This needs a bench check.
   - AM32 is not stall-watched, so under throttle it is under the plain 400 ms LOST rule: a
     telemetry decode dropout longer than that stops it in the web tool (tool policy) and drops its
     identity; it is read again through its bootloader when it answers.

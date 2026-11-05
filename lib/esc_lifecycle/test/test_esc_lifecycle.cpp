@@ -204,7 +204,16 @@ int main() {
 		      "M2: bidir READY with no answer within 8 s is reported (NO_ANSWER) and kept READY");
 		CHECK(p.tick(5000 + 9000, Policy::TOOL) == Ev::NONE && p.st == State::READY, "... reported once");
 		p.onPacket(14500);
-		CHECK(p.tick(14500 + LOST_MS, Policy::TOOL) == Ev::LOST_IDLE, "... and once it answers, 400 ms of silence is LOST as usual");
+		CHECK(p.st == State::PENDING && !p.id.known && !p.unconfirmed,
+		      "an identity no answer confirmed: the first answer sends it to PENDING (read again before driven)");
+		Pin c = readyPin(bluejay(), 0); c.tick(8000, Policy::TOOL);
+		CHECK(c.unconfirmed && c.st == State::READY && c.requestArm() == Arm::NOW, "unconfirmed READY still arms (armed after 8 s anyway)");
+		CHECK(c.onPacket(9000) == Ev::APPEARED && c.st == State::PENDING && c.gate(true) != Refuse::OK,
+		      "... and a swapped ESC's first answer while RUNNING stops it and reads it (never driven on the old identity)");
+		c.onReadStart(9100); c.onReadDone(true, bluejay());
+		CHECK(c.st == State::READY && !c.unconfirmed, "a read confirms it again");
+		Pin a = readyPin(bluejay(), 0); a.onPacket(100);
+		CHECK(a.st == State::READY && !a.unconfirmed, "an answer within 8 s: nothing unconfirmed, READY stays");
 		Pin n = readyPin(silabs3d(), 0);
 		CHECK(n.tick(100000, Policy::TOOL) == Ev::NONE && n.st == State::READY, "normal-DShot READY never goes LOST");
 	}

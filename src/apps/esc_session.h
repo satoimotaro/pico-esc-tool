@@ -273,12 +273,16 @@ namespace detail {
 	static uint8_t        gapRun[COUNT] = { 0 };
 	// A loop held up (a blocking op that does not pump) is not an ESC gone quiet: the lifecycle's
 	// clocks move on by the gap, and the stall clocks restart. A loop slow on every pass would keep
-	// LOST, SILENT and the stall's silence rule from ever firing, so repeated gaps are reported.
-	static void gapCheck(uint8_t i, uint32_t now) {
-		if (drvActive(i) && now - drvPollMs[i] > POLL_GAP_MS) {
-			pin[i].rebase(now - drvPollMs[i]); stall[i].onGap();
-			if (gapRun[i] < 255 && ++gapRun[i] == SLOW_GAPS) evPush(i, lc::Ev::SLOW_LOOP);
-		} else if (drvActive(i)) gapRun[i] = 0;
+	// LOST, SILENT and the stall's silence rule from ever firing, so repeated gaps are reported. Only
+	// spinPoll's own check counts them (count): the streamPin/pump checks right after it see no gap
+	// and must not reset the run.
+	static void gapCheck(uint8_t i, uint32_t now, bool count = false) {
+		bool gap = drvActive(i) && now - drvPollMs[i] > POLL_GAP_MS;
+		if (gap) { pin[i].rebase(now - drvPollMs[i]); stall[i].onGap(); }
+		if (count && drvActive(i)) {
+			if (!gap) gapRun[i] = 0;
+			else if (gapRun[i] < 255 && ++gapRun[i] == SLOW_GAPS) evPush(i, lc::Ev::SLOW_LOOP);
+		}
 		drvPollMs[i] = now;
 	}
 	// One loop's worth of pin i's stream: arm window, deadman, telemetry, stall watch, EDT, one frame.
@@ -316,6 +320,8 @@ namespace detail {
 			if (ty != BidirDshotTelemetryType::CHECKSUM_ERROR && ty != BidirDshotTelemetryType::NO_PACKET) {
 				drvTele[i].pktStampMs = now;
 				evPush(i, pin[i].onPacket(now));
+				// an unconfirmed identity's first answer sends the pin to PENDING: nothing more this frame
+				if (pin[i].st != lc::State::RUNNING) { drvTarget[i] = 0; armStart[i] = false; }
 			}
 			// Stall watch (lc::Stall): armed, under throttle, on a stream that has answered, Bluejay/
 			// BLHeli-derived (AM32 stays in its run). Its silence there is the watch's, not LOST
@@ -783,7 +789,7 @@ inline void spinPoll() {   // call every core0 loop: lifecycle + hold + async re
 	using namespace detail;
 	uint32_t now = millis();
 	for (uint8_t i = 0; i < COUNT; i++) {
-		gapCheck(i, now);
+		gapCheck(i, now, true);
 		stall[i].poll(now);
 		lc::Ev e = pin[i].tick(now, policy);
 		if (e == lc::Ev::LOST_STOPPED) { drvTarget[i] = 0; armStart[i] = false; }   // TOOL: stop that ESC only

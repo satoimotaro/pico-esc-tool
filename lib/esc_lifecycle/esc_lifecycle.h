@@ -102,23 +102,27 @@ struct Pin {
 	// over after a stall and must answer again within ANSWER_MAX_MS, or the pin is LOST after all.
 	bool     stallWatch = false, rearmed = false;
 	bool     noAnswerSaid = false;   // Ev::NO_ANSWER went out for the current stream
+	// READY (or RUNNING) on an identity no telemetry has ever confirmed (NO_ANSWER): the ESC may have
+	// been swapped before its first answer, so that answer sends the pin to PENDING (read again)
+	// instead of trusting the identity.
+	bool     unconfirmed = false;
 	uint32_t streamMs = 0, pktMs = 0, burstMs = 0, cntMs = 0;
 	uint8_t  burst = 0;
 	State    prePt = State::EMPTY; // state when the passthrough began
 
-	void toEmpty() { st = State::EMPTY; id = Identity{}; seen = queued = armWanted = openLoop = false; burst = 0; }
+	void toEmpty() { st = State::EMPTY; id = Identity{}; seen = queued = armWanted = openLoop = unconfirmed = false; burst = 0; }
 	// LOST forgets `seen` too: what answered is gone, so a read that then fails finds nothing (EMPTY,
 	// detection on) rather than FAILED (silent until the user reads it again).
-	void toLost()  { st = State::LOST; id = Identity{}; seen = armWanted = openLoop = false; burst = 0; }
+	void toLost()  { st = State::LOST; id = Identity{}; seen = armWanted = openLoop = unconfirmed = false; burst = 0; }
 	void toPending(bool byRequest) {
-		st = State::PENDING; id = Identity{}; queued = byRequest; burst = 0;
+		st = State::PENDING; id = Identity{}; queued = byRequest; burst = 0; unconfirmed = false;
 		if (!byRequest) armWanted = false;   // found by telemetry: nobody asked to drive it
 	}
 	// Every "read finished OK" exit (async read, sync session, passthrough) lands here, so an arm that
 	// waited for the read is honoured exactly once and never outlives it.
 	void finish(const Identity& ident) {
 		id = ident; st = armWanted ? State::RUNNING : State::READY;
-		armWanted = openLoop = false;
+		armWanted = openLoop = unconfirmed = false;
 	}
 	// Telemetry that is fresh when a read starts is what makes its failure FAILED (something answers
 	// but will not read: no automatic retry loop). Old telemetry from before a session or passthrough
@@ -167,6 +171,8 @@ struct Pin {
 			cntMs = now;
 		}
 		if ((st == State::EMPTY || st == State::LOST) && burst >= APPEAR_PKTS) { toPending(false); return Ev::APPEARED; }
+		// the first answer on an identity that never had one: read it again before it is driven
+		if (unconfirmed && (st == State::READY || st == State::RUNNING)) { toPending(false); return Ev::APPEARED; }
 		if (st == State::RUNNING && openLoop) { openLoop = false; return Ev::RETURNED; }
 		return Ev::NONE;
 	}
@@ -180,7 +186,7 @@ struct Pin {
 		case State::READY:
 			if (streaming && streamBidir && answered && now - pktMs >= LOST_MS) { toLost(); return Ev::LOST_IDLE; }
 			if (streaming && streamBidir && !answered && !noAnswerSaid && now - streamMs >= ANSWER_MAX_MS) {
-				noAnswerSaid = true; return Ev::NO_ANSWER;   // kept READY (see ANSWER_MAX_MS)
+				noAnswerSaid = unconfirmed = true; return Ev::NO_ANSWER;   // kept READY (see ANSWER_MAX_MS)
 			}
 			break;
 		case State::RUNNING:   // unanswered RUNNING keeps 4baed53's "armed after 8 s anyway", except after a stall
@@ -315,7 +321,8 @@ inline uint32_t since(uint32_t now, uint32_t t) { int32_t d = (int32_t)(now - t)
 // until it is sent 0: a jam is never restarted on its own. After STALL_MAX restarts with no run in
 // between, only a zero held for STALL_REST_MS frees it.
 static const uint32_t STALL_ZERO_MS   = 1500;
-static const uint32_t STALL_SILENT_MS = 500;
+static const uint32_t STALL_SILENT_MS = 500;   // so "EDT-only flow is never a stall" holds only while
+                                                // a valid EDT packet comes at least every 500 ms
 static const uint8_t  STALL_MAX       = 3;
 static const uint32_t STALL_REST_MS   = 1000;
 static const uint32_t STALL_RECENT_MS = 5000;   // "restarted after a stall" for a UI, this long
