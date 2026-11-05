@@ -89,24 +89,27 @@ public:
 	// pack would otherwise keep reading the old, higher pack for ~27 min of running — high, which is the
 	// wrong direction for the one decision this number exists to inform. The calibration SCALE is a model
 	// constant (persisted by `cfg save`) and is deliberately kept.
-	void arm(Drive mode = Drive::AUTO) {
-		escs::spinArm(index_, mode); vc.reset(); submode_ = RAW;
+	// false = refused (FAILED: scan or a configurator read reads it again) or no free PIO SM (initOk()).
+	bool arm(Drive mode = Drive::AUTO) {
+		bool ok = escs::spinArm(index_, mode); vc.reset(); submode_ = RAW;
 		senseVref_ = 0.0f; vbattMax_ = 0.0f; senseZeroCmd_ = 0.0f;
 		gate_.reset();   // dwell, hysteresis latch and both tiers: an arm ends the condition under which
 		                 // anything measured before it is comparable to anything measured after.
+		return ok;
 	}
-	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle. Setting a RAW
+	// RAW target: signed thrust on a reversible (3D) ESC, else unidirectional throttle, by the identity
+	// read from the ESC (escs::drive). A negative value on a one-way ESC is refused (REVERSE_ONEWAY),
+	// never cast: (uint16_t)-300 used to clamp to full throttle. Setting a RAW
 	// target disengages the rpm loop (submode_ -> RAW) so a stray step() can't fight it.
 	// [B.6-fix] ...and that disengagement must close the soft-sensor with it: poll() returns early at
 	// submode_ != RPM, so a latched gate would otherwise survive `rpm 1 1600` -> `thrust 1 300` and
 	// `sense` would report a minutes-old vest as valid=1|why=ok while the motor runs at an arbitrary
 	// RAW throttle — and `sense zero` would succeed there, recording a stale command as the off-point
 	// centre and poisoning every later `load`. Same reasoning as stop(), same fix.
-	void setRaw(int v) {
+	lc::Refuse setRaw(int v) {
 		submode_ = RAW;
 		gate_.reset();
-		if (reversible()) escs::spinThrust(index_, (int16_t)v);
-		else              escs::spinThrottle(index_, (uint16_t)v);
+		return escs::drive(index_, v);
 	}
 	// RPM target: engage the closed loop. Reset the step clock so the first dt is sane.
 	void setRpm(float rpm) { submode_ = RPM; vc.setTarget(rpm); lastStepUs_ = micros(); }
@@ -425,7 +428,12 @@ public:
 	// ---- io adapter: the ONLY place that knows escs:: telemetry -> vel::EscIo. Reads owner->index_. --
 	struct Io : public vel::EscIo {
 		Thruster* owner = nullptr;
-		void thrust(int cmd) override { escs::spinThrust(owner->index_, (int16_t)cmd); }
+		// A one-way ESC has no reverse: a negative command (the loop braking) is zero there, sent at
+		// once rather than left to the deadman. Signed rpm as a semantic command is phase 2.
+		void thrust(int cmd) override {
+			if (cmd < 0 && !owner->reversible()) cmd = 0;
+			escs::spinThrust(owner->index_, (int16_t)cmd);
+		}
 		bool readTele(float& mechRpm, float& tempC) override {
 			escs::Telem t;
 			if (!escs::spinTele(owner->index_, t) || !t.valid) return false;

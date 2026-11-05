@@ -253,6 +253,8 @@ function renderEscs() {
       h('div', { class: 'card-head' },
         h('label', {}, h('input', { type: 'checkbox', class: 'esc-sel', 'data-ch': ch, checked: true }), h('h3', {}, `ESC ${ch + 1}`)),
         h('span', { class: 'tag' }, `${esc.family.name} ${esc.version}`),
+        // stock BLHeli_S has no telemetry: the Pico cannot see it being swapped (docs/esc-lifecycle.md)
+        esc.family.id === 'blheli_s' ? h('span', { class: 'tag dim' }, '交換は検出されません: 交換したら読み直してください') : null,
         h('span', { class: 'meta' }, [esc.layoutTag, esc.mcu, esc.name].filter(Boolean).join(' · '))),
       esc.family.fields.length
         ? h('div', { class: 'fields' }, ...esc.family.fields.map((f) => fieldInput(ch, f)))

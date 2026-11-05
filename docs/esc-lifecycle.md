@@ -1,7 +1,8 @@
-# ESC lifecycle: identify, drive, hot-plug (design, not yet built)
+# ESC lifecycle: identify, drive, hot-plug (design; phase 1 built)
 
-Status: agreed design for the release after rev0. rev0 ships the current code with the
-fixes listed at the end; nothing below is implemented yet.
+Status: phase 1 is implemented (`lib/esc_lifecycle`, `src/apps/esc_session.h`); phase 2 is still
+design. See "Phase 1 and phase 2" below for the split and for where the code refines this design.
+Hot-plug timing and the LOST threshold have not had a hardware bench pass yet.
 
 ## Requirements
 
@@ -45,8 +46,9 @@ fixes listed at the end; nothing below is implemented yet.
   bootloader. Ownership changes only on a state change.
 - LOST drops the identity and goes to PENDING when telemetry returns. A swap always passes through
   LOST, so a new ESC is never driven with the old one's identity (R2, R3).
-- FAILED is left only by a user action (`scan`, a read from the configurator) or, for bidir, by
-  telemetry appearing.
+- FAILED is left only by a user action (`scan`, a read from the configurator). It sends nothing, so
+  it cannot see telemetry appear either: a read that fails without any telemetry seen on the pin goes
+  to EMPTY instead (refinement 4 below).
 
 ### Asynchronous reads
 
@@ -89,6 +91,73 @@ request to a non-3D ESC is refused and reported, not clamped to zero silently.
 - Writes never use cached identity: the bootloader session that writes reads signature and layout
   first and compares (already so in the web flasher's `flashCheck`; to be checked for the CLI and
   for the cached `fwHave` reply).
+
+## Phase 1 and phase 2
+
+Landed in phase 1:
+
+- `lib/esc_lifecycle/esc_lifecycle.h`: the state machine (`lc::Pin`), the identity rules, the 3D map
+  and the semantic drive mapping, with a native g++ test.
+- `escs::` keeps one `lc::Pin` per pin. `spinPoll()` feeds it telemetry and time, runs the idle hold
+  (bidir zero on EMPTY/PENDING/LOST, zero in the identity's protocol on READY) and so detects a bidir
+  ESC being plugged in or pulled out. `idle off` stops the hold, and with it the hot-plug detection.
+- Reads on the drive path (`spinArm`, hot-plug, the motor test) run on core1 as one asynchronous job
+  (`Op::READID`: prime, line high, the 1 s / 4 s / 4 s ladder, learn, run). core0 keeps streaming and
+  collects the result on a later loop.
+- The explicit config ops and the 4-way passthrough stay synchronous, but every core0 wait pumps the
+  other pins' frames, telemetry and deadman.
+- LOST handling with the tool/ROV switch (`escs::setPolicy`), `escs::drive()` with refusals
+  (`err not-armed`, `err not-armed (state X)`, `err reverse-on-one-way (ESC i is not 3D)`), and a
+  `state` CLI command.
+- The AM32 mask is gone: `/cfg/present` is one word (an older 8-byte file still loads), and the
+  passthrough always waits the AM32 time.
+- LittleFS writes run under `escs::FsGuard` (core1 parked in its idle branch); a refusal answers
+  `err busy (ESC read in progress, retry)`, and the present mask is retried.
+
+- One bootloader line: a read cannot run while `scan`, `read` or `enter` holds an ESC in its
+  bootloader. A pin waiting to be read wins once the session is idle: no op on it for 5 s, and never
+  a session that has been written (an `erase`/`writeflash` sequence must not see its ESC run
+  mid-image; `run` ends it). The held session is then learned and run, and the next config op on
+  that ESC enters it again. `arm` of a pin that must be read first runs a foreign held session at
+  once (as 4baed53's `arm` did), unless it was written: then it answers
+  `err busy (ESC <s> is being written; run it first)`. `arm` on a pin not read yet answers
+  `arming (reading first, then ~3s) (state X)`; hosts poll `state` for RUNNING
+  (`host/pico_esc/drive.py` `wait_read`). An async read that finds an ESC on a pin missing from the
+  present mask adds it.
+
+Phase 2:
+
+- The explicit config commands (`scan`, `read`, `enter`, `editpage`, `erase`, `writeflash`,
+  `readflash`, `preset`, web flash, `blprobe`) go asynchronous with deferred replies.
+- ROV identity from a telemetry id or declared config (a mismatch keeps the pin FAILED), and `scan`
+  at ROV launch.
+- The RPM controller falling back to open loop on LOST in ROV mode (phase 1 keeps streaming and
+  reports `# esc i: lost, open loop`).
+- Signed rpm as a semantic command, and `spinThrust` on a non-3D ESC in RPM mode (phase 1 sends zero
+  for a negative command there).
+- The legacy `esc_tool.cpp` negative-throttle path.
+
+Where the code refines the design:
+
+1. READY accepts `arm`, not a bare non-zero command: non-zero needs RUNNING and an armed stream.
+   After `disarm` or a firmware abort, host scripts rely on `err not-armed`, and rev0's idle hold
+   re-enabled throttle by itself. A READY pin whose zero stream is already armed in the asked
+   protocol goes RUNNING with no new arm window, so `arm` and the motor test stay fast.
+2. A read that fails without fresh telemetry at its start goes to EMPTY, not FAILED (for example
+   `arm` on a bare pin, or `scan` after an ESC was pulled). FAILED sends nothing, which avoids a read-fail, reboot, telemetry, re-read loop.
+3. Hot-plug debounce: EMPTY or LOST becomes PENDING after 3 valid packets within 250 ms, each counted
+   at least 15 ms after the previous one (so they span 30 ms or more). LOST is no
+   valid packet for 400 ms once the pin has answered on its current stream (the reboot gap after a
+   read is expected). A bidir READY pin that never answers within 8 s goes LOST. RUNNING keeps the
+   "armed after 8 s anyway" rule for an ESC that never answers. The driver keeps only the newest
+   telemetry word per read, and core0 polls every ~200 us: the 15 ms spacing is what makes 3 samples
+   real evidence. A failed read is FAILED only if telemetry was fresh (under 400 ms old) when the read
+   started; a read after a session, a passthrough or a LOST finds stale telemetry and goes to EMPTY.
+4. Writes never trust a cached reply. A 4-way re-select of a non-AM32 ESC sends a fresh BootInit and
+   adopts a different reply as a new ESC; AM32 answers only the first BootInit, so it still re-adopts
+   the cached reply if a keepalive answers (a swap there is caught by the re-read after the
+   passthrough). Two failed keepalives in a row mark the CLI session lost, and the next op enters
+   again with a fresh CONNECT. A write makes closing the session read the identity again before RUN.
 
 ## rev0 (the current code, shipped first)
 

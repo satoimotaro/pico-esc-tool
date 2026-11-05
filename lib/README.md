@@ -8,6 +8,7 @@ PlatformIO auto-discovers each subfolder here as a library. Each module is self-
 | `blheli_bl/` | **BLHeli-S 1-wire bootloader client** — connect, device ID, read/write flash, erase, run. `PROTOCOL.md` is the wire reference. | proven on HW |
 | `esc_setup/` | BLHeli-S config decode/encode + full-page read-modify-write (on `blheli_bl`). | proven on HW |
 | `esc_flash/` | Intel-HEX parse, program/verify, and layout/MCU compatibility check (on `blheli_bl`). | proven on HW |
+| `esc_lifecycle/` | One state per ESC signal pin (EMPTY/PENDING/READING/READY/RUNNING/LOST/FAILED), identity rules, semantic drive mapping. Pure header, native test. | native test; HW bench pending |
 
 `blheli_bl` is the shared foundation: `esc_setup` (config) and `esc_flash` (firmware) both do
 their 1-wire I/O through it. The unified firmware `src/apps/esc_tool.cpp` (via `esc_session.h`) uses

@@ -199,15 +199,17 @@ public:
 		pinMode(ESC_MODE_PIN, INPUT_PULLUP);
 #endif
 		delay(50);
-		if (!LittleFS.begin()) { LittleFS.format(); LittleFS.begin(); }   // firmware library store
+		// Every LittleFS mutation runs under escs::FsGuard: a flash write pauses core1, which must not
+		// be in the middle of a bootloader byte. At boot it is idle, so these always get it.
+		{ escs::FsGuard g; if (!LittleFS.begin() && g.ok) { LittleFS.format(); LittleFS.begin(); } }   // firmware library store
 		{ static const uint8_t pins[] = ESC_SIGNAL_PINS;                  // GP16/17 wired as an ESC signal:
 		  for (uint8_t p : pins) if (p == 16 || p == 17) encOff_ = true; } // the encoder's I2C would take it
 		if (!encOff_) enc_.begin();                                      // AS5600 encoder (I2C0, GP16/17)
-		LittleFS.mkdir("/fw");
+		{ escs::FsGuard g; if (g.ok) LittleFS.mkdir("/fw"); }
 		// Restore the saved runtime config (motor identity, gains, DOB, vbatt scale) — so `sense vcal`
 		// and `motor` are no longer per-power-cycle. main.cpp has already applied the compile-time
 		// defaults, so a stored config deliberately wins over them; an absent/corrupt one changes nothing.
-		LittleFS.mkdir(settings::CFG_DIR);
+		{ escs::FsGuard g; if (g.ok) LittleFS.mkdir(settings::CFG_DIR); }
 		uint16_t storedVer = 0;
 		int restored = settings::load(th_, n_, &storedVer);
 		if (restored > 0)
@@ -222,6 +224,7 @@ public:
 		// through the same pointers, and unbound they reported the heading as "inf".
 		if (n_ >= 2) az_.bind(th_[0], th_[1], &enc_);
 		loadPresent();
+		escs::setHold(true);   // the idle hold (and hot-plug detection) for every wired ESC
 		az_.zero_raw = settings::azLoadZero();
 		if (az_.zero_raw >= 0)
 			console::out().printf("# az: heading zero restored (raw %ld)\n", (long)az_.zero_raw);
@@ -259,15 +262,16 @@ public:
 #endif
 		handleSerial();
 		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
-		if (escs::armMask() != armSaved_) savePresent(escs::presentMask());   // a connect learned AM32
+		if (escs::presentGrew()) savePresent(escs::presentMask());   // an async read found one on an unlisted pin
+		presentPersist();                                       // a deferred /cfg/present write
 		motorTestPoll();
-		idlePoll();
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
 			for (uint8_t i = 0; i < n_; i++) { th_[i]->poll(); thermalNotice(i); }   // RPM submode closes the loop
 			escs::spinPoll();                                          // keep DShot frames flowing
 		}
+		eventPoll();
 		linkWatch();
 		if (wifiUp_) server_.handleClient();
 #if ESC_LCD
@@ -373,7 +377,11 @@ private:
 		if (!strcmp(sub, "show") || !strcmp(sub, "rm")) {
 			char* name = strtok(nullptr, " "); presets::Loaded l;
 			if (!name || !presets::find(name, l)) { o.println("err no-preset"); return; }
-			if (sub[0] == 'r') { o.println(!l.builtin && presets::remove(name) ? "ok" : "err builtin"); return; }
+			if (sub[0] == 'r') {
+				if (l.builtin) { o.println("err builtin"); return; }
+				escs::FsGuard g;
+				o.println(!g.ok ? BUSY : presets::remove(name) ? "ok" : "err builtin"); return;
+			}
 			o.printf("preset|%s|%s|%s|%s\n", l.name, presets::familyName(l.family), l.builtin ? "builtin" : "saved", l.note);
 			for (uint8_t k = 0; k < l.n; k++) o.printf("%s%02X:%02X", k ? "," : "bytes|", l.b[k].off, l.b[k].val);
 			o.println(); o.println("ok"); return;
@@ -393,11 +401,11 @@ private:
 			o.printf("err wrong-family (ESC %d runs %s, preset is %s)\n", i, presets::familyName(fam), presets::familyName(l.family));
 			return;
 		}
-		bool ok;
+		bool ok; busy_ = false;
 		if (fam == presets::AM32) ok = apply ? presetApplyAm32((uint8_t)i, l) : presetSaveAm32((uint8_t)i, name);
 		else                      ok = apply ? presetApplyBj((uint8_t)i, l)   : presetSaveBj((uint8_t)i, name, fam);
 		escs::release();
-		o.println(ok ? "ok" : "err failed");
+		o.println(ok ? "ok" : busy_ ? BUSY : "err failed");
 	}
 	bool presetApplyBj(uint8_t i, const presets::Loaded& l) {
 		uint16_t offs[presets::MAX_BYTES]; uint8_t vals[presets::MAX_BYTES];
@@ -412,6 +420,8 @@ private:
 		if (!th_[i]->readConfig(cfg)) return false;
 		presets::Byte b[presets::MAX_BYTES]; uint8_t n = 0;
 		for (uint8_t a = presets::BJ_FIRST; a <= presets::BJ_LAST; a++) b[n++] = { a, cfg[a] };
+		escs::FsGuard g;
+		if (!g.ok) { busy_ = true; return false; }
 		if (!presets::save(name, fam, b, n)) return false;
 		console::out().printf("preset|%s|saved %u bytes from esc %u (%s)\n", name, n, i, presets::familyName(fam));
 		return true;
@@ -438,6 +448,8 @@ private:
 		if (!th_[i]->readFlash(escs::am32Eeprom(i), blk, sizeof blk)) return false;
 		presets::Byte b[presets::MAX_BYTES]; uint8_t n = 0;
 		for (uint8_t a = presets::AM_FIRST; a <= presets::AM_LAST; a++) if (a < 14 || a > 16) b[n++] = { a, blk[a] };   // 14..16 reserved
+		escs::FsGuard g;
+		if (!g.ok) { busy_ = true; return false; }
 		if (!presets::save(name, presets::AM32, b, n)) return false;
 		console::out().printf("preset|%s|saved %u bytes from esc %u (am32)\n", name, n, i);
 		return true;
@@ -455,20 +467,22 @@ private:
 	//   - a passthrough starts. An ESC the CLI already armed is left alone, and a CLI `disarm` of
 	//     one the test armed hands it back.
 	// Spinning goes through Thruster::arm/setRaw like the CLI's `throttle`: the same 3 s arm, the
-	// same 500 ms deadman (fed here every loop), the same reversible handling.
+	// same 500 ms deadman (fed here every loop), the same reversible handling. An ESC the idle hold
+	// has armed already (READY) arms at once; one not read yet arms once its async read lands.
+	// An owned ESC that is lost, refused or stopped elsewhere is latched: the test does not arm it
+	// again until its slider is back at stop.
 	static const uint32_t MT_TIMEOUT_MS = 2000;
 	uint32_t mtOwned_ = 0;          // ESCs this motor test armed
-	uint32_t mtArmedMs_ = 0;        // when an arm() returned or the loop was last held up: it can block
-	uint32_t mtLoopMs_ = 0;         // for a bootloader visit, and the queued MSP is no silence
+	uint32_t mtLatched_ = 0;        // ... and lost again: not re-armed until the channel is at stop
+	uint32_t mtArmedMs_ = 0;        // when the loop was last held up (a sync bootloader op, a scan):
+	uint32_t mtLoopMs_ = 0;         // the MSP queued meanwhile is no silence
 	bool     mtDtr_ = false;
-	// IDLE HOLD. AM32 resets itself after 2 s without a valid frame (am32 Src/main.c, NVIC_SystemReset)
-	// and plays its startup tune on every boot, so an AM32 left alone beeps every few seconds; BLHeli_S
-	// and Bluejay play their beacon after a few minutes without signal. A flight controller never leaves
-	// them alone: it streams zero throttle. So does this, for every wired ESC while nothing else needs
-	// them — not in a passthrough, a flash or a bootloader session (a connect frees the pin itself). The motor test takes an idle-held ESC over; a CLI throttle drives it as
-	// it is. `idle off` turns it off. One arm per 5 s: an arm can block while it learns the ESC.
-	uint32_t idle_ = 0, idleNextMs_ = 0;   // idle_: bit i = ESC i is held at zero throttle by this
-	bool     idleOn_ = true;
+	// IDLE HOLD (escs::setHold). AM32 resets itself after 2 s without a valid frame (am32 Src/main.c,
+	// NVIC_SystemReset) and plays its startup tune on every boot, so an AM32 left alone beeps every few
+	// seconds; BLHeli_S and Bluejay play their beacon after a few minutes without signal. A flight
+	// controller never leaves them alone: it streams zero throttle. So does escs:: now, for every wired
+	// ESC that is not driven, from its lifecycle (bidir zero until it is read, which also sees a bidir
+	// ESC being plugged in; then zero in its own protocol). `idle off` turns it off.
 	// The PWM slice keeps its width while core0 waits on core1, so a bootloader visit (scan, read, a
 	// configurator op) is refused while a PWM pin is fed above its stop. (The stop width also goes out
 	// during any visit, and a timer IRQ falls back to it 500 ms after the last width.)
@@ -476,32 +490,11 @@ private:
 		for (uint8_t i = 0; i < n_; i++) if (escs::pwmDriving(i)) { console::out().println("err busy (pwm running: pwm <i> stop first)"); return true; }
 		return false;
 	}
-	bool driving() {   // anything spinning that the idle hold does not own (PWM included)
-		for (uint8_t i = 0; i < n_; i++) {
-			if (escs::pwmActive(i)) return true;
-			if ((escs::spinArmed(i) || escs::spinArming(i)) && !(idle_ >> i & 1)) return true;
-		}
+	bool driving() {   // anything spinning or arming (PWM included); the hold's zero streams are not
+		for (uint8_t i = 0; i < n_; i++)
+			if (escs::pwmActive(i) || escs::spinArmed(i) || escs::spinArming(i)) return true;
 		return false;
 	}
-	void idlePoll() {
-		for (uint8_t i = 0; i < n_; i++) {   // drop the ones that stopped, or that someone gave a throttle
-			bool on = escs::spinArmed(i) || escs::spinArming(i);
-			if (!on || escs::spinTarget(i)) idle_ &= ~(1u << i);
-		}
-		if (!idleOn_ || fw_.active() || fl_ == FL_START || fl_ == FL_RUN || escs::sessionOpen()) return;
-		// An arm may read the ESC through its bootloader, which stops every DShot stream on the board
-		// for seconds: never while something else is driven, and never again for an ESC whose read
-		// already failed (unpowered, unplugged, broken) until `scan` or a configurator read succeeds.
-		if (driving() || (int32_t)(millis() - idleNextMs_) < 0) return;
-		for (uint8_t i = 0; i < n_; i++) {
-			if (!escs::isPresent(i) || escs::identFailed(i)) continue;
-			if (escs::spinArmed(i) || escs::spinArming(i) || escs::pwmActive(i)) continue;
-			th_[i]->arm(); th_[i]->setRaw(0);
-			idle_ |= 1u << i; idleNextMs_ = millis() + 5000;
-			return;
-		}
-	}
-	void idleStop() { for (uint8_t i = 0; i < n_; i++) if (idle_ >> i & 1) th_[i]->stop(); idle_ = 0; }
 
 	void motorTestStop(const char* why) {
 		// Back to zero throttle on the same stream, held by the idle hold, instead of cutting the signal:
@@ -515,7 +508,7 @@ private:
 		}
 		// not during a passthrough: the line would land inside the configurator's 4-way replies
 		if (mtOwned_ && !fw_.active()) console::out().printf("# motor test stopped: %s\n", why);
-		mtOwned_ = 0; fw_.clearMotors();
+		mtOwned_ = 0; mtLatched_ = 0; fw_.clearMotors();
 	}
 	void motorTestPoll() {
 		// FEATURE_3D follows what is known, but never mid-test: the first arm of a test reads the ESC,
@@ -539,30 +532,36 @@ private:
 		}
 		mtDtr_ = dtr;
 #endif
-		// Silence counts from the later of the last MSP and the last arm(): an arm that had to read
-		// the ESC's settings held this loop (and the configurator's queued polls) for seconds.
+		// Silence counts from the later of the last MSP and the last time this loop was held up: the
+		// drive path's reads are async now, but a sync config op (scan, read) still holds it, and the
+		// configurator's polls queue meanwhile.
 		uint32_t heard = fw_.mspMs(); if ((int32_t)(mtArmedMs_ - heard) > 0) heard = mtArmedMs_;
 		bool silent = millis() - heard > MT_TIMEOUT_MS;
 		if (silent && (mtOwned_ || fw_.motorWanted()) && !fw_.active()) motorTestStop("configurator silent");
 		if (linkGone || silent) fw_.endSession(linkGone);
-		if (!mtOwned_ && !fw_.motorWanted()) return;
+		if (!mtOwned_ && !fw_.motorWanted()) { mtLatched_ = 0; return; }
 		if (fw_.active())                              { motorTestStop("passthrough"); return; }
 		for (uint8_t ch = 0; ch < 8; ch++) {
 			int8_t e = FourWay::channel(ch);
 			if (e < 0 || e >= n_) continue;
 			uint8_t i = (uint8_t)e; Thruster* th = th_[i];
 			uint16_t v = fw_.motor(ch);
-			bool owned = mtOwned_ >> i & 1;
+			uint32_t bit = 1u << i;
+			bool owned = mtOwned_ & bit;
 			bool c3d = fw_.chThreeD(ch);
+			if (!fw_.wanted(ch)) mtLatched_ &= ~bit;                       // back at stop: may arm again
 			if (!owned) {
-				if (!fw_.wanted(ch)) continue;
-				bool idle = idle_ >> i & 1;                                   // held at zero: free to take
-				if (!idle && (escs::spinArmed(i) || escs::spinArming(i))) continue;   // the CLI has it
-				if (!idle) th->arm();
-				idle_ &= ~(1u << i); mtOwned_ |= 1u << i; mtArmedMs_ = millis();
+				if (!fw_.wanted(ch) || (mtLatched_ & bit)) continue;
+				if (escs::spinArmed(i) || escs::spinArming(i) || escs::pwmActive(i)) continue;   // the CLI has it
+				mtOwned_ |= bit;                                           // ours from the request on
+				if (!th->arm()) {
+					mtOwned_ &= ~bit; mtLatched_ |= bit;
+					console::out().printf("# motor test: ESC %u not armed (state %s)\n", i, escs::stateName(i));
+					continue;
+				}
 				console::out().printf("# motor test: arming ESC %u (%s)\n", i, th->spinMode());
-			} else if (!escs::spinArmed(i) && !escs::spinArming(i)) {   // stopped elsewhere (CLI disarm)
-				mtOwned_ &= ~(1u << i); continue;
+			} else if (!escs::spinArmed(i) && !escs::spinArming(i)) {   // stopped elsewhere (CLI disarm), or lost
+				mtOwned_ &= ~bit; mtLatched_ |= bit; continue;
 			}
 			// 1000..2000 (stop 1000) or 3D 1000..1500..2000 -> the CLI's raw units. Reverse only when the
 			// value is 3D AND the ESC is: any other pairing runs forward or not at all. 0 (a short or
@@ -583,25 +582,53 @@ private:
 		return c3d ? (v > 1500 ? 1000 + (v - 1500) * 2 : 1000) : v;
 	}
 
-	// Which ESCs are wired (escs::presentMask) and which of them run AM32 (escs::armMask), kept
-	// across reboots. Wired is set by `scan` or `escs`; AM32 is learned on every bootloader connect,
-	// and tells the passthrough how long to wait for that ESC right after a reboot.
+	// Lifecycle events from escs:: (appeared, lost, read ...) as `#` lines; dropped during a
+	// passthrough, where they would land inside the configurator's 4-way replies.
+	void eventPoll() {
+		uint8_t i; lc::Ev e; lc::State st;
+		while (escs::pollEvent(i, e, st))
+			if (!fw_.active()) console::out().printf("# esc %u: %s (%s)\n", i, lc::evName(e), lc::stateName(st));
+	}
+
+	// Refusals of a drive command. `err not-armed` stays the prefix host scripts match on; outside
+	// READY/RUNNING the state is appended (arm cannot help there until a read lands).
+	void notArmed(uint8_t i) {
+		lc::State s = escs::state(i);
+		if (s == lc::State::READY || s == lc::State::RUNNING) console::out().println("err not-armed");
+		else console::out().printf("err not-armed (state %s)\n", lc::stateName(s));
+	}
+	bool refused(uint8_t i, lc::Refuse r) {
+		if (r == lc::Refuse::OK) return false;
+		if (r == lc::Refuse::REVERSE_ONEWAY) console::out().printf("err reverse-on-one-way (ESC %u is not 3D)\n", i);
+		else notArmed(i);
+		return true;
+	}
+	static constexpr const char* BUSY = "err busy (ESC read in progress, retry)";
+	bool busy_ = false;             // a preset save met a busy FsGuard
+
+	// Which ESCs are wired (escs::presentMask), kept across reboots. Wired is set by `scan` or `escs`.
+	// Older files also carry the AM32 mask as a second word; it is ignored (the passthrough always
+	// waits the AM32 time now).
 	static constexpr const char* PRESENT_PATH = "/cfg/present";
+	uint32_t presentSave_ = 0;
+	bool     presentDirty_ = false;
 	void loadPresent() {
 		File f = LittleFS.open(PRESENT_PATH, "r");
 		if (!f) return;
-		uint32_t m = 0, a = 0;
+		uint32_t m = 0;
 		if (f.read((uint8_t*)&m, sizeof m) == sizeof m) escs::setPresent(m);
-		if (f.read((uint8_t*)&a, sizeof a) == sizeof a) escs::setArmMask(a);   // absent in older files
 		f.close();
-		armSaved_ = escs::armMask();
 		console::out().print("# escs: "); printPresent();
 	}
-	void savePresent(uint32_t m) {
-		escs::setPresent(m);
-		uint32_t a = armSaved_ = escs::armMask();
+	// RAM at once; the file once core1 is off the line (retried from poll() while an ESC read runs).
+	void savePresent(uint32_t m) { escs::setPresent(m); presentSave_ = m; presentDirty_ = true; presentPersist(); }
+	void presentPersist() {
+		if (!presentDirty_) return;
+		escs::FsGuard g;
+		if (!g.ok) return;
 		File f = LittleFS.open(PRESENT_PATH, "w");
-		if (f) { f.write((const uint8_t*)&m, sizeof m); f.write((const uint8_t*)&a, sizeof a); f.close(); }
+		if (f) { f.write((const uint8_t*)&presentSave_, sizeof presentSave_); f.close(); }
+		presentDirty_ = false;
 	}
 	void printPresent() {
 		console::out().printf("escs|%u/%u|", escs::presentCount(), n_);
@@ -614,7 +641,8 @@ private:
 	// STATUS LCD. With an ESC armed (or arming) it shows the lowest-index one in detail:
 	//   0A T 600 R 1115       index, a=arming / A=armed, DShot value sent, rpm (--- once stale > 0.5 s)
 	//   11.2V c 11  32C       EDT volts, raw current code (the AM32 fork's code x0.05 A), ESC temp
-	// otherwise every ESC's state (off / BL = in its bootloader / FL = flashing) and the mode.
+	// otherwise every ESC's lifecycle state (E empty, P pending, R reading = core1 in its bootloader,
+	// - ready, D driven, L lost, F failed, x not wired) and the mode.
 	// The text is rebuilt at 5 Hz; Lcd1602::poll() trickles the changed characters out.
 	static constexpr uint8_t LCD_D_[8] = ESC_LCD_D;
 	Lcd1602  lcd_{ESC_LCD_RS, ESC_LCD_RW, ESC_LCD_E, LCD_D_};
@@ -645,11 +673,11 @@ private:
 			else                     snprintf(r1, sizeof r1, "configurator");
 		} else {
 			int k = 0;
-			// one cell per ESC: index + state (- idle, B bootloader, F flashing, x not wired)
+			// one cell per ESC: index + lifecycle letter (a flash shows R: core1 has the pin)
 			for (uint8_t i = 0; i < n_ && k < 16; i++) {
-				bool fl = (fl_ == FL_START || fl_ == FL_RUN) && flIdx_ == i;
+				lc::State st = escs::state(i);
 				k += snprintf(r0 + k, sizeof r0 - k, "%u%c ", i,
-				              fl ? 'F' : escs::inBootloader(i) ? 'B' : escs::isPresent(i) ? '-' : 'x');
+				              !escs::isPresent(i) && st == lc::State::EMPTY ? 'x' : "EPR-DLF"[(uint8_t)st]);
 			}
 #if ESC_WIFI_STA
 			// S/D = mode, then the LAN address to point the host at; * = a TCP client is attached
@@ -670,7 +698,6 @@ private:
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
 	uint8_t         n_;          // how many
 	As5600Tracker   enc_;
-	uint32_t        armSaved_ = 0;      // escs::armMask() as last written to PRESENT_PATH
 	bool            encOff_ = false;    // an ESC signal sits on GP16/17, so the encoder stays off
 	Azimuth         az_;
 	Mode            mode_   = SETUP;
@@ -749,15 +776,20 @@ private:
 	void hRun()      { escs::release(); server_.send(200,"application/json","{\"result\":\"restarted\"}"); }
 	void hArm()      { int i=server_.arg("i").toInt();
 		if (i<0||i>=n_) { server_.send(200,"application/json","{\"ok\":false}"); return; }
+		if (fw_.active()) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"passthrough\"}"); return; }
 		escs::Drive m = escs::Drive::AUTO; String md = server_.arg("mode");
 		if (md=="normal") m=escs::Drive::NORMAL; else if (md=="bidir") m=escs::Drive::BIDIR;
-		th_[i]->arm(m);
-		String j="{\"ok\":true,\"mode\":\""; j+=th_[i]->spinMode();
+		bool ok = th_[i]->arm(m);          // false: refused (FAILED, another ESC being written) or no free PIO SM
+		String j="{\"ok\":"; j+=ok?"true":"false";
+		if (!ok && escs::armBusySession() >= 0) j+=",\"err\":\"busy\"";
+		j+=",\"mode\":\""; j+=th_[i]->spinMode();
 		j+="\",\"rev\":"; j+=th_[i]->reversible()?"true":"false"; j+="}";
 		server_.send(200,"application/json",j); }
 	void hSpin()     { int i=server_.arg("i").toInt(); int v=server_.arg("v").toInt();   // armed only
-		if (i>=0&&i<n_) th_[i]->setRaw(v);                      // RAW: setRaw picks thrust/throttle
-		server_.send(200,"application/json","{\"ok\":true}"); }
+		lc::Refuse r = (i>=0&&i<n_) ? th_[i]->setRaw(v) : lc::Refuse::STATE;   // RAW: by the ESC's identity
+		server_.send(200,"application/json", r==lc::Refuse::OK ? "{\"ok\":true}"
+			: r==lc::Refuse::REVERSE_ONEWAY ? "{\"ok\":false,\"err\":\"reverse-on-one-way\"}"
+			: "{\"ok\":false,\"err\":\"not-armed\"}"); }
 	void hRpm()      { int i=server_.arg("i").toInt(); float v=server_.arg("v").toFloat();  // closed loop
 		if (i<0||i>=n_) { server_.send(200,"application/json","{\"ok\":false}"); return; }
 		if (!th_[i]->armed()) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"not-armed\"}"); return; }
@@ -861,6 +893,8 @@ private:
 		if (!esc_flash::parseIntelHex(hexBuf_, hexLen_, img_, &perr)) {
 			String j="{\"ok\":false,\"err\":\""; j+=jesc(perr); j+="\"}"; server_.send(200,"application/json",j); return;
 		}
+		escs::FsGuard g;
+		if (!g.ok) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"busy\"}"); return; }
 		LittleFS.mkdir(FW_DIR);
 		File f = LittleFS.open(fwHex(name), "w");
 		if (!f) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"fs write failed\"}"); return; }
@@ -899,6 +933,8 @@ private:
 	}
 	void hFwDelete() {   // POST /api/fwdelete?name=<label>
 		String n = fwSafe(server_.arg("name"));
+		escs::FsGuard g;
+		if (!g.ok) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"busy\"}"); return; }
 		LittleFS.remove(fwHex(n)); LittleFS.remove(fwTag(n));
 		server_.send(200,"application/json","{\"ok\":true}");
 	}
@@ -935,11 +971,14 @@ private:
 			else if (!strcmp(cmd,"scan")) { if (pwmBusy()) continue; uint32_t m=0; for(uint8_t i=0;i<n_;i++){ escs::Info in;
 				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,Esc::pin(i));
 				else { m|=1u<<i; console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } }
+				// no telemetry means the hold cannot see a plug or a pull on that pin (docs/esc-lifecycle.md)
+				for(uint8_t i=0;i<n_;i++){ lc::Identity id=escs::identity(i);
+					if((m>>i&1) && id.known && !id.bidir) console::out().printf("# esc %u: normal DShot (no telemetry): a swap is not detected; read again after changing it\n",i); }
 				savePresent(m); printPresent(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"preset")) { if (!pwmBusy()) presetCmd(); }
-			else if (!strcmp(cmd,"idle")) { char* a=strtok(nullptr," ");   // idle [on|off]: zero-throttle hold for AM32
-				if (a && !strcmp(a,"off")) { idleOn_=false; idleStop(); } else if (a && !strcmp(a,"on")) idleOn_=true;
-				console::out().printf("idle|%s|held=%lx\n", idleOn_?"on":"off", (unsigned long)idle_); console::out().println("ok"); }
+			else if (!strcmp(cmd,"idle")) { char* a=strtok(nullptr," ");   // idle [on|off]: zero-throttle hold (also hot-plug detection)
+				if (a && !strcmp(a,"off")) escs::setHold(false); else if (a && !strcmp(a,"on")) escs::setHold(true);
+				console::out().printf("idle|%s|held=%lx\n", escs::holdActive()?"on":"off", (unsigned long)escs::heldMask()); console::out().println("ok"); }
 			else if (!strcmp(cmd,"escs")) { char* a=strtok(nullptr," ");   // escs [all | <i> <i> ...]: which are wired
 				if (a) { uint32_t m=0; bool bad=false;
 					if (!strcmp(a,"all")) m=~0u;
@@ -947,6 +986,12 @@ private:
 					if (bad) { console::out().println("err bad-index"); continue; }
 					savePresent(m); }
 				printPresent(); console::out().println("ok"); }
+			else if (!strcmp(cmd,"state")) {   // state: per ESC its lifecycle state, what is on the wire, 3D, swap note
+				for(uint8_t i=0;i<n_;i++){ lc::State st=escs::state(i); lc::Identity id=escs::identity(i);
+					bool rd = st==lc::State::READY || st==lc::State::RUNNING;
+					console::out().printf("state|%u|%s|%s|3d=%c|%s\n", i, lc::stateName(st), escs::streamProto(i),
+						!id.known ? '?' : id.rev ? 'y' : 'n', rd && id.known && !id.bidir ? "swap-not-detected" : "-"); }
+				console::out().println("ok"); }
 			else if (!strcmp(cmd,"read")) { if (pwmBusy()) continue; int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
 				if(i<0||i>=n_) console::out().println("err bad-index");
 				else if(!th_[i]->readConfig(cfg)) console::out().println("err no-connect");
@@ -988,23 +1033,30 @@ private:
 				else { console::out().print("data|"); printHex(flbuf,rl); console::out().println(); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"arm")) { int i=argi(); char* m=strtok(nullptr," ");   // arm <i> [normal|bidir]
 				if(i<0||i>=n_) console::out().println("err bad-index");
+				else if(fw_.active()) console::out().println("err busy (passthrough)");
 				else { escs::Drive md=escs::Drive::AUTO;
 					if(m&&!strcmp(m,"normal"))md=escs::Drive::NORMAL; else if(m&&!strcmp(m,"bidir"))md=escs::Drive::BIDIR;
-					th_[i]->arm(md);
+					bool ok=th_[i]->arm(md);
 					if(!th_[i]->initOk()) { console::out().println("err dshot-init-failed (no free PIO SM?)"); continue; }
-					console::out().printf("arming ~3s (mode %s, %s)\n",th_[i]->spinMode(),th_[i]->reversible()?"reversible":"one-way");
+					if(!ok && escs::armBusySession()>=0) { console::out().printf("err busy (ESC %d is being written; run it first)\n",escs::armBusySession()); continue; }
+					if(!ok) { console::out().printf("err not-ready (state %s: scan or a configurator read reads it again)\n",escs::stateName(i)); continue; }
+					// Not read yet: the arm waits for the async read (1-11 s), then the ~3 s window; a host
+					// polls `state` for RUNNING (host/pico_esc/drive.py wait_read).
+					if(escs::state(i)!=lc::State::RUNNING) console::out().printf("arming (reading first, then ~3s) (state %s)\n",escs::stateName(i));
+					else { lc::Identity id=escs::identity(i);
+						console::out().printf("arming ~3s (mode %s, %s)\n",th_[i]->spinMode(),id.rev?"reversible":"one-way"); }
 					console::out().println("ok"); } }
 			else if (!strcmp(cmd,"throttle")||!strcmp(cmd,"spin")) { int i=argi(); char* v=strtok(nullptr," ");  // 0..2000
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
-				else if(!th_[i]->armed()) console::out().println("err not-armed");
-				else { th_[i]->setRaw(atoi(v)); console::out().println("ok"); } }
+				else if(!th_[i]->armed()) notArmed(i);
+				else if(!refused(i, th_[i]->setRaw(atoi(v)))) console::out().println("ok"); }
 			else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D; full scale at +-953)
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
-				else if(!th_[i]->armed()) console::out().println("err not-armed");
-				else { th_[i]->setRaw(atoi(v)); console::out().println("ok"); } }
+				else if(!th_[i]->armed()) notArmed(i);
+				else if(!refused(i, th_[i]->setRaw(atoi(v)))) console::out().println("ok"); }
 			else if (!strcmp(cmd,"rpm")) { int i=argi(); char* v=strtok(nullptr," ");   // NEW: closed-loop velocity target (mech RPM, signed)
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
-				else if(!th_[i]->armed()) console::out().println("err not-armed");
+				else if(!th_[i]->armed()) notArmed(i);
 				else { th_[i]->setRpm(atof(v)); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"gain")) { int i=argi(); char* g=strtok(nullptr," "); char* v=strtok(nullptr," ");   // gain <i> <kp|ki|kd|dtau|trim|slew> <v>
 				if(i<0||i>=n_||!g||!v) console::out().println("err bad-args");
@@ -1214,14 +1266,18 @@ private:
 						th_[i]->vbattScale(), th_[i]->motorCrossUp(),
 						th_[i]->vc.warn_temp, th_[i]->vc.max_temp);
 					console::out().printf("cfg|stored=%d\n", settings::exists()?1:0); console::out().println("ok"); }
-				else if(!strcmp(sub,"save")) { if(settings::save(th_,n_)) { console::out().printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); console::out().println("ok"); }
+				else if(!strcmp(sub,"save")) { escs::FsGuard g;
+					if(!g.ok) console::out().println(BUSY);
+					else if(settings::save(th_,n_)) { console::out().printf("cfg|saved %u ESC(s) to %s\n", n_, settings::CFG_PATH); console::out().println("ok"); }
 					else console::out().println("err cfg-save: filesystem write failed"); }
 				else if(!strcmp(sub,"load")) { bool anyArmed=false; for(uint8_t i=0;i<n_;i++) if(th_[i]->armed()) anyArmed=true;
 					if(anyArmed) console::out().println("err cfg-load: disarm first (replaces the FF curve)");
 					else { uint16_t sv=0; int k=settings::load(th_,n_,&sv); if(k>0) { console::out().printf("cfg|restored %d ESC(s)\n", k); console::out().println("ok"); }
 						else if(sv && sv!=settings::CFG_VERSION) console::out().printf("err cfg-load: stored config is v%u, this build wants v%u — re-save\n", sv, settings::CFG_VERSION);
 						else console::out().println("err cfg-load: no valid stored config (magic/size/CRC)"); } }
-				else if(!strcmp(sub,"clear")) { if(settings::clear()) console::out().println("ok"); else console::out().println("err cfg-clear: nothing stored"); }
+				else if(!strcmp(sub,"clear")) { escs::FsGuard g;
+					if(!g.ok) console::out().println(BUSY);
+					else if(settings::clear()) console::out().println("ok"); else console::out().println("err cfg-clear: nothing stored"); }
 				else console::out().println("err bad-args (cfg [show|save|load|clear])"); }
 			// Stop-all goes through each Thruster rather than escs::spinStopAll() alone: the engine call
 			// silences the DShot frames but leaves the objects' submode / soft-sensor validity untouched,
@@ -1248,8 +1304,10 @@ private:
 				// a motor-test value means nothing until the page has said which channels are 3D
 				else if(byCh && !fw_.declared()) console::out().println("err no-mtmode");
 				else { if(!escs::pwmActive(i)){
-						if(!escs::identKnown(i)){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; }
-						th_[i]->stop(); idle_&=~(1u<<i); escs::pwmBegin(i); }
+						// checked before the stop: a refused PWM start leaves a CLI-armed ESC as it was
+						if(!escs::identity(i).known){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; }
+						th_[i]->stop();
+						if(!escs::pwmBegin(i)){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; } }
 					if (us > 3000) us = 3000;
 					if (byCh) us = pwmFromTest(i, (uint16_t)us, (uint8_t)a);              // the motor test's value, mapped per ESC
 					escs::pwmSet(i,(uint16_t)us);                             // fed like `throttle`: 500 ms deadman -> stop pulse
@@ -1320,16 +1378,18 @@ private:
 							              (long)az_.zero_raw, settings::azZeroStored()?1:0,
 							              (double)az_.heading(), az_.absolute?1:0);
 						console::out().println("ok"); }
-					else if(g && !strcmp(g,"clear")) {
-						az_.zero_raw = -1; settings::azClearZero();
-						console::out().println("ok"); }
+					else if(g && !strcmp(g,"clear")) { escs::FsGuard fg;
+						if(!fg.ok) console::out().println(BUSY);
+						else { az_.zero_raw = -1; settings::azClearZero(); console::out().println("ok"); } }
 					else if(az_.on()) console::out().println("err az: stop the loop before re-zeroing");
 					else if(!enc_.present()) console::out().println("err az: no encoder");
-					else if(!az_.setZeroHere(g?atof(g):0.0f)) console::out().println("err az: no encoder");
-					else if(!settings::azSaveZero(az_.zero_raw)) console::out().println("err az: zero not saved");
-					else { console::out().printf("az|zero|raw=%ld|head=%.2f\n",
-					                     (long)az_.zero_raw, (double)az_.heading());
-					       console::out().println("ok"); } }
+					else { escs::FsGuard fg;   // refused before the zero moves, so RAM and the file agree
+						if(!fg.ok) console::out().println(BUSY);
+						else if(!az_.setZeroHere(g?atof(g):0.0f)) console::out().println("err az: no encoder");
+						else if(!settings::azSaveZero(az_.zero_raw)) console::out().println("err az: zero not saved");
+						else { console::out().printf("az|zero|raw=%ld|head=%.2f\n",
+						                     (long)az_.zero_raw, (double)az_.heading());
+						       console::out().println("ok"); } } }
 				else if(!strcmp(sub,"on")) {
 					char* c=strtok(nullptr," "); char* g=strtok(nullptr," ");
 					if(n_<2) { console::out().println("err az: needs two ESCs"); }

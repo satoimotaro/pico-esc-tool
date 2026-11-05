@@ -9,6 +9,7 @@ the sys.exit / RuntimeError / TimeoutError messages are byte-identical.
 """
 from __future__ import annotations
 
+import re
 import sys
 import time
 
@@ -19,6 +20,9 @@ except ImportError:
     sys.exit("pyserial required:  pip install pyserial")
 
 RPI_VID = 0x2E8A
+# Lifecycle events the firmware prints on its own (`# esc 1: lost, stopped (LOST)`, esc_tool_app.h
+# eventPoll). They can land between any command and its `ok`, so they are not part of a reply.
+_EVENT = re.compile(r"^# esc \d+: ")
 
 
 def find_pico(port: str | None) -> str:
@@ -69,6 +73,8 @@ class EscHost:
                 return out
             if ln.startswith("err"):
                 raise RuntimeError(f"device: {ln}")
+            if _EVENT.match(ln):
+                continue
             out.append(ln)
         raise TimeoutError(f"no 'ok' for: {line}")
 
