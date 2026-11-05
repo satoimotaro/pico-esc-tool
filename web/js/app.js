@@ -148,6 +148,7 @@ async function readAll() {
       }
     }
     renderEscs(); renderFlash();
+    if (!st.test.on) renderTest();
   });
 }
 
@@ -294,22 +295,36 @@ async function importPresets(file) {
 // PWM (pico-esc-tool only) sends the same slider values as CLI lines, `pwmch <motor> <value>`, also
 // every 100 ms: the firmware maps each to that ESC's own pulse (a 3D ESC stops at 1500 us) and falls
 // back to the stop pulse after 500 ms without one. SET_MOTOR is not sent then: it would re-arm DShot.
-const stopValue = () => (st.threeD ? 1500 : 1000);
+// Each slider stops where ITS ESC stops: 1500 on a 3D ESC (up forward, down reverse), 1000 on a
+// one-way one. On pico-esc-tool the page knows that per motor from the ESCs it read, and tells the
+// firmware (`mtmode <mask>`) so the values mean the same thing on both sides; a Betaflight FC has one
+// 3D setting for every motor (FEATURE_3D), so there it is that.
+function motor3d(i) {   // from the last read; undefined = not read
+  const e = st.escs[i];
+  if (!e) return undefined;
+  return e.mode === MODE.ARM_BLB ? e.block[18] === 1 : (e.block[0x0B] === 3 || e.block[0x0B] === 4);
+}
+const is3d = (i) => (st.pico ? motor3d(i) ?? st.threeD : st.threeD);
+const stopOf = (i) => (is3d(i) ? 1500 : 1000);
+const unread = () => st.pico && Array.from({ length: st.motors }, (_, i) => st.escs[i]).some((e) => e === undefined);
 
 function renderTest() {
   const box = $('#sliders');
   box.replaceChildren();
-  st.test.values = Array.from({ length: 8 }, () => stopValue());
+  st.test.values = Array.from({ length: 8 }, (_, i) => stopOf(i));
+  $('#test-all').value = 0;
   for (let i = 0; i < st.motors; i++) {
-    const out = h('output', {}, String(stopValue()));
+    const stop = stopOf(i);
+    const out = h('output', {}, String(stop));
+    const known = !st.pico || motor3d(i) !== undefined;
     box.append(h('label', { class: 'slider' }, h('span', {}, `M${i + 1}`),
-      h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stopValue(), 'data-m': i, disabled: !st.test.on,
+      h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stop, 'data-m': i, disabled: !st.test.on,
         oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } }),
-      out));
+      out,
+      h('span', { class: known ? 'tag' : 'tag dim' }, (is3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込'))));
   }
-  $('#test-note').textContent = (st.threeD
-    ? '3D モード: 1500 が停止、上が正転、下が逆転です。'
-    : '1000 が停止です。少しずつ上げてください。')
+  $('#test-note').textContent = (unread() ? '開始すると、先に ESC を読んで 3D かどうかを確かめます。' : '')
+    + '少しずつ動かしてください。3D の ESC は 1500 が停止で、上が正転、下が逆転です。'
     + (pwmMode() ? ' PWM: 切り替え後 5 秒は停止パルスで待機状態に入れます。テレメトリは出ません。Bluejay は PWM を受け付けません。' : '');
 }
 
@@ -318,8 +333,14 @@ const sendLine = (line) => st.pipe.write(Array.from(new TextEncoder().encode(lin
 
 async function startTest() {
   if (!$('#test-safe').checked) { log('プロペラを外したことを確認してください', 'err'); return; }
+  if (unread()) { log('3D かどうかを確かめるため、先に ESC を読み込みます'); await readAll(); }
   await task('モーターテスト', async () => {
     await passthrough(false);
+    if (st.pico) {
+      let mask = 0;
+      for (let i = 0; i < st.motors; i++) if (is3d(i)) mask |= 1 << i;
+      await sendLine(`mtmode ${mask}`);
+    }
     st.test.on = true;
     st.test.pwm = pwmMode();
     $('#test-proto').disabled = true;
@@ -354,7 +375,7 @@ async function stopTest(why) {
   if (!st.test.on) return;
   st.test.on = false;
   clearInterval(st.test.timer);
-  st.test.values = st.test.values.map(() => stopValue());
+  st.test.values = st.test.values.map((_, i) => stopOf(i));
   $('#test-proto').disabled = false;
   if (st.pipe && st.test.pwm) {
     for (let i = 0; i < st.motors; i++) await sendLine(`pwmch ${i} stop`).catch(() => {});
@@ -519,8 +540,12 @@ function init() {
   $('#exit-pt').addEventListener('click', () => task('パススルー終了', () => passthrough(false)));
   $('#test-toggle').addEventListener('click', () => (st.test.on ? stopTest('停止ボタン') : startTest()));
   $('#test-proto').addEventListener('change', renderTest);
-  $('#test-all').addEventListener('input', (e) => {
-    document.querySelectorAll('#sliders input').forEach((s) => { s.value = e.target.value; s.dispatchEvent(new Event('input')); });
+  $('#test-all').addEventListener('input', (e) => {   // 0..1000 forward, from each motor's own stop
+    const p = +e.target.value;
+    document.querySelectorAll('#sliders input').forEach((s) => {
+      const i = +s.dataset.m;
+      s.value = stopOf(i) + (is3d(i) ? p / 2 : p); s.dispatchEvent(new Event('input'));
+    });
   });
   $('#hexfile').addEventListener('change', (e) => e.target.files[0] && loadHex(e.target.files[0]));
   $('#flash-go').addEventListener('click', flashSelected);

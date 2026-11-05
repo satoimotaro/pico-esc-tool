@@ -25,11 +25,20 @@ public:
 	// slider moves, but polls BATTERY_STATE every second while the motor panel is open.
 	uint16_t motor(uint8_t ch) const { return ch < MAX_CH ? motor_[ch] : 0; }
 	uint32_t mspMs() const { return mspMs_; }
-	bool     motorWanted() const { for (uint16_t v : motor_) if (v > stopValue()) return true; return false; }
+	bool     motorWanted() const { for (uint8_t c = 0; c < MAX_CH; c++) if (wanted(c)) return true; return false; }
 	uint16_t stopValue() const { return threeD_ ? 1500 : 1000; }
-	void     clearMotors() { for (uint16_t& v : motor_) v = 0; }
+	void     clearMotors() { for (uint16_t& v : motor_) v = 0; declSet_ = false; }
 	void     setThreeD(bool on) { threeD_ = on; }   // report FEATURE_3D (a reversible ESC is wired)
 	bool     threeD() const { return threeD_; }
+	// What a channel's value MEANS: 3D (1500 = stop) or one-way (1000 = stop). A stock configurator
+	// gets the one FEATURE_3D answer for every channel; this firmware's web page declares it per
+	// channel (`mtmode <mask>`), from the ESCs it read, until the test ends (clearMotors).
+	void     declare(uint8_t mask) { declMask_ = mask; declSet_ = true; }
+	bool     chThreeD(uint8_t ch) const { return declSet_ ? (declMask_ >> ch & 1) : threeD_; }
+	bool     wanted(uint8_t ch) const {   // a non-stop value on that channel
+		uint16_t v = motor(ch);
+		return v && (chThreeD(ch) ? v != 1500 : v > 1000);
+	}
 	// A configurator channel -> escs:: index: the wired ESCs, numbered without gaps.
 	static int8_t channel(uint8_t ch) { return ch < MAX_CH ? escs::presentIndex(ch) : -1; }
 
@@ -68,6 +77,8 @@ private:
 	uint16_t motor_[8] = {0};
 	uint32_t mspMs_ = 0;
 	bool     threeD_ = false;
+	bool     declSet_ = false;
+	uint8_t  declMask_ = 0;
 
 	// ---------------------------------------------------------------- MSP v1: $ M < len cmd data ck
 	void mspByte(uint8_t c) {

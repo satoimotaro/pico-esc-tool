@@ -501,9 +501,14 @@ private:
 		mtOwned_ = 0; fw_.clearMotors();
 	}
 	void motorTestPoll() {
-		bool reversibleWired = false;
-		for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
-		fw_.setThreeD(reversibleWired);
+		// FEATURE_3D follows what is known, but never mid-test: the first arm of a test reads the ESC,
+		// and flipping the meaning of the configurator's values then turned a one-way "1100" into
+		// nothing and a 3D "1000" (stop, as the page drew it) into full reverse.
+		if (!mtOwned_ && !fw_.motorWanted()) {
+			bool reversibleWired = false;
+			for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
+			fw_.setThreeD(reversibleWired);
+		}
 #if !ESC_CONSOLE_UART
 		bool dtr = Serial.dtr();
 		if (mtDtr_ && !dtr) {
@@ -520,15 +525,15 @@ private:
 		// the ESC's settings held this loop (and the configurator's queued polls) for seconds.
 		uint32_t heard = fw_.mspMs(); if ((int32_t)(mtArmedMs_ - heard) > 0) heard = mtArmedMs_;
 		if (millis() - heard > MT_TIMEOUT_MS)          { motorTestStop("configurator silent"); return; }
-		uint16_t stop = fw_.stopValue();
 		for (uint8_t ch = 0; ch < 8; ch++) {
 			int8_t e = FourWay::channel(ch);
 			if (e < 0 || e >= n_) continue;
 			uint8_t i = (uint8_t)e; Thruster* th = th_[i];
 			uint16_t v = fw_.motor(ch);
 			bool owned = mtOwned_ >> i & 1;
+			bool c3d = fw_.chThreeD(ch);
 			if (!owned) {
-				if (v <= stop) continue;
+				if (!fw_.wanted(ch)) continue;
 				bool idle = idle_ >> i & 1;                                   // held at zero: free to take
 				if (!idle && (escs::spinArmed(i) || escs::spinArming(i))) continue;   // the CLI has it
 				if (!idle) th->arm();
@@ -537,19 +542,21 @@ private:
 			} else if (!escs::spinArmed(i) && !escs::spinArming(i)) {   // stopped elsewhere (CLI disarm)
 				mtOwned_ &= ~(1u << i); continue;
 			}
-			// 1000..2000 (stop 1000) or 3D 1000..1500..2000 -> the CLI's raw units
+			// 1000..2000 (stop 1000) or 3D 1000..1500..2000 -> the CLI's raw units. Reverse only when the
+			// value is 3D AND the ESC is: any other pairing runs forward or not at all.
 			int raw;
-			if (th->reversible()) raw = fw_.threeD() ? (int(v) - 1500) * 2 : (v > 1000 ? (int(v) - 1000) : 0);
-			else                  raw = fw_.threeD() ? (v > 1500 ? (int(v) - 1500) * 4 : 0) : (v > 1000 ? (int(v) - 1000) * 2 : 0);
+			if (th->reversible()) raw = c3d ? (int(v) - 1500) * 2 : (v > 1000 ? (int(v) - 1000) : 0);
+			else                  raw = c3d ? (v > 1500 ? (int(v) - 1500) * 4 : 0) : (v > 1000 ? (int(v) - 1000) * 2 : 0);
 			th->setRaw(raw);
 		}
 	}
 
-	// A motor-test value (1000..2000, or 3D 1000..1500..2000 when the configurator was told 3D) as a
-	// servo pulse for ESC i, by that ESC's own direction mode — the same mapping as the DShot test.
-	uint16_t pwmFromTest(uint8_t i, uint16_t v) {
-		if (escs::knownReversible(i)) return fw_.threeD() ? v : (v > 1000 ? 1500 + (v - 1000) / 2 : 1500);
-		return fw_.threeD() ? (v > 1500 ? 1000 + (v - 1500) * 2 : 1000) : v;
+	// A motor-test value on channel ch (1000..2000, or 3D 1000..1500..2000) as a servo pulse for ESC i,
+	// by that ESC's own direction mode — the same mapping as the DShot test.
+	uint16_t pwmFromTest(uint8_t i, uint16_t v, uint8_t ch) {
+		bool c3d = fw_.chThreeD(ch);
+		if (escs::knownReversible(i)) return c3d ? v : (v > 1000 ? 1500 + (v - 1000) / 2 : 1500);
+		return c3d ? (v > 1500 ? 1000 + (v - 1500) * 2 : 1000) : v;
 	}
 
 	// Which ESCs are wired (escs::presentMask) and which of them run AM32 (escs::armMask), kept
@@ -1204,6 +1211,8 @@ private:
 			else if (!strcmp(cmd,"link")) { char* v=strtok(nullptr," ");   // link [<ms>|off] — host-link deadman, see linkWatch()
 				if(v) linkTimeoutMs_ = strcmp(v,"off") ? (uint32_t)atol(v) : 0;
 				console::out().printf("link|timeout_ms=%lu\n", (unsigned long)linkTimeoutMs_); console::out().println("ok"); }
+			else if (!strcmp(cmd,"mtmode")) { int m=argi();   // mtmode <mask>: bit c = motor-test channel c sends 3D values
+				if(m<0||m>255) console::out().println("err bad-args"); else { fw_.declare((uint8_t)m); console::out().printf("mtmode|%02x\n",m); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"pwm") || !strcmp(cmd,"pwmch")) {   // servo PWM (50 Hz) instead of DShot: pwm <i> <us|stop>
 				bool byCh = cmd[3] == 'c';                                // pwmch <motor-test channel> <us|stop> (web tool)
 				int a=argi(); int i = byCh ? (a >= 0 ? FourWay::channel((uint8_t)a) : -1) : a; char* v=strtok(nullptr," ");
@@ -1213,7 +1222,7 @@ private:
 				else { if(!escs::pwmActive(i)){ th_[i]->stop(); idle_&=~(1u<<i);
 						if(!escs::pwmBegin(i)){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; } }
 					int us = constrain(atoi(v),0,3000);
-					if (byCh) us = pwmFromTest(i, (uint16_t)us);              // the motor test's value, mapped per ESC
+					if (byCh) us = pwmFromTest(i, (uint16_t)us, (uint8_t)a);              // the motor test's value, mapped per ESC
 					escs::pwmSet(i,(uint16_t)us);                             // fed like `throttle`: 500 ms deadman -> stop pulse
 					console::out().printf("pwm|%d|%uus|%s\n",i,escs::pwmTarget(i),escs::pwmArming(i)?"arming":"armed"); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"enc")) {   // AS5600 read: enc|raw|ang|deg|md|ml|mh|agc|mag  (err if no sensor)

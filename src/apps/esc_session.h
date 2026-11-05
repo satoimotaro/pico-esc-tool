@@ -337,8 +337,11 @@ inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirect
 inline void spinThrust(uint8_t idx, int16_t s) {   // reversible (3D): -1000..+1000, 0 = stop
 	using namespace detail;
 	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;
-	if (s >  1000) s =  1000;
-	if (s < -1000) s = -1000;
+	// +-953, not +-1000: sendThrottle() adds 47 on top of the band values below, so past 953 forward
+	// already saturates at 2047 and reverse would run past 1047 into the FORWARD band (full reverse
+	// read as slow forward). Clamping both ends keeps every calibrated cmd where it was measured.
+	if (s >  953) s =  953;
+	if (s < -953) s = -953;
 	// DShot 3D throttle bands: 48..1047 = reverse (48 slow .. 1047 fast), 1048..2047 = forward
 	// (1048 slow .. 2047 fast), 0 = stop. Magnitude must map MONOTONICALLY within each band.
 	// (Old mapping used 1000+s / 1001+s: forward leaked into the reverse band for s<48, and reverse
