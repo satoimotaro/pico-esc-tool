@@ -338,11 +338,34 @@ function renderTest() {
     box.append(h('label', { class: 'slider' }, pick, h('span', {}, `M${i + 1}`),
       range,
       out,
-      h('span', { class: known ? 'tag' : 'tag dim' }, (is3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込'))));
+      h('span', { class: known ? 'tag' : 'tag dim' }, (is3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込')),
+      h('span', { class: 'mstate tag', 'data-m': i })));
   }
   $('#test-note').textContent = (unread() ? '開始すると、先に ESC を読んで 3D かどうかを確かめます。' : '')
     + '少しずつ動かしてください。3D の ESC は 1500 が停止で、上が正転、下が逆転です。'
     + (pwmMode() ? ' PWM: 切り替え後 5 秒は停止パルスで待機状態に入れます。テレメトリは出ません。Bluejay は PWM を受け付けません。' : '');
+}
+
+// pico-esc-tool says per motor whether it can move now. While its ESC is being read or armed (or does
+// not answer) the slider is held at stop and locked, so a value never waits behind an arm and lands
+// as a jump; the tag says why. 0 = the board does not say (Betaflight, older firmware): no lock.
+const UI = { 1: '読み込み中…', 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし' };
+function applyUi(codes) {
+  st.test.ui = codes;
+  if (st.test.pwm) return;
+  codes.forEach((c, i) => {
+    const range = document.querySelector(`#sliders input[type=range][data-m="${i}"]`);
+    const tag = document.querySelector(`#sliders .mstate[data-m="${i}"]`);
+    if (!range) return;
+    const locked = c === 1 || c === 2 || c === 5;
+    if (tag) { tag.textContent = c ? UI[c] || '' : ''; tag.className = `mstate tag${locked ? ' dim' : ''}`; }
+    if (!st.test.on || !picked(i)) return;
+    if (locked && !range.disabled) {
+      range.value = stopOf(i); st.test.values[i] = stopOf(i);
+      range.dispatchEvent(new Event('input'));
+    }
+    range.disabled = locked;
+  });
 }
 
 const pwmMode = () => st.pico && $('#test-proto').value === 'pwm';
@@ -421,7 +444,8 @@ function parseTele(d) {
     const q = d.slice(1 + 13 * i, 14 + 13 * i);
     if (q.length < 13) break;
     out.push({ rpm: (q[0] | q[1] << 8 | q[2] << 16) + q[3] * 0x1000000, bad: (q[4] | q[5] << 8) / 100,
-      temp: q[6], volt: (q[7] | q[8] << 8) / 100, amp: (q[9] | q[10] << 8) / 100 });
+      temp: q[6], volt: (q[7] | q[8] << 8) / 100, amp: (q[9] | q[10] << 8) / 100,
+      ui: q[12] === 0x5A ? q[11] : 0 });   // pico-esc-tool: the pin's state (escs::uiState)
   }
   return out;
 }
@@ -447,6 +471,7 @@ async function pollTele() {
       h('td', {}, r.temp ? String(r.temp) : '—'),
       h('td', { class: ok ? 'ok' : 'meta' }, ok ? '受信中' : '停止中 / 信号なし')));
   });
+  applyUi(rows.map((r) => r.ui));
   tele.hist.push({ t: now, rpm: rows.map((r) => (r.bad < 100 ? r.rpm : 0)) });
   while (tele.hist.length && now - tele.hist[0].t > tele.span) tele.hist.shift();
   drawChart(rows.length);

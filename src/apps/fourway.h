@@ -137,7 +137,14 @@ private:
 					uint16_t bad = fresh ? 0 : 10000, v = uint16_t(t.voltage * 100), a = uint16_t(t.current * 100);
 					q[0] = rpm; q[1] = rpm >> 8; q[2] = rpm >> 16; q[3] = rpm >> 24;
 					q[4] = bad; q[5] = bad >> 8; q[6] = uint8_t(t.tempC);
-					q[7] = v; q[8] = v >> 8; q[9] = a; q[10] = a >> 8; q[11] = q[12] = 0;
+					q[7] = v; q[8] = v >> 8; q[9] = a; q[10] = a >> 8;
+					// mAh (unused here) carries what the web tool's motor test can do with this ESC now,
+					// 0x5A marks it: 2 arming, 3 armed (moves at once), 4 not streaming (a move arms it,
+					// ~3 s), 5 not wired / its read failed.
+					uint8_t ui = 5;
+					if (e >= 0) ui = escs::spinArmed(e) ? 3 : escs::spinArming(e) ? 2
+					               : (escs::isPresent(e) && !escs::identFailed(e)) ? 4 : 5;
+					q[11] = ui; q[12] = 0x5A;
 				}
 				mspReply(cmd, d, 1 + 13 * n); break;
 			}
