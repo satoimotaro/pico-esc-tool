@@ -552,6 +552,7 @@ inline uint32_t heldMask() {   // pins carrying a zero stream the hold owns
 }
 inline void setPolicy(lc::Policy p) { detail::policy = p; }
 inline lc::State state(uint8_t i) { return i < COUNT ? detail::pin[i].st : lc::State::EMPTY; }
+// What a motor-test UI can do with pin i now: uiState() below (after the PWM API it reads).
 inline const char* stateName(uint8_t i) { return lc::stateName(state(i)); }
 inline lc::Identity identity(uint8_t i) { return i < COUNT ? detail::curIdent(i) : lc::Identity{}; }
 inline bool openLoop(uint8_t i) { return i < COUNT && detail::pin[i].openLoop; }   // ROV: telemetry gone
@@ -587,8 +588,11 @@ namespace detail {
 		Drive m = armMode[i];
 		if (m == Drive::AUTO) m = pin[i].id.bidir ? Drive::BIDIR : Drive::NORMAL;
 		bool wantB = m == Drive::BIDIR;
-		if (drvActive(i) && drvArmed[i] && (drvB[i] != nullptr) == wantB && drvKb[i] == kbaudOf(i) && !armMsReq[i]) {
-			drvTarget[i] = 0; drvLast[i] = millis(); stall[i].reset(); return true;    // the hold armed it already
+		// The hold's stream in that protocol is kept, armed or still arming: a new driver cuts the line,
+		// and a Bluejay that loses its signal starts over from its boot (it did, on every first slider
+		// move of a motor test that came within the hold's arm window).
+		if (drvActive(i) && (drvB[i] != nullptr) == wantB && drvKb[i] == kbaudOf(i) && !armMsReq[i]) {
+			drvTarget[i] = 0; drvLast[i] = millis(); stall[i].reset(); return true;
 		}
 		if (!drvStart(i, wantB)) { pin[i].onStop(); return false; }   // no SM: READY again, no false ARMED
 		drvArmMs[i] = armMsReq[i];   // 0 => SPIN_ARM_MS (see streamPin)
