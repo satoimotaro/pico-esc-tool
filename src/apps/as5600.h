@@ -55,12 +55,26 @@ public:
 	void poll() {
 		uint32_t now = micros();
 		if ((uint32_t)(now - last_us_) < SAMPLE_US) return;
+		// THE GAP IS THE ONE NUMBER THAT DECIDES WHETHER THE ACCUMULATOR CAN BE TRUSTED.
+		// The unwrap below folds every step into +/-2048 counts, so a gap longer than HALF A
+		// REVOLUTION of travel silently subtracts a whole turn — and it does so without any error,
+		// without `miss_`, and without changing the MEAN sample rate enough to notice. At the rates
+		// this pod reaches (measured 2500-9500 deg/s = 7-26 rev/s) half a rev is 19-72 ms, and the
+		// loop only has to stall once. `samples()/s` was already being read as proof of health on
+		// 2026-08-15 and it cannot serve: an average of 700/s is perfectly consistent with a 40 ms
+		// stall every second. Record the WORST gap, and let the caller compare it against the speed.
+		uint32_t gap = (uint32_t)(now - last_us_);
+		if (gap > max_gap_us_) max_gap_us_ = gap;
 		last_us_ = now;
 		int a = dev_.u12(0x0C);                  // RAW_ANGLE 0..4095
 		if (a < 0) { miss_++; return; }
 		present_ = true;
 		if (have_prev_) {
 			int d = ((a - prev_raw_ + 2048) & 0x0FFF) - 2048;   // signed -2048..2047
+			// How close did that step come to the +/-2048 fold? A run whose peak |d| approaches
+			// 2048 was one stall away from aliasing even if it never actually did.
+			uint16_t ad = (uint16_t)(d < 0 ? -d : d);
+			if (ad > max_step_) max_step_ = ad;
 			accum_ += d;
 		}
 		prev_raw_ = a;
@@ -90,6 +104,12 @@ public:
 	int32_t  accum()   const { return accum_; }     // unwrapped signed position (ticks, 4096/rev)
 	uint16_t raw()     const { return raw_; }
 	uint32_t samples() const { return samples_; }
+	// --- aliasing diagnostics. See the comment in poll(): the accumulator is only trustworthy while
+	// max_step stays well under the 2048-count fold, and max_gap is what puts it there.
+	uint32_t maxGapUs() const { return max_gap_us_; }
+	uint16_t maxStep()  const { return max_step_; }        // counts, worst single unwrapped step
+	uint32_t misses()   const { return miss_; }
+	void     resetDiag() { max_gap_us_ = 0; max_step_ = 0; miss_ = 0; }
 	bool     present() const { return present_; }
 	uint8_t  status()  const { return status_; }
 	uint8_t  agc()     const { return agc_; }
@@ -120,7 +140,8 @@ private:
 	volatile int32_t  accum_ = 0;
 	volatile float    rpm_ = 0.0f;
 	volatile uint16_t raw_ = 0;
-	uint32_t last_us_ = 0, lastHealth_ = 0, samples_ = 0, miss_ = 0;
+	uint32_t last_us_ = 0, lastHealth_ = 0, samples_ = 0, miss_ = 0, max_gap_us_ = 0;
+	uint16_t max_step_ = 0;
 	bool     present_ = false;
 	uint8_t  status_ = 0, agc_ = 0;
 	uint16_t mag_ = 0;

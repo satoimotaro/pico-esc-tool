@@ -13,7 +13,32 @@
 // One GPIO per ESC. Each line carries BOTH the 1-wire bootloader (config/flash) AND DShot
 // (drive/telemetry) for that ESC. List them in ESC-index order; add/remove entries to match how
 // many ESCs you wired. See construction/wiring/.
+// How many: the 1-wire bootloader is bit-banged, so any GPIO works for config/flash, and the
+// configurator passthrough (fourway.h) shows up to 8. Driving is the limit: each armed ESC holds one
+// PIO state machine for bidir DShot, and the RP2040 has 8 (the Pico W radio takes one), so about 7
+// can spin at once. Which of the listed ESCs are actually wired is learned at run time (`scan`,
+// `escs`), not set here.
+// ESC_BOARD_PANEL (env:main_panel) is the old prayer-wheel display board reused as a bench panel:
+// Pico W + SC1602 LCD + PWM1..4 headers on GP16..19. Its LCD bus takes GP5..15, so GP10/11 are not
+// free there.
+#ifndef ESC_BOARD_PANEL
+#define ESC_BOARD_PANEL   0
+#endif
+#if ESC_BOARD_PANEL
+#define ESC_SIGNAL_PINS   { 16, 17, 18, 19 }   // PWM1..PWM4
+#else
 #define ESC_SIGNAL_PINS   { 10, 11 }
+#endif
+
+// --- Status LCD (16x2 HD44780, 8-bit bus, write-only) -------------------------------------------
+// Shows each ESC's state, and for the armed one throttle / rpm / volts / current code / temp.
+#ifndef ESC_LCD
+#define ESC_LCD           ESC_BOARD_PANEL
+#endif
+#define ESC_LCD_RS        15
+#define ESC_LCD_RW        14               // held LOW: the 5 V LCD never drives the bus
+#define ESC_LCD_E         13
+#define ESC_LCD_D         { 12, 11, 10, 9, 8, 7, 6, 5 }   // D0..D7
 
 // --- Mode-select GPIO (esc_tool only) ---------------------------------------------------------
 // Read once at boot: tie LOW for DRIVE (Wi-Fi off), or leave UNCONNECTED (internal pull-up => HIGH)
@@ -21,9 +46,38 @@
 // switch anytime with the `mode` command).
 #define ESC_MODE_PIN      22
 
+// --- CLI transport -----------------------------------------------------------------------------
+// 0 = USB CDC (default; host/esctool.py on a laptop). 1 = UART0 on the pins below, for a board with
+// no USB host — the ROV's Pi, or the thrust bench's fixture Pico relaying the CLI over Wi-Fi. Same
+// line protocol either way; the `#` boot notices follow the CLI to the chosen transport.
+#ifndef ESC_CONSOLE_UART
+#define ESC_CONSOLE_UART  0
+#endif
+#define ESC_UART_TX       0                // GP0 -> peer RX
+#define ESC_UART_RX       1                // GP1 <- peer TX
+#define ESC_UART_BAUD     921600
+// The CLI is polled once per core0 loop and a flash step holds the loop, so the RX side needs more
+// than the 32-byte default to take a full 600-char command line without dropping bytes.
+#define ESC_UART_FIFO     1024
+
 // --- Wi-Fi Access Point (esc_tool SETUP mode) -------------------------------------------------
 #define ESC_AP_SSID       "pico-esc-tool"
 #define ESC_AP_PASS       "esctool1234"    // >= 8 chars (WPA2); change before real use
+
+// --- Home Wi-Fi + CLI over TCP (net_console.h) ---------------------------------------------------
+// The Pico joins the LAN as a station and serves the same CLI on ESC_TCP_PORT, next to USB:
+// host tools take `--port socket://<ip>:2323`. Needs src/apps/wifi_secrets.h (gitignored; copy
+// wifi_secrets.h.example). With it on, the web UI is served on the LAN address in SETUP mode
+// instead of from the pico-esc-tool access point, and the radio stays on in DRIVE.
+#ifndef ESC_WIFI_STA
+#if ESC_BOARD_PANEL && __has_include("wifi_secrets.h")
+#define ESC_WIFI_STA      1
+#else
+#define ESC_WIFI_STA      0
+#endif
+#endif
+#define ESC_TCP_PORT      2323
+#define ESC_HOSTNAME      "pico-esc"
 
 // --- DShot / motor ----------------------------------------------------------------------------
 #define ESC_DSHOT_KBAUD   300              // DShot bitrate in kbaud  [TEST: A_H_30 ESCs may need 300, not 600]

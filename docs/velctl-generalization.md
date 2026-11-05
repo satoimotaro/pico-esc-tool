@@ -1,8 +1,13 @@
 # BlueGill velocity control & generalization — design spec
 
-Status: DRAFT for review (2026-07-17). Turns the "don't make the ESC a per-motor special" goal into a
-concrete layered design. Companion to `ESC-firmware/docs/sine-drive-design.md` and the current-state
-memory. Terms: **mech RPM** = mechanical; **eRPM** = electrical (mech × pole_pairs); on this stack the
+>  **STATUS: HISTORICAL (frozen 2026-07-17).** This is the design spec that shaped the architecture, kept
+>  for the *why*. It is **not** a description of current behaviour and its numbers are not current — for
+>  that read [`README.md`](README.md), the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one) and
+>  [`velocity-control.md`](velocity-control.md). Its principles held up; its open questions are answered
+>  at the foot of this file.
+
+Turns the "don't make the ESC a per-motor special" goal into a concrete layered design. Companion to
+`ESC-firmware/docs/sine-drive-design.md` and the current-state memory. Terms: **mech RPM** = mechanical; **eRPM** = electrical (mech × pole_pairs); on this stack the
 `tele` line is ALREADY mechanical (firmware divides eRPM by pole pairs).
 
 ## 1. Goals & principles
@@ -193,11 +198,27 @@ verification harness + calibration tool** (same stack autocal uses). So:
   KV=300 motor, re-test the down-catch (3× BEMF should resolve the over-commutation) and set `down_catch`
   per result. Load-independent electrical params → per-model profile (reusable, encoder removed after).
 
-## 8. Open questions / decisions for the review
-1. velctl gain scheduling: single PI with regime blend, or separate low/high controllers?
-2. FF seed source when a profile has no measured curve yet: pure spec-computed (KV×V×duty) acceptable?
-3. Profile identity/selection: match by `motor.model` string, or an explicit `--profile` at setup?
-4. Where does the regime blend live — velctl (host/Pico) knowledge of the crossover band, or a signal
-   from the ESC (e.g. tele going live) as the regime indicator? (Prefer: tele-live as the 6-step signal.)
-5. Do we keep the down-catch firmware in-tree (config-gated, off by default) pending the KV=300 test, or
-   leave it out until proven?
+## 8. Open questions — ANSWERED by the work that followed
+
+Kept with their answers, because the answers are the interesting part.
+
+1. *Gain scheduling: single PI with regime blend, or separate controllers?* → **Single PI, gated.** The
+   firmware `VelocityController` fades PI trim by telemetry liveness, and the host adds regime/settle
+   gates (`fb_floor`/`fb_band`, `err_band`). Aggressive PI near the crossover is dangerous: it collapsed
+   an 800 rpm target to 158 rpm at no load.
+2. *FF seed with no measured curve — is spec-computed `KV*V*duty` acceptable?* → **Yes.** `MotorModel(kv,
+   pp, v)` predicts the curve to ~12 rpm RMSE from KV alone, ~6 rpm after a one-scalar eRPM self-cal.
+   That is the shipped parametric path.
+3. *Profile identity: match by `motor.model`, or explicit `--profile`?* → **Explicit `--profile`**, and
+   this turned out to matter: the default is still a sim-derived 930 KV profile on a 350 KV bench (see
+   the hazard section in [`velocity-control.md`](velocity-control.md)).
+4. *Where does the regime blend live — velctl's knowledge of the band, or a signal from the ESC?* →
+   **Neither, as originally framed.** "tele going live" is not usable as the regime indicator, because
+   below the seam `tele` is a *constant 182 rpm* rather than absent — it lies rather than staying quiet.
+   The validity decision is therefore keyed on the **command**, whose seam is derived from the configured
+   `cross_up` (`vel::SenseGate`, `lib/vel_control/sense_gate.h`). This is the one question whose premise
+   the measurements overturned.
+5. *Keep the down-catch firmware in-tree pending the KV=300 test?* → **Moot for the forward path.** The
+   down handoff does not stall on the 350 KV bench (1048→175 rpm, no stall, 3/3, both mechanical
+   configurations), so the historical "cross_dn stalls the motor" failure does not reproduce in this
+   configuration. Reverse remains unproven.

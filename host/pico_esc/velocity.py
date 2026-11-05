@@ -56,6 +56,21 @@ from .drive import Aborted
 # kp~0.03, ki~0.12, trim_max~400. Gains are plant-dependent, like the speed curve itself, so they
 # live PER-PROFILE; these defaults only apply when a profile omits `control`.
 DEFAULT_GAINS = {"kp": 0.4, "ki": 1.5, "trim_max": 200.0, "blend_secs": 0.3}
+# Below this the profile's forward prediction carries no information worth checking a measurement
+# against: it is the curve's low-command region, where the segment resolution and the ESC's telemetry
+# floor are the same size as the prediction. Mirrors vel::TRACK_MIN_PREDICTED_RPM.
+TRACK_MIN_PREDICTED_RPM = 100.0
+# Fraction of the profile's own forward prediction the measurement must reach before the PI is
+# allowed to gain authority. Mirrors vel::VelocityController::track_min_frac; see it for the whole
+# argument. 0 disables the test and restores the pre-2026-08-01 liveness-only behaviour.
+DEFAULT_TRACK_MIN_FRAC = 0.25
+# Consecutive over-threshold LIVE FRAMES before the over-speed abort fires. Mirrors
+# vel::OVERSPEED_READINGS. One garbled frame stopped a healthy thruster on the bench
+# (steptrace_20260801_114818 run 6: a frame read 12045 mech rpm against a true ~3900, the auto
+# threshold 2*maxRpm = 11235 was exceeded, and the ~1000 dead frames after it are the CONSEQUENCE of
+# the disarm, not its cause). This loop drives the same hardware through velctl, so it is equally
+# exposed and gets the same debounce.
+OVERSPEED_READINGS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +173,34 @@ class SpeedProfile:
                 frac = (a - r0) / (r1 - r0)
                 return sign * (t0 + frac * (t1 - t0))
         return sign * pts[-1][0]                  # unreachable (guarded above)
+
+    # -- forward map: signed ESC command -> mech RPM (the inverse of thrust_for) --
+    def rpm_for(self, thrust):
+        """Mech RPM the curve says a command SHOULD produce. Mirrors vel::SpeedProfile::rpmFor().
+
+        Added for the controller's CORROBORATION gate (see VelocityController.track_min_frac): the
+        only way to ask "is this measurement consistent with the plant we think we are driving" is to
+        have the curve's own prediction for the command we actually sent.
+
+        The C++ mirror additionally SNAPS across a seam-straddling segment rather than interpolating
+        an rpm the plant cannot hold; this one interpolates, because a Python SpeedProfile carries no
+        per-point regime tags to identify that segment. The difference is bounded by the height of the
+        seam jump and only matters INSIDE the gap, where the corroboration test is a ratio with a 4x
+        margin — but it is a real difference between the two, so it is written down rather than
+        assumed away."""
+        sign = -1.0 if thrust < 0 else 1.0
+        a = abs(float(thrust))
+        pts = self.points
+        if a <= pts[0][0]:
+            return sign * pts[0][1]
+        if a >= pts[-1][0]:
+            return sign * pts[-1][1]
+        for (t0, r0), (t1, r1) in zip(pts, pts[1:]):
+            if t0 <= a <= t1:
+                if t1 == t0:
+                    return sign * r0
+                return sign * (r0 + (a - t0) / (t1 - t0) * (r1 - r0))
+        return sign * pts[-1][1]                  # unreachable (guarded above)
 
     @property
     def max_rpm(self):
@@ -294,13 +337,17 @@ class VelocityController:
     def __init__(self, esc, profile, *, kp=DEFAULT_GAINS["kp"], ki=DEFAULT_GAINS["ki"],
                  trim_max=DEFAULT_GAINS["trim_max"], blend_secs=DEFAULT_GAINS["blend_secs"],
                  tele_period=DT, over_speed_rpm=None, stall_secs=1.0, slew_rpm_s=200.0,
-                 max_temp=80.0, max_secs=30.0, use_encoder=False, enc_sign=1, stop_below_rpm=0.0):
+                 max_temp=80.0, max_secs=30.0, use_encoder=False, enc_sign=1, stop_below_rpm=0.0,
+                 track_min_frac=DEFAULT_TRACK_MIN_FRAC):
         self.esc = esc
         self.profile = profile
         self.kp = float(kp)
         self.ki = float(ki)
         self.trim_max = float(trim_max)
         self.blend_secs = float(blend_secs)
+        # AUTHORITY REQUIRES CORROBORATION — see the class docstring and vel_control.h's
+        # track_min_frac, which carries the full argument and the bench numbers.
+        self.track_min_frac = float(track_min_frac)
         self.tele_period = float(tele_period)
         # over-speed net (live tele only): default clears twice the curve's top speed (and a 1200
         # floor so a tiny-range curve still has headroom); an explicit value overrides.
@@ -327,7 +374,10 @@ class VelocityController:
         self._w = 0.0               # PI authority weight, 0..1 (faded with tele liveness)
         self._tele_mech = None      # last LIVE measured mech RPM (signed to the setpoint), else None
         self._live = False          # last telemetry poll was a live 6-step frame
+        self._corroborated = True   # ...and that frame was consistent with the curve's own prediction
+        self._last_sent = 0         # the command the current measurement is a response to
         self._stale_since = None    # time tele first went stale while commanding into "line"
+        self._over_speed_readings = 0   # consecutive live frames over the over-speed threshold
         self._pending = None        # a staged set_speed target (down-catch through ~0)
         self._last_sign = 1.0       # last non-zero setpoint sign (for signing a tele MAGNITUDE at sp==0)
 
@@ -485,6 +535,8 @@ class VelocityController:
                 self._i = 0.0
                 self._w = 0.0
                 self._live = False
+                self._corroborated = True
+                self._last_sent = 0
                 self._pending = None
                 self._stale_since = None
                 sent = self.esc.thrust(0)
@@ -537,10 +589,23 @@ class VelocityController:
                         raise Aborted(f"over-temperature: ESC {temp}C >= --max-temp "
                                       f"{self.max_temp:.0f}C — lower speed / cool down")
 
-            # -- PI authority (w) fades with tele liveness: 0->1 while live, 1->0 while stale, over
-            #    blend_secs. On w==0 reset the integrator so a re-arm from below the seam starts clean. --
+            # -- PI authority (w) fades with tele liveness AND CORROBORATION: 0->1 while a live frame
+            #    is also consistent with the plant we think we are driving, 1->0 otherwise, over
+            #    blend_secs. On w==0 reset the integrator so a re-arm from below the seam starts clean.
+            #
+            #    Corroboration compares the measurement against the curve's forward prediction for the
+            #    command we ACTUALLY SENT last tick. Two deliberate escapes: the first tick has sent
+            #    nothing, and any prediction below TRACK_MIN_PREDICTED_RPM is in the curve's own
+            #    low-command region. Both mean "no information", and no information must not withdraw
+            #    authority — only a prediction we can check, and fail, does. Mirrors vel_control.h. --
+            self._corroborated = True
+            if self._live and self.track_min_frac > 0.0:
+                predicted = self.profile.rpm_for(self._last_sent)
+                if abs(predicted) > TRACK_MIN_PREDICTED_RPM:
+                    self._corroborated = (abs(self._tele_mech)
+                                          >= self.track_min_frac * abs(predicted))
             rate = dt / self.blend_secs if self.blend_secs > 0 else 1.0
-            if self._live:
+            if self._live and self._corroborated:
                 self._w = min(1.0, self._w + rate)
             else:
                 self._w = max(0.0, self._w - rate)
@@ -553,6 +618,7 @@ class VelocityController:
             applied = self._w * trim
             cmd = ff + applied
             sent = self.esc.thrust(cmd)
+            self._last_sent = sent          # what the NEXT tick's measurement is a response to
 
             # -- back-calculation anti-windup on the OUTER ESC tmax clamp: if the ESC clamped the
             #    command, fold the trim the ESC ACTUALLY delivered back into the integrator so a
@@ -571,10 +637,20 @@ class VelocityController:
                     self._i = max(-self.trim_max, min(self.trim_max, unblended - self.kp * err))
 
             # -- safety guards on the LIVE measurement (never on the profile/crossover config) --
-            if self._live and abs(self._tele_mech) > self.over_speed_rpm:
-                self.esc.thrust(0)
-                raise Aborted(f"over-speed: |tele|={abs(self._tele_mech):.0f} RPM > "
-                              f"{self.over_speed_rpm:.0f} — lower speed / check the curve")
+            # DEBOUNCED over OVERSPEED_READINGS consecutive live frames — see the constant. The counter
+            # advances only on a live frame (so it counts FRAMES, not loop iterations); a live frame
+            # under the threshold clears it; a dropout HOLDS it, because absence of telemetry is not
+            # evidence the rotor slowed down, and the stall guard below owns the dropout case.
+            if self._live:
+                if abs(self._tele_mech) > self.over_speed_rpm:
+                    self._over_speed_readings += 1
+                    if self._over_speed_readings >= OVERSPEED_READINGS:
+                        self.esc.thrust(0)
+                        raise Aborted(f"over-speed: |tele|={abs(self._tele_mech):.0f} RPM > "
+                                      f"{self.over_speed_rpm:.0f} on {OVERSPEED_READINGS} consecutive "
+                                      f"frames — lower speed / check the curve")
+                else:
+                    self._over_speed_readings = 0
             # stall: the setpoint is at/above the profile's genuinely 6-step-REACHABLE floor (so we
             # EXPECT live telemetry) yet the loop is still commanding into that region (the trim
             # hasn't backed the command off) and telemetry never went live -> the ESC failed to reach

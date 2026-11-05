@@ -26,29 +26,41 @@ from __future__ import annotations
 import argparse
 import json
 
-from pico_esc.motor_model import DUTY6_A, DUTY6_B
+from pico_esc.motor_model import duty6
 
 
-def duty(cmd):
-    d = DUTY6_A * abs(cmd) + DUTY6_B
+def duty(cmd, cross_up):
+    """Effective 6-step duty. `cross_up` is REQUIRED — deliberately no default.
+
+    The shape constants were fitted at Cross_Up 34, and the ESC's `cross_rescale_duty` shifts the duty
+    by ~0.042 per unit. Leaving it defaulted on a bench running 36 makes V_eff read ~0.6 % high at
+    cmd 780 and ~44 % high at cmd 570 — and the load/droop numbers below then absorb that model error
+    as if it were physics. That is exactly what happened: `sim_obs.py` imported this function bare and
+    silently modelled a different ESC than the hardware it was validated against. A default here is a
+    silent 20-40 % error, so callers must say which ESC they mean and a TypeError is the correct
+    answer when they do not."""
+    d = duty6(cmd, cross_up)
     return d if d > 0 else 0.0
 
 
-def estimate(kv, pp, samples):
+def estimate(kv, pp, samples, cross_up):
     """samples = [(cmd, rpm_mech), ...] in the 6-step region. Returns a dict with V_eff (least-squares
-    scale), per-point V, the load-droop residual trend, and a crude load coefficient (rpm^2 fit)."""
-    pts = [(c, r) for c, r in samples if duty(c) > 0.02 and abs(r) > 100]
+    scale), per-point V, the load-droop residual trend, and a crude load coefficient (rpm^2 fit).
+
+    `cross_up` is REQUIRED for the same reason `duty()` requires it: every duty below is the ESC's, and
+    which ESC config it is changes the answer by tens of percent."""
+    pts = [(c, r) for c, r in samples if duty(c, cross_up) > 0.02 and abs(r) > 100]
     if len(pts) < 2:
         return {"error": "need >=2 six-step points"}
     pts.sort(key=lambda cr: abs(cr[1]))   # [#7.2] ascending rpm so resid[-1] IS the max-duty top point
                                           # (offline JSON is unsorted; the load_present test uses max(duty))
     # least-squares scale: rpm = s * (KV*duty) => s = <rpm, base> / <base, base>
-    num = sum(abs(r) * (kv * duty(c)) for c, r in pts)
-    den = sum((kv * duty(c)) ** 2 for c, r in pts)
+    num = sum(abs(r) * (kv * duty(c, cross_up)) for c, r in pts)
+    den = sum((kv * duty(c, cross_up)) ** 2 for c, r in pts)
     v_eff = num / den if den else 0.0
-    per_point_v = [(c, abs(r) / (kv * duty(c))) for c, r in pts]
+    per_point_v = [(c, abs(r) / (kv * duty(c, cross_up))) for c, r in pts]
     # residual (measured - no-load prediction at v_eff): a downward trend growing with rpm = load
-    resid = [(abs(r), abs(r) - v_eff * kv * duty(c)) for c, r in pts]   # (rpm, residual)
+    resid = [(abs(r), abs(r) - v_eff * kv * duty(c, cross_up)) for c, r in pts]   # (rpm, residual)
     # crude load coeff: fit residual ~ -k_load * rpm^2  (least squares through origin)
     n2 = sum(-e * (rp * rp) for rp, e in resid)
     d2 = sum((rp * rp) ** 2 for rp, e in resid)
@@ -57,7 +69,9 @@ def estimate(kv, pp, samples):
     return {"v_eff": v_eff, "per_point_v": per_point_v,
             "v_spread": (max(v for _, v in per_point_v) - min(v for _, v in per_point_v)),
             "k_load_rpm2": k_load, "droop_top_rpm": droop_hi,
-            "load_present": abs(droop_hi) > 0.05 * (v_eff * kv * max(duty(c) for c, _ in pts))}
+            "cross_up": cross_up,
+            "load_present": abs(droop_hi) > 0.05 * (v_eff * kv * max(duty(c, cross_up)
+                                                                    for c, _ in pts))}
 
 
 def cmd_estimate(kv, pp, opts):
@@ -67,7 +81,7 @@ def cmd_estimate(kv, pp, opts):
         samples = [(p["thrust"], p["rpm"]) for p in data["curve"] if p.get("rpm")]
     else:
         samples = [(c, r) for c, r in data]
-    res = estimate(kv, pp, samples)
+    res = estimate(kv, pp, samples, opts.cross_up)
     _report(res, kv)
 
 
@@ -103,19 +117,19 @@ def cmd_measure(kv, pp, opts):
         try: esc.disarm()
         except Exception: pass
         host.close()
-    res = estimate(kv, pp, samples)
+    res = estimate(kv, pp, samples, opts.cross_up)
     _report(res, kv, opts.v0)
 
 
 def _report(res, kv, v_known=None):
     if "error" in res:
         print("!! " + res["error"]); return
-    print(f"\n=== soft-sensor estimate (KV={kv:g}) ===")
+    print(f"\n=== soft-sensor estimate (KV={kv:g}, cross_up={res.get('cross_up')}) ===")
     print(f"  V_eff (supply x motor-eff) = {res['v_eff']:.2f} V   (per-point spread {res['v_spread']:.2f} V)")
     if v_known:
         print(f"    known supply {v_known:.1f} V -> implied eff {res['v_eff']/v_known:.3f} "
               f"(load/IR pulls this below 1)")
-    print(f"  per-point V:  " + "  ".join(f"{v:.1f}" for _, v in res['per_point_v']))
+    print("  per-point V:  " + "  ".join(f"{v:.1f}" for _, v in res['per_point_v']))
     print(f"  load signature: droop@top {res['droop_top_rpm']:+.0f} rpm, k_load {res['k_load_rpm2']:.2e} /rpm^2"
           f"  -> {'LOAD detected' if res['load_present'] else '~no load'}")
 
@@ -128,6 +142,10 @@ def main(argv=None):
     ap.add_argument("--port")
     ap.add_argument("--enc-sign", type=int, default=-1, choices=(-1, 1))
     ap.add_argument("--tmax", type=int, default=700)
+    ap.add_argument("--cross-up", type=float, required=True,
+                    help="the ESC's sine_cross_up. REQUIRED: it shifts the 6-step duty by ~0.042 per "
+                         "unit, so guessing it is a 20-40%% error in V_eff and the load estimate "
+                         "(read it with `esctool.py dump`)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("estimate"); e.add_argument("--data", required=True)
     m = sub.add_parser("measure")

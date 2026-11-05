@@ -73,7 +73,7 @@ def run(opts):
             # stall guard: expect the motor to actually be turning in 6-step
             if rpm < opts.stall_rpm:
                 print(f"  cmd={cmd}: rpm {rpm:.0f} < stall floor {opts.stall_rpm} — aborting (desync?)"); break
-            d = softsensor.duty(cmd)
+            d = softsensor.duty(cmd, opts.cross_up)
             vest = rpm / (opts.kv * d) if d > 0.02 else 0.0
             samples.append((cmd, rpm))
             rows.append({"cmd": cmd, "rpm": rpm, "rpm_std": statistics.pstdev(vs),
@@ -90,7 +90,7 @@ def run(opts):
 
     if len(samples) < 2:
         print("# too few points to characterize."); return
-    est = softsensor.estimate(opts.kv, opts.pp, samples)
+    est = softsensor.estimate(opts.kv, opts.pp, samples, opts.cross_up)
     # supply estimate = the lightest-load (lowest rpm^2, i.e. highest V_eff) point
     v_supply = max(r["vest"] for r in rows)
     print("\n# ==== observer characterization ====")
@@ -99,7 +99,7 @@ def run(opts):
     print(f"# V_eff spread across the sweep  = {est.get('v_spread', 0):.2f} V   (droop range = load signal)")
     print(f"# load coeff  k_load (~rpm^2)    = {est.get('k_load_rpm2', 0):.3e}")
     print(f"# load_present flag              = {est.get('load_present')}")
-    model = {"motor": opts.motor, "kv": opts.kv, "pp": opts.pp,
+    model = {"motor": opts.motor, "kv": opts.kv, "pp": opts.pp, "cross_up": opts.cross_up,
              "v_supply_est": v_supply, "v_eff_ls": est.get("v_eff"),
              "k_load_rpm2": est.get("k_load_rpm2"), "points": rows}
     with open(opts.out, "w") as f:
@@ -125,6 +125,10 @@ def main():
     ap.add_argument("--stall-rpm", type=float, default=300.0, help="abort a level below this mech rpm")
     ap.add_argument("--max-secs", type=float, default=40.0, help="hard total-run cap (conservative)")
     ap.add_argument("--esc-index", type=int, default=1)
+    ap.add_argument("--cross-up", type=float, required=True,
+                    help="the ESC's sine_cross_up (read it with `esctool.py dump`). REQUIRED: it "
+                         "shifts the 6-step duty by ~0.042/unit, and every V_eff/droop number below "
+                         "is computed from that duty, so a wrong one is charged to 'load'")
     ap.add_argument("--port", default=None)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "models", "obschar_f2838_350kv.json"))

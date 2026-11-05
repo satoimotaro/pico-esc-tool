@@ -39,13 +39,26 @@ def _pctl(xs, q):
 
 
 def _sense(dev, idx):
+    """(vest, valid) from the `sense` line, or None if there was no usable line at all.
+
+    `vest` comes back as the literal `n/a` when the validity window is shut — the firmware prints it
+    that way so "no reading" stops looking like the number 0.00 (docs/soft-sensor.md). That is NOT a
+    parse failure, so it lands as NaN and lets the caller's own gate reject it: `vest > 0` is False on
+    a NaN. Keeping the two apart matters because None means "the Pico said nothing", which is a
+    different fault from "the motor is not in 6-step yet".
+    """
     for ln in _cmd(dev, f"sense {idx}"):
         if ln.startswith("sense|"):
             f = {kv.split("=")[0]: kv.split("=")[1] for kv in ln.split("|")[2:] if "=" in kv}
             try:
-                return float(f["vest"]), int(f["valid"])
+                valid = int(f["valid"])
             except (KeyError, ValueError):
                 return None
+            try:
+                vest = float(f["vest"])
+            except (KeyError, ValueError):
+                vest = float("nan")
+            return vest, valid
     return None
 
 

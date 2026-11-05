@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESC Web Configurator</title>
+<meta name="description" content="BLHeli_S / Bluejay / BlueGill / AM32 ESC の設定・プリセット・モーターテスト・ファーム書き込みをブラウザから。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>ESC Web Configurator</h1>
+  <span id="conn">未接続</span>
+  <button id="connect" class="primary">接続</button>
+</header>
+<nav>
+  <button data-tab="settings" class="active">ESC 設定</button>
+  <button data-tab="presets">プリセット</button>
+  <button data-tab="test">モーターテスト</button>
+  <button data-tab="flash">ファーム書き込み</button>
+  <button data-tab="help">使い方</button>
+</nav>
+<main>
+  <section id="settings">
+    <div class="bar">
+      <button id="read" class="primary needs-conn">ESC を読み込む</button>
+      <button id="write-sel" class="needs-conn">選択した ESC の変更を書き込む</button>
+      <button id="exit-pt" class="needs-conn">パススルー終了</button>
+    </div>
+    <div id="escs"></div>
+  </section>
+
+  <section id="presets" hidden>
+    <p class="hint">組み込みのプリセットは、実機で回せたときの設定です。出どころと測定結果は
+      pico-esc-tool の <code>docs/motor-settings.md</code> にあります。
+      ESC 設定タブで「今の値をプリセットに保存」すると、このブラウザに保存されます。</p>
+    <div class="bar">
+      <button id="preset-export">保存したプリセットを書き出す (JSON)</button>
+      <label class="button">JSON を読み込む <input id="preset-import" type="file" accept=".json,application/json" hidden></label>
+    </div>
+    <div id="preset-list"></div>
+  </section>
+
+  <section id="test" hidden>
+    <p class="warn">⚠ プロペラを外すか、モーターを固定してから使ってください。Esc キー / スペースキーでいつでも全停止します。
+      タブを移る・ページを隠す・接続が切れると止まります。</p>
+    <label><input type="checkbox" id="test-safe"> プロペラを外した / 固定した</label>
+    <div class="bar">
+      <button id="test-toggle" class="primary needs-conn">開始</button>
+      <label class="slider" title="チェックしたモーターだけ動きます">全体 (正転) <input type="range" id="test-all" min="0" max="1000" step="5" value="0"></label>
+      <label id="test-proto-box" hidden>出力 <select id="test-proto">
+        <option value="dshot">DShot</option>
+        <option value="pwm">PWM 50 Hz (AM32 / BLHeli_S)</option>
+      </select></label>
+    </div>
+    <p id="test-note" class="hint"></p>
+    <div class="test-grid">
+      <div>
+        <div id="sliders"></div>
+        <h3>テレメトリ <span class="meta">(双方向 DShot のときだけ。5 Hz)</span></h3>
+        <table id="tele"><thead><tr><th>モーター</th><th>指令</th><th>回転数 rpm</th><th>電圧 V</th><th>電流 A</th><th>温度 °C</th><th>状態</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="test-chart">
+        <canvas id="rpm-chart"></canvas>
+        <div id="rpm-legend" class="meta"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="flash" hidden>
+    <p class="hint">HEX ファイルはローカルから選びます:
+      <a href="https://github.com/bird-sanctuary/bluejay/releases">Bluejay</a> ·
+      <a href="https://github.com/am32-firmware/AM32/releases">AM32</a>。
+      レイアウト (例 <code>#A_H_30#</code>) と MCU が ESC と一致しないものは、強制しない限り書き込みません。</p>
+    <div class="bar">
+      <input type="file" id="hexfile" accept=".hex,.HEX">
+      <label><input type="checkbox" id="flash-migrate" checked> 設定を引き継ぐ</label>
+      <label><input type="checkbox" id="flash-force"> 不一致でも強制する (危険)</label>
+      <button id="flash-go" class="primary needs-conn">選択した ESC に書き込む</button>
+    </div>
+    <div id="flash-escs"></div>
+  </section>
+
+  <section id="help" hidden>
+    <h2>使い方</h2>
+    <ol>
+      <li>PC の Chrome か Edge で開きます (Web Serial を使います)。</li>
+      <li>pico-esc-tool の Pico、または Betaflight のフライトコントローラーを USB でつなぎ、「接続」を押してポートを選びます。ESC の電源も入れておきます。</li>
+      <li>「ESC を読み込む」で、各 ESC がブートローダーに入り設定を読みます (1 個あたり数秒)。</li>
+      <li>値を変えるかプリセットを反映し、「書き込む」を押します。書いたあと読み戻して照合します。</li>
+      <li>モーターテストに移るとパススルーを抜けます (ESC が再起動します)。</li>
+    </ol>
+    <h2>対応</h2>
+    <ul>
+      <li>BLHeli_S 16.x、Bluejay (0.9〜0.22 系)、BlueGill、AM32 (eeprom 版 2 以上)。BLHeli_32 と Atmel は非対応。</li>
+      <li>ファーム書き込みは SiLabs の 512 バイトページ品 (EFM8BB1/BB2 など) と AM32。</li>
+    </ul>
+    <p class="meta">GPL-3.0 · <a href="https://github.com/satoimotaro/pico-esc-tool">pico-esc-tool</a></p>
+  </section>
+</main>
+<footer><div id="log"></div></footer>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

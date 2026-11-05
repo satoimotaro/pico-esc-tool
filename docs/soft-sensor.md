@@ -33,25 +33,116 @@ V_eff = rpm / (KV · duty(cmd)) = V_supply − I·R / duty
    ```
    motor <i> <kv> <pp> <v>        # e.g. motor 1 350 7 11.1  (must disarm first; validated kv>0 pp>=1 v>0)
    ```
-2. Spin it **in 6-step** (a real RPM target, closed loop): `rpm <i> <target>`. Below the sine↔6-step
-   crossover the sample is invalid (`valid=0`).
+2. Spin it **in 6-step** (a real RPM target, closed loop): `rpm <i> <target>`. Anywhere outside the
+   validity window below — and that is stricter than "above the crossover" — the sample is invalid
+   (`valid=0`, with `why=` naming the condition).
 
 ## The `sense` command
 
 ```
-sense <i>            -> sense|<i>|vest=<V>|vref=<V>|load=<V>|valid=<0|1>
-sense <i> zero       -> baseline the no-load reference at the current vest (errors if not BEMF-live)
+sense <i>            -> sense|<i>|vest=<V|n/a>|vref=<V|n/a>|load=<V|n/a>|vbatt=<V|n/a>|valid=<0|1>|floor=<rpm>
+                        |dhat=<rpm>|settled=<0..1>|trim=<cmd units>|cmd=<int>
+                        |why=<str>|cmdfloor=<cmd>|loadok=<0|1>|vbok=<0|1>
+                        |temp=<C>|tpeak=<C>|tlim=<0..1>|tstate=<str>
+sense <i> zero       -> baseline the reference at the current vest, and record the command it was
+                        taken at (refused unless the validity window is open — `why=` says why not)
+sense <i> vcal <V>   -> calibrate vbatt to a known battery voltage (needs the light-load tier, `vbok`)
 ```
+
+New keys are always **appended**; the prefix and the existing key order are a contract with the host
+tools (`host/driftsoak.py`, `host/vbatt.py`, `host/loadtest.py`), pinned by
+`host/tests/test_sense_line.py`.
+
+### `n/a` — the four gated fields have no zero
+
+`vest`, `vref`, `load` and `vbatt` each print the literal **`n/a`** when they have no reading, and a
+number only when they do. They used to print `0.00` in both cases, and that is unreadable: **every one
+of those zeros is also a plausible measurement** — 0 V is a dead supply, 0 V of droop is an unloaded
+prop. On 2026-08-18 a `vbatt=0.00` from a motor that simply was not spinning was quoted on the bench as
+evidence the supply was off; `valid=0` and `vbok=0` sat in the same line and were not read, because a
+field that reads as a number gets believed on its own. Each field has its own condition:
+
+| field | reads a number only when |
+|---|---|
+| `vest`  | the validity window is open (`valid=1`) |
+| `vref`  | `sense <i> zero` has run this arm |
+| `load`  | both of the above, **and** `loadok=1` (still near the point the reference was captured at) |
+| `vbatt` | the light-load tier has opened at least once this arm (`vbok`) — it only advances while the motor SPINS |
+
+Everything else on the line (`dhat`, `trim`, `cmd`, `temp`…) is a live number whose zero **is** a
+measurement, so those stay numeric. Hosts parse `key=value`, so no key moved — but a host that
+`float()`s these must tolerate a non-number (`_f()` in `host/driftsoak.py` and `host/loadtest.py`).
 
 | field   | meaning |
 |---------|---------|
-| `vest`  | low-passed `V_eff` estimate (gated to live 6-step). ≈ supply at light load, *before* calibration it may be biased (see below). |
-| `vref`  | the **learned no-load reference**, captured by `sense <i> zero`. `0` until you baseline it. |
-| `load`  | `vref − vest` — `0` until baselined, `≈0` at no load, and **grows positive under load** (droop). |
-| `valid` | `1` only while the loop is BEMF-live 6-step; `0` in forced sine / startup / stopped. |
+| `vest`  | low-passed `V_eff` estimate (gated to the validity window). ≈ supply at light load, *before* calibration it may be biased (see below). `n/a` when the window is shut. |
+| `vref`  | the **learned reference**, captured by `sense <i> zero`. `n/a` until you baseline it. |
+| `load`  | `vref − vest` — `≈0` at the zeroing condition, **grows positive under load** (droop). `n/a` until baselined and whenever `loadok=0`. |
+| `vbatt` | calibrated rolling-max of `vest` ≈ supply. `n/a` until the light-load tier (`vbok`) has opened this arm. |
+| `valid` | `1` only inside the validity window below; `0` in forced sine / startup / stopped / saturation. |
+| `why`   | which condition is closing the window: `ok`, `notlive`, `cmdlow`, `dutyhigh`, `rpmlow`, `settling`. |
+| `cmdfloor` | the `\|command\|` needed to open the window, **derived** from the configured seam (not typed). |
+| `loadok` | `load` is comparable to the point `sense zero` was taken at (see the window below). |
+| `vbok`   | this sample is in the light-load subset the `vbatt`/`vcal` tier is built on. |
+| `temp` / `tpeak` | last / peak **ESC MCU** temperature (EDT). Not the winding — see below. |
+| `tlim` / `tstate` | the firmware thermal limiter's command-ceiling scale and state (`none`/`ok`/`derate`/`stale`) — **[docs/velocity-control.md § Thermal protection](velocity-control.md#thermal-protection-firmware-velvelocitycontroller)**. |
 
 Firmware API (per `Thruster`, `src/apps/thruster.h`): `senseVoltage()`, `senseLoad()`, `senseVref()`,
-`senseValid()`, `senseZero()`. `arm()` resets the reference so each run re-baselines.
+`senseValid()`, `senseZero()`, `senseLoadOk()`, `senseVbattOk()`, `senseWhy()`, `senseCmdFloor()`.
+The value accessors still return `0.0f` when their gate is shut (a numeric API needs a number) — it is
+the **printer** that must not lie, so pair them with `senseValid()` / `senseVrefHas()` /
+`senseLoadHas()` / `senseVbattHas()` anywhere the value reaches a human or a log.
+`arm()` resets the reference **and** the window, so each run re-baselines; `stop()` resets the window
+(a motionless motor must never report a stale `vest` as valid).
+
+## The validity window (what `valid=1` actually promises)
+
+The old gate was `vc.live() && |tele rpm| ≥ lineFloor()` — **both terms read from telemetry**. Below the
+seam the ESC *synthesises* an eRPM: on 2026-07-30 the bench measured a constant virtual **182 rpm
+reported for every command from 60 to 450** while the rotor really went 39 → 170 rpm, and telemetry
+only became honest from ~cmd 520 (cmd 530: tele 319 vs encoder 316; cmd 540: 436 vs 431). A gate that
+reads that fiction cannot detect its own invalidity, so `sense` printed a number the caller could not
+tell apart from a good one.
+
+So the window is keyed on the **command we chose**, not on the telemetry we are trying to qualify
+(`lib/vel_control/sense_gate.h`, natively tested in `test/test_sense_gate.cpp`):
+
+| condition | threshold | why that number |
+|---|---|---|
+| command floor | `\|cmd\| ≥ 1.05 × cmd_for_duty6(DUTY6_HANDOFF_FLOOR, cross_up)` (enter), `× 1.02` (stay) | the ESC hands off when its **6-step duty demand** clears a minimum-modulation floor, not when the forced field reaches a speed (measured 2026-07-31, 930KV, 1-count sweeps: handoff at cmd 485.0/515.5/734.5 for `cross_up` 34/36/50, and the 350KV hands off at the **same command** — a duty law is KV-independent in command, a speed law is not). So the handoff command is still a firmware property, and it still moves with `crossup <i> <byte>`, but through the duty map's `cross_up` term rather than through the seam. At the bench's `cross_up = 36` the handoff is command **515.4** → **541.2 enter / 525.7 stay**, vs the measured honest onset of ~516–520 (cmd 515: tele 203 on a rotor oscillating about 198; cmd 516: tele 536.8 vs encoder 522.3). These were 591/574 while the floor was derived from the seam, so the window has moved ~49 counts **outward** — justified by the model's worst low-side residual of −0.79 counts against a 26-count enter margin. The `loadtest` point (1200 rpm ⇒ cmd ≈ 614) is inside with room: 613.6/515.4 = 1.19. |
+| duty ceiling | `duty6(cmd) ≤ 0.90` | the duty map is an **affine fit** to a modulator that cannot exceed full modulation, so near duty 1 it is extrapolating past where it was measured and `rpm6step` saturates against `noLoadTop` — `vest` would be inverting a duty the ESC is not delivering (≈ cmd 837 at `cross_up = 36`, above every operating point in use). |
+| rpm floor | the profile's own 6-step landing (`floor=`) | secondary: catches "commanded high, rotor never caught". |
+| dwell | 0.30 s continuously in-window | longer than the 130 ms worst-case 6-step plant tau from sysid, so the estimate is taken settled. **Leaving the window invalidates on the same tick** (fail-safe direction). |
+| hysteresis | enter 1.05, stay 1.02 | a command dithering at the floor must not chatter the flag — every transition re-seeds the `vest` filter. |
+
+Two sub-tiers on top, deliberately **separate flags** rather than extra terms of `valid` — folding them
+in would make `load` unavailable exactly when a load appears, which is the sensor's whole product:
+
+- **`loadok`** — `|duty6(cmd) − duty6(zerocmd)| ≤ 0.10`. `load` is a *difference* against the zero
+  point, and the residual deficit is operating-point dependent, so a reading taken far away is two
+  different biases subtracted. Outside the band `load` reports `0`, not a wrong number.
+  The band is in **duty, not command units**, for three reasons: duty is what the deficit scales with;
+  the duty map's large negative intercept makes a *percentage of the command* a wildly different
+  fraction of the duty depending where you are (±15 % of cmd 652 was duty 0.15…0.67 ≈ 590…2600 rpm —
+  nearly the whole envelope, at which width the flag degenerates into "a zero point exists"); and a
+  *difference* of two duties is invariant to `cross_up`, which shifts both by the same constant.
+  0.10 is bounded from both sides. **Floor:** `load` must survive load — holding rpm through a droop
+  `d` costs `duty × 1/(1−d)`, so the 10 % droop that closes `vbok` moves duty 0.411 → 0.457, i.e.
+  **0.046**; a tighter band than that would close `loadok` exactly when a load appears. (In command
+  units that droop is only ~17 counts / 2.6 % — which is *why* `load` survives load.) **Ceiling:** it
+  must still mean "the same operating point" — 0.10 duty is ±38 counts ≈ **±390 rpm**, so the
+  driftsoak point stays comparable to itself while a deliberate move to 1200 rpm does not.
+- **`vbok`** — droop `≤ 0.10 × vref` (light load). `vcal` is a *multiplicative* scale, so it can only
+  cancel the residual `I·R/duty` deficit near the operating point it was taken at; restricting the
+  rolling max to light load is what makes "`V_eff` → `V_supply`" true by construction. With no `vref`
+  captured yet the rolling max is itself the light-load selector, so the tier stays open.
+
+**This trades availability for trustworthiness on purpose.** `sense` now reports `valid=0` in cases
+that used to print a number — that *is* the change. `why=` exists so that a closed window is never
+mistaken for a regression, and so a failed lock says which condition blocked it.
+
+None of these thresholds is bench-validated (they were chosen with no hardware available). They
+live as named constants in one place (`sense_gate.h`) for exactly that reason.
 
 ## Load / thrust sensing (relative)
 
@@ -61,6 +152,23 @@ Firmware API (per `Thruster`, `src/apps/thruster.h`): `senseVoltage()`, `senseLo
 
 Bench check (F2838 350KV): `load ≈ 0.00 V` at no load after `sense zero`, going positive under real
 draw. (A single steady point can't separate V from load; the *change* in `load` is what's meaningful.)
+
+### `load` and `dhat` are relative to the CALIBRATION CONDITION — not to physics
+
+There is no absolute-torque path here, and the reason is measured, not stylistic. The 4-wire DC
+measurement put `R_total = 1.20 ± 0.26 Ω`, split **winding 0.79 Ω + connectors/wiring 0.41 Ω** — i.e.
+**~34 % of the resistance the `I·R/duty` term is built on is wiring**. That share is *per installation*
+(cable length, crimps, connector count) and it **corrodes**, which on a saltwater ROV is a drift with
+no schedule. Any "newton-metres from `vest`" claim would therefore have been a claim about one
+particular loom on one particular day, so absolute torque was abandoned deliberately.
+
+What survives that, by construction, is **in-situ calibration**: run `sense <i> zero` (and `sense <i>
+vcal`) **in the water, in the installed configuration**, and the installation bias is absorbed into the
+reference itself. Everything downstream is then a *difference against that reference* — which is
+exactly why `loadok` restricts the reading to a band around the command it was captured at. Model error
+after the `cross_up` duty fix is ~1 %; the residual is the no-load `I·R/duty` deficit, and it is
+**operating-point dependent and flips worst case between air (worst at low rpm) and water (worst at
+high rpm)** — so the same reference is *not* transferable between the two.
 
 ## Supply-voltage / battery estimate
 
@@ -86,8 +194,11 @@ python host/vbatt.py calibrate --known-v 11.2     # spins, captures gated high-p
 python host/vbatt.py monitor                      # reports V_batt = scale · rolling-high-percentile(V_eff)
 ```
 
-Gating (rejects garbage / the crossover region): `valid==1` + mech rpm above a floor + steady setpoint.
-1/5 Hz sampling is plenty for a battery gauge.
+Gating (rejects garbage / the crossover region): on the firmware the rolling max only advances while
+`valid=1` **and** `vbok=1` (the light-load tier) **and** the rpm is a margin above the 6-step landing —
+which is also why `sense <i> vcal` is refused until that tier has produced an estimate. The host
+prototype uses `valid==1` + mech rpm above a floor + a steady setpoint. 1/5 Hz sampling is plenty for a
+battery gauge.
 
 Bench result (real supply 11.2 V): raw `V_eff.p90 = 9.14 V` → `scale = 1.2254` → `monitor` reports
 **11.30 V (~1 %)**. Enough for a rough remaining-charge gauge / low-voltage warning. The voltage→%
@@ -112,16 +223,85 @@ otherwise it reports the model error instead. Bench, 350KV at 1600 rpm with no l
 So push a measured curve before trusting `dhat` (see the README's `curvepush` note, especially the
 `sine_cross_up` dependency). The `dob_max` clamp exists precisely so a bad curve cannot over-drive.
 
+**The DOB has never been tested against a real mechanical load.** Every number quoted for it comes from
+a **synthetic, injected** disturbance: `host/dob_bench.py` adds a transient offset to the ESC command
+that the loop does not know about ("No external load rig: we inject an INPUT disturbance… runs PI+FF
+then PI+FF+DOB against the SAME injected disturbance"), and the native sim
+(`lib/vel_control/test/test_vel_control.cpp`) models load as a **constant additive rpm deficit** —
+precisely the disturbance shape the observer assumes. Those results confirm the *implementation*, not
+the physics: a real propeller load is ~rpm², which **tilts** the curve rather than offsetting it, making
+`d_hat` speed-dependent. The only load-ish hardware number on record is the bench 1650 → 1596 rpm at a
+1600 setpoint. Treat `dhat` as a *relative* load channel (same caveat as `load`, above) until a real
+load rig has been run.
+
+## `trim` / `cmd` — the control effort, i.e. the drift channel
+
+A closed velocity loop is **blind to plant drift by design**: as the winding heats (R +0.393 %/°C) or
+the magnets weaken (KV +0.11 %/°C), the loop simply works harder and `rpm` keeps reporting the target.
+The effort is where the drift is visible.
+
+| field  | meaning |
+|--------|---------|
+| `trim` | the blended PI correction actually added to the feed-forward, in **ESC command units** — the same units as `ff` and `cmd` (thrust, −1000…1000), *not* rpm (`vc.trim()`; signed, bounded by `gain <i> trim` = `trim_max`). |
+| `cmd`  | the command actually sent, `= clamp(ff(setpoint) + trim + dob_comp)` (`vc.command()`). Logged so a drift trace is self-contained — no need to re-evaluate the FF curve offline. |
+
+To read `trim` as rpm, divide by the curve slope at that operating point: on the 350KV bench the
+6-step segment runs ≈**10.3 rpm per command unit**, so 1 unit of `trim` ≈ 10 rpm of correction.
+(`trim_max`, `dob_max` and `dob`'s internal `comp` are all in these same command units — `comp`
+divides `d_hat` by `rpmSlopeAt()` precisely to get there.)
+
+At a **fixed setpoint**, `trim` walking away from its cold value is the drift signal; `rpm` will not
+move until `trim` saturates at `trim_max`. Rough scale on the 350KV bench: a 40 °C rise is worth
+≈70 rpm at 1600 rpm, i.e. only ≈**7 command units** of `trim` against a `trim_max` of 80 — small, but
+well clear of saturation and resolvable at the 0.1-unit print precision.
+
+Caveat: `trim` responds to **load** exactly as it responds to drift. Interpreting it as drift needs a
+benign reference condition (a known setpoint at known low load), or — on a multi-thruster vehicle —
+cross-thruster comparison, where common-mode is the environment and an outlier is the unit.
+
 ## Offline analysis — `host/softsensor.py`
 
 Fit `V_eff` and a load-droop trend from a `(cmd, rpm)` sweep (e.g. a `sysid` curve or a `cmd_measure`
 run): `v_eff` (least-squares supply), per-point V, an `rpm²` load coefficient, and a `load_present`
 flag. Useful to characterise a motor offline; the firmware `sense` is the live version.
 
+### `--cross-up` is REQUIRED (2026-07-30)
+
+`softsensor.duty(cmd, cross_up)` and `softsensor.estimate(kv, pp, samples, cross_up)` have **no
+default** for `cross_up`, and calling them without it raises `TypeError`. `host/obschar.py`,
+`host/duty_sweep.py`, `host/softsensor.py` and `host/sim_obs.py` all take `--cross-up` on the CLI.
+
+The default used to be 34 (the value `DUTY6_A/B` were fitted at) while the bench ran 36. That is a
+fixed **duty** offset of `DUTY6_CROSSUP_K × 2`, so it is a ~0.6 % error in `V_eff` at cmd 780 and a ~44 % error
+at cmd 570 — and because `estimate()` charges every unexplained deficit to *load*, the droop and
+`k_load` numbers silently absorbed it as if it were physics. `host/sim_obs.py` imported `duty` bare and
+so validated a model of a **different ESC** than the hardware it was compared against. A wrong
+`cross_up` costs 13.7–45.0 % on the static curve (`python3 host/plantid.py validate --static`), so the
+argument is required rather than defaulted: a `TypeError` is a better answer than a plausible number.
+
+Read the byte with `python3 host/esctool.py dump`; never assume it, and re-read it after every flash
+(`esctool.py flash` wipes the config to firmware defaults).
+
+## The rotor NEVER coasts — zero throttle is a BRAKE
+
+Not a soft-sensor property, but it governs every "sample opportunistically while it spins" assumption
+here, so it belongs in this document as a constraint. **Full treatment and the numbers:**
+the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one).
+
+The ESC brakes whenever the commanded throttle is zero, on a fixed ~0.30 s delay — identically via
+`disarm`, via letting the 500 ms deadman expire, and while armed holding zero. `brake_on_stop = 0` does
+not disable it.
+
+What that means for sampling: the spinning window ends **abruptly rather than tapering**, so there is no
+slow-coast tail to sample during, and the last `sense` reading before a stop is the last one you get.
+There is no post-command coast-down to observe.
+
 ## Limitations & notes
 
-- **Only while spinning in live 6-step.** Stopped / forced-sine / near-crossover → `valid=0`. In an
-  ROV, sample opportunistically whenever a thruster is running.
+- **Only inside the validity window.** Stopped / forced-sine / near-crossover / duty-saturated /
+  within the 0.3 s dwell → `valid=0`, with `why=` naming the condition. In an ROV, sample
+  opportunistically whenever a thruster is running **above the command floor** — and note that the
+  window is *deliberately* narrower than "the motor is spinning".
 - **Absolute voltage needs the calibration** (and `cfg save` to survive a reset); raw `vest` is biased (~18 % low on the bench
   350KV). Relative trends (load, battery draining) work even uncalibrated.
 - **Can't separate V from load at a single point** — that's why voltage uses *max-over-time* (lightest

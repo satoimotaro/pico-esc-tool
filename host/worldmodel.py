@@ -116,7 +116,10 @@ def insample_fit(plant, raw):
     return out
 
 
-def _fit_stats(real, sim):
+def fit_stats(real, sim):
+    """rmse / VAF / n for a (real, sim) pair. PUBLIC since 2026-07-30: `plantid.py` and `sim_obs.py`
+    both need it, and a third copy of the VAF arithmetic is how three implementations end up
+    disagreeing about whether a model got better."""
     n = min(len(real), len(sim))
     real, sim = real[:n], sim[:n]
     err = [r - m for r, m in zip(real, sim)]
@@ -125,6 +128,9 @@ def _fit_stats(real, sim):
     var_err = statistics.pvariance(err) if n > 1 else 0.0
     vaf = 100.0 * (1.0 - var_err / var_real) if var_real > 1e-9 else 0.0
     return {"rmse": round(rmse, 2), "vaf": round(vaf, 1), "n": n}
+
+
+_fit_stats = fit_stats          # the old private name, kept so existing call sites are untouched
 
 
 # ---------------------------------------------------------------------------

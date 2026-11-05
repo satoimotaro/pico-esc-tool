@@ -38,6 +38,12 @@ class EscHost:
 
     def __init__(self, port: str | None = None):
         self.ser = None
+        if port and "://" in port:
+            # A pyserial URL — e.g. socket://<ip>:<port> for a Pico whose CLI is on its UART
+            # (env:main_uart) behind a TCP relay. Same line protocol; no USB to find or re-enumerate.
+            self.ser = serial.serial_for_url(port, timeout=10)
+            self.ser.reset_input_buffer()
+            return
         p = find_pico(port)
         for _ in range(30):                         # port can be briefly un-openable after an upload
             try:

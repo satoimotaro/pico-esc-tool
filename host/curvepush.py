@@ -110,6 +110,7 @@ def check_crossover(dev, idx, prof, apply_it):
     have_up, have_dn = s.get("sine_cross_up"), s.get("sine_cross_dn")
     if (have_up, have_dn) == (cu, cd):
         print(f"crossover: ESC matches the profile (sine_cross_up={cu} sine_cross_dn={cd})")
+        sync_crossup(dev, idx, cu)
         return True
     print(f"CROSSOVER MISMATCH: ESC has sine_cross_up={have_up} sine_cross_dn={have_dn}, "
           f"the curve was measured at {cu}/{cd}.")
@@ -121,7 +122,29 @@ def check_crossover(dev, idx, prof, apply_it):
     cfg.set(sine_cross_up=cu, sine_cross_dn=cd)
     cfg.restart()
     print(f"  applied sine_cross_up={cu} sine_cross_dn={cd} and restarted the ESC")
+    sync_crossup(dev, idx, cu)
     return True
+
+
+def sync_crossup(dev, idx, cross_up):
+    """Tell the CONTROLLER which sine_cross_up the ESC is on (firmware `crossup`).
+
+    Two different consumers, both wrong without it:
+      * the parametric FF — cross_up shifts the 6-step duty map by a constant, and
+      * the SOFT-SENSOR — `estimateV`/`estimateLoad` invert that same map, so `vest`/`load`/`vbatt`
+        stay biased by the shift even while a MEASURED curve is driving the feed-forward.
+    Nothing else sets it: `motor` can, but it discards the measured curve, which is the opposite of
+    what this tool just did. Best-effort — an older firmware without the command must not fail a push.
+    """
+    try:
+        for ln in dev.cmd(f"crossup {idx} {cross_up}", timeout=6):
+            if ln.startswith("crossup|"):
+                print(f"  controller: {ln}")
+                return True
+    except Exception as e:
+        print(f"  note: could not set the controller's cross_up ({e}); `vest`/`load` stay biased if it "
+              f"is not already {cross_up}. Older firmware? Set it by hand: crossup {idx} {cross_up}")
+    return False
 
 
 def push(dev, idx, prof, cap=FW_MAX_POINTS):
@@ -224,7 +247,28 @@ def main(argv=None):
 
         if opts.motor:
             kv, pp, v = (x.strip() for x in opts.motor.split(","))
-            print("motor:", *dev.cmd(f"motor {opts.index} {kv} {pp} {v}"))
+            # BEST-EFFORT, exactly like sync_crossup() above, and for a sharper reason. What this tool
+            # needs from `motor` is the SIDE EFFECT — kv/pp/v into the controller's parametric model, so
+            # the soft-sensor's duty map is right — not the parametric FF curve, which the measured one
+            # below is about to replace anyway. But `motor` legitimately fails when no parametric curve
+            # exists at the ESC's cross_up (>= 48: the handoff is above the cmd 700 the curve is sampled
+            # to), and the firmware applies kv/pp/v BEFORE it discovers that, so the side effect has
+            # already landed by the time the error arrives. Letting the RuntimeError out would abort the
+            # push — i.e. the one feed-forward that IS valid up there would never be uploaded, on the
+            # exact command line README.md documents.
+            # NARROW on purpose. `EscHost.cmd` raises RuntimeError for every `err ...` reply and
+            # TimeoutError for a dead link, and only ONE of those reply texts means "kv/pp/v landed,
+            # the curve did not". `err bad-args` and `err motor: disarm first` are rejected BEFORE
+            # setMotor runs, so the side effect did NOT land and the note below would be a lie; a
+            # TimeoutError or a serial fault is not a cross_up problem at all and must not be
+            # diagnosed as one. So: swallow the no-curve case, re-raise everything else.
+            try:
+                print("motor:", *dev.cmd(f"motor {opts.index} {kv} {pp} {v}"))
+            except RuntimeError as e:
+                if "no 6-step curve" not in str(e):
+                    raise
+                print(f"  note: no parametric curve at this cross_up ({e}); kv/pp/v ARE applied for the "
+                      f"soft-sensor, and the measured curve below is what drives the FF")
 
         sent, expect = push(dev, opts.index, prof, opts.max_points)
         print(f"pushed {len(sent)} point(s) from {os.path.basename(opts.profile)} "
@@ -244,7 +288,7 @@ def main(argv=None):
                 bad += 1
         # [#11-6] Verify the REGIME TAGS and the metadata too, not just the points. Mis-handled tags are
         # the failure this whole change exists to prevent (they move lineFloor(), hence the soft-sensor
-        # gate), and a pp that disagrees with the commit is exactly what slipped past the first version.
+        # gate), and a pp that disagrees with the commit is the failure this check exists to catch.
         got_tags = [g for *_, g in got]
         if len(got) == len(expect) and got_tags != expect:
             print(f"MISMATCH: regimes expected {''.join(expect)} got {''.join(got_tags)}")

@@ -205,6 +205,10 @@ bool Bootloader::connect() {
 	for (uint8_t i = 0; i < 8; i++) {
 		if (!rxByte(info[i], 100)) return false;
 	}
+	// AM32's bootloader appends a 9th byte (0x30 ACK) that SiLabs doesn't send. Drain it, or our
+	// next frame collides with it on the shared wire.
+	uint8_t tail;
+	dev_.am32 = rxByte(tail, 3) && tail == br_SUCCESS;
 	memcpy(dev_.bootInfo, info, 8);
 	if (!(info[0] == '4' && info[1] == '7' && info[2] == '1')) return false;
 	dev_.signature[0] = info[4];                    // sigHi
@@ -217,6 +221,25 @@ bool Bootloader::connect() {
 	dev_.name  = signatureName(w);
 	dev_.valid = true;
 	connected_ = true;                              // from here on, frames carry CRC
+	return true;
+}
+
+bool Bootloader::adoptReply(const uint8_t info[8], bool am32) {
+	connected_ = false;
+	dev_ = DeviceInfo{};
+	if (!(info[0] == '4' && info[1] == '7' && info[2] == '1')) return false;
+	memcpy(dev_.bootInfo, info, 8);
+	dev_.am32         = am32;
+	dev_.signature[0] = info[4];
+	dev_.signature[1] = info[5];
+	dev_.bootVersion  = info[6];
+	dev_.bootPages    = info[7];
+	uint16_t w = dev_.signatureWord();
+	if (w == 0) return false;
+	dev_.mcu   = mcuTypeFor(w);
+	dev_.name  = signatureName(w);
+	dev_.valid = true;
+	connected_ = true;
 	return true;
 }
 
@@ -257,6 +280,8 @@ int Bootloader::connectRawProbe(uint8_t out[8], uint32_t perByteTimeoutMs) {
 		if (!rxByte(out[i], perByteTimeoutMs)) break;
 		n++;
 	}
+	uint8_t tail;
+	lastProbeAm32_ = (n == 8) && rxByte(tail, 3) && tail == br_SUCCESS;   // AM32's trailing ACK
 	return n;
 }
 

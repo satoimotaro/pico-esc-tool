@@ -38,6 +38,49 @@ FIELD_OFF = {
 FIELD_ENUM = {"motor_direction": DIRECTION, "comm_timing": TIMING, "demag_compensation": DEMAG}
 NAME_OFF, NAME_LEN = 0x60, 16
 
+# --- which ESCs is it safe to WRITE these offsets to? ----------------------------------------
+# `decode()` reads any BLHeli-S-family block, and the shared prefix makes a foreign one LOOK
+# decodable. Writing is a different promise: FIELD_OFF is the Bluejay 0.21 layout, and the
+# firmware family does not guarantee offsets across EEPROM revisions. The flash compat check is
+# no help — it compares the layout TAG (`#A_H_30#`), which is the FET pin map, not the config
+# layout. Three firmwares, three (eeprom, layout) pairs, all reporting the same tag, all
+# bench-observed on one ESC (recorded per-installation, outside this repo):
+#     BlueGill S4            0.21 / 226   <- what FIELD_OFF encodes, including 0x2B..0x33
+#     Bluejay v0.21.0 stock  0.21 / 208   <- shared offsets only; 0x2B..0x33 are NOT sine there
+#     BLHeli-S Rev16.7       16.7 / 33    <- a different layout; nothing here may be written
+# Refusing per FIELD rather than per ESC is deliberate: `snapshots/stock-comparable.yaml` writes
+# the 13 shared settings to stock Bluejay on purpose (it is the firmware control), and only
+# offsets 0x04/0x07/0x09/0x0B/0x1F moved. A blanket refusal would break a workflow that is
+# correct; a blanket permit is what would have written Bluejay-shaped bytes into BLHeli-S.
+BLUEJAY_EEPROM_REV = "0.21"
+BLUEGILL_LAYOUT_REV = 226
+BLUEJAY_LAYOUT_REV = 208
+BLUEGILL_ONLY_FIELDS = frozenset(k for k, o in FIELD_OFF.items() if o >= 0x2B)
+
+
+def write_compat(raw: bytes, keys) -> tuple[str | None, dict[str, str]]:
+    """Is it safe to write `keys` to the ESC whose config block is `raw`?
+
+    Returns `(fatal, refused)`. `fatal` is a reason to write NOTHING; `refused` maps the
+    individual settings that must be dropped to why. Both empty/None means go ahead.
+
+    Fails closed: a block too short to carry the revision bytes is fatal, because the whole point
+    is that we do not know what we would be writing into."""
+    if raw is None or len(raw) <= 0x02:
+        return ("could not read the ESC's config block, so its EEPROM layout is unknown", {})
+    eeprom, layout = f"{raw[0x00]}.{raw[0x01]}", raw[0x02]
+    if eeprom != BLUEJAY_EEPROM_REV:
+        return (f"EEPROM revision {eeprom} (layout {layout}) is not the Bluejay "
+                f"{BLUEJAY_EEPROM_REV} layout these offsets encode — writing would put bytes at "
+                f"the wrong addresses", {})
+    if layout != BLUEGILL_LAYOUT_REV:
+        why = (f"offset 0x2B..0x33 is BlueGill-only and this ESC reports layout revision {layout}, "
+               f"not {BLUEGILL_LAYOUT_REV}"
+               + (" (stock Bluejay: those slots are not the sine settings)"
+                  if layout == BLUEJAY_LAYOUT_REV else ""))
+        return (None, {k: why for k in keys if k in BLUEGILL_ONLY_FIELDS})
+    return (None, {})
+
 # BlueGill max_erpm (0x2C) is in units of 1000 eRPM. The firmware's 80000/N decode is
 # exact only for N <= 136 and the high-rpm path bypasses the governor above ~156k eRPM,
 # so the effective ceiling is <= 136k eRPM; values above that are clamped (with a warning).
@@ -66,6 +109,42 @@ SINE_CROSS_UP_ERPM_MIN = 4 * 10000.0 / SINE_CROSS_TICKS_MAX   # ~1333 eRPM
 SINE_CROSS_UP_ERPM_MAX = 4 * 10000.0 / SINE_CROSS_TICKS_MIN   # ~4444 eRPM
 
 
+def handoff_ticks(up_erpm: float) -> float:
+    """The 4-sector seed window, in ticks, the firmware measures at a seam of `up_erpm`.
+
+    inf for a non-positive OR NaN seam: both are outside the window either way, and returning a number
+    keeps every caller (all of which only format it) free of its own zero/NaN check."""
+    return 4 * 10000.0 / up_erpm if up_erpm > 0 else float("inf")
+
+
+def up_erpm_handoffable(up_erpm: float) -> bool:
+    """True when the firmware will actually FIRE the up-handoff at this seam. THE one definition of
+    the window; mirrored by vel::handoffPossibleAt() in lib/vel_control/motor_model.h and read by
+    pico_esc.motor_model.MotorModel.handoff_possible().
+
+    The window is on the TRUNCATED integer tick count, which is not the same test as the continuous
+    band [SINE_CROSS_UP_ERPM_MIN, SINE_CROSS_UP_ERPM_MAX] that `sine_crossover_bytes()` below applies
+    to its (pre-rounding) argument, and the two DISAGREE for one seam that matters: cross_up 34 ->
+    1328.125 eRPM -> 30.12 ticks, which this accepts and that band rejects as "below the BEMF floor".
+    THE BENCH BACKS THIS ONE — the 2026-07-31 sweeps hand off at cross_up 34 on two different motors
+    (host/reports/sinesweep_20260731_014004.csv), and 34 is the byte `MotorModel.esc_config()`
+    recommends. [2026-08-01] `sine_crossover_bytes()` now shares this predicate rather than applying
+    the stricter continuous band, so the two no longer disagree. That also fixes its one concrete
+    victim: `MotorModel.esc_config(seamless_down=True)` used to RAISE, because `_seamless_cross_dn()`
+    feeds it `sine_crossover_bytes(34 * 39.0625 = 1328.125, ...)` — the same byte 34 this function
+    accepts. The widening is deliberate and one-directional: it makes `esctool.py set --up-erpm` and
+    `autocal.py` accept exactly the seams the firmware accepts, and nothing outside them.
+
+    Written as a bounds test on `up_erpm` rather than as `int(4*10000/up_erpm)` so it is the SAME
+    expression as vel::handoffPossibleAt() in lib/vel_control/motor_model.h, and so that NaN, inf, 0
+    and a denormal seam all come out False instead of raising (`int(inf)` is an OverflowError and
+    `int(nan)` a ValueError — a refusal predicate must not have a third outcome). Truncation-equivalent
+    by construction: `int(40000/up) <= MAX` iff `40000/up < MAX+1` iff `up > 40000/(MAX+1)`, and
+    likewise on the MIN side. Every comparison against a NaN is False, so a NaN refuses."""
+    return (4 * 10000.0 / (SINE_CROSS_TICKS_MAX + 1) < up_erpm
+            <= 4 * 10000.0 / SINE_CROSS_TICKS_MIN)
+
+
 def sine_crossover_bytes(up_erpm: float, dn_erpm: float) -> tuple[int, int]:
     """(up_erpm, dn_erpm) -> (cross_up, cross_dn) bytes, validating exactly as the firmware
     guards + hysteresis require. Returns rounded bytes; raises ValueError on any violation.
@@ -74,11 +153,22 @@ def sine_crossover_bytes(up_erpm: float, dn_erpm: float) -> tuple[int, int]:
     handoff-able band (where the seed would be too coarse / below the BEMF floor)."""
     if up_erpm <= 0 or dn_erpm <= 0:
         raise ValueError("both eRPM values must be positive")
-    if not SINE_CROSS_UP_ERPM_MIN <= up_erpm <= SINE_CROSS_UP_ERPM_MAX:
+    # ONE definition of the window, shared with up_erpm_handoffable() — the firmware's own
+    # TRUNCATED-tick test. This used to apply the continuous pre-rounding band
+    # [SINE_CROSS_UP_ERPM_MIN, SINE_CROSS_UP_ERPM_MAX] instead, which is one tick's worth stricter on
+    # the low side and so rejected cross_up 34 (1328.125 eRPM -> 30.12 ticks) as "below the BEMF
+    # floor". The bench refutes that: the 2026-07-31 sweeps hand off at 34 on two different motors
+    # (host/reports/sinesweep_20260731_014004.csv), and 34 is the byte MotorModel.esc_config()
+    # recommends. A validator that refuses what the hardware accepts is wrong in the direction that
+    # costs you a working configuration, so it moves to the tested predicate.
+    if not up_erpm_handoffable(up_erpm):
+        lo = 4 * 10000.0 / (SINE_CROSS_TICKS_MAX + 1)
         raise ValueError(f"up eRPM {up_erpm:g} outside the handoff-able band "
-                         f"~{SINE_CROSS_UP_ERPM_MIN:.0f}..{SINE_CROSS_UP_ERPM_MAX:.0f} eRPM: below it "
-                         f"is under the BEMF floor, above it the 4-sector seed gets too coarse "
-                         f"(>~{100.0/SINE_CROSS_TICKS_MIN:.0f}%) and the firmware would refuse to hand off")
+                         f"~{lo:.0f}..{SINE_CROSS_UP_ERPM_MAX:.0f} eRPM: below it the 4-sector seed "
+                         f"window exceeds {SINE_CROSS_TICKS_MAX} ticks, above it it drops under "
+                         f"{SINE_CROSS_TICKS_MIN} and gets too coarse "
+                         f"(>~{100.0/SINE_CROSS_TICKS_MIN:.0f}%); the firmware refuses to hand off "
+                         f"either way")
     cross_up = round(up_erpm / SINE_CROSS_UP_ERPM_PER_UNIT)
     cross_dn = round(SINE_CROSS_DN_ERPM_NUM / dn_erpm)
     if not 1 <= cross_up <= 255:

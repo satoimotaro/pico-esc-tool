@@ -13,6 +13,16 @@ Two parts:
 - **`esctool`** (`host/esctool.py`) — a BLHeli-Configurator-like **CLI** on the PC: list ESCs, read /
   write settings (YAML profiles), and flash firmware, with a layout/MCU **compatibility guard**.
 
+**"BlueGill"**, where it appears below, is our fork of the [Bluejay](https://github.com/mathiasvr/bluejay)
+ESC firmware, which adds low-speed **forced-commutation sine drive** and a **sine↔BEMF crossover** so a
+low-KV thruster can creep and hold below the speed where sensorless 6-step can lock. It is a separate
+project; this tool works with stock Bluejay and BLHeli-S too, and the BlueGill-only features are the ones
+labelled S1/S2/S3 or `sine_*`.
+
+> **Before you touch the bench or the vehicle, read [`docs/README.md`](docs/README.md).** It carries the
+> six behaviours that will bite you (telemetry lies below the crossover seam; zero throttle is a brake),
+> which numbers are measured versus fitted, and the current hardware state.
+
 ## Quick start
 
 ```
@@ -23,7 +33,9 @@ python host/esctool.py set 0 motor_direction=Reversed
 python host/esctool.py flash 0 firmware.hex --yes             # flash matching BLHeli-S/Bluejay firmware
 ```
 
-The Pico is auto-detected (USB VID 2E8A). Wiring — signal pins, mode pin, Wi-Fi, motor poles — lives
+The Pico is auto-detected (USB VID 2E8A). For a board with no USB host, `pio run -e main_uart` puts
+the same CLI on UART0 (GP0 TX / GP1 RX, 921600); behind a TCP relay, every host tool takes
+`--port socket://<ip>:<port>`. Wiring — signal pins, mode pin, Wi-Fi, motor poles — lives
 in one file, `src/apps/esc_config.h`; see `construction/wiring/`.
 
 ## The firmware: declare your ESCs in `main.cpp`
@@ -56,18 +68,22 @@ void loop() { tool.poll(); }                   // serial + Wi-Fi + each ESC's RP
 ```
 arm <i> [normal|bidir]      # arm ESC i (AUTO: bidir for Bluejay/JESC, else normal DShot)
 throttle <i> <0..2000>      # RAW one-way throttle          (armed)
-thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop
+thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop (full scale at +-953)
 rpm     <i> <mech-rpm>      # CLOSED-LOOP velocity target (signed); 0 = clean stop; needs a profile
 gain    <i> kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle <v>   # tune the closed loop live
 tele    <i>                 # rpm | volts | amps | tempC | stress   (bidir firmware only)
 disarm  <i>                 # stop + release
 cfg     [show|save|load|clear]   # persist/restore motor + gains + DOB + vbatt cal on the Pico's flash
 curve   <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>]   # upload a measured FF curve
+pwm     <i> <1000..2000|stop>          # servo PWM (50 Hz) instead of DShot; see the web tool below
+pwmch   <ch> <1000..2000|stop>         # the same by motor-test channel, value mapped per ESC (needs mtmode)
+mtmode  <mask>                        # motor test: bit c = channel c sends 3D values (web tool)
 ```
 
 Arming streams zero throttle ~3 s (BLHeli-S won't spin until armed); a **deadman** re-zeros if no
-command arrives within 500 ms. `throttle`/`thrust` are RAW (open loop); `rpm` engages the closed loop
-and the ESC holds the target speed. Stock BLHeli-S = normal DShot (throttle only, no telemetry);
+command arrives within 500 ms. A Bluejay/BLHeli-derived bidir ESC that stalls (eRPM 0 under throttle
+for 1.5 s) is armed again and held at 0 until it is sent 0. `throttle`/`thrust` are RAW (open loop);
+`rpm` engages the closed loop and the ESC holds the target speed. Stock BLHeli-S = normal DShot (throttle only, no telemetry);
 **Bluejay/JESC** = bidirectional DShot with eRPM/EDT telemetry and reversible support.
 
 ## Closed-loop RPM control
@@ -145,6 +161,32 @@ edit settings, run a per-thruster spin/RPM test with live telemetry, and flash f
 layout-guarded flow as the CLI. Wi-Fi is a bench affordance — 2.4 GHz doesn't travel underwater, so a
 deployed craft is driven over its tether/host.
 
+## ESC Web Configurator (`web/`)
+
+One page in the browser (Chrome / Edge, Web Serial) that stands in for both esc-configurator and the
+AM32 configurator: read and edit settings for **BLHeli_S 16.x, Bluejay, BlueGill and AM32** side by
+side, apply **presets** (the same built-ins as the firmware's `preset` command, plus your own, kept in
+the browser and exported as JSON), run a **motor test**, and **flash** a local `.hex` (layout/MCU
+guarded, settings carried over). It talks Betaflight MSP + the BLHeli 4-way passthrough, so it works
+with this firmware or with any Betaflight flight controller. Static files, no build step:
+`python3 -m http.server -d web` and open `http://localhost:8000`, or the GitHub Pages copy
+(`.github/workflows/pages.yml`). Known-good settings per motor: [`docs/motor-settings.md`](docs/motor-settings.md).
+
+The motor test re-sends its values every 100 ms and the firmware stops the motors after 2 s of MSP
+silence, after the USB port closes, or when a passthrough starts; the page also stops on Esc/Space,
+on leaving the tab, and when hidden.
+
+On this firmware the motor test can also send **servo PWM** (50 Hz, 1000–2000 µs) instead of DShot,
+for firmwares that take it: AM32 and stock BLHeli_S, not Bluejay (DShot only). The CLI form is
+`pwm <i> <µs|stop>` (1000..2000; `0`, junk and anything below 1000 are refused: a typo must not become a width the ESC reads as full reverse).
+The ESC must have been read first (`scan`, a configurator read, or a DShot arm), because the stop pulse
+is 1500 µs on a 3D ESC; the first 5 s after switching hold that stop pulse so the ESC re-detects the
+protocol and arms, and after that a width passes only once one stop width has been sent. Fed like
+`throttle`: 500 ms without a value falls back to the stop pulse (also while the board is busy), and
+3 s without one after the arm the pin leaves PWM. Bootloader commands are refused while a PWM pin
+runs. There is no telemetry on PWM. The rev0 known limits and the design notes for the next
+ESC-handling rework: [`docs/esc-lifecycle.md`](docs/esc-lifecycle.md).
+
 ## Position control (`host/posctl.py`)
 
 A host-side closed-loop **shaft-position** servo using an **AS5600** encoder on the Pico (I2C0,
@@ -154,21 +196,39 @@ The encoder is a **calibration/position instrument** — the RPM closed loop abo
 
 ## ESC soft-sensor (voltage + load, no extra sensors)
 
-Infer **effective supply voltage** and a **relative load/thrust** signal from just the DShot telemetry
-RPM + the motor model — no voltage, current, or force sensor. `V_eff = rpm/(KV·duty) = V_supply −
-I·R/duty`, so `V_eff ≈ V_supply` at light load and droops under load.
+Infer **effective supply voltage** and a **relative load/thrust** signal from the DShot telemetry RPM plus
+the motor model — no voltage, current or force sensor. `V_eff = rpm/(KV·duty) = V_supply − I·R/duty`, so
+`V_eff ≈ V_supply` at light load and droops under load.
 
 ```
-motor 1 350 7 11.1                        # set the motor model (kv pp v), then spin in 6-step (rpm ...)
-sense 1                                   # -> sense|1|vest|vref|load|vbatt|valid|floor|dhat|settled
-sense 1 zero                              # baseline the no-load reference (load = vref - vest thereafter)
-sense 1 vcal 11.2                         # calibrate vbatt to a known battery voltage (per motor+config)
-cfg save                                  # persist motor/gains/DOB/vcal to the Pico's flash (else RAM-only)
-python host/vbatt.py calibrate --known-v 11.2   # host-side equivalent; host/vbatt.py monitor -> V_batt
+motor 1 350 7 11.1        # set the motor model (kv pp v), then spin into 6-step with `rpm ...`
+sense 1                   # vest|vref|load|vbatt|valid|why|... (see docs for the full field list)
+sense 1 zero              # baseline the no-load reference (load = vref - vest thereafter)
+sense 1 vcal 11.2         # calibrate vbatt to a known battery voltage
+cfg save                  # persist motor/gains/DOB/vcal to flash (otherwise RAM-only)
 ```
 
-Rough battery gauge (max-over-time ≈ supply, ~1 % after one calibration) + fouled-prop / entanglement
-load detection. Only valid while spinning in live 6-step. **Full details: [`docs/soft-sensor.md`](docs/soft-sensor.md).**
+Good for a rough battery gauge and for fouled-prop / entanglement detection. Valid only inside a
+deliberately narrow window (command above the derived handoff, duty below saturation, held 0.3 s);
+outside it `valid=0` and `why=` names the blocking condition, because a number you cannot tell apart from
+a good one is worse than no number. **`--cross-up` is required** on `softsensor`/`obschar`/`duty_sweep`/
+`sim_obs` — there is no safe default and the wrong one is a silent 13–45 % error.
+→ [`docs/soft-sensor.md`](docs/soft-sensor.md)
+
+### The measured plant
+
+`host/pico_esc/plant.py` + `measured.py` are the plant model: structure fixed by physics, numbers in a
+provenance-tagged inventory keyed by mechanical configuration (propeller on vs bare shaft — never mix
+them). Moving to water changes exactly one callable (`PlantParams.drag`), and `PlantParams` is frozen so
+that is a property of the type rather than a convention.
+
+```
+python3 host/plantid.py provenance      # where every number came from, and what each preset borrows
+python3 host/plantid.py validate --all  # replay the committed fixtures offline, print the out-of-sample table
+python3 host/plantid.py validate --pair # the controlled bare-shaft vs propeller comparison
+```
+
+→ the plant inventory (measured separately per installation; see `host/pico_esc/plant.py` for the structure and `host/plantid.py --help` for how to build one)
 
 ## Requirements
 
@@ -190,11 +250,17 @@ src/apps/profiles.h      per-motor curves — includes the generated profiles_ge
 src/apps/profiles_gen.h  GENERATED from host/profiles/*.yaml (do not edit by hand)
 lib/vel_control/         portable closed-loop velocity controller (host-unit-tested)
 lib/{blheli_bl,esc_setup,esc_flash}/   bootloader client / config codec / HEX flash
+web/                     ESC Web Configurator (static page: settings, presets, motor test, flash)
 host/esctool.py          the PC CLI                host/posctl.py   position controller
 host/rpm_sweep.py        velocity-loop sweep + HTML evaluation report (rpm_sweep_report.py)
 host/gen_profile_header.py   YAML profile -> C++ header codegen
 host/profiles/           calibrated YAML profiles (source of truth for firmware curves)
-docs/                    design notes (velctl-generalization.md, etc.)
+host/pico_esc/measured.py    the measured plant inventory (one provenance record per number)
+host/pico_esc/plant.py       the plant model (firmware / rotor / load, in three separable layers)
+host/plantid.py              offline fit + out-of-sample validation of the plant (no hardware)
+host/tests/data/             committed bench fixtures + plant_fixtures.json (the manifest)
+docs/README.md           START HERE — operational facts, confidence tiering, doc map
+docs/                    the plant inventory (kept per-installation), soft-sensor.md, velocity-control.md, protocol-notes.md
 ```
 
 Legacy standalone bring-up apps (`dshot_demo`, `spike_*`, `encoder_test`) live on branch
