@@ -54,11 +54,17 @@
       </select></label>
     </div>
     <p id="test-note" class="hint"></p>
-    <div id="sliders"></div>
-    <h3>テレメトリ <span class="meta">(双方向 DShot のときだけ。5 Hz)</span></h3>
-    <table id="tele"><thead><tr><th>モーター</th><th>指令</th><th>回転数 rpm</th><th>電圧 V</th><th>電流 A</th><th>温度 °C</th><th>状態</th></tr></thead><tbody></tbody></table>
-    <canvas id="rpm-chart" height="180"></canvas>
-    <div id="rpm-legend" class="meta"></div>
+    <div class="test-grid">
+      <div>
+        <div id="sliders"></div>
+        <h3>テレメトリ <span class="meta">(双方向 DShot のときだけ。5 Hz)</span></h3>
+        <table id="tele"><thead><tr><th>モーター</th><th>指令</th><th>回転数 rpm</th><th>電圧 V</th><th>電流 A</th><th>温度 °C</th><th>状態</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="test-chart">
+        <canvas id="rpm-chart"></canvas>
+        <div id="rpm-legend" class="meta"></div>
+      </div>
+    </div>
   </section>
 
   <section id="flash" hidden>

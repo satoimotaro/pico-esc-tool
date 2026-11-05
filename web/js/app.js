@@ -62,31 +62,39 @@ async function connect() {
     await pipe.open();
     pipe.onclose = () => { if (st.pipe === pipe) dropped(); };
     st.pipe = pipe; st.msp = new Msp(pipe); st.fw = new FourWay(pipe);
-    await new Promise((r) => setTimeout(r, 300));
-    pipe.drain();
-    let api;
-    for (let i = 0; i < 3 && !api; i++) api = await st.msp.request(MSP.API_VERSION).catch(() => null);
-    if (!api) throw new Error('MSP の応答がありません (ポートやボーレートを確認)');
-    const variant = String.fromCharCode(...await st.msp.request(MSP.FC_VARIANT));
-    const board = String.fromCharCode(...(await st.msp.request(MSP.BOARD_INFO)).slice(0, 4));
-    st.board = `${variant} ${board}`.trim();
-    const feat = await st.msp.request(MSP.FEATURE_CONFIG).catch(() => [0, 0, 0, 0]);
-    st.threeD = !!((feat[0] | feat[1] << 8 | feat[2] << 16 | feat[3] << 24) & FEATURE_3D);
-    const mc = await st.msp.request(MSP.MOTOR_CONFIG).catch(() => null);
-    if (mc && mc.length > 6) st.motors = mc[6];
-    else {
-      const m = await st.msp.request(MSP.MOTOR);
-      st.motors = 0;
-      for (let i = 0; i < m.length / 2; i++) if (m[2 * i] | m[2 * i + 1] << 8) st.motors++;
+    try { await identify(pipe); } catch (e) {
+      st.pipe = null;                  // not a board we can talk to: give the port back
+      await pipe.close();
+      throw e;
     }
-    log(`接続: ${st.board}, API ${api[1]}.${api[2]}, モーター ${st.motors} 個${st.threeD ? ' (3D)' : ''}`, 'ok');
-    st.pico = board === 'PICO';
-    $('#test-proto-box').hidden = !st.pico;
-    if (!st.pico) $('#test-proto').value = 'dshot';
-    renderTest();
   });
   if (!st.pipe) return;
   status();
+}
+
+async function identify(pipe) {
+  await new Promise((r) => setTimeout(r, 300));
+  pipe.drain();
+  let api;
+  for (let i = 0; i < 3 && !api; i++) api = await st.msp.request(MSP.API_VERSION).catch(() => null);
+  if (!api) throw new Error('MSP の応答がありません (ポートやボーレートを確認)');
+  const variant = String.fromCharCode(...await st.msp.request(MSP.FC_VARIANT));
+  const board = String.fromCharCode(...(await st.msp.request(MSP.BOARD_INFO)).slice(0, 4));
+  st.board = `${variant} ${board}`.trim();
+  const feat = await st.msp.request(MSP.FEATURE_CONFIG).catch(() => [0, 0, 0, 0]);
+  st.threeD = !!((feat[0] | feat[1] << 8 | feat[2] << 16 | feat[3] << 24) & FEATURE_3D);
+  const mc = await st.msp.request(MSP.MOTOR_CONFIG).catch(() => null);
+  if (mc && mc.length > 6) st.motors = mc[6];
+  else {
+    const m = await st.msp.request(MSP.MOTOR);
+    st.motors = 0;
+    for (let i = 0; i < m.length / 2; i++) if (m[2 * i] | m[2 * i + 1] << 8) st.motors++;
+  }
+  log(`接続: ${st.board}, API ${api[1]}.${api[2]}, モーター ${st.motors} 個${st.threeD ? ' (3D)' : ''}`, 'ok');
+  st.pico = board === 'PICO';
+  $('#test-proto-box').hidden = !st.pico;
+  if (!st.pico) $('#test-proto').value = 'dshot';
+  renderTest();
 }
 
 function dropped() {

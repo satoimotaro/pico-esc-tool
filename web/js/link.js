@@ -40,24 +40,31 @@ export class SerialPipe extends Pipe {
     this.writer = this.port.writable.getWriter();
     this.reading = this.readLoop();
   }
+  // port.readable hands out a fresh stream after a cancel while the port is open, so the loop has to
+  // be told to stop (`closing`), or it takes a new reader and port.close() fails on the locked stream:
+  // the port stays open and the next connect cannot open it.
   async readLoop() {
     try {
-      while (this.port.readable) {
+      while (this.port.readable && !this.closing) {
         this.reader = this.port.readable.getReader();
-        for (;;) {
-          const { value, done } = await this.reader.read();
-          if (done) break;
-          this.push(value);
-        }
-        this.reader.releaseLock();
+        try {
+          for (;;) {
+            const { value, done } = await this.reader.read();
+            if (done) break;
+            this.push(value);
+          }
+        } finally { this.reader.releaseLock(); }
       }
     } catch (e) { /* unplugged */ }
     if (this.onclose) this.onclose();
   }
   async write(bytes) { await this.writer.write(Uint8Array.from(bytes)); }
   async close() {
+    this.closing = true;
     try { await this.reader?.cancel(); } catch (e) { /* already gone */ }
-    try { this.writer?.releaseLock(); await this.port?.close(); } catch (e) { /* already gone */ }
+    await this.reading;                              // the loop has released its lock
+    try { this.writer?.releaseLock(); } catch (e) { /* already gone */ }
+    try { await this.port?.close(); } catch (e) { /* already gone */ }
   }
 }
 
