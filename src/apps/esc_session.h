@@ -52,6 +52,15 @@ static const uint16_t SPIN_MAX        = 2000;   // max throttle
 static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no command within this
 static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this long to ARM the ESC
                                                 // (covers the ESC's boot beep after leaving the BL)
+// A bidir ESC counts as armed only once it answers and has taken the EDT enable. Bluejay sends its
+// first telemetry from wait_for_start, i.e. once it has armed, and takes DShot commands only there;
+// with "require EDT to arm" set it refuses to start without EDT, beeps and waits again
+// (Bluejay.asm wait_for_start_nonzero), and a reboot clears EDT. EDT used to go out only in a
+// zero-throttle gap after the arm, which a motor test that sends throttle at once never leaves:
+// the Bluejay then never started after a passthrough. An ESC that never answers is armed after
+// SPIN_ARM_TELE_MAX_MS, as before.
+static const uint32_t SPIN_ARM_TELE_HOLD_MS = 300;    // zero throttle after its first answer
+static const uint32_t SPIN_ARM_TELE_MAX_MS  = 8000;
 static const uint16_t PWM_MIN_US      = 1000;   // servo PWM pulse range
 static const uint16_t PWM_MAX_US      = 2000;
 static const uint16_t PWM_STOP_US     = 1000;   // zero throttle / arming pulse, one-way ESC
@@ -112,6 +121,7 @@ namespace detail {
 	static bool              drvArmed[COUNT] = { false };
 	static uint32_t          drvArmStart[COUNT] = { 0 };
 	static uint16_t          drvArmMs[COUNT] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
+	static uint32_t          drvAnswer[COUNT] = { 0 };  // this arm's first telemetry (0 = none yet)
 	                                                    // a re-arm after a run-mode stop can be short
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
@@ -327,6 +337,7 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	if (drvInitFail[idx]) drvFree(idx);   // PIO init failed (e.g. no free SM) — don't report a false ARMED
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
 	drvArmMs[idx] = armMs;   // 0 => SPIN_ARM_MS (see spinPoll)
+	drvAnswer[idx] = 0;
 }
 inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
 	using namespace detail;
@@ -382,13 +393,22 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!drvActive(i)) continue;
 		any = true;
-		if (!drvArmed[i]) { drvTarget[i] = 0; uint32_t win = drvArmMs[i] ? drvArmMs[i] : SPIN_ARM_MS;
-		                    if (millis() - drvArmStart[i] > win) drvArmed[i] = true; }
+		if (!drvArmed[i]) {
+			drvTarget[i] = 0;
+			uint32_t t = millis() - drvArmStart[i], win = drvArmMs[i] ? drvArmMs[i] : SPIN_ARM_MS;
+			// an explicit (short) window is a re-arm of an ESC that is armed already
+			bool heard = !drvB[i] || drvArmMs[i] ||
+			             (drvAnswer[i] && millis() - drvAnswer[i] >= SPIN_ARM_TELE_HOLD_MS && drvEdt[i] == 0);
+			if (t > win && (heard || t > SPIN_ARM_TELE_MAX_MS)) {
+				drvArmed[i] = true;
+				if (drvB[i]) drvEdt[i] = 20;   // again once armed and stopped: AM32 may answer before it arms
+			}
+		}
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		if (drvB[i]) {
 			uint32_t v = 0;
 			switch (drvB[i]->getTelemetryPacket(&v)) {
-				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); break;
+				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); if (!drvAnswer[i]) drvAnswer[i] = millis() | 1; break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
 				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; drvTele[i].tempStampMs = millis(); break;
@@ -398,7 +418,9 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 			}
 			// Enable EDT (extended telemetry: V/A/temp) once armed and still stopped — the ESC ignores
 			// commands during its post-bootloader boot beep, so this must come after the arm window.
-			if (drvArmed[i] && drvTarget[i] == 0 && drvEdt[i] > 0) { drvB[i]->sendRaw11Bit(13); drvEdt[i]--; continue; }
+			// While arming that is once it has answered (above); otherwise once armed and stopped.
+			bool edtNow = drvArmed[i] ? drvTarget[i] == 0 : drvAnswer[i] != 0;
+			if (edtNow && drvEdt[i] > 0) { drvB[i]->sendRaw11Bit(13); drvEdt[i]--; continue; }
 		}
 		drvSend(i, drvTarget[i]);
 	}
@@ -502,7 +524,12 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); forget its session
 	using namespace detail;
 	if (idx >= COUNT || !fwHave[idx]) return;
-	fwIdx = idx; runOp(Op::FWRUN, PINS[idx]);
+	fwIdx = idx;
+	// Learn it again while it is still in its bootloader: whatever the configurator wrote or flashed
+	// is in by now, and the motor test that usually follows then arms without a second bootloader
+	// visit (that one stalled the board for ~5 s, and the web test gave up on it).
+	if (runOp(Op::FWSELECT, PINS[idx])) infoFail[idx] = !learnInfo(idx);
+	runOp(Op::FWRUN, PINS[idx]);
 	fwHave[idx] = false; if (session == (int8_t)idx) session = -1;
 }
 inline void fwEnd() { for (uint8_t i = 0; i < COUNT; i++) fwRun(i); }

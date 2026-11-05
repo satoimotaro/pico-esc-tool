@@ -201,8 +201,8 @@ function savePreset(ch) {
 // ------------------------------------------------------------------------------- ESC cards
 function fieldInput(ch, f) {
   const edit = st.edits[ch], base = st.escs[ch].block;
-  const v = edit[f.off];
-  const set = (x) => { edit[f.off] = x; renderEscs(); };
+  const v = f.get ? f.get(edit) : edit[f.off];
+  const set = (x) => { if (f.put) f.put(edit, x); else edit[f.off] = x; renderEscs(); };
   let input;
   if (f.type === 'enum') {
     const known = f.opts.some(([k]) => k === v);
@@ -215,7 +215,8 @@ function fieldInput(ch, f) {
     input = h('input', { type: 'number', min: f.min, max: f.max, value: v,
       onchange: (e) => set(Math.max(0, Math.min(255, +e.target.value | 0))) });
   }
-  return h('label', { class: `field${v !== base[f.off] ? ' changed' : ''}`, title: f.help || '' },
+  const was = f.get ? f.get(base) : base[f.off];
+  return h('label', { class: `field${v !== was ? ' changed' : ''}`, title: f.help || '' },
     h('span', { class: 'fname' }, f.label),
     input,
     f.fmt ? h('span', { class: 'fmt' }, f.fmt(v)) : null);
@@ -353,12 +354,14 @@ async function startTest() {
       log('モーターテスト開始 (PWM)');
       return;
     }
-    // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while it arms an
-    // ESC (~3 s), so only a link silent for longer than that counts as lost.
+    // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while an arm
+    // reads an ESC it does not know yet (a bootloader visit, up to ~4 s each, one ESC after another),
+    // so only a link silent for longer than that counts as lost. The firmware stops the motors on
+    // its own when MSP goes quiet.
     let inflight = false, heard = performance.now();
     st.test.timer = setInterval(() => {
       if (!st.pipe || !st.test.on || inflight) return;
-      if (performance.now() - heard > 5000) { stopTest('ボードの応答が 5 秒ありません'); return; }
+      if (performance.now() - heard > 10000) { stopTest('ボードの応答が 10 秒ありません'); return; }
       const d = [];
       for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
       inflight = true;

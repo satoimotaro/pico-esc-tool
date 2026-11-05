@@ -54,6 +54,25 @@ const EDT_ARM = { key: 'FORCE_EDT_ARM', off: 0x2A, label: 'EDT を必須にす�
 const PWM_209 = { key: 'PWM_FREQUENCY', off: 0x0A, label: 'PWM 周波数', type: 'enum',
   opts: [[24, '24 kHz'], [48, '48 kHz'], [96, '96 kHz'], [0, '可変']] };
 
+// The startup melody sits in the same block (SiLabs 0x70.., AM32 tune[] at 48..). A field with
+// get/put stands for something that is not one byte.
+// Bluejay skips the melody when its first byte is 0xFF (Fx.asm play_beep_melody); the notes stay,
+// so turning it back on only restores that byte.
+const MELODY = { key: 'startup_melody', label: '起動音', type: 'enum', opts: [[1, 'メロディ'], [0, 'なし']],
+  get: (b) => (b[0x70] === 0xFF ? 0 : 1), put: (b, v) => { b[0x70] = v ? 0x02 : 0xFF; },
+  help: '電源投入時のメロディ。なしでも、信号を受けたときの短い音は鳴る' };
+// AM32 plays tune[] when tune[0] is not 0xFF and stops at the first all-zero note (sounds.c
+// playBlueJayTune); with tune[0] = 0xFF it plays its own three short beeps instead.
+const AM32_TUNE = 48;
+const TUNE = { key: 'startup_tune', label: '起動音', type: 'enum',
+  opts: [[2, 'メロディ'], [1, '短いビープ 3 回'], [0, 'なし']],
+  get: (b) => (b[AM32_TUNE] === 0xFF ? 1 : (b[AM32_TUNE + 4] || b[AM32_TUNE + 5] ? 2 : 0)),
+  put: (b, v) => {
+    if (v === 1) { b[AM32_TUNE] = 0xFF; return; }
+    if (v === 0) { if (b[AM32_TUNE] === 0xFF) b.fill(0, AM32_TUNE, AM32_TUNE + 4); b[AM32_TUNE + 4] = 0; b[AM32_TUNE + 5] = 0; }
+  },
+  help: '電源投入時の音。AM32 は信号が 2 秒途切れると再起動するので、そのたびに鳴る' };
+
 function bluejayFields(rev) {
   const f = [DIRECTION, SP_MIN];
   if (rev >= 201) f.push(SP_MAX);
@@ -70,6 +89,7 @@ function bluejayFields(rev) {
   }
   f.push(BEEP, BEACON, BEACON_DELAY);
   if (rev <= 202 || rev === 205) f.push(STARTUP_BEEP);
+  f.push(MELODY);
   if (rev <= 207) f.push(DITHER);
   f.push(LED);
   return f;
@@ -109,6 +129,7 @@ const AM32 = [
   { key: 'brake_on_stop', off: 28, label: '停止時ブレーキ', type: 'enum', opts: [[0, 'Off'], [1, 'Drag'], [2, 'Active']] },
   b('stall_protection', 29, '低回転の失速保護'),
   n('beep_volume', 30, 'ビープ音量', 0, 11),
+  TUNE,
   b('telemetry_on_interval', 31, '定期テレメトリ'),
   n('max_ramp', 5, '最大ランプ', 10, 250, (v) => `${(v / 10).toFixed(1)} %/ms`),
   n('minimum_duty_cycle', 6, '最小デューティ', 1, 50, (v) => `${(v / 5).toFixed(1)} %`),
@@ -151,7 +172,7 @@ export const AM32_MAP = {
 // Which map a SiLabs block uses, from its revision bytes
 export function silabsFamily(block) {
   const main = block[0], layout = block[2];
-  if (layout === 226) return { id: 'bluegill', name: 'BlueGill', fields: [...bluejayFields(208), ...BLUEGILL_EXTRA] };
+  if (layout === 226) return { id: 'bluegill', name: 'BlueGill', fields: [...bluejayFields(208).filter((f) => f !== MELODY), ...BLUEGILL_EXTRA] };
   if (layout >= 200 && layout <= 209) return { id: 'bluejay', name: 'Bluejay', fields: bluejayFields(layout) };
   if (main === 16 && (layout === 32 || layout === 33)) return { id: 'blheli_s', name: 'BLHeli_S', fields: BLHELI_S };
   return { id: 'unknown', name: '不明', fields: [] };

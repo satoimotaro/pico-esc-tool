@@ -460,10 +460,10 @@ private:
 	uint32_t mtArmedMs_ = 0;        // when an arm() returned: it can block for a bootloader visit
 	bool     mtDtr_ = false;
 	// IDLE HOLD. AM32 resets itself after 2 s without a valid frame (am32 Src/main.c, NVIC_SystemReset)
-	// and plays its startup tune on every boot, so an AM32 left alone beeps every few seconds. A flight
-	// controller never leaves it alone: it streams zero throttle. So does this, for the wired AM32 ESCs
-	// while nothing else needs them — not in a passthrough, a flash or a bootloader session (a connect
-	// frees the pin itself). The motor test takes an idle-held ESC over; a CLI throttle drives it as
+	// and plays its startup tune on every boot, so an AM32 left alone beeps every few seconds; BLHeli_S
+	// and Bluejay play their beacon after a few minutes without signal. A flight controller never leaves
+	// them alone: it streams zero throttle. So does this, for every wired ESC while nothing else needs
+	// them — not in a passthrough, a flash or a bootloader session (a connect frees the pin itself). The motor test takes an idle-held ESC over; a CLI throttle drives it as
 	// it is. `idle off` turns it off. One arm per 5 s: an arm can block while it learns the ESC.
 	uint32_t idle_ = 0, idleNextMs_ = 0;   // idle_: bit i = ESC i is held at zero throttle by this
 	bool     idleOn_ = true;
@@ -485,7 +485,7 @@ private:
 		// already failed (unpowered, unplugged, broken) until `scan` or a configurator read succeeds.
 		if (driving() || (int32_t)(millis() - idleNextMs_) < 0) return;
 		for (uint8_t i = 0; i < n_; i++) {
-			if (!(escs::armMask() >> i & 1) || !escs::isPresent(i) || escs::identFailed(i)) continue;
+			if (!escs::isPresent(i) || escs::identFailed(i)) continue;
 			if (escs::spinArmed(i) || escs::spinArming(i) || escs::pwmActive(i)) continue;
 			th_[i]->arm(); th_[i]->setRaw(0);
 			idle_ |= 1u << i; idleNextMs_ = millis() + 5000;

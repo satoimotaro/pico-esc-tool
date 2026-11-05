@@ -1,6 +1,6 @@
 # ESC lifecycle: identify, drive, hot-plug (design, not yet built)
 
-Status: agreed design for the release after rev0. rev0 ships the current code with the two
+Status: agreed design for the release after rev0. rev0 ships the current code with the
 fixes listed at the end; nothing below is implemented yet.
 
 ## Requirements
@@ -97,5 +97,11 @@ request to a non-3D ESC is refused and reported, not clamped to zero silently.
 - PWM output (50 Hz servo pulses) for firmwares that take it (AM32, stock BLHeli_S; not Bluejay,
   which accepts DShot only): its own deadman, the idle hold leaves PWM pins alone, and switching
   back to DShot needs no reboot.
+- The idle hold covers every wired ESC (Bluejay and BLHeli_S beacon too), not only AM32.
+- A bidir arm completes only once the ESC answers with telemetry and has taken the EDT enable.
+  Bluejay with "require EDT to arm" never started after a passthrough when the motor test sent
+  throttle at once: EDT went out only in a zero-throttle gap after the arm.
+- The end of a passthrough re-reads each ESC while it is still in its bootloader, so the motor test
+  that follows arms without another bootloader visit.
 - Known limits, in the release notes: a bootloader read on the drive path still stalls every
   stream; swaps are not detected; a stale direction after a failed read is possible.
