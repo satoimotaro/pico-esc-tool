@@ -68,18 +68,22 @@ void loop() { tool.poll(); }                   // serial + Wi-Fi + each ESC's RP
 ```
 arm <i> [normal|bidir]      # arm ESC i (AUTO: bidir for Bluejay/JESC, else normal DShot)
 throttle <i> <0..2000>      # RAW one-way throttle          (armed)
-thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop
+thrust  <i> <-1000..1000>   # RAW reversible/3D signed thrust, 0 = stop (full scale at +-953)
 rpm     <i> <mech-rpm>      # CLOSED-LOOP velocity target (signed); 0 = clean stop; needs a profile
 gain    <i> kp|ki|kd|dtau|trim|slew|dob|dobtau|dobmax|dobsettle <v>   # tune the closed loop live
 tele    <i>                 # rpm | volts | amps | tempC | stress   (bidir firmware only)
 disarm  <i>                 # stop + release
 cfg     [show|save|load|clear]   # persist/restore motor + gains + DOB + vbatt cal on the Pico's flash
 curve   <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>]   # upload a measured FF curve
+pwm     <i> <1000..2000|stop>          # servo PWM (50 Hz) instead of DShot; see the web tool below
+pwmch   <ch> <1000..2000|stop>         # the same by motor-test channel, value mapped per ESC (needs mtmode)
+mtmode  <mask>                        # motor test: bit c = channel c sends 3D values (web tool)
 ```
 
 Arming streams zero throttle ~3 s (BLHeli-S won't spin until armed); a **deadman** re-zeros if no
-command arrives within 500 ms. `throttle`/`thrust` are RAW (open loop); `rpm` engages the closed loop
-and the ESC holds the target speed. Stock BLHeli-S = normal DShot (throttle only, no telemetry);
+command arrives within 500 ms. A Bluejay/BLHeli-derived bidir ESC that stalls (eRPM 0 under throttle
+for 1.5 s) is armed again and held at 0 until it is sent 0. `throttle`/`thrust` are RAW (open loop);
+`rpm` engages the closed loop and the ESC holds the target speed. Stock BLHeli-S = normal DShot (throttle only, no telemetry);
 **Bluejay/JESC** = bidirectional DShot with eRPM/EDT telemetry and reversible support.
 
 ## Closed-loop RPM control
@@ -174,11 +178,14 @@ on leaving the tab, and when hidden.
 
 On this firmware the motor test can also send **servo PWM** (50 Hz, 1000–2000 µs) instead of DShot,
 for firmwares that take it: AM32 and stock BLHeli_S, not Bluejay (DShot only). The CLI form is
-`pwm <i> <µs|stop>`. The ESC must have been read first (`scan`, a configurator read, or a DShot arm),
-because the stop pulse is 1500 µs on a 3D ESC; the first 5 s after switching hold that stop pulse so
-the ESC re-detects the protocol and arms. Fed like `throttle`: 500 ms without a value falls back to the
-stop pulse. There is no telemetry on PWM. Design notes for the next ESC-handling rework:
-[`docs/esc-lifecycle.md`](docs/esc-lifecycle.md).
+`pwm <i> <µs|stop>` (1000..2000; `0`, junk and anything below 1000 are refused: a typo must not become a width the ESC reads as full reverse).
+The ESC must have been read first (`scan`, a configurator read, or a DShot arm), because the stop pulse
+is 1500 µs on a 3D ESC; the first 5 s after switching hold that stop pulse so the ESC re-detects the
+protocol and arms, and after that a width passes only once one stop width has been sent. Fed like
+`throttle`: 500 ms without a value falls back to the stop pulse (also while the board is busy), and
+3 s without one after the arm the pin leaves PWM. Bootloader commands are refused while a PWM pin
+runs. There is no telemetry on PWM. The rev0 known limits and the design notes for the next
+ESC-handling rework: [`docs/esc-lifecycle.md`](docs/esc-lifecycle.md).
 
 ## Position control (`host/posctl.py`)
 

@@ -450,14 +450,16 @@ private:
 	//     for it is dropped, so a stale SET_MOTOR cannot restart a motor (Betaflight tasks.c,
 	//     checkUsbLinkLost);
 	//   - no MSP at all for MT_TIMEOUT_MS (esc-configurator polls BATTERY_STATE every 1 s while the
-	//     motor panel is open, so silence means it is gone or wedged);
+	//     motor panel is open, so silence means it is gone or wedged); a loop held up for longer
+	//     than that (an arm or a scan reading an ESC) is not silence;
 	//   - a passthrough starts. An ESC the CLI already armed is left alone, and a CLI `disarm` of
 	//     one the test armed hands it back.
 	// Spinning goes through Thruster::arm/setRaw like the CLI's `throttle`: the same 3 s arm, the
 	// same 500 ms deadman (fed here every loop), the same reversible handling.
 	static const uint32_t MT_TIMEOUT_MS = 2000;
 	uint32_t mtOwned_ = 0;          // ESCs this motor test armed
-	uint32_t mtArmedMs_ = 0;        // when an arm() returned: it can block for a bootloader visit
+	uint32_t mtArmedMs_ = 0;        // when an arm() returned or the loop was last held up: it can block
+	uint32_t mtLoopMs_ = 0;         // for a bootloader visit, and the queued MSP is no silence
 	bool     mtDtr_ = false;
 	// IDLE HOLD. AM32 resets itself after 2 s without a valid frame (am32 Src/main.c, NVIC_SystemReset)
 	// and plays its startup tune on every boot, so an AM32 left alone beeps every few seconds; BLHeli_S
@@ -467,6 +469,13 @@ private:
 	// it is. `idle off` turns it off. One arm per 5 s: an arm can block while it learns the ESC.
 	uint32_t idle_ = 0, idleNextMs_ = 0;   // idle_: bit i = ESC i is held at zero throttle by this
 	bool     idleOn_ = true;
+	// The PWM slice keeps its width while core0 waits on core1, so a bootloader visit (scan, read, a
+	// configurator op) is refused while a PWM pin is fed above its stop. (The stop width also goes out
+	// during any visit, and a timer IRQ falls back to it 500 ms after the last width.)
+	bool pwmBusy() {
+		for (uint8_t i = 0; i < n_; i++) if (escs::pwmDriving(i)) { console::out().println("err busy (pwm running: pwm <i> stop first)"); return true; }
+		return false;
+	}
 	bool driving() {   // anything spinning that the idle hold does not own (PWM included)
 		for (uint8_t i = 0; i < n_; i++) {
 			if (escs::pwmActive(i)) return true;
@@ -511,28 +520,33 @@ private:
 	void motorTestPoll() {
 		// FEATURE_3D follows what is known, but never mid-test: the first arm of a test reads the ESC,
 		// and flipping the meaning of the configurator's values then turned a one-way "1100" into
-		// nothing and a 3D "1000" (stop, as the page drew it) into full reverse.
-		if (!mtOwned_ && !fw_.motorWanted()) {
-			bool reversibleWired = false;
-			for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
-			fw_.setThreeD(reversibleWired);
-		}
+		// nothing and a 3D "1000" (stop, as the page drew it) into full reverse. Once a client has
+		// read it, fw_ keeps the answer for that client (FourWay::setThreeD).
+		bool idle = !mtOwned_ && !fw_.motorWanted(), reversibleWired = false;
+		if (idle) for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
+		fw_.setThreeD(reversibleWired, idle);
+		if (millis() - mtLoopMs_ > 500) mtArmedMs_ = millis();   // held up: queued MSP is no silence
+		mtLoopMs_ = millis();
+		// The session ends with the link or with MSP, whether or not a test runs: what the last
+		// client declared (mtmode) or left on a slider must not be read by the next one.
+		bool linkGone = false;
 #if !ESC_CONSOLE_UART
 		bool dtr = Serial.dtr();
-		if (mtDtr_ && !dtr) {
-			if (mtOwned_ || fw_.motorWanted()) {
-				while (Serial.available()) Serial.read();
-				motorTestStop("USB link lost");
-			}
+		linkGone = mtDtr_ && !dtr;
+		if (linkGone && (mtOwned_ || fw_.motorWanted())) {
+			while (Serial.available()) Serial.read();
+			motorTestStop("USB link lost");
 		}
 		mtDtr_ = dtr;
 #endif
-		if (!mtOwned_ && !fw_.motorWanted()) return;
-		if (fw_.active())                              { motorTestStop("passthrough"); return; }
 		// Silence counts from the later of the last MSP and the last arm(): an arm that had to read
 		// the ESC's settings held this loop (and the configurator's queued polls) for seconds.
 		uint32_t heard = fw_.mspMs(); if ((int32_t)(mtArmedMs_ - heard) > 0) heard = mtArmedMs_;
-		if (millis() - heard > MT_TIMEOUT_MS)          { motorTestStop("configurator silent"); return; }
+		bool silent = millis() - heard > MT_TIMEOUT_MS;
+		if (silent && (mtOwned_ || fw_.motorWanted()) && !fw_.active()) motorTestStop("configurator silent");
+		if (linkGone || silent) fw_.endSession(linkGone);
+		if (!mtOwned_ && !fw_.motorWanted()) return;
+		if (fw_.active())                              { motorTestStop("passthrough"); return; }
 		for (uint8_t ch = 0; ch < 8; ch++) {
 			int8_t e = FourWay::channel(ch);
 			if (e < 0 || e >= n_) continue;
@@ -551,7 +565,9 @@ private:
 				mtOwned_ &= ~(1u << i); continue;
 			}
 			// 1000..2000 (stop 1000) or 3D 1000..1500..2000 -> the CLI's raw units. Reverse only when the
-			// value is 3D AND the ESC is: any other pairing runs forward or not at all.
+			// value is 3D AND the ESC is: any other pairing runs forward or not at all. 0 (a short or
+			// cleared frame) is stop, not "below full reverse".
+			if (!v) v = c3d ? 1500 : 1000;
 			int raw;
 			if (th->reversible()) raw = c3d ? (int(v) - 1500) * 2 : (v > 1000 ? (int(v) - 1000) : 0);
 			else                  raw = c3d ? (v > 1500 ? (int(v) - 1500) * 4 : 0) : (v > 1000 ? (int(v) - 1000) * 2 : 0);
@@ -916,11 +932,11 @@ private:
 			else if (!strcmp(cmd,"mode")) { char* a=strtok(nullptr," ");
 				if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
 				console::out().printf("mode %s (wifi %s)\n", mode_==SETUP?"setup":"drive", wifiUp_?"on":"off"); console::out().println("ok"); }
-			else if (!strcmp(cmd,"scan")) { uint32_t m=0; for(uint8_t i=0;i<n_;i++){ escs::Info in;
+			else if (!strcmp(cmd,"scan")) { if (pwmBusy()) continue; uint32_t m=0; for(uint8_t i=0;i<n_;i++){ escs::Info in;
 				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,Esc::pin(i));
 				else { m|=1u<<i; console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } }
 				savePresent(m); printPresent(); console::out().println("ok"); }
-			else if (!strcmp(cmd,"preset")) presetCmd();
+			else if (!strcmp(cmd,"preset")) { if (!pwmBusy()) presetCmd(); }
 			else if (!strcmp(cmd,"idle")) { char* a=strtok(nullptr," ");   // idle [on|off]: zero-throttle hold for AM32
 				if (a && !strcmp(a,"off")) { idleOn_=false; idleStop(); } else if (a && !strcmp(a,"on")) idleOn_=true;
 				console::out().printf("idle|%s|held=%lx\n", idleOn_?"on":"off", (unsigned long)idle_); console::out().println("ok"); }
@@ -931,16 +947,16 @@ private:
 					if (bad) { console::out().println("err bad-index"); continue; }
 					savePresent(m); }
 				printPresent(); console::out().println("ok"); }
-			else if (!strcmp(cmd,"read")) { int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
+			else if (!strcmp(cmd,"read")) { if (pwmBusy()) continue; int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
 				if(i<0||i>=n_) console::out().println("err bad-index");
 				else if(!th_[i]->readConfig(cfg)) console::out().println("err no-connect");
 				else { console::out().print("cfg|"); printHex(cfg,esc_setup::kEepromLen); console::out().println(); console::out().println("ok"); } }
-			else if (!strcmp(cmd,"enter")) { int i=argi(); escs::Info in;
+			else if (!strcmp(cmd,"enter")) { if (pwmBusy()) continue; int i=argi(); escs::Info in;
 				if(i<0||i>=n_) console::out().println("err bad-index");
 				else if(!th_[i]->connect(in)) console::out().println("err no-connect");
 				else { console::out().printf("dev|%04X|%u|%u\n",in.sig,in.bootVer,in.bootPages); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"run")||!strcmp(cmd,"disconnect")) { escs::release(); console::out().println("ok"); }
-			else if (!strcmp(cmd,"editpage")) { int i=argi(); char* ovr=strtok(nullptr," ");
+			else if (!strcmp(cmd,"editpage")) { if (pwmBusy()) continue; int i=argi(); char* ovr=strtok(nullptr," ");
 				if(i<0||i>=n_||!ovr){ console::out().println("err bad-args"); continue; }
 				uint16_t offs[160]; uint8_t vals[160]; int n=0; bool bad=false;
 				for(char* tok=strtok(ovr,",");tok&&!bad;tok=strtok(nullptr,",")){ char* col=strchr(tok,':');
@@ -952,20 +968,20 @@ private:
 				else if(r==-3)console::out().println("err bad-override"); else if(r==-4)console::out().println("err write-verify-failed");
 				else if(r==0){ console::out().println("unchanged (flash write skipped)"); console::out().println("ok"); }
 				else { console::out().printf("edited %d byte(s)\n",n); console::out().println("ok"); } }
-			else if (!strcmp(cmd,"erase")) { int i=argi(); char* ad=strtok(nullptr," ");
+			else if (!strcmp(cmd,"erase")) { if (pwmBusy()) continue; int i=argi(); char* ad=strtok(nullptr," ");
 				if(i<0||i>=n_||!ad) console::out().println("err bad-args");
 				else console::out().println(th_[i]->erasePage((uint16_t)strtol(ad,nullptr,16))?"ok":"err erase-failed"); }
-			else if (!strcmp(cmd,"writeflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* hx=strtok(nullptr," ");
+			else if (!strcmp(cmd,"writeflash")) { if (pwmBusy()) continue; int i=argi(); char* ad=strtok(nullptr," "); char* hx=strtok(nullptr," ");
 				if(i<0||i>=n_||!ad||!hx){ console::out().println("err bad-args"); continue; }
 				int n=parseHex(hx,flbuf,sizeof(flbuf));
 				if(n<=0)console::out().println("err bad-hex");
 				else console::out().println(th_[i]->writeFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)n)?"ok":"err write-failed"); }
-			else if (!strcmp(cmd,"blprobe")) { int i=argi(); char* h=strtok(nullptr," ");   // blprobe <i> [holdMs]
+			else if (!strcmp(cmd,"blprobe")) { if (pwmBusy()) continue; int i=argi(); char* h=strtok(nullptr," ");   // blprobe <i> [holdMs]
 				if(i<0||i>=n_){ console::out().println("err bad-index"); continue; }
 				uint8_t raw[8]; uint32_t e,l,t; int n=escs::probe((uint8_t)i, h?(uint32_t)atoi(h):2600, raw, e, l, t);
 				console::out().printf("blprobe|n=%d|raw=",n); printHex(raw,8);
 				console::out().printf("|edges=%lu|low=%lu/%lu\n",(unsigned long)e,(unsigned long)l,(unsigned long)t); console::out().println("ok"); }
-			else if (!strcmp(cmd,"readflash")) { int i=argi(); char* ad=strtok(nullptr," "); char* ln=strtok(nullptr," ");
+			else if (!strcmp(cmd,"readflash")) { if (pwmBusy()) continue; int i=argi(); char* ad=strtok(nullptr," "); char* ln=strtok(nullptr," ");
 				int rl=ln?atoi(ln):-1;
 				if(i<0||i>=n_||!ad||rl<1||rl>(int)sizeof(flbuf)) console::out().println("err bad-args");
 				else if(!th_[i]->readFlash((uint16_t)strtol(ad,nullptr,16),flbuf,(uint16_t)rl)) console::out().println("err read-failed");
@@ -982,7 +998,7 @@ private:
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
 				else if(!th_[i]->armed()) console::out().println("err not-armed");
 				else { th_[i]->setRaw(atoi(v)); console::out().println("ok"); } }
-			else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D)
+			else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D; full scale at +-953)
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
 				else if(!th_[i]->armed()) console::out().println("err not-armed");
 				else { th_[i]->setRaw(atoi(v)); console::out().println("ok"); } }
@@ -1224,12 +1240,17 @@ private:
 			else if (!strcmp(cmd,"pwm") || !strcmp(cmd,"pwmch")) {   // servo PWM (50 Hz) instead of DShot: pwm <i> <us|stop>
 				bool byCh = cmd[3] == 'c';                                // pwmch <motor-test channel> <us|stop> (web tool)
 				int a=argi(); int i = byCh ? (a >= 0 ? FourWay::channel((uint8_t)a) : -1) : a; char* v=strtok(nullptr," ");
-				if(i<0||i>=n_||!v) console::out().println("err bad-args");
+				char* end=nullptr; long us = v ? strtol(v,&end,10) : 0;   // "0" or junk is no width: 1000 us is full reverse on 3D
+				bool isStop = v && !strcmp(v,"stop");
+				if(i<0||i>=n_||!v||(!isStop&&(end==v||*end||us<1000))) console::out().println("err bad-args");
 				else if(fw_.active()||fl_==FL_START||fl_==FL_RUN) console::out().println("err busy");
-				else if(!strcmp(v,"stop")){ th_[i]->stop(); console::out().printf("pwm|%d|off\n",i); console::out().println("ok"); }
-				else { if(!escs::pwmActive(i)){ th_[i]->stop(); idle_&=~(1u<<i);
-						if(!escs::pwmBegin(i)){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; } }
-					int us = constrain(atoi(v),0,3000);
+				else if(isStop){ th_[i]->stop(); console::out().printf("pwm|%d|off\n",i); console::out().println("ok"); }
+				// a motor-test value means nothing until the page has said which channels are 3D
+				else if(byCh && !fw_.declared()) console::out().println("err no-mtmode");
+				else { if(!escs::pwmActive(i)){
+						if(!escs::identKnown(i)){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; }
+						th_[i]->stop(); idle_&=~(1u<<i); escs::pwmBegin(i); }
+					if (us > 3000) us = 3000;
 					if (byCh) us = pwmFromTest(i, (uint16_t)us, (uint8_t)a);              // the motor test's value, mapped per ESC
 					escs::pwmSet(i,(uint16_t)us);                             // fed like `throttle`: 500 ms deadman -> stop pulse
 					console::out().printf("pwm|%d|%uus|%s\n",i,escs::pwmTarget(i),escs::pwmArming(i)?"arming":"armed"); console::out().println("ok"); } }

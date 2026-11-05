@@ -54,23 +54,29 @@ const EDT_ARM = { key: 'FORCE_EDT_ARM', off: 0x2A, label: 'EDT を必須にす�
 const PWM_209 = { key: 'PWM_FREQUENCY', off: 0x0A, label: 'PWM 周波数', type: 'enum',
   opts: [[24, '24 kHz'], [48, '48 kHz'], [96, '96 kHz'], [0, '可変']] };
 
-// The startup melody sits in the same block (SiLabs 0x70.., AM32 tune[] at 48..). A field with
-// get/put stands for something that is not one byte.
+// The startup melody sits in the same block (SiLabs 0x70..0xEF, AM32 tune[] at 48..175). A field
+// with get/put stands for something that is not one byte; put(edit, v, base) gets the block as it was
+// read, so a choice can be undone without losing bytes. offer(base, k) hides an option it cannot give.
 // Bluejay skips the melody when its first byte is 0xFF (Fx.asm play_beep_melody); the notes stay,
-// so turning it back on only restores that byte.
+// so turning it back on only restores that byte (as read, or 0x02 if it was read off).
+const MELODY_END = 0xF0;
 const MELODY = { key: 'startup_melody', label: '起動音', type: 'enum', opts: [[1, 'メロディ'], [0, 'なし']],
-  get: (b) => (b[0x70] === 0xFF ? 0 : 1), put: (b, v) => { b[0x70] = v ? 0x02 : 0xFF; },
+  get: (b) => (b[0x70] === 0xFF ? 0 : 1),
+  put: (b, v, base) => { b[0x70] = v ? (base && base[0x70] !== 0xFF ? base[0x70] : 0x02) : 0xFF; },
+  offer: (base, k) => k !== 1 || base[0x70] !== 0xFF || base.subarray(0x71, MELODY_END).some((x) => x !== 0xFF && x !== 0),
   help: '電源投入時のメロディ。なしでも、信号を受けたときの短い音は鳴る' };
 // AM32 plays tune[] when tune[0] is not 0xFF and stops at the first all-zero note (sounds.c
 // playBlueJayTune); with tune[0] = 0xFF it plays its own three short beeps instead.
-const AM32_TUNE = 48;
+const AM32_TUNE = 48, AM32_TUNE_END = 176;
 const TUNE = { key: 'startup_tune', label: '起動音', type: 'enum',
   opts: [[2, 'メロディ'], [1, '短いビープ 3 回'], [0, 'なし']],
   get: (b) => (b[AM32_TUNE] === 0xFF ? 1 : (b[AM32_TUNE + 4] || b[AM32_TUNE + 5] ? 2 : 0)),
-  put: (b, v) => {
+  put: (b, v, base) => {
+    if (v === 2) { b.set(base.subarray(AM32_TUNE, AM32_TUNE_END), AM32_TUNE); return; }   // the tune as read
     if (v === 1) { b[AM32_TUNE] = 0xFF; return; }
     if (v === 0) { if (b[AM32_TUNE] === 0xFF) b.fill(0, AM32_TUNE, AM32_TUNE + 4); b[AM32_TUNE + 4] = 0; b[AM32_TUNE + 5] = 0; }
   },
+  offer: (base, k) => k !== 2 || TUNE.get(base) === 2,   // a melody only if one was read
   help: '電源投入時の音。AM32 は信号が 2 秒途切れると再起動するので、そのたびに鳴る' };
 
 function bluejayFields(rev) {

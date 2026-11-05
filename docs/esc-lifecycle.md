@@ -103,5 +103,38 @@ request to a non-3D ESC is refused and reported, not clamped to zero silently.
   throttle at once: EDT went out only in a zero-throttle gap after the arm.
 - The end of a passthrough re-reads each ESC while it is still in its bootloader, so the motor test
   that follows arms without another bootloader visit.
-- Known limits, in the release notes: a bootloader read on the drive path still stalls every
-  stream; swaps are not detected; a stale direction after a failed read is possible.
+- The 3D/one-way meaning of a motor-test value is fixed per session on both sides. The page takes
+  each motor's meaning once when the test starts and keeps it until the test has stopped, even if an
+  ESC is forgotten or re-read meanwhile; it declares it (`mtmode <mask>`, answered `mtmode|xx`) and
+  repeats the declaration ahead of every frame. Without an answer it treats every motor as FEATURE_3D
+  says. The firmware latches its FEATURE_3D answer when a client reads it, until USB DTR falls or it
+  is read again with no test running. A declaration ends with the test, when DTR falls, and after
+  2 s without MSP (a loop held up by a bootloader read does not count). An undeclared channel takes
+  an ESC over only above the reported stop.
+- Known limits, in the release notes:
+  - A bootloader read on the drive path still stalls every stream.
+  - Swaps are not detected. A bidir ESC that answered and then goes silent for 1 s while armed is
+    reported (code 7); after 3 prompt polls in a row the page forgets its read and locks its slider.
+  - A failed read leaves the ESC unknown (no stale direction is used), and it is not retried
+    automatically.
+  - Stall re-arm (Bluejay/BLHeli-derived bidir only, not AM32): eRPM 0 under throttle for 1.5 s, or
+    no telemetry for 0.5 s once it has turned, re-arms the ESC (EDT included). A throttle below the
+    start point therefore re-arms after 1.5 s. The target is then held at 0 until a 0 is sent, so a
+    jam is never restarted on its own. After 3 restarts without a run in between, only a 0 held for
+    1 s frees it.
+  - A session ends on DTR fall (USB). Transports without DTR (the `main_uart` build, a WebSocket
+    bridge) only end it on MSP silence: a client that reconnects within 2 s inherits the old test.
+  - The firmware's `mtmode` declaration and the FEATURE_3D latch are RAM only; the page sends the
+    declaration again on each frame.
+  - MOTOR_TELEMETRY's mAh field carries the motor-test state (escs::UiState: 2 arming, 3 armed,
+    4 idle, 5 absent, 6 stalled, 7 silent; 1 reserved) with 0x5A in the high byte. Betaflight
+    Configurator shows it as about 23 Ah. The page reads it only from a board that says PICO.
+  - PWM: a width sent during the 5 s arm is not kept. After the arm, only the stop width passes
+    until one stop width has come (reported as arming, code 2, so the page keeps its slider locked).
+    The 500 ms deadman also runs from a timer IRQ, so it holds while core0 is blocked. Every PWM
+    pin goes to its stop width during any bootloader visit, and CLI bootloader commands are refused
+    while a PWM pin is fed above its stop. A pin unfed for 3 s after its arm leaves PWM, and the idle
+    hold takes it back. There is no hardware watchdog: a core0 hang with interrupts off keeps the
+    last width.
+  - `thrust` and the 3D motor-test range reach full scale at ±953. Past that the value is clamped,
+    because the next 47 units would fall into the other direction's band.

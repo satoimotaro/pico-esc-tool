@@ -18,6 +18,8 @@
 #include "esc_setup.h"
 #include <hardware/pwm.h>
 #include <hardware/clocks.h>
+#include <hardware/sync.h>
+#include <pico/time.h>
 
 namespace escs {
 
@@ -63,17 +65,23 @@ static const uint32_t SPIN_ARM_TELE_HOLD_MS = 300;    // zero throttle after its
 static const uint32_t SPIN_ARM_TELE_MAX_MS  = 8000;
 // A bidir ESC that stalls drops out of its run: Bluejay beeps, clears EDT and waits to be armed again
 // (Bluejay.asm exit_run_mode), and with "require EDT to arm" it then refuses every start. Seen as eRPM
-// at 0 under throttle for STALL_ZERO_MS, or no telemetry at all for STALL_SILENT_MS (forced sine
-// sends no eRPM but keeps sending EDT, so only total silence counts). The pin is then armed again
-// (zero, answer, EDT); after STALL_MAX restarts in a row the target stays 0 until it is sent 0.
+// at 0 under throttle for STALL_ZERO_MS (so a throttle below the start point counts too: raise past it
+// within 1.5 s), or, once it has turned in this run, no telemetry at all for STALL_SILENT_MS (forced
+// sine sends no eRPM but keeps sending EDT, so only total silence counts). The pin is then armed again
+// (zero, answer, EDT) and its target held at 0 until it is sent 0: a jam is never restarted on its
+// own. After STALL_MAX restarts with no run in between, only a zero held for STALL_REST_MS frees it.
+// Bluejay/BLHeli-derived firmware only: AM32 stays in its run on a stall (armSeen).
 static const uint32_t STALL_ZERO_MS   = 1500;
 static const uint32_t STALL_SILENT_MS = 500;
 static const uint8_t  STALL_MAX       = 3;
+static const uint32_t STALL_REST_MS   = 1000;
+static const uint32_t TELE_LOST_MS    = 1000;   // armed bidir ESC that answered, silent this long: gone
 static const uint16_t PWM_MIN_US      = 1000;   // servo PWM pulse range
 static const uint16_t PWM_MAX_US      = 2000;
 static const uint16_t PWM_STOP_US     = 1000;   // zero throttle / arming pulse, one-way ESC
 static const uint16_t PWM_MID_US      = 1500;   // the same on a 3D ESC (1000 us is full reverse there)
 static const uint32_t PWM_ARM_MS      = 5000;   // hold PWM_STOP_US this long after switching to PWM
+static const uint32_t PWM_RELEASE_MS  = 3000;   // after the arm, unfed this long: the pin leaves PWM
 static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc_config.h)
 
 // Per-ESC DShot mode. BLHeli-S understands only *normal* DShot; *bidir* DShot (inverted, with eRPM/
@@ -137,8 +145,11 @@ namespace detail {
 	static uint32_t          drvPktMs[COUNT] = { 0 };   // last valid telemetry packet of any kind
 	static uint32_t          drvZeroMs[COUNT] = { 0 };  // since when eRPM has read 0 under throttle
 	static uint32_t          drvStallMs[COUNT] = { 0 }; // last stall restart (0 = none)
-	static uint8_t           drvStalls[COUNT] = { 0 };  // restarts since the target last was 0
-	                                                    // a re-arm after a run-mode stop can be short
+	static uint8_t           drvStalls[COUNT] = { 0 };  // restarts since it last ran STALL_ZERO_MS
+	static uint32_t          drvRunMs[COUNT] = { 0 };   // since when eRPM has read > 0 under throttle
+	static bool              drvSpun[COUNT] = { false }; // eRPM > 0 seen since the target left 0
+	static bool              drvHold[COUNT] = { false }; // stalled: target 0 until a zero command
+	static uint32_t          drvZeroCmd[COUNT] = { 0 };  // since when the commands have been 0
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
 	static bool              drvInitFail[COUNT] = { false }; // last spinArm's DShot PIO init failed
@@ -159,10 +170,24 @@ namespace detail {
 	                                                        // automatic arm must not try again (see idle hold)
 	// Servo PWM (50 Hz, 1000..2000 us) instead of DShot, for firmwares that take it (AM32, stock
 	// BLHeli-S; Bluejay does not). Hardware PWM slice, not PIO. pwmUs = 0: the pin is not on PWM.
-	static uint16_t          pwmUs[COUNT] = { 0 }, pwmStop[COUNT] = { 0 };   // pwmStop: 1500 on a 3D ESC
-	static uint32_t          pwmLast[COUNT] = { 0 }, pwmStart[COUNT] = { 0 };
+	static volatile uint16_t pwmUs[COUNT] = { 0 }, pwmStop[COUNT] = { 0 };   // read by the deadman IRQ;   // pwmStop: 1500 on a 3D ESC
+	static volatile uint32_t pwmLast[COUNT] = { 0 };
+	static uint32_t          pwmStart[COUNT] = { 0 };
+	static bool              pwmZero[COUNT] = { false };   // a stop width came after the arm
 	static inline bool pwmOn(uint8_t i) { return pwmUs[i] != 0; }
-	static inline void pwmLevel(uint8_t i, uint16_t us) { pwm_set_gpio_level(PINS[i], us); }
+	// IRQs off: a slice's two pins share one CC register, and the deadman alarm below writes it too.
+	static inline void pwmLevel(uint8_t i, uint16_t us) {
+		uint32_t s = save_and_disable_interrupts(); pwm_set_gpio_level(PINS[i], us); restore_interrupts(s);
+	}
+	// The slice keeps its last width whatever core0 does, so the deadman also runs from a timer IRQ:
+	// a loop held up (a bootloader read, a hang) still falls back to the stop width after 500 ms.
+	static repeating_timer_t pwmTimer; static bool pwmTimerOn = false;
+	static bool pwmWatch(repeating_timer_t*) {
+		for (uint8_t i = 0; i < COUNT; i++)
+			if (pwmOn(i) && millis() - pwmLast[i] > SPIN_DEADMAN_MS) pwm_set_gpio_level(PINS[i], pwmStop[i]);
+		return true;
+	}
+	static inline void pwmSafe() { for (uint8_t i = 0; i < COUNT; i++) if (pwmOn(i)) pwmLevel(i, pwmStop[i]); }
 	static inline void pwmOff(uint8_t i) {
 		if (!pwmOn(i)) return;
 		pwmLevel(i, 0); pwmUs[i] = 0;
@@ -179,13 +204,24 @@ namespace detail {
 		if (drvB[i]) { drvB[i]->sendThrottle(0); delete drvB[i]; drvB[i] = nullptr; }
 		if (drvN[i]) { uint16_t a[4] = { 0, 0, 0, 0 }; drvN[i]->sendThrottles(a); delete drvN[i]; drvN[i] = nullptr; }
 	}
+	// A command after a stall (see STALL_ZERO_MS): held at 0 until a zero comes, or after STALL_MAX
+	// restarts that never ran, until zeros have come for STALL_REST_MS.
+	static inline uint16_t stallGate(uint8_t i, uint16_t t) {
+		uint32_t now = millis();
+		if (t) { drvZeroCmd[i] = 0; return drvHold[i] ? 0 : t; }
+		if (!drvZeroCmd[i]) drvZeroCmd[i] = stamp(now);
+		if (drvStalls[i] < STALL_MAX || now - drvZeroCmd[i] >= STALL_REST_MS) drvHold[i] = false;
+		return 0;
+	}
 
 	static bool runOp(Op o, uint8_t pin) {          // core0: hand an op to core1, block till done
+		pwmSafe();                                   // nothing is fed while this blocks
 		opPin = pin; opOk = false; opDone = false; op = o;
 		while (!opDone) delay(1);
 		op = Op::NONE; return opOk;
 	}
 	static bool enterBootloader(uint8_t pin, int tries = 3) {   // DShot-prime -> signal-loss -> connect (retry)
+		pwmSafe();
 		for (int a = 0; a < tries; a++) {
 			// AM32 only reboots into its bootloader after ~2 s without a valid frame, plus its startup
 			// tune, and its bootloader bails back to the app on garbage. So prime only on the first
@@ -354,38 +390,46 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
 	drvArmMs[idx] = armMs;   // 0 => SPIN_ARM_MS (see spinPoll)
 	drvAnswer[idx] = 0; drvZeroMs[idx] = 0; drvStalls[idx] = 0; drvStallMs[idx] = 0;
+	drvRunMs[idx] = 0; drvSpun[idx] = false; drvHold[idx] = false; drvZeroCmd[idx] = 0;
 }
 inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
 	using namespace detail;
 	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;   // must be armed first
-	if (throttle == 0) drvStalls[idx] = 0;
-	else if (drvStalls[idx] >= STALL_MAX) throttle = 0;   // gave up: back to 0 first
+	throttle = stallGate(idx, throttle);
 	drvTarget[idx] = throttle > SPIN_MAX ? SPIN_MAX : throttle;
 	drvLast[idx] = millis();
 }
-inline void spinThrust(uint8_t idx, int16_t s) {   // reversible (3D): -1000..+1000, 0 = stop
+// Reversible (3D): -1000..+1000, 0 = stop, but full scale is reached at +-953: anything past that is
+// clamped (the top 47 units of either direction do nothing more; see below).
+inline void spinThrust(uint8_t idx, int16_t s) {
 	using namespace detail;
 	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;
-	// +-953, not +-1000: sendThrottle() adds 47 on top of the band values below, so past 953 forward
-	// already saturates at 2047 and reverse would run past 1047 into the FORWARD band (full reverse
-	// read as slow forward). Clamping both ends keeps every calibrated cmd where it was measured.
-	if (s >  953) s =  953;
-	if (s < -953) s = -953;
-	// DShot 3D throttle bands: 48..1047 = reverse (48 slow .. 1047 fast), 1048..2047 = forward
-	// (1048 slow .. 2047 fast), 0 = stop. Magnitude must map MONOTONICALLY within each band.
+	// DShot 3D on the wire: 48..1047 = reverse (48 slow .. 1047 fast), 1048..2047 = forward (1048 slow
+	// .. 2047 fast), 0 = stop. sendThrottle() adds 47 to every non-zero value, so t below is the wire
+	// value minus 47: forward 1047+s, reverse 47-s, and past +-953 forward saturates at 2047 while
+	// reverse would run past 1047 into the FORWARD band (full reverse read as slow forward). Hence the
+	// clamp; it keeps every calibrated cmd where it was measured.
 	// (Old mapping used 1000+s / 1001+s: forward leaked into the reverse band for s<48, and reverse
 	// was INVERTED — tiny |s| -> ~1000 (near max reverse), large |s| -> ~1 (below the 48 floor) —
 	// so reverse ran fast at low command, slowed as command rose, and handed off to 6-step almost
-	// immediately. Correct: forward -> 1047+s, reverse -> 47-s.)
-	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1047 + s)      // forward s=1..1000 -> 1048..2047
-	                                   : (uint16_t)(47 - s));       // reverse s=-1..-1000 -> 48..1047
-	if (t == 0) drvStalls[idx] = 0;
-	else if (drvStalls[idx] >= STALL_MAX) t = 0;
+	// immediately.)
+	if (s >  953) s =  953;
+	if (s < -953) s = -953;
+	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1047 + s)      // forward s=1..953 -> wire 1095..2047
+	                                   : (uint16_t)(47 - s));       // reverse s=-1..-953 -> wire 95..1047
+	t = stallGate(idx, t);
 	drvTarget[idx] = t; drvLast[idx] = millis();
 }
 inline bool spinArmed(uint8_t idx)      { return idx < COUNT && detail::drvActive(idx) && detail::drvArmed[idx]; }
 // Restarted after a stall within the last few seconds (a UI can say why it is arming again).
 inline bool spinStalled(uint8_t idx) { return idx < COUNT && detail::drvStallMs[idx] && millis() - detail::drvStallMs[idx] < 5000; }
+// Held at 0 after a stall until it is sent 0 (see STALL_ZERO_MS).
+inline bool spinHeld(uint8_t idx) { return idx < COUNT && detail::drvActive(idx) && detail::drvHold[idx]; }
+// Armed bidir ESC that has answered once and now sends nothing at all: unplugged or unpowered.
+inline bool spinSilent(uint8_t idx) {
+	using namespace detail;
+	return idx < COUNT && drvB[idx] && drvArmed[idx] && drvPktMs[idx] && millis() - drvPktMs[idx] > TELE_LOST_MS;
+}
 inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::drvRev[idx]; }
 inline const char* spinMode(uint8_t idx) {
 	using namespace detail;
@@ -412,6 +456,9 @@ inline bool spinTele(uint8_t idx, Telem& out) {
 inline void spinPoll() {   // call every core0 loop while spinning: arm + frames + deadman + telemetry
 	using namespace detail;
 	bool any = false;
+	// A loop held up (a bootloader read, a scan) is not an ESC gone quiet: restart the stall clocks.
+	static uint32_t lastMs = 0;
+	bool gap = lastMs && millis() - lastMs > 100; lastMs = millis();
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!drvActive(i)) continue;
 		any = true;
@@ -427,19 +474,32 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 			}
 		}
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
+		// the last command was 0, long enough ago: free it even if no more come (the idle hold sends one)
+		if (drvHold[i] && drvZeroCmd[i] && millis() - drvZeroCmd[i] >= STALL_REST_MS) drvHold[i] = false;
 		if (drvB[i]) {
 			uint32_t v = 0, now = millis();
 			BidirDshotTelemetryType ty = drvB[i]->getTelemetryPacket(&v);
 			if (ty != BidirDshotTelemetryType::NO_PACKET && ty != BidirDshotTelemetryType::CHECKSUM_ERROR) drvPktMs[i] = now;
-			if (drvArmed[i] && drvTarget[i]) {
-				if (ty == BidirDshotTelemetryType::ERPM) drvZeroMs[i] = v ? 0 : (drvZeroMs[i] ? drvZeroMs[i] : stamp(now));
-				bool stalled = (drvZeroMs[i] && now - drvZeroMs[i] > STALL_ZERO_MS) || (drvAnswer[i] && now - drvPktMs[i] > STALL_SILENT_MS);   // one that never answered: not watched
-				if (stalled) { 
-					drvArmed[i] = false; drvArmStart[i] = now; drvArmMs[i] = 0; drvAnswer[i] = 0;
-					drvZeroMs[i] = 0; drvStallMs[i] = now; if (drvStalls[i] < 255) drvStalls[i]++;
-					drvTarget[i] = 0;
+			if (gap) { if (drvPktMs[i]) drvPktMs[i] = stamp(now); drvZeroMs[i] = 0; }
+			if (drvArmed[i] && drvTarget[i] && !armSeen[i]) {   // AM32 stays in its run: not watched
+				if (ty == BidirDshotTelemetryType::ERPM) {
+					if (v) {
+						drvZeroMs[i] = 0; drvSpun[i] = true;
+						if (!drvRunMs[i]) drvRunMs[i] = stamp(now);
+						else if (now - drvRunMs[i] > STALL_ZERO_MS) drvStalls[i] = 0;   // it runs
+					} else { drvRunMs[i] = 0; if (!drvZeroMs[i]) drvZeroMs[i] = stamp(now); }
 				}
-			} else drvZeroMs[i] = 0;
+				// silence counts only once it has turned: one that never answered is not watched, and
+				// below the start point the zero rule judges it
+				bool stalled = (drvZeroMs[i] && now - drvZeroMs[i] > STALL_ZERO_MS) || (drvSpun[i] && now - drvPktMs[i] > STALL_SILENT_MS);
+				if (stalled) {
+					drvArmed[i] = false; drvArmStart[i] = now; drvArmMs[i] = 0; drvAnswer[i] = 0;
+					drvEdt[i] = 20;   // Bluejay cleared EDT: it goes out again in this arm, which waits for it
+					drvZeroMs[i] = drvRunMs[i] = 0; drvSpun[i] = false;
+					drvStallMs[i] = now; if (drvStalls[i] < 255) drvStalls[i]++;
+					drvTarget[i] = 0; drvHold[i] = true;
+				}
+			} else { drvZeroMs[i] = drvRunMs[i] = 0; drvSpun[i] = false; }
 			switch (ty) {
 				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); if (!drvAnswer[i]) drvAnswer[i] = stamp(millis()); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
@@ -459,7 +519,10 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 	}
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!pwmOn(i)) continue;
-		bool arming = millis() - pwmStart[i] < PWM_ARM_MS, dead = millis() - pwmLast[i] > SPIN_DEADMAN_MS;
+		uint32_t now = millis();
+		bool arming = now - pwmStart[i] < PWM_ARM_MS, dead = now - pwmLast[i] > SPIN_DEADMAN_MS;
+		// left unfed after its arm: hand the pin back (no longer driving(); the idle hold takes it)
+		if (!arming && now - pwmLast[i] > PWM_RELEASE_MS && now - pwmStart[i] > PWM_ARM_MS + PWM_RELEASE_MS) { pwmOff(i); continue; }
 		pwmLevel(i, arming || dead ? pwmStop[i] : pwmUs[i]);
 	}
 	if (any) delayMicroseconds(200);
@@ -471,9 +534,20 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 // it. The stop width is 1000 us, or 1500 us on a 3D ESC, where 1000 us is full reverse: so the ESC
 // must have been read (scan, a configurator read or a DShot arm) and pwmBegin refuses one that was
 // not. pwmSet() then gives the pulse width, fed like spinThrottle (the same 500 ms deadman falls back
-// to the stop width, it does not cut the signal). spinStop()/spinArm() end PWM on the pin.
+// to the stop width, also from a timer IRQ while core0 is held up; it does not cut the signal). A width
+// sent during the arm is not kept, and after it nothing but the stop width passes until one stop width
+// has come: a value never waits behind the arm and lands as a jump. Unfed for PWM_RELEASE_MS after the
+// arm, the pin leaves PWM. spinStop()/spinArm() end PWM on the pin.
 inline bool pwmActive(uint8_t idx) { return idx < COUNT && detail::pwmOn(idx); }
-inline bool pwmArming(uint8_t idx) { return pwmActive(idx) && millis() - detail::pwmStart[idx] < PWM_ARM_MS; }
+// Arming, or waiting for its first stop width after the arm.
+inline bool pwmArming(uint8_t idx) {
+	return pwmActive(idx) && (millis() - detail::pwmStart[idx] < PWM_ARM_MS || !detail::pwmZero[idx]);
+}
+// Fed a width above its stop within the deadman: a blocking bootloader visit must wait.
+inline bool pwmDriving(uint8_t idx) {
+	using namespace detail;
+	return pwmActive(idx) && pwmUs[idx] != pwmStop[idx] && millis() - pwmLast[idx] <= SPIN_DEADMAN_MS;
+}
 inline bool pwmBegin(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return false;
@@ -488,13 +562,17 @@ inline bool pwmBegin(uint8_t idx) {
 	pwmStop[idx] = infoRev[idx] ? PWM_MID_US : PWM_STOP_US;
 	pwmLevel(idx, pwmStop[idx]);
 	pwm_set_enabled(slice, true);
-	pwmUs[idx] = pwmStop[idx]; pwmStart[idx] = pwmLast[idx] = millis();
+	pwmUs[idx] = pwmStop[idx]; pwmStart[idx] = pwmLast[idx] = millis(); pwmZero[idx] = false;
+	if (!pwmTimerOn) pwmTimerOn = add_repeating_timer_ms(50, pwmWatch, nullptr, &pwmTimer);
 	return true;
 }
 inline void pwmSet(uint8_t idx, uint16_t us) {
 	using namespace detail;
 	if (!pwmActive(idx)) return;
-	pwmUs[idx] = us < PWM_MIN_US ? PWM_MIN_US : (us > PWM_MAX_US ? PWM_MAX_US : us);
+	us = us < PWM_MIN_US ? PWM_MIN_US : (us > PWM_MAX_US ? PWM_MAX_US : us);
+	if (millis() - pwmStart[idx] < PWM_ARM_MS) us = pwmStop[idx];   // arming: not kept
+	else if (!pwmZero[idx]) { if (us == pwmStop[idx]) pwmZero[idx] = true; else us = pwmStop[idx]; }
+	pwmUs[idx] = us;
 	pwmLast[idx] = millis();
 }
 inline uint16_t pwmTarget(uint8_t idx) { return pwmActive(idx) ? detail::pwmUs[idx] : 0; }
@@ -561,7 +639,9 @@ inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); fo
 	// Learn it again while it is still in its bootloader: whatever the configurator wrote or flashed
 	// is in by now, and the motor test that usually follows then arms without a second bootloader
 	// visit (that one stalled the board for ~5 s, and the web test gave up on it).
-	if (runOp(Op::FWSELECT, PINS[idx])) infoFail[idx] = !learnInfo(idx);
+	// a failed read leaves it unknown: the next arm or PWM start must not use a direction from before
+	bool ok = runOp(Op::FWSELECT, PINS[idx]) && learnInfo(idx);
+	infoFail[idx] = !ok; if (!ok) infoKnown[idx] = false;
 	runOp(Op::FWRUN, PINS[idx]);
 	fwHave[idx] = false; if (session == (int8_t)idx) session = -1;
 }
@@ -574,6 +654,7 @@ inline void     setPresent(uint32_t m) { detail::present = m; }
 inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
 // Configured reversible (3D), as last read from the ESC (false while unknown).
 inline bool     identFailed(uint8_t i) { return i < COUNT && detail::infoFail[i]; }   // last arm could not read it
+inline bool     identKnown(uint8_t i) { return i < COUNT && detail::infoKnown[i]; }   // firmware/direction read
 inline bool     knownReversible(uint8_t i) { return i < COUNT && detail::infoKnown[i] && detail::infoRev[i]; }
 // The AM32 settings block of ESC i, as found by its last connect (0 = not AM32 / not seen yet).
 inline uint16_t am32Eeprom(uint8_t i) { return i < COUNT && detail::armSeen[i] ? detail::am32Eep[i] : 0; }
@@ -584,6 +665,26 @@ inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i
 inline int8_t   presentIndex(uint8_t k) {
 	for (uint8_t i = 0; i < COUNT; i++) if (isPresent(i) && k-- == 0) return (int8_t)i;
 	return -1;
+}
+
+// What the web tool's motor test can do with ESC i now. Sent in MOTOR_TELEMETRY's mAh field with a
+// 0x5A marker (fourway.h); mirrored once in web/js/app.js (UI). 1 is reserved and never sent.
+enum class UiState : uint8_t {
+	NONE = 0,
+	ARMING = 2,    // DShot arm, or PWM arm / waiting for a stop width: the slider stays at stop
+	ARMED = 3,     // moves at once
+	IDLE = 4,      // not streaming: a move arms it (~3 s)
+	ABSENT = 5,    // not wired, or its read failed
+	STALLED = 6,   // stalled: arming again, or held at 0 until it is sent 0
+	SILENT = 7,    // armed bidir ESC that answered, silent for TELE_LOST_MS (unplugged?)
+};
+inline UiState uiState(uint8_t i) {
+	if (i >= COUNT) return UiState::ABSENT;
+	if (pwmActive(i)) return pwmArming(i) ? UiState::ARMING : UiState::ARMED;
+	if ((spinStalled(i) && !spinArmed(i)) || spinHeld(i)) return UiState::STALLED;
+	if (spinArmed(i)) return spinSilent(i) ? UiState::SILENT : UiState::ARMED;
+	if (spinArming(i)) return UiState::ARMING;
+	return isPresent(i) && !identFailed(i) ? UiState::IDLE : UiState::ABSENT;
 }
 
 // ---- core1 worker: call once from loop1() ------------------------------------------------------

@@ -30,7 +30,9 @@ const st = {
   escs: [],            // results of readEsc, by channel (null = not answering)
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
-  test: { on: false, values: [], timer: null, sel: [], heard: [] },
+  // mode: each motor's 3D meaning, frozen for the test (null = no test); mask: its `mtmode` (pico only);
+  // silent: polls in a row a motor came back SILENT; gone: forgotten mid-test; pwmOn: switched to PWM
+  test: { on: false, values: [], timer: null, sel: [], mode: null, mask: null, silent: [], gone: [], pwmOn: [] },
 };
 
 // ------------------------------------------------------------------------------- log / status
@@ -108,7 +110,7 @@ function dropped() {
 // What was read belongs to that connection: another board, or other ESCs, may be there next time.
 function forget() {
   if (st.escs.some((e, ch) => e && dirty(ch))) log('書き込んでいない変更は破棄しました');
-  st.escs = []; st.edits = [];
+  st.escs = []; st.edits = []; st.test.silent = [];
   renderEscs(); renderFlash(); renderTest();
 }
 
@@ -146,15 +148,19 @@ async function passthrough(on) {
 // ------------------------------------------------------------------------------- read / write
 async function readAll() {
   await task('読み込み', async () => {
+    const pipe = st.pipe;   // a disconnect mid-read: what comes back belongs to that board, drop it
     await passthrough(true);
+    if (st.pipe !== pipe) return;
     st.escs = []; st.edits = [];
     for (let ch = 0; ch < st.motors; ch++) {
       const t0 = performance.now();
       try {
         const esc = await readEsc(st.fw, ch);
+        if (st.pipe !== pipe) return;
         st.escs[ch] = esc; st.edits[ch] = Uint8Array.from(esc.block);
         log(`ESC ${ch + 1}: ${esc.family.name} ${esc.version} ${esc.layoutTag} ${esc.name} (${((performance.now() - t0) / 1000).toFixed(1)} s)`);
       } catch (e) {
+        if (st.pipe !== pipe) return;
         st.escs[ch] = null;
         log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
       }
@@ -214,12 +220,13 @@ function savePreset(ch) {
 function fieldInput(ch, f) {
   const edit = st.edits[ch], base = st.escs[ch].block;
   const v = f.get ? f.get(edit) : edit[f.off];
-  const set = (x) => { if (f.put) f.put(edit, x); else edit[f.off] = x; renderEscs(); };
+  const set = (x) => { if (f.put) f.put(edit, x, base); else edit[f.off] = x; renderEscs(); };
   let input;
   if (f.type === 'enum') {
-    const known = f.opts.some(([k]) => k === v);
+    const opts = f.opts.filter(([k]) => k === v || !f.offer || f.offer(base, k));
+    const known = opts.some(([k]) => k === v);
     input = h('select', { onchange: (e) => set(+e.target.value) },
-      ...f.opts.map(([k, label]) => h('option', { value: k, selected: k === v }, label)),
+      ...opts.map(([k, label]) => h('option', { value: k, selected: k === v }, label)),
       known ? null : h('option', { value: v, selected: true }, `不明 (0x${hex2(v)})`));
   } else if (f.type === 'bool') {
     input = h('input', { type: 'checkbox', checked: v === 1, onchange: (e) => set(e.target.checked ? 1 : 0) });
@@ -312,13 +319,16 @@ async function importPresets(file) {
 // one-way one. On pico-esc-tool the page knows that per motor from the ESCs it read, and tells the
 // firmware (`mtmode <mask>`) so the values mean the same thing on both sides; a Betaflight FC has one
 // 3D setting for every motor (FEATURE_3D), so there it is that.
+// The meaning is taken once, when the test starts (st.test.mode), and held until it has stopped: the
+// firmware holds the same declaration, so an ESC forgotten or re-read mid-test must not change it.
 function motor3d(i) {   // from the last read; undefined = not read
   const e = st.escs[i];
   if (!e) return undefined;
   return e.mode === MODE.ARM_BLB ? e.block[18] === 1 : (e.block[0x0B] === 3 || e.block[0x0B] === 4);
 }
 const is3d = (i) => (st.pico ? motor3d(i) ?? st.threeD : st.threeD);
-const stopOf = (i) => (is3d(i) ? 1500 : 1000);
+const mode3d = (i) => (st.test.mode ? st.test.mode[i] : is3d(i));
+const stopOf = (i) => (mode3d(i) ? 1500 : 1000);
 const unread = () => st.pico && Array.from({ length: st.motors }, (_, i) => st.escs[i]).some((e) => e === undefined);
 
 // Only the motors ticked here move; the others stay at their stop value (and are never armed by the
@@ -336,9 +346,10 @@ function renderTest() {
     const out = h('output', {}, String(stop));
     const known = !st.pico || motor3d(i) !== undefined;
     const range = h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stop, 'data-m': i,
-      disabled: !st.test.on || !picked(i),
+      disabled: !st.test.on || !picked(i) || LOCKED.has(st.test.ui?.[i]),
       oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } });
-    const pick = h('input', { type: 'checkbox', checked: picked(i), title: '回すモーターを選ぶ',
+    const pick = h('input', { type: 'checkbox', checked: picked(i), title: '回すモーターを選ぶ', 'data-m': i,
+      disabled: !!st.test.gone[i],
       onchange: (e) => {
         st.test.sel[i] = e.target.checked;
         range.disabled = !st.test.on || !e.target.checked;
@@ -347,7 +358,7 @@ function renderTest() {
     box.append(h('label', { class: 'slider' }, pick, h('span', {}, `M${i + 1}`),
       range,
       out,
-      h('span', { class: known ? 'tag' : 'tag dim' }, (is3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込')),
+      h('span', { class: known ? 'tag' : 'tag dim' }, (mode3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込')),
       h('span', { class: 'mstate tag', 'data-m': i })));
   }
   $('#test-note').textContent = (unread() ? '開始すると、先に ESC を読んで 3D かどうかを確かめます。' : '')
@@ -355,35 +366,49 @@ function renderTest() {
     + (pwmMode() ? ' PWM: 切り替え後 5 秒は停止パルスで待機状態に入れます。テレメトリは出ません。Bluejay は PWM を受け付けません。' : '');
 }
 
-// pico-esc-tool says per motor whether it can move now. While its ESC is being read or armed (or does
-// not answer) the slider is held at stop and locked, so a value never waits behind an arm and lands
-// as a jump; the tag says why. 0 = the board does not say (Betaflight, older firmware): no lock.
-const UI = { 1: '読み込み中…', 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし',
-  6: '失速しました。arm し直しています' };
-// A bidir ESC (Bluejay, AM32) that is held armed answers telemetry all the time; silent for this long
-// it has been unplugged or lost power, and what was read from it no longer holds.
-const GONE_MS = 2000;
-const bidirRead = (i) => st.escs[i] && (st.escs[i].mode === MODE.ARM_BLB || st.escs[i].family?.id !== 'blheli_s');
-function applyUi(codes, rows) {
+// pico-esc-tool says per motor whether it can move now (escs::UiState in src/apps/esc_session.h; 1 is
+// reserved, never sent). While its ESC is being read or armed, stalled, or does not answer, the slider
+// is held at stop and locked, so a value never waits behind an arm and lands as a jump; the tag says
+// why. 0 = the board does not say (Betaflight, older firmware): no lock. PWM reports its arm as 2.
+const UI = { 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし',
+  6: '失速しました。arm し直しています', 7: 'テレメトリが来ません' };
+const LOCKED = new Set([2, 5, 6]);
+// 7: a bidir ESC held armed that answered once and now sends nothing. On this many answers in a row
+// that came back promptly (a board held up by a bootloader read answers late, every stamp stale) it
+// has been unplugged or lost power, and what was read from it no longer holds.
+const GONE_POLLS = 3;
+const bidirKnown = (i) => ['bluejay', 'bluegill', 'am32'].includes(st.escs[i]?.family?.id);
+const slider = (i, type = 'range') => document.querySelector(`#sliders input[type=${type}][data-m="${i}"]`);
+function gone(i) {
+  st.test.silent[i] = 0;
+  log(`ESC ${i + 1}: テレメトリが途切れました (外れた / 電源が切れた?)。つなぎ直したら読み込み直してください`, 'err');
+  if (dirty(i)) log(`ESC ${i + 1}: 書き込んでいない変更は破棄しました`);
+  st.escs[i] = null;
+  renderEscs(); renderFlash();
+  if (!st.test.on) { renderTest(); return; }
+  // mid-test: stop it and lock it, but its channel keeps the meaning the test started with
+  st.test.sel[i] = false; st.test.gone[i] = true;
+  const range = slider(i), pick = slider(i, 'checkbox');
+  if (pick) { pick.checked = false; pick.disabled = true; }
+  st.test.values[i] = stopOf(i);
+  if (range) { range.value = stopOf(i); range.dispatchEvent(new Event('input')); range.disabled = true; }
+}
+function applyUi(codes, prompt) {
   st.test.ui = codes;
-  const now = performance.now();
-  rows.forEach((r, i) => {
-    if (r.bad < 100) { st.test.heard[i] = now; return; }
-    if (codes[i] === 3 && bidirRead(i) && now - (st.test.heard[i] ?? now) > GONE_MS) {
-      log(`ESC ${i + 1}: テレメトリが途切れました (外れた / 電源が切れた?)。つなぎ直したら読み込み直してください`, 'err');
-      st.escs[i] = null; st.test.heard[i] = undefined;
-      renderEscs(); renderFlash();
-    }
-  });
-  if (st.test.pwm) return;
   codes.forEach((c, i) => {
-    const range = document.querySelector(`#sliders input[type=range][data-m="${i}"]`);
+    if (c !== 7) { st.test.silent[i] = 0; return; }
+    if (!prompt || !bidirKnown(i)) return;
+    st.test.silent[i] = (st.test.silent[i] || 0) + 1;
+    if (st.test.silent[i] >= GONE_POLLS) gone(i);
+  });
+  codes.forEach((c, i) => {
+    const range = slider(i);
     const tag = document.querySelector(`#sliders .mstate[data-m="${i}"]`);
     if (!range) return;
-    const locked = c === 1 || c === 2 || c === 5 || c === 6;
+    const locked = LOCKED.has(c);
     if (tag) { tag.textContent = c ? UI[c] || '' : ''; tag.className = `mstate tag${locked ? ' dim' : ''}`; }
     if (!st.test.on || !picked(i)) return;
-    if (locked && !range.disabled) {
+    if (locked && (+range.value !== stopOf(i) || st.test.values[i] !== stopOf(i))) {
       range.value = stopOf(i); st.test.values[i] = stopOf(i);
       range.dispatchEvent(new Event('input'));
     }
@@ -394,25 +419,58 @@ function applyUi(codes, rows) {
 const pwmMode = () => st.pico && $('#test-proto').value === 'pwm';
 const sendLine = (line) => st.pipe.write(Array.from(new TextEncoder().encode(line + '\n')));
 
+// `mtmode <mask>` tells pico-esc-tool which channels carry 3D values. Its answer `mtmode|xx` comes
+// back as text between MSP frames; undefined = no answer (older firmware, or a board held up).
+// 10 s: right after a passthrough the firmware re-reads every ESC before it answers anything.
+async function declare(mask, ms = 10000) {
+  await st.msp.busy;   // no MSP request may be reading the pipe meanwhile
+  st.pipe.drain();     // an old `mtmode|` (the last PWM tick's) must not pass for this answer
+  await sendLine(`mtmode ${mask}`);
+  return st.pipe.until((buf) => {
+    const s = String.fromCharCode(...buf), k = s.indexOf('mtmode|'), e = k < 0 ? -1 : s.indexOf('\n', k);
+    if (e < 0) return undefined;
+    buf.splice(0, e + 1);
+    return parseInt(s.slice(k + 7, e), 16);
+  }, ms);
+}
+
 async function startTest() {
   if (!$('#test-safe').checked) { log('プロペラを外したことを確認してください', 'err'); return; }
+  if (st.test.stopping) return;   // the last test's stop frames are still going out
   if (unread()) { log('3D かどうかを確かめるため、先に ESC を読み込みます'); await readAll(); }
   await task('モーターテスト', async () => {
     await passthrough(false);
+    let mode = Array.from({ length: 8 }, (_, i) => !!is3d(i)), mask = null;
     if (st.pico) {
-      let mask = 0;
-      for (let i = 0; i < st.motors; i++) if (is3d(i)) mask |= 1 << i;
-      await sendLine(`mtmode ${mask}`);
+      const want = mode.reduce((m, on, i) => m | (on ? 1 << i : 0), 0);
+      if (await declare(want) !== want) {
+        // per-motor stops only once the firmware has said it takes them; from here every frame
+        // carries the declaration again, so a late answer cannot leave the two sides apart
+        mode = mode.map(() => st.threeD);
+        log(`ボードがモーターごとの 3D 指定に答えません: すべて${st.threeD ? '3D (1500 停止)' : '正転のみ (1000 停止)'}として扱います`, 'err');
+      }
+      mask = mode.reduce((m, on, i) => m | (on ? 1 << i : 0), 0);
     }
+    st.test.mode = mode; st.test.mask = mask;
+    st.test.silent = []; st.test.gone = []; st.test.pwmOn = [];
     st.test.on = true;
     st.test.pwm = pwmMode();
     $('#test-proto').disabled = true;
     renderTest();
     if (st.test.pwm) {
+      // Only ticked motors with a read ESC go to PWM; the others stay on the zero-throttle hold. One
+      // write per tick, none while the last is pending (a board held up must not grow a queue).
+      let pending = false;
       st.test.timer = setInterval(() => {
-        if (!st.pipe || !st.test.on) return;
-        const vals = sendValues();
-        for (let i = 0; i < st.motors; i++) sendLine(`pwmch ${i} ${vals[i]}`).catch(() => {});
+        if (!st.pipe || !st.test.on || pending) return;
+        const vals = sendValues(), lines = [`mtmode ${st.test.mask}`];
+        for (let i = 0; i < st.motors; i++) {
+          if (!st.test.pwmOn[i] && (!picked(i) || !st.escs[i])) continue;
+          st.test.pwmOn[i] = true;
+          lines.push(`pwmch ${i} ${vals[i]}`);
+        }
+        pending = true;
+        sendLine(lines.join('\n')).catch(() => {}).finally(() => { pending = false; });
       }, 100);
       log('モーターテスト開始 (PWM)');
       return;
@@ -420,7 +478,7 @@ async function startTest() {
     // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while an arm
     // reads an ESC it does not know yet (a bootloader visit, up to ~4 s each, one ESC after another),
     // so only a link silent for longer than that counts as lost. The firmware stops the motors on
-    // its own when MSP goes quiet.
+    // its own when MSP goes quiet, and then forgets the declaration: every frame carries it again.
     let inflight = false, heard = performance.now();
     st.test.timer = setInterval(() => {
       if (!st.pipe || !st.test.on || inflight) return;
@@ -428,7 +486,8 @@ async function startTest() {
       const d = [];
       for (const v of sendValues()) d.push(v & 0xFF, v >> 8);
       inflight = true;
-      st.msp.request(MSP.SET_MOTOR, d, 1000)
+      (st.test.mask == null ? Promise.resolve() : sendLine(`mtmode ${st.test.mask}`))
+        .then(() => st.msp.request(MSP.SET_MOTOR, d, 1000))
         .then(() => { heard = performance.now(); }, () => {})
         .finally(() => { inflight = false; });
     }, 100);
@@ -439,17 +498,30 @@ async function startTest() {
 
 async function stopTest(why) {
   if (!st.test.on) return;
-  st.test.on = false;
+  st.test.on = false; st.test.stopping = true;
+  $('#test-toggle').disabled = true;
   clearInterval(st.test.timer);
-  st.test.values = st.test.values.map((_, i) => stopOf(i));
+  st.test.values = st.test.values.map((_, i) => stopOf(i));   // still the test's meaning
   $('#test-proto').disabled = false;
   if (st.pipe && st.test.pwm) {
-    for (let i = 0; i < st.motors; i++) await sendLine(`pwmch ${i} stop`).catch(() => {});
+    const lines = st.test.pwmOn.map((on, i) => (on ? `pwmch ${i} stop` : null)).filter(Boolean);
+    if (lines.length) await sendLine(lines.join('\n')).catch(() => {});
   } else if (st.pipe) {
+    // Stop values for ~0.5 s, not one frame: telemetry polls keep MSP alive, so a lost frame would
+    // leave a motor at its last value while the page shows it stopped.
     const d = [];
     for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
-    await st.msp.request(MSP.SET_MOTOR, d, 500).catch(() => {});
+    const end = performance.now() + 500;
+    for (let k = 0; st.pipe && k < 8 && (k < 3 || performance.now() < end); k++) {
+      if (st.test.mask != null) await sendLine(`mtmode ${st.test.mask}`).catch(() => {});
+      await st.msp.request(MSP.SET_MOTOR, d, 300).catch(() => {});
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
+  st.test.mode = null; st.test.mask = null; st.test.pwm = false;
+  st.test.silent = []; st.test.gone = []; st.test.pwmOn = [];
+  st.test.stopping = false;
+  $('#test-toggle').disabled = false;
   renderTest();
   $('#test-toggle').textContent = '開始';
   log(`モーターテスト停止: ${why}`);
@@ -468,7 +540,7 @@ function parseTele(d) {
     if (q.length < 13) break;
     out.push({ rpm: (q[0] | q[1] << 8 | q[2] << 16) + q[3] * 0x1000000, bad: (q[4] | q[5] << 8) / 100,
       temp: q[6], volt: (q[7] | q[8] << 8) / 100, amp: (q[9] | q[10] << 8) / 100,
-      ui: q[12] === 0x5A ? q[11] : 0 });   // pico-esc-tool: the pin's state (escs::uiState)
+      ui: st.pico && q[12] === 0x5A ? q[11] : 0 });   // pico-esc-tool: the pin's state (escs::UiState)
   }
   return out;
 }
@@ -477,7 +549,9 @@ async function pollTele() {
   if (!st.pipe || st.inPassthrough || st.busy || tele.inflight) return;
   let rows;
   tele.inflight = true;
+  const t0 = performance.now();
   try { rows = parseTele(await st.msp.request(MSP.MOTOR_TELEMETRY, [], 1000)); } catch (e) { rows = null; } finally { tele.inflight = false; }
+  const prompt = performance.now() - t0 < 400;
   if (!rows && st.test.on) return;   // busy arming: keep the last table
   const body = $('#tele tbody');
   body.replaceChildren();
@@ -494,7 +568,7 @@ async function pollTele() {
       h('td', {}, r.temp ? String(r.temp) : '—'),
       h('td', { class: ok ? 'ok' : 'meta' }, ok ? '受信中' : '停止中 / 信号なし')));
   });
-  applyUi(rows.map((r) => r.ui), rows);
+  applyUi(rows.map((r) => r.ui), prompt);
   tele.hist.push({ t: now, rpm: rows.map((r) => (r.bad < 100 ? r.rpm : 0)) });
   while (tele.hist.length && now - tele.hist[0].t > tele.span) tele.hist.shift();
   drawChart(rows.length);
@@ -612,8 +686,8 @@ function init() {
     const p = +e.target.value;
     document.querySelectorAll('#sliders input[type=range]').forEach((s) => {
       const i = +s.dataset.m;
-      if (!picked(i)) return;
-      s.value = stopOf(i) + (is3d(i) ? p / 2 : p); s.dispatchEvent(new Event('input'));
+      if (!picked(i) || s.disabled) return;   // a locked slider stays at stop
+      s.value = stopOf(i) + (mode3d(i) ? p / 2 : p); s.dispatchEvent(new Event('input'));
     });
   });
   $('#hexfile').addEventListener('change', (e) => e.target.files[0] && loadHex(e.target.files[0]));

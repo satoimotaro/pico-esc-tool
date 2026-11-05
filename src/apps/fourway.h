@@ -28,16 +28,29 @@ public:
 	bool     motorWanted() const { for (uint8_t c = 0; c < MAX_CH; c++) if (wanted(c)) return true; return false; }
 	uint16_t stopValue() const { return threeD_ ? 1500 : 1000; }
 	void     clearMotors() { for (uint16_t& v : motor_) v = 0; declSet_ = false; }
-	void     setThreeD(bool on) { threeD_ = on; }   // report FEATURE_3D (a reversible ESC is wired)
+	// The MSP session ended (the link fell, or MSP went silent): nothing it declared or sent is kept.
+	// The FEATURE_3D answer is kept unless the link fell: esc-configurator reads it once at connect
+	// and can sit quiet on its main screen for longer than any timeout, still believing it.
+	void     endSession(bool linkGone) { clearMotors(); if (linkGone) latched_ = false; }
+	// What FEATURE_3D would say now (a reversible ESC is wired); idle = no test owns or wants an ESC.
+	// Once a client has read the answer it stays that until the link falls or it is read again while
+	// idle: an unlock sends the stop the client was told, and it must mean that stop here.
+	void     setThreeD(bool on, bool idle) { idle_ = idle; if (idle) live3d_ = on; if (!latched_ && idle) threeD_ = on; }
 	bool     threeD() const { return threeD_; }
 	// What a channel's value MEANS: 3D (1500 = stop) or one-way (1000 = stop). A stock configurator
 	// gets the one FEATURE_3D answer for every channel; this firmware's web page declares it per
-	// channel (`mtmode <mask>`), from the ESCs it read, until the test ends (clearMotors).
-	void     declare(uint8_t mask) { declMask_ = mask; declSet_ = true; }
+	// channel (`mtmode <mask>`), from the ESCs it read, until the test or the MSP session ends. A
+	// declaration counts as MSP traffic: the page sends one ahead of every SET_MOTOR.
+	void     declare(uint8_t mask) { declMask_ = mask; declSet_ = true; mspMs_ = millis(); }
+	bool     declared() const { return declSet_; }
 	bool     chThreeD(uint8_t ch) const { return declSet_ ? (declMask_ >> ch & 1) : threeD_; }
-	bool     wanted(uint8_t ch) const {   // a non-stop value on that channel
+	bool     wanted(uint8_t ch) const {   // a value that takes an ESC over
 		uint16_t v = motor(ch);
-		return v && (chThreeD(ch) ? v != 1500 : v > 1000);
+		if (!v) return false;
+		if (!chThreeD(ch)) return v > 1000;
+		// 3D: the page (declared) may start in reverse; a stock client never takes an ESC over at or
+		// below its stop, so a value it did not mean as 3D cannot reach an ESC as reverse
+		return declSet_ ? v != 1500 : v > 1500;
 	}
 	// A configurator channel -> escs:: index: the wired ESCs, numbered without gaps.
 	static int8_t channel(uint8_t ch) { return ch < MAX_CH ? escs::presentIndex(ch) : -1; }
@@ -76,7 +89,8 @@ private:
 	uint8_t  mode_ = imSIL_BLB;
 	uint16_t motor_[8] = {0};
 	uint32_t mspMs_ = 0;
-	bool     threeD_ = false;
+	bool     threeD_ = false;          // the meaning of an undeclared channel (what FEATURE_3D said)
+	bool     live3d_ = false, latched_ = false, idle_ = true;
 	bool     declSet_ = false;
 	uint8_t  declMask_ = 0;
 
@@ -116,8 +130,12 @@ private:
 			case 3:   d[0] = 4; d[1] = 5; d[2] = 0; mspReply(cmd, d, 3); break;              // FC_VERSION
 			case 4:   memcpy(d, "PICO", 4); mspReply(cmd, d, 6); break;                      // BOARD_INFO
 			case 5:   memcpy(d, __DATE__, 11); memcpy(d + 11, __TIME__, 8); mspReply(cmd, d, 19); break;  // BUILD_INFO
-			case 36:  if (threeD_) d[1] = 0x10;                                              // FEATURE_CONFIG: FEATURE_3D = 1<<12
-			          mspReply(cmd, d, 4); break;
+			case 36:                                                                         // FEATURE_CONFIG: FEATURE_3D = 1<<12
+				// a client starts here: answer what is known now (never mid-test), and mean it until it goes
+				if (idle_) { threeD_ = live3d_; declSet_ = false; }
+				latched_ = true;
+				if (threeD_) d[1] = 0x10;
+				mspReply(cmd, d, 4); break;
 			case 101: d[15] = 0; d[16] = 1; d[17] = 0x04; mspReply(cmd, d, 22); break;      // STATUS: RX_FAILSAFE (radio off)
 			case 104: for (uint8_t i = 0; i < 8; i++) { uint16_t v = i < n ? 1000 : 0;      // MOTOR: >0 = an ESC is there
 			                                            d[2 * i] = v & 0xFF; d[2 * i + 1] = v >> 8; }
@@ -138,12 +156,9 @@ private:
 					q[0] = rpm; q[1] = rpm >> 8; q[2] = rpm >> 16; q[3] = rpm >> 24;
 					q[4] = bad; q[5] = bad >> 8; q[6] = uint8_t(t.tempC);
 					q[7] = v; q[8] = v >> 8; q[9] = a; q[10] = a >> 8;
-					// mAh (unused here) carries what the web tool's motor test can do with this ESC now,
-					// 0x5A marks it: 2 arming, 3 armed (moves at once), 4 not streaming (a move arms it,
-					// ~3 s), 5 not wired / its read failed, 6 stalled and arming again.
-					uint8_t ui = 5;
-					if (e >= 0) ui = escs::spinStalled(e) && !escs::spinArmed(e) ? 6 : escs::spinArmed(e) ? 3 : escs::spinArming(e) ? 2
-					               : (escs::isPresent(e) && !escs::identFailed(e)) ? 4 : 5;
+					// mAh (unused here) carries what the web tool's motor test can do with this ESC now
+					// (escs::UiState), 0x5A marks it. A Betaflight configurator shows ~23 Ah here.
+					uint8_t ui = (uint8_t)(e >= 0 ? escs::uiState(e) : escs::UiState::ABSENT);
 					q[11] = ui; q[12] = 0x5A;
 				}
 				mspReply(cmd, d, 1 + 13 * n); break;
