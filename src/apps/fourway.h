@@ -95,7 +95,7 @@ private:
 	}
 
 	void mspCommand(uint8_t cmd) {
-		uint8_t d[32] = {0};
+		uint8_t d[8 * 13 + 1] = {0};
 		mspMs_ = millis();
 		uint8_t n = escs::presentCount();
 		if (n > MAX_CH) n = MAX_CH;
@@ -114,6 +114,22 @@ private:
 			case 130: mspReply(cmd, d, 11); break;                                           // BATTERY_STATE: none
 			case 131: d[6] = n; d[7] = 14; mspReply(cmd, d, 10); break;                      // MOTOR_CONFIG: count at [6]
 			case 160: mspReply(cmd, d, 12); break;                                           // UID
+			case 139: {                                                                      // MOTOR_TELEMETRY
+				// per motor: rpm u32, invalid % u16 (x100), temp u8 C, volts u16 (x100), amps u16 (x100),
+				// mAh u16 — Betaflight's layout. Bidir DShot only; a stale or absent packet reads 100 % invalid.
+				d[0] = n;
+				for (uint8_t c = 0; c < n; c++) {
+					uint8_t* q = d + 1 + 13 * c;
+					escs::Telem t; int8_t e = channel(c);          // Telem zero-initialises: no ESC = zeros
+					bool fresh = e >= 0 && escs::spinTele(e, t) && t.valid && millis() - t.rpmStampMs < 500;
+					uint32_t rpm = fresh ? t.rpm : 0;
+					uint16_t bad = fresh ? 0 : 10000, v = uint16_t(t.voltage * 100), a = uint16_t(t.current * 100);
+					q[0] = rpm; q[1] = rpm >> 8; q[2] = rpm >> 16; q[3] = rpm >> 24;
+					q[4] = bad; q[5] = bad >> 8; q[6] = uint8_t(t.tempC);
+					q[7] = v; q[8] = v >> 8; q[9] = a; q[10] = a >> 8; q[11] = q[12] = 0;
+				}
+				mspReply(cmd, d, 1 + 13 * n); break;
+			}
 			case 214:                                                                        // SET_MOTOR: 8 x u16, 1000..2000
 				for (uint8_t i = 0; i < MAX_CH && 2 * i + 1 < len_; i++) motor_[i] = buf_[5 + 2 * i] | buf_[6 + 2 * i] << 8;
 				mspReply(cmd, d, 0); break;

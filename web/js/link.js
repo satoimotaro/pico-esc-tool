@@ -80,7 +80,7 @@ export class SocketPipe extends Pipe {
 // ------------------------------------------------------------------------------------- MSP v1
 export const MSP = {
   API_VERSION: 1, FC_VARIANT: 2, FC_VERSION: 3, BOARD_INFO: 4, FEATURE_CONFIG: 36,
-  MOTOR: 104, BATTERY_STATE: 130, MOTOR_CONFIG: 131, SET_MOTOR: 214, SET_PASSTHROUGH: 245,
+  MOTOR: 104, BATTERY_STATE: 130, MOTOR_CONFIG: 131, MOTOR_TELEMETRY: 139, SET_MOTOR: 214, SET_PASSTHROUGH: 245,
 };
 export const FEATURE_3D = 1 << 12;
 

@@ -289,7 +289,7 @@ function renderTest() {
   for (let i = 0; i < st.motors; i++) {
     const out = h('output', {}, String(stopValue()));
     box.append(h('label', { class: 'slider' }, h('span', {}, `M${i + 1}`),
-      h('input', { type: 'range', min: 1000, max: 2000, step: 5, value: stopValue(), 'data-m': i, disabled: !st.test.on,
+      h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stopValue(), 'data-m': i, disabled: !st.test.on,
         oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } }),
       out));
   }
@@ -304,11 +304,18 @@ async function startTest() {
     await passthrough(false);
     st.test.on = true;
     renderTest();
+    // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while it arms an
+    // ESC (~3 s), so only a link silent for longer than that counts as lost.
+    let inflight = false, heard = performance.now();
     st.test.timer = setInterval(() => {
-      if (!st.pipe || !st.test.on) return;
+      if (!st.pipe || !st.test.on || inflight) return;
+      if (performance.now() - heard > 5000) { stopTest('ボードの応答が 5 秒ありません'); return; }
       const d = [];
       for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
-      st.msp.request(MSP.SET_MOTOR, d, 500).catch((e) => stopTest(`送信エラー: ${e.message}`));
+      inflight = true;
+      st.msp.request(MSP.SET_MOTOR, d, 1000)
+        .then(() => { heard = performance.now(); }, () => {})
+        .finally(() => { inflight = false; });
     }, 100);
     log('モーターテスト開始');
   });
@@ -328,6 +335,82 @@ async function stopTest(why) {
   renderTest();
   $('#test-toggle').textContent = '開始';
   log(`モーターテスト停止: ${why}`);
+}
+
+// ------------------------------------------------------------------------------- telemetry
+// MSP_MOTOR_TELEMETRY (Betaflight's layout): per motor rpm u32, invalid % x100 u16, temp u8,
+// volts x100 u16, amps x100 u16, mAh u16. Polled while the motor-test tab is open.
+const SERIES = ['#2563eb', '#d97706', '#059669', '#db2777', '#7c3aed', '#0891b2', '#65a30d', '#dc2626'];
+const tele = { timer: null, hist: [], span: 15000 };
+
+function parseTele(d) {
+  const out = [];
+  for (let i = 0; i < d[0]; i++) {
+    const q = d.slice(1 + 13 * i, 14 + 13 * i);
+    if (q.length < 13) break;
+    out.push({ rpm: (q[0] | q[1] << 8 | q[2] << 16) + q[3] * 0x1000000, bad: (q[4] | q[5] << 8) / 100,
+      temp: q[6], volt: (q[7] | q[8] << 8) / 100, amp: (q[9] | q[10] << 8) / 100 });
+  }
+  return out;
+}
+
+async function pollTele() {
+  if (!st.pipe || st.inPassthrough || st.busy || tele.inflight) return;
+  let rows;
+  tele.inflight = true;
+  try { rows = parseTele(await st.msp.request(MSP.MOTOR_TELEMETRY, [], 1000)); } catch (e) { rows = null; } finally { tele.inflight = false; }
+  if (!rows && st.test.on) return;   // busy arming: keep the last table
+  const body = $('#tele tbody');
+  body.replaceChildren();
+  const now = performance.now();
+  if (!rows) { body.append(h('tr', {}, h('td', { colspan: 7 }, 'このボードはテレメトリを返しません'))); return; }
+  rows.forEach((r, i) => {
+    const ok = r.bad < 100;
+    body.append(h('tr', {},
+      h('td', {}, h('span', { class: 'swatch', style: `background:${SERIES[i % 8]}` }), `M${i + 1}`),
+      h('td', {}, String(st.test.values[i] ?? '')),
+      h('td', { class: 'rpm' }, ok ? String(r.rpm) : '—'),
+      h('td', {}, r.volt ? r.volt.toFixed(2) : '—'),
+      h('td', {}, r.amp ? r.amp.toFixed(2) : '—'),
+      h('td', {}, r.temp ? String(r.temp) : '—'),
+      h('td', { class: ok ? 'ok' : 'meta' }, ok ? '受信中' : '停止中 / 信号なし')));
+  });
+  tele.hist.push({ t: now, rpm: rows.map((r) => (r.bad < 100 ? r.rpm : 0)) });
+  while (tele.hist.length && now - tele.hist[0].t > tele.span) tele.hist.shift();
+  drawChart(rows.length);
+}
+
+function drawChart(n) {
+  const cv = $('#rpm-chart');
+  const w = cv.clientWidth, hgt = cv.clientHeight, dpr = devicePixelRatio || 1;
+  cv.width = w * dpr; cv.height = hgt * dpr;
+  const g = cv.getContext('2d');
+  g.scale(dpr, dpr);
+  const ink = getComputedStyle(document.body).color;
+  const max = Math.max(500, ...tele.hist.flatMap((p) => p.rpm)) * 1.1;
+  const now = performance.now();
+  const x = (t) => 40 + (w - 50) * (1 - (now - t) / tele.span), y = (v) => hgt - 20 - (hgt - 30) * v / max;
+  g.font = '11px system-ui'; g.fillStyle = ink; g.globalAlpha = 0.6;
+  for (let k = 0; k <= 4; k++) {
+    const v = max * k / 4;
+    g.fillText(String(Math.round(v / 10) * 10), 2, y(v) + 4);
+    g.globalAlpha = 0.12; g.fillRect(40, y(v), w - 50, 1); g.globalAlpha = 0.6;
+  }
+  g.fillText('rpm / 直近 15 秒', 44, 12);
+  g.globalAlpha = 1; g.lineWidth = 2;
+  for (let i = 0; i < n; i++) {
+    g.strokeStyle = SERIES[i % 8];
+    g.beginPath();
+    tele.hist.forEach((p, k) => (k ? g.lineTo(x(p.t), y(p.rpm[i] || 0)) : g.moveTo(x(p.t), y(p.rpm[i] || 0))));
+    g.stroke();
+  }
+  $('#rpm-legend').replaceChildren(...Array.from({ length: n }, (_, i) =>
+    h('span', {}, h('span', { class: 'swatch', style: `background:${SERIES[i % 8]}` }), `M${i + 1}`)));
+}
+
+function teleRun(on) {
+  clearInterval(tele.timer);
+  tele.timer = on ? setInterval(pollTele, 200) : null;
 }
 
 // ------------------------------------------------------------------------------- flash tab
@@ -393,6 +476,7 @@ function tabs() {
     document.querySelectorAll('nav button').forEach((x) => x.classList.toggle('active', x === b));
     document.querySelectorAll('main > section').forEach((s) => { s.hidden = s.id !== b.dataset.tab; });
     if (b.dataset.tab !== 'test') stopTest('タブを離れた');
+    teleRun(b.dataset.tab === 'test');
   }));
 }
 
