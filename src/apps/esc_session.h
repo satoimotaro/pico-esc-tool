@@ -428,7 +428,10 @@ inline bool spinHeld(uint8_t idx) { return idx < COUNT && detail::drvActive(idx)
 // Armed bidir ESC that has answered once and now sends nothing at all: unplugged or unpowered.
 inline bool spinSilent(uint8_t idx) {
 	using namespace detail;
-	return idx < COUNT && drvB[idx] && drvArmed[idx] && drvPktMs[idx] && millis() - drvPktMs[idx] > TELE_LOST_MS;
+	// Only at zero: under throttle a silent ESC is the stall watch's (a failed start beeps without
+	// telemetry and is re-armed); calling it gone there made the page forget a healthy ESC.
+	return idx < COUNT && drvB[idx] && drvArmed[idx] && drvTarget[idx] == 0 && !drvHold[idx] &&
+	       drvPktMs[idx] && millis() - drvPktMs[idx] > TELE_LOST_MS;
 }
 inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::drvRev[idx]; }
 inline const char* spinMode(uint8_t idx) {
