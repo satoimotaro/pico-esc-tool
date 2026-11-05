@@ -251,6 +251,114 @@ int main() {
 		Identity j = identFromSilabs("JESC", 4), s = identFromSilabs("BLHeli_S", 1);
 		CHECK(j.bidir && j.rev && !s.bidir && !s.rev && !s.am32, "SiLabs identity: bidir by name, 3D by direction byte");
 	}
+	{   // rev0 stamp(): 0 means "none", and a stamp is never in the future
+		CHECK(stamp(0) == 1 && stamp(7) == 7 && stamp(8) == 8, "stamp(): 0 -> 1, anything else unchanged (millis()|1 was 9 for 8)");
+	}
+	{   // stall watch: the zero rule (eRPM 0 under throttle for STALL_ZERO_MS)
+		Stall s;
+		bool st = false;
+		for (uint32_t t = 1000; t <= 1000 + STALL_ZERO_MS && !st; t += 10) st = s.step(t, true, true, 0, t);
+		CHECK(!st, "eRPM 0 under throttle for exactly 1.5 s: not yet a stall");
+		CHECK(s.step(1000 + STALL_ZERO_MS + 1, true, true, 0, 2501) && s.hold && s.stalls == 1,
+		      "eRPM 0 for over 1.5 s: stall, held, counted");
+		CHECK(s.gate(2600, 300) == 0, "held: a throttle after the stall is sent as 0");
+		CHECK(s.gate(2610, 0) == 0 && !s.hold, "a zero command frees it (fewer than STALL_MAX stalls)");
+		CHECK(s.gate(2620, 300) == 300, "then a throttle passes again");
+		Stall q;   // nothing at all once the throttle came: judged by the zero rule from the start
+		bool hit = false;
+		for (uint32_t t = 0; t <= 1600 && !hit; t += 10) hit = q.step(t, true, false, 0, 0);
+		CHECK(hit, "no telemetry at all under throttle (a failed start): a stall after 1.5 s, not RUNNING in silence");
+	}
+	{   // stall watch: the silence rule only after it has turned
+		Stall s;
+		s.step(0, true, true, 500, 0);                     // it turns
+		CHECK(!s.step(400, true, false, 0, 0), "turned, then 400 ms without a packet: no stall yet");
+		CHECK(s.step(501, true, false, 0, 0) && s.hold, "turned, then over 500 ms without any packet: stall");
+		Stall q;
+		for (uint32_t t = 0; t < 1400; t += 10) q.step(t, true, t % 100 == 0, 0, t - t % 100);
+		CHECK(!q.hold, "never turned: silence gaps are not the silence rule (only the zero rule, 1.5 s)");
+		Stall w;
+		w.step(0, true, true, 500, 0);
+		CHECK(!w.step(5000, false, false, 0, 0) && !w.spun, "not watched (target 0, AM32, not armed): clocks cleared, never a stall");
+		Stall g; g.step(0, true, true, 0, 0); g.onGap();
+		CHECK(!g.step(1600, true, true, 0, 1600), "a loop held up restarts the zero clock (no stall counted across the gap)");
+	}
+	{   // stall watch: STALL_MAX restarts that never ran need a zero held STALL_REST_MS
+		Stall s; uint32_t t = 0;
+		for (int k = 0; k < STALL_MAX; k++) {
+			for (uint32_t u = 0; u <= STALL_ZERO_MS + 10 && !s.step(t, true, true, 0, t); u += 10) t += 10;
+			t += 10; s.gate(t, 0); t += 10; s.gate(t, 300);
+		}
+		CHECK(s.stalls == STALL_MAX && s.hold, "after STALL_MAX stalls in a row a zero command does not free it at once");
+		s.gate(t + 10, 0);
+		CHECK(s.hold && s.gate(t + 20, 300) == 0, "... nor a throttle right after it");
+		s.gate(t + 30, 0); s.poll(t + 30 + STALL_REST_MS);
+		CHECK(!s.hold, "a zero held STALL_REST_MS frees it (also with no command coming, via poll)");
+		Stall r; r.step(10, true, true, 0, 10); bool rs = r.step(1511, true, true, 0, 1511); r.gate(1520, 0);
+		r.step(2000, true, true, 900, 2000); r.step(3600, true, true, 900, 3600);
+		CHECK(rs && r.stalls == 0, "running for over 1.5 s clears the stall count");
+		CHECK(r.recent(1511 + STALL_RECENT_MS - 1) && !r.recent(1511 + STALL_RECENT_MS), "recent(): within 5 s of the restart");
+	}
+	{   // stall vs LOST in the lifecycle: under throttle the watch owns silence; a re-arm must answer
+		Pin p = readyPin(bluejay(), 0); p.requestArm(); p.onPacket(100);
+		p.stallWatch = true;
+		CHECK(p.tick(100 + LOST_MS + 50, Policy::TOOL) == Ev::NONE && p.st == State::RUNNING,
+		      "RUNNING under throttle (stall watch): 450 ms of silence is not LOST");
+		p.onRearm(600);
+		CHECK(p.tick(600 + LOST_MS + 50, Policy::TOOL) == Ev::NONE && p.st == State::RUNNING, "re-armed after a stall: not answered yet, not LOST");
+		CHECK(p.tick(600 + ANSWER_MAX_MS, Policy::TOOL) == Ev::LOST_STOPPED && p.st == State::LOST && !p.id.known,
+		      "a stall re-arm that never answers within 8 s: LOST, identity dropped");
+		Pin q = readyPin(bluejay(), 0); q.requestArm(); q.onPacket(100); q.onRearm(200); q.onPacket(900);
+		CHECK(q.tick(1200, Policy::TOOL) == Ev::NONE && q.tick(900 + LOST_MS, Policy::TOOL) == Ev::LOST_STOPPED,
+		      "a re-arm that answered: LOST again on 400 ms of silence at zero");
+		Pin r = readyPin(bluejay(), 0); r.requestArm(); r.onPacket(100); r.stallWatch = true; r.onStop();
+		CHECK(!r.stallWatch && !r.rearmed, "stop clears the stall flags");
+	}
+	{   // SILENT: an answered bidir stream gone quiet, before LOST
+		Pin p = readyPin(bluejay(), 0); p.onPacket(100);
+		CHECK(!p.silent(100 + SILENT_MS - 1) && p.silent(100 + SILENT_MS), "READY answered stream: silent after 200 ms");
+		Pin n = readyPin(silabs3d(), 0);
+		CHECK(!n.silent(5000), "normal DShot (no telemetry) is never silent");
+		Pin e; e.onStreamStart(0, true); e.onPacket(10);
+		CHECK(!e.silent(5000), "EMPTY is never silent (only READY/RUNNING)");
+	}
+	{   // PWM width gate (rev0): arm widths dropped, then a stop width first
+		bool z = false;
+		CHECK(pwmGate(100, 5000, z, 1600, 1000) == 1000 && !z, "a width during the arm is not kept");
+		CHECK(pwmGate(5000, 5000, z, 1600, 1000) == 1000 && !z, "after the arm, a width before any stop width: stop");
+		CHECK(pwmGate(5100, 5000, z, 1000, 1000) == 1000 && z, "a stop width opens it");
+		CHECK(pwmGate(5200, 5000, z, 1600, 1000) == 1600, "then widths pass");
+		bool z3 = false;
+		CHECK(pwmGate(6000, 5000, z3, 1000, 1500) == 1500 && !z3, "3D: 1000 us (full reverse) is not its stop and does not open it");
+	}
+	{   // UI codes (MSP_MOTOR_TELEMETRY mAh field) from the lifecycle state
+		UiIn none;
+		Pin e;
+		CHECK(uiCode(e, none) == Ui::ABSENT, "EMPTY -> 5");
+		Pin pe = appeared(0);
+		CHECK(uiCode(pe, none) == Ui::READING, "PENDING -> 1");
+		pe.requestArm();
+		CHECK(uiCode(pe, none) == Ui::ARMING, "PENDING with an arm waiting for the read -> 2");
+		Pin r = readyPin(bluejay(), 0);
+		CHECK(uiCode(r, none) == Ui::IDLE, "READY without a stream -> 4");
+		UiIn st; st.stream = true;
+		CHECK(uiCode(r, st) == Ui::ARMING, "READY, hold stream still arming -> 2");
+		st.armed = true;
+		CHECK(uiCode(r, st) == Ui::ARMED, "READY with an armed hold stream -> 3");
+		UiIn si = st; si.silent = true;
+		CHECK(uiCode(r, si) == Ui::SILENT, "READY, armed, silent at zero -> 7");
+		r.requestArm();
+		UiIn sh = st; sh.stalled = true;
+		CHECK(uiCode(r, sh) == Ui::STALLED, "RUNNING, stalled / held -> 6");
+		CHECK(uiCode(r, st) == Ui::ARMED && uiCode(r, none) == Ui::ARMING, "RUNNING armed -> 3; RUNNING before its stream -> 2");
+		UiIn pw; pw.pwm = true; pw.pwmArming = true;
+		CHECK(uiCode(r, pw) == Ui::ARMING, "PWM arming / waiting for a stop width -> 2");
+		pw.pwmArming = false;
+		CHECK(uiCode(r, pw) == Ui::ARMED, "PWM past its arm -> 3");
+		Pin l = readyPin(bluejay(), 0); l.onPacket(10); l.tick(10 + LOST_MS, Policy::TOOL);
+		CHECK(l.st == State::LOST && uiCode(l, st) == Ui::ABSENT, "LOST -> 5");
+		CHECK((uint8_t)Ui::STALLED == 6 && (uint8_t)Ui::SILENT == 7 && (uint8_t)Ui::ABSENT == 5, "the codes the page reads are fixed");
+	}
 	{   // names
 		const char* want[] = { "EMPTY", "PENDING", "READING", "READY", "RUNNING", "LOST", "FAILED" };
 		bool all = true;

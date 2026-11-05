@@ -267,6 +267,8 @@ inline Refuse mapDrive(const Identity& id, int v, bool& use3d, int16_t& s3d, uin
 // even, and now - stamp then wrapped to ~4e9: the 300 ms answer hold and the stall timeouts passed
 // at once).
 inline uint32_t stamp(uint32_t now) { return now ? now : 1; }
+// ms from stamp t to now, 0 if t is ahead (the stamp(0) = 1 case).
+inline uint32_t since(uint32_t now, uint32_t t) { int32_t d = (int32_t)(now - t); return d > 0 ? (uint32_t)d : 0; }
 
 // STALL WATCH (rev0 8805f12, e6ddda2). A bidir ESC that stalls drops out of its run: Bluejay beeps,
 // clears EDT and waits to be armed again (Bluejay.asm exit_run_mode), and with "require EDT to arm" it
@@ -306,12 +308,12 @@ struct Stall {
 			if (v) {
 				zeroMs = 0; spun = true;
 				if (!runMs) runMs = stamp(now);
-				else if (now - runMs > STALL_ZERO_MS) stalls = 0;   // it runs
+				else if (since(now, runMs) > STALL_ZERO_MS) stalls = 0;   // it runs
 			} else { runMs = 0; if (!zeroMs) zeroMs = stamp(now); }
 		}
 		// silence counts only once it has turned: one that never answered is not watched, and below
 		// the start point the zero rule judges it
-		bool stalled = (zeroMs && now - zeroMs > STALL_ZERO_MS) || (spun && now - pktMs > STALL_SILENT_MS);
+		bool stalled = (zeroMs && since(now, zeroMs) > STALL_ZERO_MS) || (spun && since(now, pktMs) > STALL_SILENT_MS);
 		if (!stalled) return false;
 		zeroMs = runMs = 0; spun = false;
 		stallMs = stamp(now); if (stalls < 255) stalls++;
@@ -323,12 +325,12 @@ struct Stall {
 	uint16_t gate(uint32_t now, uint16_t t) {
 		if (t) { zeroCmd = 0; return hold ? 0 : t; }
 		if (!zeroCmd) zeroCmd = stamp(now);
-		if (stalls < STALL_MAX || now - zeroCmd >= STALL_REST_MS) hold = false;
+		if (stalls < STALL_MAX || since(now, zeroCmd) >= STALL_REST_MS) hold = false;
 		return 0;
 	}
 	// The last command was 0, long enough ago: free it even if no more come (the hold sends none).
-	void poll(uint32_t now) { if (hold && zeroCmd && now - zeroCmd >= STALL_REST_MS) hold = false; }
-	bool recent(uint32_t now) const { return stallMs && now - stallMs < STALL_RECENT_MS; }
+	void poll(uint32_t now) { if (hold && zeroCmd && since(now, zeroCmd) >= STALL_REST_MS) hold = false; }
+	bool recent(uint32_t now) const { return stallMs && since(now, stallMs) < STALL_RECENT_MS; }
 };
 
 // SERVO PWM width gate (rev0 e6ddda2). A width sent during the PWM arm (sinceStart < armMs) is not

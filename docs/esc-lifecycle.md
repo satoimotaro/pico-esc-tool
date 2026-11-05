@@ -2,7 +2,8 @@
 
 Status: phase 1 is implemented (`lib/esc_lifecycle`, `src/apps/esc_session.h`); phase 2 is still
 design. See "Phase 1 and phase 2" below for the split and for where the code refines this design.
-Hot-plug timing and the LOST threshold have not had a hardware bench pass yet.
+Hot-plug timing and the LOST threshold have not had a hardware bench pass yet. rev1 carries rev0's
+drive rules into it ("rev1" below).
 
 ## Requirements
 
@@ -159,7 +160,58 @@ Where the code refines the design:
    passthrough). Two failed keepalives in a row mark the CLI session lost, and the next op enters
    again with a fresh CONNECT. A write makes closing the session read the identity again before RUN.
 
-## rev0 (the current code, shipped first)
+## rev1: rev0's drive rules on the lifecycle
+
+rev1 is phase 1 rebased onto rev0. Every rev0 rule below still holds; this is where each one
+lives now and how it meets the lifecycle states.
+
+- Motor-test state (MSP_MOTOR_TELEMETRY mAh field, 0x5A marker) is one enum, `lc::Ui`
+  (`escs::UiState`), mapped from the pin's state by `lc::uiCode`:
+  - 1: PENDING or READING.
+  - 2: an arm waiting for its read, a DShot arm window, the hold's stream still arming, or a PWM
+    arm or PWM waiting for its first stop width.
+  - 3: armed (READY on an armed hold stream, or RUNNING).
+  - 4: READY with no stream.
+  - 5: EMPTY, LOST or FAILED.
+  - 6: RUNNING and stalled: re-arming, or held at 0.
+  - 7: an answered bidir stream at zero, not held, that has been silent for 200 ms
+    (`lc::SILENT_MS`), or the ROV open loop.
+
+  The page locks 1, 2, 5 and 6. Under the tool policy a pulled ESC goes LOST 400 ms after its
+  last packet, so 7 shows for one poll at most. The page's gone rule (3 prompt polls in a row,
+  read Bluejay/BlueGill/AM32 only) therefore also counts 5 once that motor has reported a live
+  code on this connection.
+- Stall watch (`lc::Stall`, run in `escs::detail::streamPin`): the same thresholds and the same
+  hold until a zero command, STALL_MAX, and no stall judgement for AM32. It watches an armed
+  RUNNING bidir stream under throttle. Under throttle its silence belongs to the stall watch, not
+  to LOST (`lc::Pin::stallWatch`), because a failed start beeps without telemetry. The zero rule's
+  clock starts when the throttle comes, so an ESC that never sends anything under throttle still
+  stalls after 1.5 s instead of staying RUNNING in silence. A stall re-arms the same stream (zero,
+  answer, EDT; `lc::Pin::onRearm`). A re-arm that gets no answer within 8 s is LOST. At zero the
+  400 ms LOST rule applies as before.
+- The loop-gap guard is `gapCheck`: a pin not polled for 50 ms moves its lifecycle clocks on by
+  the gap, and its stall clocks restart. `lc::stamp` replaces `millis()|1`.
+- PWM: `lc::pwmGate` drops widths sent during the arm and needs one stop width first. The IRQ
+  deadman stays. Every sync bootloader visit (`runOp`, `enterBootloader`) sends the stop width
+  while it waits, because pump() keeps PWM going. `pwmBusy` refuses CLI bootloader commands. A pin
+  unfed for 3 s after its arm goes back to READY, and the hold takes it. `pwmBegin` refuses when no
+  alarm slot is free for the IRQ deadman.
+- Unchanged from rev0:
+  - the FEATURE_3D latch, the `mtmode` declaration and its acknowledgement, and the session end on
+    DTR fall or MSP silence (fourway.h, `motorTestPoll`);
+  - SET_MOTOR 0 as stop;
+  - the undeclared 3D rule;
+  - the page's mode snapshot, 全体, stop streaming, the stopping flag, the readAll pipe guard,
+    forget on disconnect, and the lossless TUNE/MELODY fields.
+- Known limits added by rev1:
+  - A swap under throttle is caught only after a stall re-arm that gets no answer (8 s). An ESC
+    plugged in within that time answers the re-arm as if it were the old one, though held at 0
+    until a zero command.
+  - Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. If one lasts
+    longer than 400 ms at zero, the pin goes LOST and is read again when it answers. This needs a
+    bench check.
+
+## rev0 (the first release)
 
 - Idle hold: start holding only when nothing else is being driven, and never retry an ESC whose
   read failed until `scan` or a configurator read.
@@ -181,7 +233,7 @@ Where the code refines the design:
   2 s without MSP (a loop held up by a bootloader read does not count). An undeclared channel takes
   an ESC over only above the reported stop.
 - Known limits, in the release notes:
-  - A bootloader read on the drive path still stalls every stream.
+  - A bootloader read on the drive path still stalls every stream (rev1: async, see above).
   - Swaps are not detected. A bidir ESC that answered and then goes silent for 1 s while armed is
     reported (code 7); after 3 prompt polls in a row the page forgets its read and locks its slider.
   - A failed read leaves the ESC unknown (no stale direction is used), and it is not retried
@@ -196,7 +248,8 @@ Where the code refines the design:
   - The firmware's `mtmode` declaration and the FEATURE_3D latch are RAM only; the page sends the
     declaration again on each frame.
   - MOTOR_TELEMETRY's mAh field carries the motor-test state (escs::UiState: 2 arming, 3 armed,
-    4 idle, 5 absent, 6 stalled, 7 silent; 1 reserved) with 0x5A in the high byte. Betaflight
+    4 idle, 5 absent, 6 stalled, 7 silent; 1 reserved in rev0, "being read" from rev1) with 0x5A in
+    the high byte. Betaflight
     Configurator shows it as about 23 Ah. The page reads it only from a board that says PICO.
   - PWM: a width sent during the 5 s arm is not kept. After the arm, only the stop width passes
     until one stop width has come (reported as arming, code 2, so the page keeps its slider locked).

@@ -184,8 +184,8 @@ is 1500 µs on a 3D ESC; the first 5 s after switching hold that stop pulse so t
 protocol and arms, and after that a width passes only once one stop width has been sent. Fed like
 `throttle`: 500 ms without a value falls back to the stop pulse (also while the board is busy), and
 3 s without one after the arm the pin leaves PWM. Bootloader commands are refused while a PWM pin
-runs. There is no telemetry on PWM. The rev0 known limits and the design notes for the next
-ESC-handling rework: [`docs/esc-lifecycle.md`](docs/esc-lifecycle.md).
+runs. There is no telemetry on PWM. The ESC lifecycle (hot-plug, async reads), how rev1 carries the
+rev0 rules into it, and the known limits of both: [`docs/esc-lifecycle.md`](docs/esc-lifecycle.md).
 
 ## Position control (`host/posctl.py`)
 
