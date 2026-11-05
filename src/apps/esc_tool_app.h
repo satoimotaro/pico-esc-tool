@@ -497,15 +497,9 @@ private:
 	}
 
 	void motorTestStop(const char* why) {
-		// Back to zero throttle on the same stream, held by the idle hold, instead of cutting the signal:
-		// a cut AM32 reboots in 2 s, and a Bluejay that loses its signal beeps until re-armed (up to 5 s
-		// per ESC by the hold). Not when the hold is off or a passthrough takes the pins.
-		bool keep = idleOn_ && !fw_.active();
-		for (uint8_t i = 0; i < n_; i++) {
-			if (!(mtOwned_ >> i & 1)) continue;
-			if (keep && escs::spinArmed(i)) { th_[i]->setRaw(0); idle_ |= 1u << i; }
-			else th_[i]->stop();
-		}
+		// stop() leaves the ESC on its stream at zero while the hold is on (escs::spinStop: RUNNING ->
+		// READY): a cut AM32 would reboot, a cut Bluejay beep until re-armed.
+		for (uint8_t i = 0; i < n_; i++) if (mtOwned_ >> i & 1) th_[i]->stop();
 		// not during a passthrough: the line would land inside the configurator's 4-way replies
 		if (mtOwned_ && !fw_.active()) console::out().printf("# motor test stopped: %s\n", why);
 		mtOwned_ = 0; mtLatched_ = 0; fw_.clearMotors();
