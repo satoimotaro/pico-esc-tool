@@ -30,7 +30,7 @@ const st = {
   escs: [],            // results of readEsc, by channel (null = not answering)
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
-  test: { on: false, values: [], timer: null },
+  test: { on: false, values: [], timer: null, sel: [] },
 };
 
 // ------------------------------------------------------------------------------- log / status
@@ -62,28 +62,39 @@ async function connect() {
     await pipe.open();
     pipe.onclose = () => { if (st.pipe === pipe) dropped(); };
     st.pipe = pipe; st.msp = new Msp(pipe); st.fw = new FourWay(pipe);
-    await new Promise((r) => setTimeout(r, 300));
-    pipe.drain();
-    let api;
-    for (let i = 0; i < 3 && !api; i++) api = await st.msp.request(MSP.API_VERSION).catch(() => null);
-    if (!api) throw new Error('MSP の応答がありません (ポートやボーレートを確認)');
-    const variant = String.fromCharCode(...await st.msp.request(MSP.FC_VARIANT));
-    const board = String.fromCharCode(...(await st.msp.request(MSP.BOARD_INFO)).slice(0, 4));
-    st.board = `${variant} ${board}`.trim();
-    const feat = await st.msp.request(MSP.FEATURE_CONFIG).catch(() => [0, 0, 0, 0]);
-    st.threeD = !!((feat[0] | feat[1] << 8 | feat[2] << 16 | feat[3] << 24) & FEATURE_3D);
-    const mc = await st.msp.request(MSP.MOTOR_CONFIG).catch(() => null);
-    if (mc && mc.length > 6) st.motors = mc[6];
-    else {
-      const m = await st.msp.request(MSP.MOTOR);
-      st.motors = 0;
-      for (let i = 0; i < m.length / 2; i++) if (m[2 * i] | m[2 * i + 1] << 8) st.motors++;
+    try { await identify(pipe); } catch (e) {
+      st.pipe = null;                  // not a board we can talk to: give the port back
+      await pipe.close();
+      throw e;
     }
-    log(`接続: ${st.board}, API ${api[1]}.${api[2]}, モーター ${st.motors} 個${st.threeD ? ' (3D)' : ''}`, 'ok');
-    renderTest();
   });
   if (!st.pipe) return;
   status();
+}
+
+async function identify(pipe) {
+  await new Promise((r) => setTimeout(r, 300));
+  pipe.drain();
+  let api;
+  for (let i = 0; i < 3 && !api; i++) api = await st.msp.request(MSP.API_VERSION).catch(() => null);
+  if (!api) throw new Error('MSP の応答がありません (ポートやボーレートを確認)');
+  const variant = String.fromCharCode(...await st.msp.request(MSP.FC_VARIANT));
+  const board = String.fromCharCode(...(await st.msp.request(MSP.BOARD_INFO)).slice(0, 4));
+  st.board = `${variant} ${board}`.trim();
+  const feat = await st.msp.request(MSP.FEATURE_CONFIG).catch(() => [0, 0, 0, 0]);
+  st.threeD = !!((feat[0] | feat[1] << 8 | feat[2] << 16 | feat[3] << 24) & FEATURE_3D);
+  const mc = await st.msp.request(MSP.MOTOR_CONFIG).catch(() => null);
+  if (mc && mc.length > 6) st.motors = mc[6];
+  else {
+    const m = await st.msp.request(MSP.MOTOR);
+    st.motors = 0;
+    for (let i = 0; i < m.length / 2; i++) if (m[2 * i] | m[2 * i + 1] << 8) st.motors++;
+  }
+  log(`接続: ${st.board}, API ${api[1]}.${api[2]}, モーター ${st.motors} 個${st.threeD ? ' (3D)' : ''}`, 'ok');
+  st.pico = board === 'PICO';
+  $('#test-proto-box').hidden = !st.pico;
+  if (!st.pico) $('#test-proto').value = 'dshot';
+  renderTest();
 }
 
 function dropped() {
@@ -93,13 +104,16 @@ function dropped() {
   status();
 }
 
+// Each step is bounded: a board that has stopped answering (or a read still in flight) must not keep
+// the page stuck in "connected". The Pico stops the motors on its own once MSP goes quiet.
 async function disconnect() {
-  await stopTest('切断');
-  if (st.inPassthrough) await st.fw.exit().catch(() => {});
+  const within = (p, ms) => Promise.race([p.catch(() => {}), new Promise((r) => setTimeout(r, ms))]);
+  await within(stopTest('切断'), 1500);
+  if (st.inPassthrough) await within(st.fw.exit(), 1500);
   const p = st.pipe;
   st.pipe = null; st.inPassthrough = false;
-  await p?.close();
   status();
+  if (p) await within(p.close(), 2000);
 }
 
 async function passthrough(on) {
@@ -137,6 +151,7 @@ async function readAll() {
       }
     }
     renderEscs(); renderFlash();
+    if (!st.test.on) renderTest();
   });
 }
 
@@ -189,8 +204,8 @@ function savePreset(ch) {
 // ------------------------------------------------------------------------------- ESC cards
 function fieldInput(ch, f) {
   const edit = st.edits[ch], base = st.escs[ch].block;
-  const v = edit[f.off];
-  const set = (x) => { edit[f.off] = x; renderEscs(); };
+  const v = f.get ? f.get(edit) : edit[f.off];
+  const set = (x) => { if (f.put) f.put(edit, x); else edit[f.off] = x; renderEscs(); };
   let input;
   if (f.type === 'enum') {
     const known = f.opts.some(([k]) => k === v);
@@ -203,7 +218,8 @@ function fieldInput(ch, f) {
     input = h('input', { type: 'number', min: f.min, max: f.max, value: v,
       onchange: (e) => set(Math.max(0, Math.min(255, +e.target.value | 0))) });
   }
-  return h('label', { class: `field${v !== base[f.off] ? ' changed' : ''}`, title: f.help || '' },
+  const was = f.get ? f.get(base) : base[f.off];
+  return h('label', { class: `field${v !== was ? ' changed' : ''}`, title: f.help || '' },
     h('span', { class: 'fname' }, f.label),
     input,
     f.fmt ? h('span', { class: 'fmt' }, f.fmt(v)) : null);
@@ -280,38 +296,91 @@ async function importPresets(file) {
 // ------------------------------------------------------------------------------- motor test
 // MSP_SET_MOTOR goes out every 100 ms while the test is on: the pico-esc-tool firmware (like a
 // cautious FC) stops the motors when MSP goes quiet, so a closed tab or a dead link stops them.
-const stopValue = () => (st.threeD ? 1500 : 1000);
+// PWM (pico-esc-tool only) sends the same slider values as CLI lines, `pwmch <motor> <value>`, also
+// every 100 ms: the firmware maps each to that ESC's own pulse (a 3D ESC stops at 1500 us) and falls
+// back to the stop pulse after 500 ms without one. SET_MOTOR is not sent then: it would re-arm DShot.
+// Each slider stops where ITS ESC stops: 1500 on a 3D ESC (up forward, down reverse), 1000 on a
+// one-way one. On pico-esc-tool the page knows that per motor from the ESCs it read, and tells the
+// firmware (`mtmode <mask>`) so the values mean the same thing on both sides; a Betaflight FC has one
+// 3D setting for every motor (FEATURE_3D), so there it is that.
+function motor3d(i) {   // from the last read; undefined = not read
+  const e = st.escs[i];
+  if (!e) return undefined;
+  return e.mode === MODE.ARM_BLB ? e.block[18] === 1 : (e.block[0x0B] === 3 || e.block[0x0B] === 4);
+}
+const is3d = (i) => (st.pico ? motor3d(i) ?? st.threeD : st.threeD);
+const stopOf = (i) => (is3d(i) ? 1500 : 1000);
+const unread = () => st.pico && Array.from({ length: st.motors }, (_, i) => st.escs[i]).some((e) => e === undefined);
+
+// Only the motors ticked here move; the others stay at their stop value (and are never armed by the
+// test: a value at stop is not a request).
+const picked = (i) => st.test.sel[i] !== false;
+const sendValues = () => st.test.values.map((v, i) => (picked(i) ? v : stopOf(i)));
 
 function renderTest() {
   const box = $('#sliders');
   box.replaceChildren();
-  st.test.values = Array.from({ length: 8 }, () => stopValue());
+  st.test.values = Array.from({ length: 8 }, (_, i) => stopOf(i));
+  $('#test-all').value = 0;
   for (let i = 0; i < st.motors; i++) {
-    const out = h('output', {}, String(stopValue()));
-    box.append(h('label', { class: 'slider' }, h('span', {}, `M${i + 1}`),
-      h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stopValue(), 'data-m': i, disabled: !st.test.on,
-        oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } }),
-      out));
+    const stop = stopOf(i);
+    const out = h('output', {}, String(stop));
+    const known = !st.pico || motor3d(i) !== undefined;
+    const range = h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stop, 'data-m': i,
+      disabled: !st.test.on || !picked(i),
+      oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } });
+    const pick = h('input', { type: 'checkbox', checked: picked(i), title: '回すモーターを選ぶ',
+      onchange: (e) => {
+        st.test.sel[i] = e.target.checked;
+        range.disabled = !st.test.on || !e.target.checked;
+        if (!e.target.checked) { range.value = stop; st.test.values[i] = stop; out.textContent = String(stop); }
+      } });
+    box.append(h('label', { class: 'slider' }, pick, h('span', {}, `M${i + 1}`),
+      range,
+      out,
+      h('span', { class: known ? 'tag' : 'tag dim' }, (is3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込'))));
   }
-  $('#test-note').textContent = st.threeD
-    ? '3D モード: 1500 が停止、上が正転、下が逆転です。'
-    : '1000 が停止です。少しずつ上げてください。';
+  $('#test-note').textContent = (unread() ? '開始すると、先に ESC を読んで 3D かどうかを確かめます。' : '')
+    + '少しずつ動かしてください。3D の ESC は 1500 が停止で、上が正転、下が逆転です。'
+    + (pwmMode() ? ' PWM: 切り替え後 5 秒は停止パルスで待機状態に入れます。テレメトリは出ません。Bluejay は PWM を受け付けません。' : '');
 }
+
+const pwmMode = () => st.pico && $('#test-proto').value === 'pwm';
+const sendLine = (line) => st.pipe.write(Array.from(new TextEncoder().encode(line + '\n')));
 
 async function startTest() {
   if (!$('#test-safe').checked) { log('プロペラを外したことを確認してください', 'err'); return; }
+  if (unread()) { log('3D かどうかを確かめるため、先に ESC を読み込みます'); await readAll(); }
   await task('モーターテスト', async () => {
     await passthrough(false);
+    if (st.pico) {
+      let mask = 0;
+      for (let i = 0; i < st.motors; i++) if (is3d(i)) mask |= 1 << i;
+      await sendLine(`mtmode ${mask}`);
+    }
     st.test.on = true;
+    st.test.pwm = pwmMode();
+    $('#test-proto').disabled = true;
     renderTest();
-    // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while it arms an
-    // ESC (~3 s), so only a link silent for longer than that counts as lost.
+    if (st.test.pwm) {
+      st.test.timer = setInterval(() => {
+        if (!st.pipe || !st.test.on) return;
+        const vals = sendValues();
+        for (let i = 0; i < st.motors; i++) sendLine(`pwmch ${i} ${vals[i]}`).catch(() => {});
+      }, 100);
+      log('モーターテスト開始 (PWM)');
+      return;
+    }
+    // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while an arm
+    // reads an ESC it does not know yet (a bootloader visit, up to ~4 s each, one ESC after another),
+    // so only a link silent for longer than that counts as lost. The firmware stops the motors on
+    // its own when MSP goes quiet.
     let inflight = false, heard = performance.now();
     st.test.timer = setInterval(() => {
       if (!st.pipe || !st.test.on || inflight) return;
-      if (performance.now() - heard > 5000) { stopTest('ボードの応答が 5 秒ありません'); return; }
+      if (performance.now() - heard > 10000) { stopTest('ボードの応答が 10 秒ありません'); return; }
       const d = [];
-      for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
+      for (const v of sendValues()) d.push(v & 0xFF, v >> 8);
       inflight = true;
       st.msp.request(MSP.SET_MOTOR, d, 1000)
         .then(() => { heard = performance.now(); }, () => {})
@@ -326,8 +395,11 @@ async function stopTest(why) {
   if (!st.test.on) return;
   st.test.on = false;
   clearInterval(st.test.timer);
-  st.test.values = st.test.values.map(() => stopValue());
-  if (st.pipe) {
+  st.test.values = st.test.values.map((_, i) => stopOf(i));
+  $('#test-proto').disabled = false;
+  if (st.pipe && st.test.pwm) {
+    for (let i = 0; i < st.motors; i++) await sendLine(`pwmch ${i} stop`).catch(() => {});
+  } else if (st.pipe) {
     const d = [];
     for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
     await st.msp.request(MSP.SET_MOTOR, d, 500).catch(() => {});
@@ -368,7 +440,7 @@ async function pollTele() {
     const ok = r.bad < 100;
     body.append(h('tr', {},
       h('td', {}, h('span', { class: 'swatch', style: `background:${SERIES[i % 8]}` }), `M${i + 1}`),
-      h('td', {}, String(st.test.values[i] ?? '')),
+      h('td', {}, String(sendValues()[i] ?? '')),
       h('td', { class: 'rpm' }, ok ? String(r.rpm) : '—'),
       h('td', {}, r.volt ? r.volt.toFixed(2) : '—'),
       h('td', {}, r.amp ? r.amp.toFixed(2) : '—'),
@@ -487,8 +559,14 @@ function init() {
   $('#write-sel').addEventListener('click', writeSelected);
   $('#exit-pt').addEventListener('click', () => task('パススルー終了', () => passthrough(false)));
   $('#test-toggle').addEventListener('click', () => (st.test.on ? stopTest('停止ボタン') : startTest()));
-  $('#test-all').addEventListener('input', (e) => {
-    document.querySelectorAll('#sliders input').forEach((s) => { s.value = e.target.value; s.dispatchEvent(new Event('input')); });
+  $('#test-proto').addEventListener('change', renderTest);
+  $('#test-all').addEventListener('input', (e) => {   // 0..1000 forward, from each motor's own stop
+    const p = +e.target.value;
+    document.querySelectorAll('#sliders input[type=range]').forEach((s) => {
+      const i = +s.dataset.m;
+      if (!picked(i)) return;
+      s.value = stopOf(i) + (is3d(i) ? p / 2 : p); s.dispatchEvent(new Event('input'));
+    });
   });
   $('#hexfile').addEventListener('change', (e) => e.target.files[0] && loadHex(e.target.files[0]));
   $('#flash-go').addEventListener('click', flashSelected);
