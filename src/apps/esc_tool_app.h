@@ -261,6 +261,7 @@ public:
 		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
 		if (escs::armMask() != armSaved_) savePresent(escs::presentMask());   // a connect learned AM32
 		motorTestPoll();
+		idlePoll();
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
 		else {
@@ -288,7 +289,7 @@ private:
 	uint32_t linkTimeoutMs_ = 0, linkLastMs_ = 0;
 	bool     linkTripped_   = false;
 	void linkWatch() {
-		if (!linkTimeoutMs_ || linkTripped_ || !escs::spinning()) return;
+		if (!linkTimeoutMs_ || linkTripped_ || !driving()) return;
 		if (millis() - linkLastMs_ <= linkTimeoutMs_) return;
 		for (uint8_t k = 0; k < n_; k++) th_[k]->stop();
 		escs::spinStopAll();
@@ -458,6 +459,35 @@ private:
 	uint32_t mtOwned_ = 0;          // ESCs this motor test armed
 	uint32_t mtArmedMs_ = 0;        // when an arm() returned: it can block for a bootloader visit
 	bool     mtDtr_ = false;
+	// IDLE HOLD. AM32 resets itself after 2 s without a valid frame (am32 Src/main.c, NVIC_SystemReset)
+	// and plays its startup tune on every boot, so an AM32 left alone beeps every few seconds. A flight
+	// controller never leaves it alone: it streams zero throttle. So does this, for the wired AM32 ESCs
+	// while nothing else needs them — not in a passthrough, a flash or a bootloader session (a connect
+	// frees the pin itself). The motor test takes an idle-held ESC over; a CLI throttle drives it as
+	// it is. `idle off` turns it off. One arm per 5 s: an arm can block while it learns the ESC.
+	uint32_t idle_ = 0, idleNextMs_ = 0;   // idle_: bit i = ESC i is held at zero throttle by this
+	bool     idleOn_ = true;
+	bool driving() {   // anything spinning that the idle hold does not own
+		for (uint8_t i = 0; i < n_; i++) if ((escs::spinArmed(i) || escs::spinArming(i)) && !(idle_ >> i & 1)) return true;
+		return false;
+	}
+	void idlePoll() {
+		for (uint8_t i = 0; i < n_; i++) {   // drop the ones that stopped, or that someone gave a throttle
+			bool on = escs::spinArmed(i) || escs::spinArming(i);
+			if (!on || escs::spinTarget(i)) idle_ &= ~(1u << i);
+		}
+		if (!idleOn_ || fw_.active() || fl_ == FL_START || fl_ == FL_RUN || escs::sessionOpen()) return;
+		if ((int32_t)(millis() - idleNextMs_) < 0) return;
+		for (uint8_t i = 0; i < n_; i++) {
+			if (!(escs::armMask() >> i & 1) || !escs::isPresent(i)) continue;
+			if (escs::spinArmed(i) || escs::spinArming(i)) continue;
+			th_[i]->arm(); th_[i]->setRaw(0);
+			idle_ |= 1u << i; idleNextMs_ = millis() + 5000;
+			return;
+		}
+	}
+	void idleStop() { for (uint8_t i = 0; i < n_; i++) if (idle_ >> i & 1) th_[i]->stop(); idle_ = 0; }
+
 	void motorTestStop(const char* why) {
 		for (uint8_t i = 0; i < n_; i++) if (mtOwned_ >> i & 1) th_[i]->stop();
 		// not during a passthrough: the line would land inside the configurator's 4-way replies
@@ -493,8 +523,10 @@ private:
 			bool owned = mtOwned_ >> i & 1;
 			if (!owned) {
 				if (v <= stop) continue;
-				if (escs::spinArmed(i) || escs::spinArming(i)) continue;   // the CLI has it
-				th->arm(); mtOwned_ |= 1u << i; mtArmedMs_ = millis();
+				bool idle = idle_ >> i & 1;                                   // held at zero: free to take
+				if (!idle && (escs::spinArmed(i) || escs::spinArming(i))) continue;   // the CLI has it
+				if (!idle) th->arm();
+				idle_ &= ~(1u << i); mtOwned_ |= 1u << i; mtArmedMs_ = millis();
 				console::out().printf("# motor test: arming ESC %u (%s)\n", i, th->spinMode());
 			} else if (!escs::spinArmed(i) && !escs::spinArming(i)) {   // stopped elsewhere (CLI disarm)
 				mtOwned_ &= ~(1u << i); continue;
@@ -861,6 +893,9 @@ private:
 				else { m|=1u<<i; console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } }
 				savePresent(m); printPresent(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"preset")) presetCmd();
+			else if (!strcmp(cmd,"idle")) { char* a=strtok(nullptr," ");   // idle [on|off]: zero-throttle hold for AM32
+				if (a && !strcmp(a,"off")) { idleOn_=false; idleStop(); } else if (a && !strcmp(a,"on")) idleOn_=true;
+				console::out().printf("idle|%s|held=%lx\n", idleOn_?"on":"off", (unsigned long)idle_); console::out().println("ok"); }
 			else if (!strcmp(cmd,"escs")) { char* a=strtok(nullptr," ");   // escs [all | <i> <i> ...]: which are wired
 				if (a) { uint32_t m=0; bool bad=false;
 					if (!strcmp(a,"all")) m=~0u;

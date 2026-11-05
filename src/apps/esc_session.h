@@ -270,6 +270,7 @@ inline int probe(uint8_t idx, uint32_t holdMs, uint8_t raw[8], uint32_t& edges, 
 }
 
 inline bool connected(uint8_t idx) { return detail::session == (int8_t)idx; }
+inline bool sessionOpen() { return detail::session >= 0; }   // some ESC is held in its bootloader
 inline void release() { using namespace detail; if (session >= 0) { runOp(Op::RUN, PINS[session]); session = -1; } }
 
 
