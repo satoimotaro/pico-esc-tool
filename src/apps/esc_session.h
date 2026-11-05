@@ -269,10 +269,16 @@ namespace detail {
 	}
 
 	static const uint32_t POLL_GAP_MS = 50;      // a pin not polled this long: core0 was away
+	static const uint8_t  SLOW_GAPS = 5;         // gaps in a row: say so (Ev::SLOW_LOOP), once per run
+	static uint8_t        gapRun[COUNT] = { 0 };
 	// A loop held up (a blocking op that does not pump) is not an ESC gone quiet: the lifecycle's
-	// clocks move on by the gap, and the stall clocks restart.
+	// clocks move on by the gap, and the stall clocks restart. A loop slow on every pass would keep
+	// LOST, SILENT and the stall's silence rule from ever firing, so repeated gaps are reported.
 	static void gapCheck(uint8_t i, uint32_t now) {
-		if (drvActive(i) && now - drvPollMs[i] > POLL_GAP_MS) { pin[i].rebase(now - drvPollMs[i]); stall[i].onGap(); }
+		if (drvActive(i) && now - drvPollMs[i] > POLL_GAP_MS) {
+			pin[i].rebase(now - drvPollMs[i]); stall[i].onGap();
+			if (gapRun[i] < 255 && ++gapRun[i] == SLOW_GAPS) evPush(i, lc::Ev::SLOW_LOOP);
+		} else if (drvActive(i)) gapRun[i] = 0;
 		drvPollMs[i] = now;
 	}
 	// One loop's worth of pin i's stream: arm window, deadman, telemetry, stall watch, EDT, one frame.
@@ -311,14 +317,21 @@ namespace detail {
 				drvTele[i].pktStampMs = now;
 				evPush(i, pin[i].onPacket(now));
 			}
-			// Stall watch: armed, under throttle, Bluejay/BLHeli-derived (AM32 stays in its run). Its
-			// silence there is the watch's, not LOST (lc::Pin::stallWatch). A stall arms the same stream
-			// again (zero, answer, EDT: Bluejay cleared it) with the target held at 0.
-			bool watched = drvArmed[i] && drvTarget[i] && pin[i].st == lc::State::RUNNING && !pin[i].id.am32;
-			if (stall[i].step(now, watched, ty == BidirDshotTelemetryType::ERPM, v, pin[i].pktMs)) {
+			// Stall watch (lc::Stall): armed, under throttle, on a stream that has answered, Bluejay/
+			// BLHeli-derived (AM32 stays in its run). Its silence there is the watch's, not LOST
+			// (lc::Pin::stallWatch). ZERO / QUIET arm the same stream again (zero, answer, EDT: Bluejay
+			// cleared it) with the target held at 0; SILENT is LOST (TOOL) or the open loop (ROV).
+			bool watched = pin[i].stallWatched(drvArmed[i], drvTarget[i]);
+			lc::Ev se;
+			lc::StallAct act = pin[i].onStall(stall[i].step(now, watched, ty == BidirDshotTelemetryType::ERPM, v, pin[i].pktMs),
+			                                  policy, now, se);
+			evPush(i, se);
+			if (act == lc::StallAct::REARM) {
+				stall[i].restart(now);
 				drvArmed[i] = false; drvArmStart[i] = now; drvArmMs[i] = 0; drvAnswer[i] = 0;
 				drvEdt[i] = 20; drvTarget[i] = 0; watched = false;
-				pin[i].onRearm(now);
+			} else if (act == lc::StallAct::LOST) {   // TOOL: stop that ESC only, as LOST_STOPPED in spinPoll
+				drvTarget[i] = 0; armStart[i] = false; stall[i].reset(); watched = false;
 			}
 			pin[i].stallWatch = watched;
 			// Enable EDT (extended telemetry: V/A/temp) once armed and still stopped — the ESC ignores
@@ -338,8 +351,10 @@ namespace detail {
 			pwmLevel(i, arming || dead || blDepth ? pwmStop[i] : pwmUs[i]);
 		}
 	}
-	// What every core0 wait runs instead of delay(): the other pins' frames, telemetry, deadman and
-	// PWM. No state ticks, no jobs, no driver created or freed — it may run inside runOp anywhere.
+	// What every core0 wait runs instead of delay(): the other pins' frames, telemetry, deadman, stall
+	// watch and PWM. Telemetry can still move a pin's state (onPacket: EMPTY/LOST -> PENDING; a stall
+	// verdict: re-arm, LOST) and push events, but there are no ticks, no scheduling, no jobs and no
+	// driver created or freed, so it may run inside runOp anywhere.
 	static void pump() {
 		for (uint8_t i = 0; i < COUNT; i++) streamPin(i);
 		pwmPoll();
@@ -664,8 +679,10 @@ inline bool spinHeld(uint8_t idx) {
 // telemetry and is re-armed); calling it gone there made the page forget a healthy ESC.
 inline bool spinSilent(uint8_t idx) {
 	using namespace detail;
+	uint32_t now = millis();
+	// not polled lately (MSP answered right after a blocking op, before spinPoll): no evidence
 	return idx < COUNT && drvB[idx] && drvArmed[idx] && drvTarget[idx] == 0 && !stall[idx].hold &&
-	       pin[idx].silent(millis());
+	       now - drvPollMs[idx] <= POLL_GAP_MS && pin[idx].silent(now);
 }
 inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::curIdent(idx).known && detail::curIdent(idx).rev; }
 inline const char* spinMode(uint8_t idx) {   // the protocol while driven, else the state (lowercase)
@@ -779,7 +796,7 @@ inline void spinPoll() {   // call every core0 loop: lifecycle + hold + async re
 	bool any = false;
 	for (uint8_t i = 0; i < COUNT; i++) { if (drvActive(i)) { any = true; streamPin(i); } }
 	// a PWM pin left unfed after its arm: back to READY, and the hold takes the pin on the next loop
-	// (no longer driving()). Here, not in pwmPoll: pump() runs inside sync ops and changes no state.
+	// (no longer driving()). Here, not in pwmPoll: pump() runs inside sync ops and frees no driver.
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!pwmOn(i)) continue;
 		if (now - pwmStart[i] > PWM_ARM_MS + PWM_RELEASE_MS && millis() - pwmLast[i] > PWM_RELEASE_MS) {

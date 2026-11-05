@@ -25,8 +25,10 @@ static const uint32_t LOST_MS          = 400;
 static const uint8_t  APPEAR_PKTS      = 3;
 static const uint32_t APPEAR_WINDOW_MS = 250;
 static const uint32_t APPEAR_GAP_MS    = 15;
-// A bidir READY pin that never answers on its stream is gone (== escs::SPIN_ARM_TELE_MAX_MS). So is
-// a RUNNING pin re-armed after a stall (Stall below) that never answers again.
+// A bidir READY pin that never answers on its stream within this long (== escs::SPIN_ARM_TELE_MAX_MS)
+// is reported once (Ev::NO_ANSWER) and kept READY: it is armed after 8 s anyway, as in rev0, and its
+// telemetry may just not decode. A RUNNING pin re-armed after a stall (Stall below) that never
+// answers again within this long is LOST: it had answered before.
 static const uint32_t ANSWER_MAX_MS    = 8000;
 // An answered bidir stream at zero with no packet for this long is reported SILENT (Ui::SILENT): the
 // web page's hint that LOST (LOST_MS) is coming, or, under Policy::ROV, the open loop.
@@ -65,12 +67,14 @@ inline Identity identFromSilabs(const char* name, uint8_t dirByte) {
 }
 
 enum class Ev : uint8_t { NONE, APPEARED, GONE, LOST_IDLE, LOST_STOPPED, LOST_OPENLOOP, RETURNED,
-                          READ_OK, READ_FAILED, READ_EMPTY, INIT_FAIL };
+                          READ_OK, READ_FAILED, READ_EMPTY, INIT_FAIL, NO_ANSWER, SLOW_LOOP };
 inline const char* evName(Ev e) {
 	static const char* const N[] = { "none", "appeared", "gone", "lost", "lost, stopped", "lost, open loop",
-	                                 "telemetry back", "read", "read failed", "nothing there", "init-fail (no free PIO SM)" };
+	                                 "telemetry back", "read", "read failed", "nothing there", "init-fail (no free PIO SM)",
+	                                 "no telemetry within 8 s (kept, armed anyway; a pull is not seen)",
+	                                 "core0 loop slow: LOST / stall checks paused" };
 	uint8_t k = (uint8_t)e;
-	return k < 11 ? N[k] : "?";
+	return k < 13 ? N[k] : "?";
 }
 
 // Why a drive command was not applied. A refusal never touches the target or feeds the deadman.
@@ -79,6 +83,9 @@ enum class Refuse : uint8_t { OK, STATE, NOT_ARMED, REVERSE_ONEWAY };
 // drive stream (arm window + target).
 enum class Out : uint8_t { NONE, ZERO_BIDIR, ZERO_ID, DRIVE };
 enum class Arm : uint8_t { NOW, AFTER_READ, REFUSED };
+// The stall watch's verdict (Stall, below) and what the pin does about it (Pin::onStall).
+enum class StallKind : uint8_t { NONE, ZERO, QUIET, SILENT };
+enum class StallAct : uint8_t { NONE, REARM, LOST, OPEN_LOOP };
 
 struct Pin {
 	State    st = State::EMPTY;
@@ -94,6 +101,7 @@ struct Pin {
 	// there is a stall (a failed start beeps without telemetry), not LOST. rearmed: the stream started
 	// over after a stall and must answer again within ANSWER_MAX_MS, or the pin is LOST after all.
 	bool     stallWatch = false, rearmed = false;
+	bool     noAnswerSaid = false;   // Ev::NO_ANSWER went out for the current stream
 	uint32_t streamMs = 0, pktMs = 0, burstMs = 0, cntMs = 0;
 	uint8_t  burst = 0;
 	State    prePt = State::EMPTY; // state when the passthrough began
@@ -118,11 +126,31 @@ struct Pin {
 	void latchSeen(uint32_t now) { seenAtRead = seen && now - pktMs < LOST_MS; }
 
 	void onStreamStart(uint32_t now, bool bidir) {
-		streaming = true; streamBidir = bidir; streamMs = now; answered = false; stallWatch = rearmed = false;
+		streaming = true; streamBidir = bidir; streamMs = now; answered = false; stallWatch = rearmed = noAnswerSaid = false;
 	}
 	void onStreamEnd() { streaming = false; answered = false; stallWatch = rearmed = false; }
 	// The same stream arms again after a stall: what it answered before no longer counts.
 	void onRearm(uint32_t now) { streamMs = now; answered = false; stallWatch = false; rearmed = true; }
+	// What the stall watch judges: RUNNING, armed, under throttle, on a stream that has answered (one
+	// that never answered is not watched: its telemetry may just not decode), not AM32 (it stays in its
+	// run on a stall).
+	bool stallWatched(bool armed, uint16_t target) const {
+		return st == State::RUNNING && armed && target && streaming && streamBidir && answered && !id.am32;
+	}
+	// A stall verdict on a RUNNING pin. ZERO / QUIET: the ESC is there and stalled, so the stream arms
+	// again with the identity kept (the caller restarts the Stall: held at 0). SILENT (it had turned,
+	// then nothing at all): under TOOL it is LOST like a silence at zero, identity dropped, so an ESC
+	// swapped in meanwhile is read before it is driven; under ROV it is the open loop (keep streaming
+	// the command, report once), as LOST while running is there.
+	StallAct onStall(StallKind k, Policy policy, uint32_t now, Ev& ev) {
+		ev = Ev::NONE;
+		if (k == StallKind::NONE || st != State::RUNNING) return StallAct::NONE;
+		if (k == StallKind::SILENT) {
+			if (policy == Policy::ROV) { if (!openLoop) { openLoop = true; ev = Ev::LOST_OPENLOOP; } return StallAct::OPEN_LOOP; }
+			toLost(); ev = Ev::LOST_STOPPED; return StallAct::LOST;
+		}
+		onRearm(now); return StallAct::REARM;
+	}
 	// An answered bidir stream gone quiet (see SILENT_MS); the caller adds "at zero, not held".
 	bool silent(uint32_t now) const {
 		return (st == State::READY || st == State::RUNNING) && streaming && streamBidir && answered &&
@@ -150,8 +178,10 @@ struct Pin {
 			if (!queued && seen && now - pktMs >= LOST_MS) { toEmpty(); return Ev::GONE; }
 			break;
 		case State::READY:
-			if (streaming && streamBidir &&
-			    (answered ? now - pktMs >= LOST_MS : now - streamMs >= ANSWER_MAX_MS)) { toLost(); return Ev::LOST_IDLE; }
+			if (streaming && streamBidir && answered && now - pktMs >= LOST_MS) { toLost(); return Ev::LOST_IDLE; }
+			if (streaming && streamBidir && !answered && !noAnswerSaid && now - streamMs >= ANSWER_MAX_MS) {
+				noAnswerSaid = true; return Ev::NO_ANSWER;   // kept READY (see ANSWER_MAX_MS)
+			}
 			break;
 		case State::RUNNING:   // unanswered RUNNING keeps 4baed53's "armed after 8 s anyway", except after a stall
 			if (streaming && streamBidir &&
@@ -272,13 +302,18 @@ inline uint32_t since(uint32_t now, uint32_t t) { int32_t d = (int32_t)(now - t)
 
 // STALL WATCH (rev0 8805f12, e6ddda2). A bidir ESC that stalls drops out of its run: Bluejay beeps,
 // clears EDT and waits to be armed again (Bluejay.asm exit_run_mode), and with "require EDT to arm" it
-// then refuses every start. Seen as eRPM at 0 under throttle for STALL_ZERO_MS (so a throttle below
-// the start point counts too: raise past it within 1.5 s), or, once it has turned in this run, no
-// telemetry at all for STALL_SILENT_MS (forced sine sends no eRPM but keeps sending EDT, so only total
-// silence counts). escs:: then arms the same stream again (zero, answer, EDT; Pin::onRearm) and the
-// target is held at 0 until it is sent 0: a jam is never restarted on its own. After STALL_MAX
-// restarts with no run in between, only a zero held for STALL_REST_MS frees it. Bluejay/BLHeli-
-// derived firmware only: AM32 stays in its run on a stall, so escs:: never watches it.
+// then refuses every start. It is watched only armed, under throttle, on a stream that has answered
+// (one that never answered is not watched: its telemetry may just not decode), and never for AM32,
+// which stays in its run on a stall. Three verdicts (StallKind):
+//   ZERO   eRPM read 0 under throttle for STALL_ZERO_MS (so a throttle below the start point counts
+//          too: raise past it within 1.5 s). The clock starts only on an eRPM reading of 0.
+//   QUIET  not turned yet, and no valid packet of any kind for STALL_SILENT_MS (a failed start beeps
+//          without telemetry). Forced sine sends EDT but no eRPM: that flow is never a stall.
+//   SILENT the same total silence once it has turned in this run: pulled or unpowered mid-run as
+//          likely as stalled, so Pin::onStall makes it LOST (TOOL) or the open loop (ROV).
+// ZERO and QUIET re-arm the same stream (zero, answer, EDT; restart()) and hold the target at 0
+// until it is sent 0: a jam is never restarted on its own. After STALL_MAX restarts with no run in
+// between, only a zero held for STALL_REST_MS frees it.
 static const uint32_t STALL_ZERO_MS   = 1500;
 static const uint32_t STALL_SILENT_MS = 500;
 static const uint8_t  STALL_MAX       = 3;
@@ -295,15 +330,10 @@ struct Stall {
 
 	void reset() { *this = Stall{}; }            // a fresh arm
 	void onGap() { zeroMs = 0; }                 // core0 was held up: its silence is no evidence
-	// One loop of pin i. watched: armed, target > 0, a bidir stream that is not AM32 (anything else
-	// clears the run clocks). erpm: this loop's packet was an eRPM reading v; pktMs: the last valid
-	// packet of any kind. true: stalled now (the caller re-arms; the hold is set here).
-	bool step(uint32_t now, bool watched, bool erpm, uint32_t v, uint32_t pktMs) {
-		if (!watched) { zeroMs = runMs = 0; spun = false; return false; }
-		// under throttle and not turned yet: the zero rule's clock runs from the start, so an ESC that
-		// sends nothing at all once the throttle comes (a failed start beeps without telemetry) is
-		// judged too, not left RUNNING in silence
-		if (!zeroMs && !spun) zeroMs = stamp(now);
+	// One loop of pin i. watched: see above (anything else clears the run clocks). erpm: this loop's
+	// packet was an eRPM reading v; pktMs: the last valid packet of any kind.
+	StallKind step(uint32_t now, bool watched, bool erpm, uint32_t v, uint32_t pktMs) {
+		if (!watched) { zeroMs = runMs = 0; spun = false; return StallKind::NONE; }
 		if (erpm) {
 			if (v) {
 				zeroMs = 0; spun = true;
@@ -311,14 +341,15 @@ struct Stall {
 				else if (since(now, runMs) > STALL_ZERO_MS) stalls = 0;   // it runs
 			} else { runMs = 0; if (!zeroMs) zeroMs = stamp(now); }
 		}
-		// silence counts only once it has turned: one that never answered is not watched, and below
-		// the start point the zero rule judges it
-		bool stalled = (zeroMs && since(now, zeroMs) > STALL_ZERO_MS) || (spun && since(now, pktMs) > STALL_SILENT_MS);
-		if (!stalled) return false;
+		if (zeroMs && since(now, zeroMs) > STALL_ZERO_MS) return StallKind::ZERO;
+		if (since(now, pktMs) > STALL_SILENT_MS) return spun ? StallKind::SILENT : StallKind::QUIET;
+		return StallKind::NONE;
+	}
+	// A re-arm after a ZERO / QUIET stall: counted, and the target held at 0.
+	void restart(uint32_t now) {
 		zeroMs = runMs = 0; spun = false;
 		stallMs = stamp(now); if (stalls < 255) stalls++;
 		hold = true;
-		return true;
 	}
 	// A command after a stall: held at 0 until a zero comes, or after STALL_MAX restarts that never
 	// ran, until zeros have come for STALL_REST_MS.

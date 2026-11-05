@@ -200,7 +200,11 @@ int main() {
 	{   // a bidir READY pin that never answers
 		Pin p = readyPin(bluejay(), 5000);
 		CHECK(p.tick(5000 + 7999, Policy::TOOL) == Ev::NONE, "bidir READY unanswered for 7999 ms stays READY");
-		CHECK(p.tick(5000 + 8000, Policy::TOOL) == Ev::LOST_IDLE && p.st == State::LOST, "bidir READY with no answer within 8 s goes LOST");
+		CHECK(p.tick(5000 + 8000, Policy::TOOL) == Ev::NO_ANSWER && p.st == State::READY && p.id.known,
+		      "M2: bidir READY with no answer within 8 s is reported (NO_ANSWER) and kept READY");
+		CHECK(p.tick(5000 + 9000, Policy::TOOL) == Ev::NONE && p.st == State::READY, "... reported once");
+		p.onPacket(14500);
+		CHECK(p.tick(14500 + LOST_MS, Policy::TOOL) == Ev::LOST_IDLE, "... and once it answers, 400 ms of silence is LOST as usual");
 		Pin n = readyPin(silabs3d(), 0);
 		CHECK(n.tick(100000, Policy::TOOL) == Ev::NONE && n.st == State::READY, "normal-DShot READY never goes LOST");
 	}
@@ -256,37 +260,47 @@ int main() {
 	}
 	{   // stall watch: the zero rule (eRPM 0 under throttle for STALL_ZERO_MS)
 		Stall s;
-		bool st = false;
-		for (uint32_t t = 1000; t <= 1000 + STALL_ZERO_MS && !st; t += 10) st = s.step(t, true, true, 0, t);
-		CHECK(!st, "eRPM 0 under throttle for exactly 1.5 s: not yet a stall");
-		CHECK(s.step(1000 + STALL_ZERO_MS + 1, true, true, 0, 2501) && s.hold && s.stalls == 1,
-		      "eRPM 0 for over 1.5 s: stall, held, counted");
+		StallKind k = StallKind::NONE;
+		for (uint32_t t = 1000; t <= 1000 + STALL_ZERO_MS && k == StallKind::NONE; t += 10) k = s.step(t, true, true, 0, t);
+		CHECK(k == StallKind::NONE, "eRPM 0 under throttle for exactly 1.5 s: not yet a stall");
+		CHECK(s.step(1000 + STALL_ZERO_MS + 1, true, true, 0, 2501) == StallKind::ZERO, "eRPM 0 for over 1.5 s: ZERO");
+		s.restart(2501);
+		CHECK(s.hold && s.stalls == 1, "restart(): held and counted");
 		CHECK(s.gate(2600, 300) == 0, "held: a throttle after the stall is sent as 0");
 		CHECK(s.gate(2610, 0) == 0 && !s.hold, "a zero command frees it (fewer than STALL_MAX stalls)");
 		CHECK(s.gate(2620, 300) == 300, "then a throttle passes again");
-		Stall q;   // nothing at all once the throttle came: judged by the zero rule from the start
-		bool hit = false;
-		for (uint32_t t = 0; t <= 1600 && !hit; t += 10) hit = q.step(t, true, false, 0, 0);
-		CHECK(hit, "no telemetry at all under throttle (a failed start): a stall after 1.5 s, not RUNNING in silence");
 	}
-	{   // stall watch: the silence rule only after it has turned
+	{   // M1: forced sine (EDT, no eRPM) is never a stall; a not-yet-turned pin stalls on total silence
+		Stall s; StallKind k = StallKind::NONE;
+		for (uint32_t t = 100; t <= 10000 && k == StallKind::NONE; t += 1) k = s.step(t, true, false, 0, t);   // EDT every ms
+		CHECK(k == StallKind::NONE, "EDT-only under throttle for 10 s is never a stall (forced sine)");
+		Stall q; k = StallKind::NONE; uint32_t at = 0;
+		for (uint32_t t = 100; t <= 2000 && k == StallKind::NONE; t += 10) { k = q.step(t, true, false, 0, 100); at = t; }
+		CHECK(k == StallKind::QUIET && at > 100 + STALL_SILENT_MS && at <= 100 + STALL_SILENT_MS + 10,
+		      "not turned, no packet of any kind for over 500 ms: QUIET (a failed start beeps without telemetry)");
+		Stall z; z.step(100, true, false, 0, 100);
+		CHECK(z.zeroMs == 0, "the zero clock does not start without an eRPM reading of 0");
+	}
+	{   // stall watch: the silence rule after it has turned
 		Stall s;
-		s.step(0, true, true, 500, 0);                     // it turns
-		CHECK(!s.step(400, true, false, 0, 0), "turned, then 400 ms without a packet: no stall yet");
-		CHECK(s.step(501, true, false, 0, 0) && s.hold, "turned, then over 500 ms without any packet: stall");
+		s.step(10, true, true, 500, 10);                     // it turns
+		CHECK(s.step(400, true, false, 0, 10) == StallKind::NONE, "turned, then 390 ms without a packet: no stall yet");
+		CHECK(s.step(511, true, false, 0, 10) == StallKind::SILENT, "turned, then over 500 ms without any packet: SILENT");
 		Stall q;
-		for (uint32_t t = 0; t < 1400; t += 10) q.step(t, true, t % 100 == 0, 0, t - t % 100);
-		CHECK(!q.hold, "never turned: silence gaps are not the silence rule (only the zero rule, 1.5 s)");
+		StallKind k = StallKind::NONE;
+		for (uint32_t t = 10; t < 1400 && k == StallKind::NONE; t += 10) k = q.step(t, true, t % 100 == 0, 0, t - t % 100);
+		CHECK(k == StallKind::NONE, "eRPM 0 every 100 ms for 1.4 s: neither rule yet");
 		Stall w;
-		w.step(0, true, true, 500, 0);
-		CHECK(!w.step(5000, false, false, 0, 0) && !w.spun, "not watched (target 0, AM32, not armed): clocks cleared, never a stall");
-		Stall g; g.step(0, true, true, 0, 0); g.onGap();
-		CHECK(!g.step(1600, true, true, 0, 1600), "a loop held up restarts the zero clock (no stall counted across the gap)");
+		w.step(10, true, true, 500, 10);
+		CHECK(w.step(5000, false, false, 0, 10) == StallKind::NONE && !w.spun, "not watched (target 0, AM32, not armed, never answered): clocks cleared, never a stall");
+		Stall g; g.step(10, true, true, 0, 10); g.onGap();
+		CHECK(g.step(1600, true, true, 0, 1600) == StallKind::NONE, "a loop held up restarts the zero clock (no stall counted across the gap)");
 	}
 	{   // stall watch: STALL_MAX restarts that never ran need a zero held STALL_REST_MS
-		Stall s; uint32_t t = 0;
+		Stall s; uint32_t t = 10;
 		for (int k = 0; k < STALL_MAX; k++) {
-			for (uint32_t u = 0; u <= STALL_ZERO_MS + 10 && !s.step(t, true, true, 0, t); u += 10) t += 10;
+			for (uint32_t u = 0; u <= STALL_ZERO_MS + 10 && s.step(t, true, true, 0, t) != StallKind::ZERO; u += 10) t += 10;
+			s.restart(t);
 			t += 10; s.gate(t, 0); t += 10; s.gate(t, 300);
 		}
 		CHECK(s.stalls == STALL_MAX && s.hold, "after STALL_MAX stalls in a row a zero command does not free it at once");
@@ -294,10 +308,32 @@ int main() {
 		CHECK(s.hold && s.gate(t + 20, 300) == 0, "... nor a throttle right after it");
 		s.gate(t + 30, 0); s.poll(t + 30 + STALL_REST_MS);
 		CHECK(!s.hold, "a zero held STALL_REST_MS frees it (also with no command coming, via poll)");
-		Stall r; r.step(10, true, true, 0, 10); bool rs = r.step(1511, true, true, 0, 1511); r.gate(1520, 0);
+		Stall r; r.step(10, true, true, 0, 10); bool rs = r.step(1511, true, true, 0, 1511) == StallKind::ZERO;
+		r.restart(1511); r.gate(1520, 0);
 		r.step(2000, true, true, 900, 2000); r.step(3600, true, true, 900, 3600);
 		CHECK(rs && r.stalls == 0, "running for over 1.5 s clears the stall count");
 		CHECK(r.recent(1511 + STALL_RECENT_MS - 1) && !r.recent(1511 + STALL_RECENT_MS), "recent(): within 5 s of the restart");
+	}
+	{   // stall verdicts on the pin: ZERO/QUIET re-arm (identity kept); SILENT is LOST (TOOL, m1) or open loop (ROV, M3)
+		Ev e;
+		Pin a = readyPin(bluejay(), 0); a.requestArm(); a.onPacket(100);
+		CHECK(a.onStall(StallKind::ZERO, Policy::TOOL, 1700, e) == StallAct::REARM && a.st == State::RUNNING && a.id.known &&
+		      a.rearmed && !a.answered && e == Ev::NONE, "ZERO: re-armed on the same stream, identity kept");
+		Pin q = readyPin(bluejay(), 0); q.requestArm(); q.onPacket(100);
+		CHECK(q.onStall(StallKind::QUIET, Policy::ROV, 700, e) == StallAct::REARM && q.st == State::RUNNING,
+		      "QUIET (failed start): re-armed under ROV too");
+		Pin t = readyPin(bluejay(), 0); t.requestArm(); t.onPacket(100);
+		CHECK(t.onStall(StallKind::SILENT, Policy::TOOL, 700, e) == StallAct::LOST && t.st == State::LOST && !t.id.known &&
+		      e == Ev::LOST_STOPPED, "m1 TOOL: SILENT after turning is LOST, identity dropped");
+		packets(t, 800, 3, 20);
+		CHECK(t.st == State::PENDING, "... so the next answer goes PENDING (read before it is driven)");
+		Pin r = readyPin(bluejay(), 0); r.requestArm(); r.onPacket(100);
+		CHECK(r.onStall(StallKind::SILENT, Policy::ROV, 700, e) == StallAct::OPEN_LOOP && r.st == State::RUNNING && r.openLoop &&
+		      r.id.known && e == Ev::LOST_OPENLOOP, "M3 ROV: SILENT after turning is the open loop, identity kept");
+		CHECK(r.onStall(StallKind::SILENT, Policy::ROV, 710, e) == StallAct::OPEN_LOOP && e == Ev::NONE, "... reported once");
+		CHECK(r.onPacket(800) == Ev::RETURNED && !r.openLoop, "... and telemetry back ends it");
+		Pin n = readyPin(bluejay(), 0);
+		CHECK(n.onStall(StallKind::ZERO, Policy::TOOL, 100, e) == StallAct::NONE && n.st == State::READY, "a verdict on a READY pin does nothing");
 	}
 	{   // stall vs LOST in the lifecycle: under throttle the watch owns silence; a re-arm must answer
 		Pin p = readyPin(bluejay(), 0); p.requestArm(); p.onPacket(100);
@@ -313,6 +349,15 @@ int main() {
 		      "a re-arm that answered: LOST again on 400 ms of silence at zero");
 		Pin r = readyPin(bluejay(), 0); r.requestArm(); r.onPacket(100); r.stallWatch = true; r.onStop();
 		CHECK(!r.stallWatch && !r.rearmed, "stop clears the stall flags");
+		Pin u = readyPin(bluejay(), 0); u.requestArm();   // M2: never answered on its stream
+		CHECK(!u.answered && u.tick(20000, Policy::TOOL) == Ev::NONE && u.st == State::RUNNING,
+		      "M2: RUNNING that never answered is not LOST (armed after 8 s anyway)");
+		CHECK(!u.stallWatched(true, 300), "M2: a stream that never answered is not stall-watched under throttle");
+		u.onPacket(30000);
+		CHECK(u.stallWatched(true, 300) && !u.stallWatched(true, 0) && !u.stallWatched(false, 300),
+		      "answered, armed, under throttle: watched; at zero or not armed: not");
+		Pin m = readyPin(bidirOneWay(), 0); m.requestArm(); m.onPacket(100);
+		CHECK(!m.stallWatched(true, 300), "AM32 is never stall-watched");
 	}
 	{   // SILENT: an answered bidir stream gone quiet, before LOST
 		Pin p = readyPin(bluejay(), 0); p.onPacket(100);

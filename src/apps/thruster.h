@@ -430,6 +430,9 @@ public:
 		Thruster* owner = nullptr;
 		// A one-way ESC has no reverse: a negative command (the loop braking) is zero there, sent at
 		// once rather than left to the deadman. Signed rpm as a semantic command is phase 2.
+		// REVERSIBLE (3D) ESCs ONLY for now: cmd is 3D thrust (lc::thrust3d), and the bench profiles
+		// are calibrated that way. On a one-way ESC a positive cmd lands in the 3D forward band (cmd 1
+		// is wire 1095, about half throttle there); mapping it by identity (escs::drive) is phase 2.
 		void thrust(int cmd) override {
 			if (cmd < 0 && !owner->reversible()) cmd = 0;
 			escs::spinThrust(owner->index_, (int16_t)cmd);

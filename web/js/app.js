@@ -32,7 +32,7 @@ const st = {
   busy: false,
   // mode: each motor's 3D meaning, frozen for the test (null = no test); mask: its `mtmode` (pico only);
   // silent: polls in a row a motor came back SILENT (or ABSENT after live); live: it reported a live
-  // state on this connection; gone: forgotten mid-test; pwmOn: switched to PWM
+  // state since the last start/stop, read or passthrough exit; gone: forgotten mid-test; pwmOn: on PWM
   test: { on: false, values: [], timer: null, sel: [], mode: null, mask: null, silent: [], live: [], gone: [], pwmOn: [] },
 };
 
@@ -139,6 +139,7 @@ async function passthrough(on) {
   } else {
     await st.fw.exit();
     st.inPassthrough = false;
+    st.test.live = [];   // the firmware reads each ESC again now: a FAILED learn is not a pull
     log('パススルー終了 (ESC は通常動作に戻りました)');
     await new Promise((r) => setTimeout(r, 1000));
     st.pipe.drain();
@@ -152,7 +153,7 @@ async function readAll() {
     const pipe = st.pipe;   // a disconnect mid-read: what comes back belongs to that board, drop it
     await passthrough(true);
     if (st.pipe !== pipe) return;
-    st.escs = []; st.edits = [];
+    st.escs = []; st.edits = []; st.test.live = [];
     for (let ch = 0; ch < st.motors; ch++) {
       const t0 = performance.now();
       try {
@@ -378,7 +379,9 @@ const UI = { 1: '読み込み中…', 2: 'arm 中… (数秒)', 3: '回せます
   6: '失速しました。arm し直しています', 7: 'テレメトリが来ません' };
 const LOCKED = new Set([1, 2, 5, 6]);
 // 7: a bidir ESC held armed that answered once and now sends nothing; the firmware then calls it LOST
-// (5) within a fraction of a second. So 7, or 5 once the motor had been live on this connection, is
+// (5) within a fraction of a second. So 7, or 5 once the motor has been live since the last test start
+// or stop, read or passthrough exit (so a firmware-side FAILED learn right after a read does not
+// erase a good read), is
 // evidence it has gone. On this many answers in a row that came back promptly (a board held up by a
 // bootloader read answers late, every stamp stale) it has been unplugged or lost power, and what was
 // read from it no longer holds.
@@ -460,7 +463,7 @@ async function startTest() {
       mask = mode.reduce((m, on, i) => m | (on ? 1 << i : 0), 0);
     }
     st.test.mode = mode; st.test.mask = mask;
-    st.test.silent = []; st.test.gone = []; st.test.pwmOn = [];
+    st.test.silent = []; st.test.live = []; st.test.gone = []; st.test.pwmOn = [];
     st.test.on = true;
     st.test.pwm = pwmMode();
     $('#test-proto').disabled = true;
@@ -527,7 +530,7 @@ async function stopTest(why) {
     }
   }
   st.test.mode = null; st.test.mask = null; st.test.pwm = false;
-  st.test.silent = []; st.test.gone = []; st.test.pwmOn = [];
+  st.test.silent = []; st.test.live = []; st.test.gone = []; st.test.pwmOn = [];
   st.test.stopping = false;
   $('#test-toggle').disabled = false;
   renderTest();
