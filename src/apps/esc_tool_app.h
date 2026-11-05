@@ -467,8 +467,11 @@ private:
 	// it is. `idle off` turns it off. One arm per 5 s: an arm can block while it learns the ESC.
 	uint32_t idle_ = 0, idleNextMs_ = 0;   // idle_: bit i = ESC i is held at zero throttle by this
 	bool     idleOn_ = true;
-	bool driving() {   // anything spinning that the idle hold does not own
-		for (uint8_t i = 0; i < n_; i++) if ((escs::spinArmed(i) || escs::spinArming(i)) && !(idle_ >> i & 1)) return true;
+	bool driving() {   // anything spinning that the idle hold does not own (PWM included)
+		for (uint8_t i = 0; i < n_; i++) {
+			if (escs::pwmActive(i)) return true;
+			if ((escs::spinArmed(i) || escs::spinArming(i)) && !(idle_ >> i & 1)) return true;
+		}
 		return false;
 	}
 	void idlePoll() {
@@ -477,10 +480,13 @@ private:
 			if (!on || escs::spinTarget(i)) idle_ &= ~(1u << i);
 		}
 		if (!idleOn_ || fw_.active() || fl_ == FL_START || fl_ == FL_RUN || escs::sessionOpen()) return;
-		if ((int32_t)(millis() - idleNextMs_) < 0) return;
+		// An arm may read the ESC through its bootloader, which stops every DShot stream on the board
+		// for seconds: never while something else is driven, and never again for an ESC whose read
+		// already failed (unpowered, unplugged, broken) until `scan` or a configurator read succeeds.
+		if (driving() || (int32_t)(millis() - idleNextMs_) < 0) return;
 		for (uint8_t i = 0; i < n_; i++) {
-			if (!(escs::armMask() >> i & 1) || !escs::isPresent(i)) continue;
-			if (escs::spinArmed(i) || escs::spinArming(i)) continue;
+			if (!(escs::armMask() >> i & 1) || !escs::isPresent(i) || escs::identFailed(i)) continue;
+			if (escs::spinArmed(i) || escs::spinArming(i) || escs::pwmActive(i)) continue;
 			th_[i]->arm(); th_[i]->setRaw(0);
 			idle_ |= 1u << i; idleNextMs_ = millis() + 5000;
 			return;
@@ -537,6 +543,13 @@ private:
 			else                  raw = fw_.threeD() ? (v > 1500 ? (int(v) - 1500) * 4 : 0) : (v > 1000 ? (int(v) - 1000) * 2 : 0);
 			th->setRaw(raw);
 		}
+	}
+
+	// A motor-test value (1000..2000, or 3D 1000..1500..2000 when the configurator was told 3D) as a
+	// servo pulse for ESC i, by that ESC's own direction mode — the same mapping as the DShot test.
+	uint16_t pwmFromTest(uint8_t i, uint16_t v) {
+		if (escs::knownReversible(i)) return fw_.threeD() ? v : (v > 1000 ? 1500 + (v - 1000) / 2 : 1500);
+		return fw_.threeD() ? (v > 1500 ? 1000 + (v - 1500) * 2 : 1000) : v;
 	}
 
 	// Which ESCs are wired (escs::presentMask) and which of them run AM32 (escs::armMask), kept
@@ -1191,13 +1204,18 @@ private:
 			else if (!strcmp(cmd,"link")) { char* v=strtok(nullptr," ");   // link [<ms>|off] — host-link deadman, see linkWatch()
 				if(v) linkTimeoutMs_ = strcmp(v,"off") ? (uint32_t)atol(v) : 0;
 				console::out().printf("link|timeout_ms=%lu\n", (unsigned long)linkTimeoutMs_); console::out().println("ok"); }
-			else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
+			else if (!strcmp(cmd,"pwm") || !strcmp(cmd,"pwmch")) {   // servo PWM (50 Hz) instead of DShot: pwm <i> <us|stop>
+				bool byCh = cmd[3] == 'c';                                // pwmch <motor-test channel> <us|stop> (web tool)
+				int a=argi(); int i = byCh ? (a >= 0 ? FourWay::channel((uint8_t)a) : -1) : a; char* v=strtok(nullptr," ");
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
-				else if(!strcmp(v,"stop")){ analogWrite(Esc::pin(i),0); pinMode(Esc::pin(i),INPUT); console::out().println("ok pwm-stop (reboot to use DShot again)"); }
-				else { th_[i]->stop(); escs::release();          // free DShot + run the ESC app
-					int us=atoi(v); if(us<900)us=900; if(us>2100)us=2100;
-					analogWriteFreq(50); analogWriteRange(20000); analogWrite(Esc::pin(i),(uint32_t)us);   // 20000us period => value=us
-					console::out().printf("pwm|%d|%dus\n",i,us); console::out().println("ok"); } }
+				else if(fw_.active()||fl_==FL_START||fl_==FL_RUN) console::out().println("err busy");
+				else if(!strcmp(v,"stop")){ th_[i]->stop(); console::out().printf("pwm|%d|off\n",i); console::out().println("ok"); }
+				else { if(!escs::pwmActive(i)){ th_[i]->stop(); idle_&=~(1u<<i);
+						if(!escs::pwmBegin(i)){ console::out().println("err not-read (scan first: the stop pulse depends on 3D)"); continue; } }
+					int us = constrain(atoi(v),0,3000);
+					if (byCh) us = pwmFromTest(i, (uint16_t)us);              // the motor test's value, mapped per ESC
+					escs::pwmSet(i,(uint16_t)us);                             // fed like `throttle`: 500 ms deadman -> stop pulse
+					console::out().printf("pwm|%d|%uus|%s\n",i,escs::pwmTarget(i),escs::pwmArming(i)?"arming":"armed"); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"enc")) {   // AS5600 read: enc|raw|ang|deg|md|ml|mh|agc|mag  (err if no sensor)
 				if(!enc_.present()) console::out().println("err no-encoder");
 				else { uint8_t st=enc_.status(); int raw=enc_.raw();

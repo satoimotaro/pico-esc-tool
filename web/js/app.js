@@ -80,6 +80,9 @@ async function connect() {
       for (let i = 0; i < m.length / 2; i++) if (m[2 * i] | m[2 * i + 1] << 8) st.motors++;
     }
     log(`接続: ${st.board}, API ${api[1]}.${api[2]}, モーター ${st.motors} 個${st.threeD ? ' (3D)' : ''}`, 'ok');
+    st.pico = board === 'PICO';
+    $('#test-proto-box').hidden = !st.pico;
+    if (!st.pico) $('#test-proto').value = 'dshot';
     renderTest();
   });
   if (!st.pipe) return;
@@ -280,6 +283,9 @@ async function importPresets(file) {
 // ------------------------------------------------------------------------------- motor test
 // MSP_SET_MOTOR goes out every 100 ms while the test is on: the pico-esc-tool firmware (like a
 // cautious FC) stops the motors when MSP goes quiet, so a closed tab or a dead link stops them.
+// PWM (pico-esc-tool only) sends the same slider values as CLI lines, `pwmch <motor> <value>`, also
+// every 100 ms: the firmware maps each to that ESC's own pulse (a 3D ESC stops at 1500 us) and falls
+// back to the stop pulse after 500 ms without one. SET_MOTOR is not sent then: it would re-arm DShot.
 const stopValue = () => (st.threeD ? 1500 : 1000);
 
 function renderTest() {
@@ -293,17 +299,31 @@ function renderTest() {
         oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } }),
       out));
   }
-  $('#test-note').textContent = st.threeD
+  $('#test-note').textContent = (st.threeD
     ? '3D モード: 1500 が停止、上が正転、下が逆転です。'
-    : '1000 が停止です。少しずつ上げてください。';
+    : '1000 が停止です。少しずつ上げてください。')
+    + (pwmMode() ? ' PWM: 切り替え後 5 秒は停止パルスで待機状態に入れます。テレメトリは出ません。Bluejay は PWM を受け付けません。' : '');
 }
+
+const pwmMode = () => st.pico && $('#test-proto').value === 'pwm';
+const sendLine = (line) => st.pipe.write(Array.from(new TextEncoder().encode(line + '\n')));
 
 async function startTest() {
   if (!$('#test-safe').checked) { log('プロペラを外したことを確認してください', 'err'); return; }
   await task('モーターテスト', async () => {
     await passthrough(false);
     st.test.on = true;
+    st.test.pwm = pwmMode();
+    $('#test-proto').disabled = true;
     renderTest();
+    if (st.test.pwm) {
+      st.test.timer = setInterval(() => {
+        if (!st.pipe || !st.test.on) return;
+        for (let i = 0; i < st.motors; i++) sendLine(`pwmch ${i} ${st.test.values[i]}`).catch(() => {});
+      }, 100);
+      log('モーターテスト開始 (PWM)');
+      return;
+    }
     // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while it arms an
     // ESC (~3 s), so only a link silent for longer than that counts as lost.
     let inflight = false, heard = performance.now();
@@ -327,7 +347,10 @@ async function stopTest(why) {
   st.test.on = false;
   clearInterval(st.test.timer);
   st.test.values = st.test.values.map(() => stopValue());
-  if (st.pipe) {
+  $('#test-proto').disabled = false;
+  if (st.pipe && st.test.pwm) {
+    for (let i = 0; i < st.motors; i++) await sendLine(`pwmch ${i} stop`).catch(() => {});
+  } else if (st.pipe) {
     const d = [];
     for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
     await st.msp.request(MSP.SET_MOTOR, d, 500).catch(() => {});
@@ -487,6 +510,7 @@ function init() {
   $('#write-sel').addEventListener('click', writeSelected);
   $('#exit-pt').addEventListener('click', () => task('パススルー終了', () => passthrough(false)));
   $('#test-toggle').addEventListener('click', () => (st.test.on ? stopTest('停止ボタン') : startTest()));
+  $('#test-proto').addEventListener('change', renderTest);
   $('#test-all').addEventListener('input', (e) => {
     document.querySelectorAll('#sliders input').forEach((s) => { s.value = e.target.value; s.dispatchEvent(new Event('input')); });
   });

@@ -48,6 +48,10 @@
     <div class="bar">
       <button id="test-toggle" class="primary needs-conn">開始</button>
       <label class="slider">全体 <input type="range" id="test-all" min="1000" max="2000" step="5" value="1000"></label>
+      <label id="test-proto-box" hidden>出力 <select id="test-proto">
+        <option value="dshot">DShot</option>
+        <option value="pwm">PWM 50 Hz (AM32 / BLHeli_S)</option>
+      </select></label>
     </div>
     <p id="test-note" class="hint"></p>
     <div id="sliders"></div>

@@ -172,6 +172,14 @@ The motor test re-sends its values every 100 ms and the firmware stops the motor
 silence, after the USB port closes, or when a passthrough starts; the page also stops on Esc/Space,
 on leaving the tab, and when hidden.
 
+On this firmware the motor test can also send **servo PWM** (50 Hz, 1000–2000 µs) instead of DShot,
+for firmwares that take it: AM32 and stock BLHeli_S, not Bluejay (DShot only). The CLI form is
+`pwm <i> <µs|stop>`. The ESC must have been read first (`scan`, a configurator read, or a DShot arm),
+because the stop pulse is 1500 µs on a 3D ESC; the first 5 s after switching hold that stop pulse so
+the ESC re-detects the protocol and arms. Fed like `throttle`: 500 ms without a value falls back to the
+stop pulse. There is no telemetry on PWM. Design notes for the next ESC-handling rework:
+[`docs/esc-lifecycle.md`](docs/esc-lifecycle.md).
+
 ## Position control (`host/posctl.py`)
 
 A host-side closed-loop **shaft-position** servo using an **AS5600** encoder on the Pico (I2C0,

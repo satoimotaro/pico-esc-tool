@@ -16,6 +16,8 @@
 #include "esc_config.h"
 #include "blheli_bl.h"
 #include "esc_setup.h"
+#include <hardware/pwm.h>
+#include <hardware/clocks.h>
 
 namespace escs {
 
@@ -50,6 +52,11 @@ static const uint16_t SPIN_MAX        = 2000;   // max throttle
 static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no command within this
 static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this long to ARM the ESC
                                                 // (covers the ESC's boot beep after leaving the BL)
+static const uint16_t PWM_MIN_US      = 1000;   // servo PWM pulse range
+static const uint16_t PWM_MAX_US      = 2000;
+static const uint16_t PWM_STOP_US     = 1000;   // zero throttle / arming pulse, one-way ESC
+static const uint16_t PWM_MID_US      = 1500;   // the same on a 3D ESC (1000 us is full reverse there)
+static const uint32_t PWM_ARM_MS      = 5000;   // hold PWM_STOP_US this long after switching to PWM
 static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc_config.h)
 
 // Per-ESC DShot mode. BLHeli-S understands only *normal* DShot; *bidir* DShot (inverted, with eRPM/
@@ -122,6 +129,19 @@ namespace detail {
 	static bool              infoBidir[COUNT] = { false };  // firmware supports bidir DShot (Bluejay/JESC)
 	static bool              infoRev[COUNT]   = { false };  // configured reversible (3D)
 	static bool              infoKnown[COUNT] = { false };
+	static bool              infoFail[COUNT]  = { false };  // the last spinArm could not read it: an
+	                                                        // automatic arm must not try again (see idle hold)
+	// Servo PWM (50 Hz, 1000..2000 us) instead of DShot, for firmwares that take it (AM32, stock
+	// BLHeli-S; Bluejay does not). Hardware PWM slice, not PIO. pwmUs = 0: the pin is not on PWM.
+	static uint16_t          pwmUs[COUNT] = { 0 }, pwmStop[COUNT] = { 0 };   // pwmStop: 1500 on a 3D ESC
+	static uint32_t          pwmLast[COUNT] = { 0 }, pwmStart[COUNT] = { 0 };
+	static inline bool pwmOn(uint8_t i) { return pwmUs[i] != 0; }
+	static inline void pwmLevel(uint8_t i, uint16_t us) { pwm_set_gpio_level(PINS[i], us); }
+	static inline void pwmOff(uint8_t i) {
+		if (!pwmOn(i)) return;
+		pwmLevel(i, 0); pwmUs[i] = 0;
+		gpio_set_function(PINS[i], GPIO_FUNC_SIO); pinMode(PINS[i], INPUT);
+	}
 
 	static inline bool drvActive(uint8_t i) { return drvB[i] || drvN[i]; }
 	static inline void drvSend(uint8_t i, uint16_t t) {
@@ -129,6 +149,7 @@ namespace detail {
 		else if (drvN[i]) { uint16_t a[4] = { t, 0, 0, 0 }; drvN[i]->sendThrottles(a); }
 	}
 	static inline void drvFree(uint8_t i) {
+		pwmOff(i);                                   // whoever takes the pin next owns it alone
 		if (drvB[i]) { drvB[i]->sendThrottle(0); delete drvB[i]; drvB[i] = nullptr; }
 		if (drvN[i]) { uint16_t a[4] = { 0, 0, 0, 0 }; drvN[i]->sendThrottles(a); delete drvN[i]; drvN[i] = nullptr; }
 	}
@@ -170,14 +191,14 @@ namespace detail {
 			uint16_t eep = am32Eep[i] = lastRaw[4] == 0x35 ? 0xF800 : 0x7C00;   // flash-size code: 64 KB / 32 KB parts
 			flAddr = eep + 18; flLen = 1;                          // bi_direction (host/pico_esc/am32.py)
 			if (!runOp(Op::READFLASH, PINS[i])) return false;
-			infoBidir[i] = true; infoRev[i] = flBuf[0] == 1; infoKnown[i] = true;
+			infoBidir[i] = true; infoRev[i] = flBuf[0] == 1; infoKnown[i] = true; infoFail[i] = false;
 			return true;
 		}
 		if (!runOp(Op::READCFG, PINS[i])) return false;
 		esc_setup::Settings s; esc_setup::decode(cfg, esc_setup::kEepromLen, s);
 		infoBidir[i] = strstr(s.name, "Bluejay") || strstr(s.name, "JESC");
 		infoRev[i]   = (cfg[0x0B] == 3 || cfg[0x0B] == 4);   // 1=Norm 2=Rev 3=3D 4=3D-Rev
-		infoKnown[i] = true;
+		infoKnown[i] = true; infoFail[i] = false;
 		return true;
 	}
 }
@@ -293,7 +314,7 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	// unknown, or when already connected to this ESC (cheap — no bootloader re-entry). This keeps a
 	// post-scan arm fast; a cold arm (never scanned) pays one bootloader entry to detect.
 	if (!infoKnown[idx] || session == (int8_t)idx) {
-		if (ensureConnected(idx)) learnInfo(idx);
+		infoFail[idx] = !(ensureConnected(idx) && learnInfo(idx));
 	}
 	if (mode == Drive::AUTO) mode = infoBidir[idx] ? Drive::BIDIR : Drive::NORMAL;
 	drvRev[idx] = infoRev[idx];
@@ -378,8 +399,47 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 		}
 		drvSend(i, drvTarget[i]);
 	}
+	for (uint8_t i = 0; i < COUNT; i++) {
+		if (!pwmOn(i)) continue;
+		bool arming = millis() - pwmStart[i] < PWM_ARM_MS, dead = millis() - pwmLast[i] > SPIN_DEADMAN_MS;
+		pwmLevel(i, arming || dead ? pwmStop[i] : pwmUs[i]);
+	}
 	if (any) delayMicroseconds(200);
 }
+
+// ---- servo PWM (core0) -------------------------------------------------------------------------
+// pwmBegin() frees the pin from DShot / the bootloader and starts 50 Hz pulses at the stop width for
+// PWM_ARM_MS: long enough for an AM32 to notice DShot is gone (2 s), reboot, detect PWM and arm on
+// it. The stop width is 1000 us, or 1500 us on a 3D ESC, where 1000 us is full reverse: so the ESC
+// must have been read (scan, a configurator read or a DShot arm) and pwmBegin refuses one that was
+// not. pwmSet() then gives the pulse width, fed like spinThrottle (the same 500 ms deadman falls back
+// to the stop width, it does not cut the signal). spinStop()/spinArm() end PWM on the pin.
+inline bool pwmActive(uint8_t idx) { return idx < COUNT && detail::pwmOn(idx); }
+inline bool pwmArming(uint8_t idx) { return pwmActive(idx) && millis() - detail::pwmStart[idx] < PWM_ARM_MS; }
+inline bool pwmBegin(uint8_t idx) {
+	using namespace detail;
+	if (idx >= COUNT) return false;
+	if (pwmOn(idx)) return true;
+	if (!infoKnown[idx]) return false;
+	if (session == (int8_t)idx) { runOp(Op::RUN, PINS[session]); session = -1; }
+	drvTarget[idx] = 0; drvArmed[idx] = false; drvFree(idx);
+	uint pin = PINS[idx], slice = pwm_gpio_to_slice_num(pin);
+	gpio_set_function(pin, GPIO_FUNC_PWM);
+	pwm_set_clkdiv(slice, clock_get_hz(clk_sys) / 1e6f);       // 1 tick = 1 us
+	pwm_set_wrap(slice, 20000 - 1);                             // 50 Hz; a slice's two pins share it
+	pwmStop[idx] = infoRev[idx] ? PWM_MID_US : PWM_STOP_US;
+	pwmLevel(idx, pwmStop[idx]);
+	pwm_set_enabled(slice, true);
+	pwmUs[idx] = pwmStop[idx]; pwmStart[idx] = pwmLast[idx] = millis();
+	return true;
+}
+inline void pwmSet(uint8_t idx, uint16_t us) {
+	using namespace detail;
+	if (!pwmActive(idx)) return;
+	pwmUs[idx] = us < PWM_MIN_US ? PWM_MIN_US : (us > PWM_MAX_US ? PWM_MAX_US : us);
+	pwmLast[idx] = millis();
+}
+inline uint16_t pwmTarget(uint8_t idx) { return pwmActive(idx) ? detail::pwmUs[idx] : 0; }
 
 // ---- 4-way passthrough (fourway.h) -------------------------------------------------------------
 // fwBegin: stop driving, and hold every signal line high so each ESC drops into its bootloader
@@ -450,6 +510,7 @@ inline uint32_t presentMask() { return detail::present & ((1u << COUNT) - 1); }
 inline void     setPresent(uint32_t m) { detail::present = m; }
 inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
 // Configured reversible (3D), as last read from the ESC (false while unknown).
+inline bool     identFailed(uint8_t i) { return i < COUNT && detail::infoFail[i]; }   // last arm could not read it
 inline bool     knownReversible(uint8_t i) { return i < COUNT && detail::infoKnown[i] && detail::infoRev[i]; }
 // The AM32 settings block of ESC i, as found by its last connect (0 = not AM32 / not seen yet).
 inline uint16_t am32Eeprom(uint8_t i) { return i < COUNT && detail::armSeen[i] ? detail::am32Eep[i] : 0; }
