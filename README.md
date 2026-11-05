@@ -157,6 +157,21 @@ edit settings, run a per-thruster spin/RPM test with live telemetry, and flash f
 layout-guarded flow as the CLI. Wi-Fi is a bench affordance — 2.4 GHz doesn't travel underwater, so a
 deployed craft is driven over its tether/host.
 
+## ESC Web Configurator (`web/`)
+
+One page in the browser (Chrome / Edge, Web Serial) that stands in for both esc-configurator and the
+AM32 configurator: read and edit settings for **BLHeli_S 16.x, Bluejay, BlueGill and AM32** side by
+side, apply **presets** (the same built-ins as the firmware's `preset` command, plus your own, kept in
+the browser and exported as JSON), run a **motor test**, and **flash** a local `.hex` (layout/MCU
+guarded, settings carried over). It talks Betaflight MSP + the BLHeli 4-way passthrough, so it works
+with this firmware or with any Betaflight flight controller. Static files, no build step:
+`python3 -m http.server -d web` and open `http://localhost:8000`, or the GitHub Pages copy
+(`.github/workflows/pages.yml`). Known-good settings per motor: [`docs/motor-settings.md`](docs/motor-settings.md).
+
+The motor test re-sends its values every 100 ms and the firmware stops the motors after 2 s of MSP
+silence, after the USB port closes, or when a passthrough starts; the page also stops on Esc/Space,
+on leaving the tab, and when hidden.
+
 ## Position control (`host/posctl.py`)
 
 A host-side closed-loop **shaft-position** servo using an **AS5600** encoder on the Pico (I2C0,
@@ -220,6 +235,7 @@ src/apps/profiles.h      per-motor curves — includes the generated profiles_ge
 src/apps/profiles_gen.h  GENERATED from host/profiles/*.yaml (do not edit by hand)
 lib/vel_control/         portable closed-loop velocity controller (host-unit-tested)
 lib/{blheli_bl,esc_setup,esc_flash}/   bootloader client / config codec / HEX flash
+web/                     ESC Web Configurator (static page: settings, presets, motor test, flash)
 host/esctool.py          the PC CLI                host/posctl.py   position controller
 host/rpm_sweep.py        velocity-loop sweep + HTML evaluation report (rpm_sweep_report.py)
 host/gen_profile_header.py   YAML profile -> C++ header codegen
