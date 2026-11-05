@@ -61,6 +61,14 @@ static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this lon
 // SPIN_ARM_TELE_MAX_MS, as before.
 static const uint32_t SPIN_ARM_TELE_HOLD_MS = 300;    // zero throttle after its first answer
 static const uint32_t SPIN_ARM_TELE_MAX_MS  = 8000;
+// A bidir ESC that stalls drops out of its run: Bluejay beeps, clears EDT and waits to be armed again
+// (Bluejay.asm exit_run_mode), and with "require EDT to arm" it then refuses every start. Seen as eRPM
+// at 0 under throttle for STALL_ZERO_MS, or no telemetry at all for STALL_SILENT_MS (forced sine
+// sends no eRPM but keeps sending EDT, so only total silence counts). The pin is then armed again
+// (zero, answer, EDT); after STALL_MAX restarts in a row the target stays 0 until it is sent 0.
+static const uint32_t STALL_ZERO_MS   = 1500;
+static const uint32_t STALL_SILENT_MS = 500;
+static const uint8_t  STALL_MAX       = 3;
 static const uint16_t PWM_MIN_US      = 1000;   // servo PWM pulse range
 static const uint16_t PWM_MAX_US      = 2000;
 static const uint16_t PWM_STOP_US     = 1000;   // zero throttle / arming pulse, one-way ESC
@@ -122,6 +130,14 @@ namespace detail {
 	static uint32_t          drvArmStart[COUNT] = { 0 };
 	static uint16_t          drvArmMs[COUNT] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
 	static uint32_t          drvAnswer[COUNT] = { 0 };  // this arm's first telemetry (0 = none yet)
+	// A time stamp where 0 means "none": never in the future (millis()|1 was, by 1 ms when millis()
+	// was even, and now - stamp then wrapped to ~4e9: the hold and the stall timeouts passed at once).
+	static inline uint32_t stamp(uint32_t now) { return now ? now : 1; }
+	// Stall watch (bidir, armed, target > 0): see spinPoll.
+	static uint32_t          drvPktMs[COUNT] = { 0 };   // last valid telemetry packet of any kind
+	static uint32_t          drvZeroMs[COUNT] = { 0 };  // since when eRPM has read 0 under throttle
+	static uint32_t          drvStallMs[COUNT] = { 0 }; // last stall restart (0 = none)
+	static uint8_t           drvStalls[COUNT] = { 0 };  // restarts since the target last was 0
 	                                                    // a re-arm after a run-mode stop can be short
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
 	static bool              drvRev[COUNT] = { false };   // ESC configured for reversible (3D) rotation
@@ -337,11 +353,13 @@ inline void spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	if (drvInitFail[idx]) drvFree(idx);   // PIO init failed (e.g. no free SM) — don't report a false ARMED
 	drvTarget[idx] = 0; drvArmed[idx] = false; drvArmStart[idx] = millis(); drvLast[idx] = millis();
 	drvArmMs[idx] = armMs;   // 0 => SPIN_ARM_MS (see spinPoll)
-	drvAnswer[idx] = 0;
+	drvAnswer[idx] = 0; drvZeroMs[idx] = 0; drvStalls[idx] = 0; drvStallMs[idx] = 0;
 }
 inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
 	using namespace detail;
 	if (idx >= COUNT || !drvActive(idx) || !drvArmed[idx]) return;   // must be armed first
+	if (throttle == 0) drvStalls[idx] = 0;
+	else if (drvStalls[idx] >= STALL_MAX) throttle = 0;   // gave up: back to 0 first
 	drvTarget[idx] = throttle > SPIN_MAX ? SPIN_MAX : throttle;
 	drvLast[idx] = millis();
 }
@@ -361,9 +379,13 @@ inline void spinThrust(uint8_t idx, int16_t s) {   // reversible (3D): -1000..+1
 	// immediately. Correct: forward -> 1047+s, reverse -> 47-s.)
 	uint16_t t = (s == 0) ? 0 : (s > 0 ? (uint16_t)(1047 + s)      // forward s=1..1000 -> 1048..2047
 	                                   : (uint16_t)(47 - s));       // reverse s=-1..-1000 -> 48..1047
+	if (t == 0) drvStalls[idx] = 0;
+	else if (drvStalls[idx] >= STALL_MAX) t = 0;
 	drvTarget[idx] = t; drvLast[idx] = millis();
 }
 inline bool spinArmed(uint8_t idx)      { return idx < COUNT && detail::drvActive(idx) && detail::drvArmed[idx]; }
+// Restarted after a stall within the last few seconds (a UI can say why it is arming again).
+inline bool spinStalled(uint8_t idx) { return idx < COUNT && detail::drvStallMs[idx] && millis() - detail::drvStallMs[idx] < 5000; }
 inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::drvRev[idx]; }
 inline const char* spinMode(uint8_t idx) {
 	using namespace detail;
@@ -406,9 +428,20 @@ inline void spinPoll() {   // call every core0 loop while spinning: arm + frames
 		}
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		if (drvB[i]) {
-			uint32_t v = 0;
-			switch (drvB[i]->getTelemetryPacket(&v)) {
-				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); if (!drvAnswer[i]) drvAnswer[i] = millis() | 1; break;
+			uint32_t v = 0, now = millis();
+			BidirDshotTelemetryType ty = drvB[i]->getTelemetryPacket(&v);
+			if (ty != BidirDshotTelemetryType::NO_PACKET && ty != BidirDshotTelemetryType::CHECKSUM_ERROR) drvPktMs[i] = now;
+			if (drvArmed[i] && drvTarget[i]) {
+				if (ty == BidirDshotTelemetryType::ERPM) drvZeroMs[i] = v ? 0 : (drvZeroMs[i] ? drvZeroMs[i] : stamp(now));
+				bool stalled = (drvZeroMs[i] && now - drvZeroMs[i] > STALL_ZERO_MS) || (drvAnswer[i] && now - drvPktMs[i] > STALL_SILENT_MS);   // one that never answered: not watched
+				if (stalled) { 
+					drvArmed[i] = false; drvArmStart[i] = now; drvArmMs[i] = 0; drvAnswer[i] = 0;
+					drvZeroMs[i] = 0; drvStallMs[i] = now; if (drvStalls[i] < 255) drvStalls[i]++;
+					drvTarget[i] = 0;
+				}
+			} else drvZeroMs[i] = 0;
+			switch (ty) {
+				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); if (!drvAnswer[i]) drvAnswer[i] = stamp(millis()); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
 				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; drvTele[i].tempStampMs = millis(); break;

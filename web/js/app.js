@@ -30,7 +30,7 @@ const st = {
   escs: [],            // results of readEsc, by channel (null = not answering)
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
-  test: { on: false, values: [], timer: null, sel: [] },
+  test: { on: false, values: [], timer: null, sel: [], heard: [] },
 };
 
 // ------------------------------------------------------------------------------- log / status
@@ -101,7 +101,15 @@ function dropped() {
   stopTest('接続が切れました');
   st.pipe = null; st.inPassthrough = false;
   log('切断されました', 'err');
+  forget();
   status();
+}
+
+// What was read belongs to that connection: another board, or other ESCs, may be there next time.
+function forget() {
+  if (st.escs.some((e, ch) => e && dirty(ch))) log('書き込んでいない変更は破棄しました');
+  st.escs = []; st.edits = [];
+  renderEscs(); renderFlash(); renderTest();
 }
 
 // Each step is bounded: a board that has stopped answering (or a read still in flight) must not keep
@@ -112,6 +120,7 @@ async function disconnect() {
   if (st.inPassthrough) await within(st.fw.exit(), 1500);
   const p = st.pipe;
   st.pipe = null; st.inPassthrough = false;
+  forget();
   status();
   if (p) await within(p.close(), 2000);
 }
@@ -230,7 +239,7 @@ function renderEscs() {
   box.replaceChildren();
   if (!st.escs.length) { box.append(h('p', { class: 'hint' }, '「ESC を読み込む」を押すと、つながっている ESC の設定を読みます。')); return; }
   st.escs.forEach((esc, ch) => {
-    if (!esc) { box.append(h('div', { class: 'card off' }, h('h3', {}, `ESC ${ch + 1}`), h('p', {}, '応答なし'))); return; }
+    if (!esc) { box.append(h('div', { class: 'card off' }, h('h3', {}, `ESC ${ch + 1}`), h('p', {}, '応答なし。つないだら「ESC を読み込む」で読み直してください'))); return; }
     const fam = presetFamily(esc);
     const usable = presets.all().filter((p) => p.family === fam);
     const card = h('div', { class: `card${dirty(ch) ? ' dirty' : ''}` },
@@ -349,15 +358,29 @@ function renderTest() {
 // pico-esc-tool says per motor whether it can move now. While its ESC is being read or armed (or does
 // not answer) the slider is held at stop and locked, so a value never waits behind an arm and lands
 // as a jump; the tag says why. 0 = the board does not say (Betaflight, older firmware): no lock.
-const UI = { 1: '読み込み中…', 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし' };
-function applyUi(codes) {
+const UI = { 1: '読み込み中…', 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし',
+  6: '失速しました。arm し直しています' };
+// A bidir ESC (Bluejay, AM32) that is held armed answers telemetry all the time; silent for this long
+// it has been unplugged or lost power, and what was read from it no longer holds.
+const GONE_MS = 2000;
+const bidirRead = (i) => st.escs[i] && (st.escs[i].mode === MODE.ARM_BLB || st.escs[i].family?.id !== 'blheli_s');
+function applyUi(codes, rows) {
   st.test.ui = codes;
+  const now = performance.now();
+  rows.forEach((r, i) => {
+    if (r.bad < 100) { st.test.heard[i] = now; return; }
+    if (codes[i] === 3 && bidirRead(i) && now - (st.test.heard[i] ?? now) > GONE_MS) {
+      log(`ESC ${i + 1}: テレメトリが途切れました (外れた / 電源が切れた?)。つなぎ直したら読み込み直してください`, 'err');
+      st.escs[i] = null; st.test.heard[i] = undefined;
+      renderEscs(); renderFlash();
+    }
+  });
   if (st.test.pwm) return;
   codes.forEach((c, i) => {
     const range = document.querySelector(`#sliders input[type=range][data-m="${i}"]`);
     const tag = document.querySelector(`#sliders .mstate[data-m="${i}"]`);
     if (!range) return;
-    const locked = c === 1 || c === 2 || c === 5;
+    const locked = c === 1 || c === 2 || c === 5 || c === 6;
     if (tag) { tag.textContent = c ? UI[c] || '' : ''; tag.className = `mstate tag${locked ? ' dim' : ''}`; }
     if (!st.test.on || !picked(i)) return;
     if (locked && !range.disabled) {
@@ -471,7 +494,7 @@ async function pollTele() {
       h('td', {}, r.temp ? String(r.temp) : '—'),
       h('td', { class: ok ? 'ok' : 'meta' }, ok ? '受信中' : '停止中 / 信号なし')));
   });
-  applyUi(rows.map((r) => r.ui));
+  applyUi(rows.map((r) => r.ui), rows);
   tele.hist.push({ t: now, rpm: rows.map((r) => (r.bad < 100 ? r.rpm : 0)) });
   while (tele.hist.length && now - tele.hist[0].t > tele.span) tele.hist.shift();
   drawChart(rows.length);
