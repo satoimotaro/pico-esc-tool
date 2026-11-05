@@ -62,7 +62,8 @@ export class SerialPipe extends Pipe {
   async close() {
     this.closing = true;
     try { await this.reader?.cancel(); } catch (e) { /* already gone */ }
-    await this.reading;                              // the loop has released its lock
+    // the loop releases its lock; a cancel that never settles must not hang the page
+    await Promise.race([this.reading, new Promise((r) => setTimeout(r, 1000))]);
     try { this.writer?.releaseLock(); } catch (e) { /* already gone */ }
     try { await this.port?.close(); } catch (e) { /* already gone */ }
   }

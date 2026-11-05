@@ -30,7 +30,7 @@ const st = {
   escs: [],            // results of readEsc, by channel (null = not answering)
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
-  test: { on: false, values: [], timer: null },
+  test: { on: false, values: [], timer: null, sel: [] },
 };
 
 // ------------------------------------------------------------------------------- log / status
@@ -104,13 +104,16 @@ function dropped() {
   status();
 }
 
+// Each step is bounded: a board that has stopped answering (or a read still in flight) must not keep
+// the page stuck in "connected". The Pico stops the motors on its own once MSP goes quiet.
 async function disconnect() {
-  await stopTest('切断');
-  if (st.inPassthrough) await st.fw.exit().catch(() => {});
+  const within = (p, ms) => Promise.race([p.catch(() => {}), new Promise((r) => setTimeout(r, ms))]);
+  await within(stopTest('切断'), 1500);
+  if (st.inPassthrough) await within(st.fw.exit(), 1500);
   const p = st.pipe;
   st.pipe = null; st.inPassthrough = false;
-  await p?.close();
   status();
+  if (p) await within(p.close(), 2000);
 }
 
 async function passthrough(on) {
@@ -309,6 +312,11 @@ const is3d = (i) => (st.pico ? motor3d(i) ?? st.threeD : st.threeD);
 const stopOf = (i) => (is3d(i) ? 1500 : 1000);
 const unread = () => st.pico && Array.from({ length: st.motors }, (_, i) => st.escs[i]).some((e) => e === undefined);
 
+// Only the motors ticked here move; the others stay at their stop value (and are never armed by the
+// test: a value at stop is not a request).
+const picked = (i) => st.test.sel[i] !== false;
+const sendValues = () => st.test.values.map((v, i) => (picked(i) ? v : stopOf(i)));
+
 function renderTest() {
   const box = $('#sliders');
   box.replaceChildren();
@@ -318,9 +326,17 @@ function renderTest() {
     const stop = stopOf(i);
     const out = h('output', {}, String(stop));
     const known = !st.pico || motor3d(i) !== undefined;
-    box.append(h('label', { class: 'slider' }, h('span', {}, `M${i + 1}`),
-      h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stop, 'data-m': i, disabled: !st.test.on,
-        oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } }),
+    const range = h('input', { type: 'range', min: 1000, max: 2000, step: 1, value: stop, 'data-m': i,
+      disabled: !st.test.on || !picked(i),
+      oninput: (e) => { st.test.values[i] = +e.target.value; out.textContent = e.target.value; } });
+    const pick = h('input', { type: 'checkbox', checked: picked(i), title: '回すモーターを選ぶ',
+      onchange: (e) => {
+        st.test.sel[i] = e.target.checked;
+        range.disabled = !st.test.on || !e.target.checked;
+        if (!e.target.checked) { range.value = stop; st.test.values[i] = stop; out.textContent = String(stop); }
+      } });
+    box.append(h('label', { class: 'slider' }, pick, h('span', {}, `M${i + 1}`),
+      range,
       out,
       h('span', { class: known ? 'tag' : 'tag dim' }, (is3d(i) ? '3D (1500 停止)' : '正転のみ (1000 停止)') + (known ? '' : ' 未読込'))));
   }
@@ -349,7 +365,8 @@ async function startTest() {
     if (st.test.pwm) {
       st.test.timer = setInterval(() => {
         if (!st.pipe || !st.test.on) return;
-        for (let i = 0; i < st.motors; i++) sendLine(`pwmch ${i} ${st.test.values[i]}`).catch(() => {});
+        const vals = sendValues();
+        for (let i = 0; i < st.motors; i++) sendLine(`pwmch ${i} ${vals[i]}`).catch(() => {});
       }, 100);
       log('モーターテスト開始 (PWM)');
       return;
@@ -363,7 +380,7 @@ async function startTest() {
       if (!st.pipe || !st.test.on || inflight) return;
       if (performance.now() - heard > 10000) { stopTest('ボードの応答が 10 秒ありません'); return; }
       const d = [];
-      for (const v of st.test.values) d.push(v & 0xFF, v >> 8);
+      for (const v of sendValues()) d.push(v & 0xFF, v >> 8);
       inflight = true;
       st.msp.request(MSP.SET_MOTOR, d, 1000)
         .then(() => { heard = performance.now(); }, () => {})
@@ -423,7 +440,7 @@ async function pollTele() {
     const ok = r.bad < 100;
     body.append(h('tr', {},
       h('td', {}, h('span', { class: 'swatch', style: `background:${SERIES[i % 8]}` }), `M${i + 1}`),
-      h('td', {}, String(st.test.values[i] ?? '')),
+      h('td', {}, String(sendValues()[i] ?? '')),
       h('td', { class: 'rpm' }, ok ? String(r.rpm) : '—'),
       h('td', {}, r.volt ? r.volt.toFixed(2) : '—'),
       h('td', {}, r.amp ? r.amp.toFixed(2) : '—'),
@@ -545,8 +562,9 @@ function init() {
   $('#test-proto').addEventListener('change', renderTest);
   $('#test-all').addEventListener('input', (e) => {   // 0..1000 forward, from each motor's own stop
     const p = +e.target.value;
-    document.querySelectorAll('#sliders input').forEach((s) => {
+    document.querySelectorAll('#sliders input[type=range]').forEach((s) => {
       const i = +s.dataset.m;
+      if (!picked(i)) return;
       s.value = stopOf(i) + (is3d(i) ? p / 2 : p); s.dispatchEvent(new Event('input'));
     });
   });
