@@ -89,6 +89,14 @@ static const Byte F2838_AM32_3D[] = {
 	{30,5}, {31,0}, {32,128}, {33,128}, {34,128}, {35,50}, {36,0}, {37,50}, {38,0}, {39,0},
 	{40,5}, {41,10}, {42,10}, {43,255}, {44,255}, {45,5}, {46,1}, {47,0} };
 
+// A2212 930KV on the same Aria (AM32 2.21), 2026-11-05: F2838_AM32 with kv 23 (= 940, the nearest
+// step to 930). Through the web motor test, in air: 1050/1100/1150/1200 -> 380/1004/1522/2021 rpm.
+static const Byte A2212_AM32[] = {
+	{5,160}, {6,1}, {7,0}, {8,10}, {9,100}, {10,0}, {11,100}, {12,0}, {13,0}, {17,0}, {18,0},
+	{19,1}, {20,1}, {21,1}, {22,1}, {23,26}, {24,24}, {25,150}, {26,23}, {27,14}, {28,0}, {29,0},
+	{30,5}, {31,0}, {32,128}, {33,128}, {34,128}, {35,50}, {36,0}, {37,50}, {38,0}, {39,0},
+	{40,5}, {41,10}, {42,10}, {43,255}, {44,255}, {45,5}, {46,1}, {47,0} };
+
 #define PRESET_N(a) uint8_t(sizeof(a) / sizeof(a[0]))
 static const Preset BUILTIN[] = {
 	{ "f2838",       BLUEJAY,  "F2838 350KV 12N14P, one-way (potted pod, 2026-10-23)", F2838_BJ,      PRESET_N(F2838_BJ) },
@@ -96,6 +104,7 @@ static const Preset BUILTIN[] = {
 	{ "sine-3d",     BLUEGILL, "BlueGill S4 forced-sine start, bidirectional",         BG_SINE_3D,    PRESET_N(BG_SINE_3D) },
 	{ "f2838-am32",  AM32,     "F2838 350KV on AM32, one-way (Aria, 2026-11-03)",      F2838_AM32,    PRESET_N(F2838_AM32) },
 	{ "f2838-am32-3d", AM32,   "F2838 350KV on AM32, bidirectional",                   F2838_AM32_3D, PRESET_N(F2838_AM32_3D) },
+	{ "a2212-am32",  AM32,     "A2212 930KV on AM32, one-way (Aria, 2026-11-05)",      A2212_AM32,    PRESET_N(A2212_AM32) },
 };
 #undef PRESET_N
 static const uint8_t BUILTIN_N = sizeof(BUILTIN) / sizeof(BUILTIN[0]);

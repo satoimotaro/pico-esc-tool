@@ -31,6 +31,7 @@ clone しただけでは存在しない。bench-registry も公開していな�
 | `sine-3d` | BlueGill | BlueGill S4 forced-sine 起動（`sine_mode 2`）、双方向 | `SNAP/20260801T050542Z-bluegill-s4` |
 | `f2838-am32` | AM32 | F2838 350KV on DYS Aria 70A（AM32 2.21）、片方向 | `src/apps/presets.h` のコメント、コミット 2bfa116（snapshot なし） |
 | `f2838-am32-3d` | AM32 | 上と同じで `bi_direction=1`（byte 18） | 同上 |
+| `a2212-am32` | AM32 | A2212 930KV、片方向。`f2838-am32` の KV を 23（= 940）に変えただけ | 2026-11-05 の Web ツールからの回転試験（5 章） |
 
 Bluejay/BlueGill の preset は 0x03..0x3F の全バイトを持つ（デフォルトとの差分ではない）。
 flash に使ったツールによって「デフォルト」が変わるため（6 章）。
@@ -75,6 +76,9 @@ flash に使ったツールによって「デフォルト」が変わるため�
   182/252/553/897/1208/1582 rpm（telemetry 中央値、`MEAS/curve_potted_pod_air_20261024.csv`）。
   snapshot の記録値は 150/300/450/600 → 234/552/877/1208（`SNAP/20261023T191345Z-potted-pod-gp16-bluejay/meta.json`）。
   150 の値が CSV（翌日 10-24）と食い違うので、低スロットル側は再現性に幅がある（推定）。電源電圧は未計測。
+- ポッティングポッド、stock Bluejay（preset `f2838`）、2026-11-05、Web ツールのモーターテスト（指令 1000 = 停止、
+  片方向なので throttle = (指令 − 1000) × 2）: 1050 / 1100 / 1150 / 1200 / 1300 → 0（起動せず）/ 369 / 588 / 805 / 1203 rpm
+  （telemetry、各 1 秒の 4 点平均）。1300 は 10-23 の throttle 600 → 1208 と一致。電源電圧は未記録。
 - AM32（Aria）、空中: throttle 100 では起動せず、200/300/450/600 → 315/513/827/1115 rpm（`src/apps/presets.h`）。
 
 ### 2.4 Pico 側（制御）パラメータ
@@ -151,14 +155,12 @@ ESC 設定は 2.2 の BlueGill 列とバイト単位で同じ。350KV への載�
 - 300KV: `host/profiles/300kv_parametric.yaml` と `demo_300kv_parametric.yaml` は `source: parametric KV=300 V=14.8` で、
   `docs/thruster-bringup.md` の `motorpack.py --kv 300` の例と同じ値。300KV ラベルの snapshot も計測ログもないので、
   実機ではなく計算・デモ用（推定）。
-- A2212: A2212 と書かれたログはなく、実測データはまだない。以下は一般知識とこのベンチで分かったことを合わせた
-  未検証の出発点で、実測値ではない。
-  - 先に磁石を数えて極数を確認する（12N14P なら 14 極 / pp 7。要確認）。エンコーダで `real_pp = pp * tele/enc` を確かめる（`docs/thruster-bringup.md`）。
-  - Bluejay: FW 既定から始めて timing Medium、demag Low（desync が出たら High）、`motor_direction` は用途に合わせる。
-    ただしこのベンチの実測から、`startup_power_max` は 5（FW 既定）のままにしない（30/25 を出発点にする）、
-    `low_rpm_power_protection` は 0 にする、の 2 点は変える。
-  - AM32: DEFAULTS、`motor_poles 14`、`motor_kv` は銘板 KV を (KV-20)/40 で丸めた値。
-  - Pico: `motor <i> <銘板KV> 7 <実測電圧> 34`（`cross_up` 34 推奨、`docs/thruster-bringup.md`）。
+- **A2212 930KV**（DYS Aria 70A / AM32 2.21、preset `a2212-am32`、2026-11-05、空中。プロペラ・負荷の有無は未記録）:
+  - 設定は `f2838-am32` と同じで `motor_kv` だけ 23（kv = 23×40+20 = 940。930 は表せない）。sine 起動、起動出力 150、14 極。
+  - Web ツールのモーターテスト: 指令 1050 / 1100 / 1150 / 1200 → 380 / 1004 / 1522 / 2021 rpm（telemetry）。
+    KV を 340 → 940 に変えても回転数は変わらなかった（AM32 は `motor_kv` を開ループの回転数には使っていないと見られる。推定）。
+  - 4 章の 930KV 12N14P と同じモーターかは記録がない（要確認）。
+  - 未確認: Bluejay / BlueGill での A2212、双方向、プロペラ付きの負荷。
 
 ## 6. ファームウェア差異の落とし穴
 
