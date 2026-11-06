@@ -52,8 +52,8 @@ public:
 		// below its stop, so a value it did not mean as 3D cannot reach an ESC as reverse
 		return declSet_ ? v != 1500 : v > 1500;
 	}
-	// A configurator channel -> escs:: index: the wired ESCs, numbered without gaps.
-	static int8_t channel(uint8_t ch) { return ch < MAX_CH ? escs::presentIndex(ch) : -1; }
+	// A configurator channel -> escs:: index: the same number (channel k is PINS[k], wired or not).
+	static int8_t channel(uint8_t ch) { return ch < MAX_CH && ch < escs::count() ? (int8_t)ch : -1; }
 
 	// Feed one byte from the console. Returns true if it was consumed here; false hands it to the
 	// CLI line reader. lineStart = the CLI has no partial line pending.
@@ -122,7 +122,7 @@ private:
 	void mspCommand(uint8_t cmd) {
 		uint8_t d[8 * 13 + 1] = {0};
 		mspMs_ = millis();
-		uint8_t n = escs::presentCount();
+		uint8_t n = escs::count();                // every configured pin; an empty one reports ABSENT
 		if (n > MAX_CH) n = MAX_CH;
 		switch (cmd) {
 			case 1:   d[0] = 0; d[1] = 1; d[2] = 46; mspReply(cmd, d, 3); break;             // API_VERSION 1.46
@@ -168,6 +168,9 @@ private:
 				mspReply(cmd, d, 0); break;
 			case 217: mspReply(cmd, d, 0); break;                                            // SET_3D: ignored
 			case 245:                                                                        // SET_PASSTHROUGH -> 4-way
+				// Every configured pin is a channel. Which ones answer is known only after fwBegin and its
+				// quiet window, and the configurator times this answer out after 1 s; an empty pin's
+				// InitFlash fails after a 500 ms probe.
 				clearMotors();                    // EscTool stops a motor test when it sees passthrough
 				d[0] = n; mspReply(cmd, d, 1);   // answer first: fwBegin primes the ESCs for 0.5 s
 				escs::fwBegin();
@@ -221,7 +224,7 @@ private:
 				break;
 			}
 			case 0x37: {                                                                           // DeviceInitFlash
-				int8_t e = channel(p[0]);
+				int8_t e = channel(p[0]);         // its first InitFlash waits the quiet window and probes PINS[e]
 				if (e < 0) { ack = ACK_I_INVALID_CHANNEL; break; }
 				uint8_t raw[8]; bool am32 = false;
 				sel_ = -1; olen = 4; memset(out, 0, 4);

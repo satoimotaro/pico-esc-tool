@@ -109,6 +109,11 @@ struct Pin {
 	uint32_t streamMs = 0, pktMs = 0, burstMs = 0, cntMs = 0;
 	uint8_t  burst = 0;
 	State    prePt = State::EMPTY; // state when the passthrough began
+	// Absent, confirmed: a read found nothing there (READ_EMPTY), or the passthrough's probe got no
+	// answer on a pin that was EMPTY before it. Any valid packet or a read that succeeds clears it.
+	// Only implicit arms (a configurator's motor test sends every channel) skip such a pin
+	// (implicitArmSkipped): each would otherwise queue a ~10 s read ladder in front of the real ESCs.
+	bool     absent = false;
 
 	void toEmpty() { st = State::EMPTY; id = Identity{}; seen = queued = armWanted = openLoop = unconfirmed = false; burst = 0; }
 	// LOST forgets `seen` too: what answered is gone, so a read that then fails finds nothing (EMPTY,
@@ -122,7 +127,7 @@ struct Pin {
 	// waited for the read is honoured exactly once and never outlives it.
 	void finish(const Identity& ident) {
 		id = ident; st = armWanted ? State::RUNNING : State::READY;
-		armWanted = openLoop = unconfirmed = false;
+		armWanted = openLoop = unconfirmed = absent = false;
 	}
 	// Telemetry that is fresh when a read starts is what makes its failure FAILED (something answers
 	// but will not read: no automatic retry loop). Old telemetry from before a session or passthrough
@@ -164,7 +169,7 @@ struct Pin {
 	// word per read, so these are loop samples, not frames: the debounce counts one per APPEAR_GAP_MS.
 	Ev onPacket(uint32_t now) {
 		if (st == State::FAILED || st == State::READING) return Ev::NONE;   // FAILED sends nothing anyway
-		seen = answered = true; pktMs = now;
+		seen = answered = true; absent = false; pktMs = now;
 		if (burst == 0 || now - cntMs >= APPEAR_GAP_MS) {
 			if (burst == 0 || now - burstMs > APPEAR_WINDOW_MS) { burstMs = now; burst = 0; }
 			if (burst < 255) burst++;
@@ -220,7 +225,7 @@ struct Pin {
 		armWanted = false; id = Identity{};
 		// Nothing answered just before the read (e.g. `arm` on a bare pin, or `scan` after a pull):
 		// EMPTY, so FAILED never needs telemetry to leave.
-		if (!seenAtRead) { toEmpty(); return Ev::READ_EMPTY; }
+		if (!seenAtRead) { toEmpty(); absent = true; return Ev::READ_EMPTY; }
 		st = State::FAILED; return Ev::READ_FAILED;
 	}
 	void onReadAborted() { toPending(true); }   // a sync op took the line: read it again later
@@ -240,6 +245,17 @@ struct Pin {
 		if (st == State::RUNNING) st = State::READY;
 	}
 	void onPassthroughBegin() { prePt = st; st = State::READING; id = Identity{}; armWanted = openLoop = queued = false; }
+	// The passthrough probes every pin after its quiet window (BootInit polled). A pin where an ESC was
+	// known when the passthrough began is polled longer and, if it still misses, gets one more full
+	// bootloader entry (DShot prime, quiet, poll): that ESC may be slow or stuck in its app. One that
+	// was EMPTY is absent after a short poll (a stock BLHeli_S with no telemetry is in its bootloader
+	// by then, and answers).
+	bool ptRetry() const { return prePt != State::EMPTY; }
+	// The probe got no answer (and no ladder found it either).
+	void onProbeMiss() { if (prePt == State::EMPTY) absent = true; }
+	// An implicit arm (the MSP motor test) leaves this pin alone: confirmed absent and still EMPTY.
+	// An explicit `arm i` / `read i` still tries it.
+	bool implicitArmSkipped() const { return absent && st == State::EMPTY; }
 	// ran: its bootloader was left by fwRun (learned or not); else it was never selected.
 	void onPassthroughEnd(bool ran, bool ok, const Identity& ident) {
 		if (ran && ok && ident.known) { finish(ident); return; }

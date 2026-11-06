@@ -49,6 +49,14 @@ function same(a, b, skip = new Set()) {
   return true;
 }
 
+// The same ESC as when it was read: bootloader reply (signature, mode) and the settings as read
+// (SiLabs: the whole settings page, which a write puts back).
+export function sameEsc(now, then) {
+  if (!now || !then || now.mode !== then.mode || now.info.signature !== then.info.signature) return false;
+  if (!same(now.block, then.block)) return false;
+  return now.mode !== MODE.SIL_BLB || same(now.page, then.page);
+}
+
 // Write a settings block (esc.block layout) back. Returns what reads back.
 export async function writeSettings(fw, esc, block) {
   if (esc.mode === MODE.SIL_BLB) {

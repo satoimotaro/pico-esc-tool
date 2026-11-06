@@ -18,7 +18,7 @@ public:
 	using Info  = escs::Info;
 	using Telem = escs::Telem;
 	using Drive = escs::Drive;
-	static const uint8_t COUNT = escs::COUNT;
+	static constexpr const uint8_t& COUNT = escs::COUNT;   // how many pins this boot uses (escs::setPins)
 	static uint8_t pin(uint8_t i) { return escs::PINS[i]; }
 
 	// bootloader session + config

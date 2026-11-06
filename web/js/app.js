@@ -6,7 +6,7 @@
 // firmware or a Betaflight flight controller.
 
 import { SerialPipe, SocketPipe, Msp, MSP, FEATURE_3D, FourWay, MODE } from './link.js';
-import { readEsc, writeSettings, flashCheck, flash } from './esc.js';
+import { readEsc, writeSettings, flashCheck, flash, sameEsc } from './esc.js';
 import { parseHex } from './hex.js';
 import { presetFamily } from './layouts.js';
 import * as presets from './presets.js';
@@ -27,6 +27,8 @@ const hex2 = (v) => v.toString(16).padStart(2, '0');
 const st = {
   pipe: null, msp: null, fw: null,
   inPassthrough: false, motors: 0, threeD: false, board: '',
+  ptEscs: 0,           // ESC channels the last MSP_SET_PASSTHROUGH offered
+  pins: null,          // pico-esc-tool's signal pin list (`pins`), null = not known
   escs: [],            // results of readEsc, by channel (null = not answering)
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
@@ -98,6 +100,7 @@ async function identify(pipe) {
   $('#test-proto-box').hidden = !st.pico;
   if (!st.pico) $('#test-proto').value = 'dshot';
   renderTest();
+  await loadPins();
 }
 
 function dropped() {
@@ -112,6 +115,7 @@ function dropped() {
 function forget() {
   if (st.escs.some((e, ch) => e && dirty(ch))) log('書き込んでいない変更は破棄しました');
   st.escs = []; st.edits = []; st.test.silent = []; st.test.live = [];
+  st.pins = null; st.ptEscs = 0; $('#pins').hidden = true;
   renderEscs(); renderFlash(); renderTest();
 }
 
@@ -133,8 +137,9 @@ async function passthrough(on) {
   if (on) {
     await stopTest('パススルーに入るため');
     const d = await st.msp.request(MSP.SET_PASSTHROUGH, [], 3000);
-    st.inPassthrough = true;
-    log(`パススルー開始 (ESC ${d[0]} 個)`);
+    st.inPassthrough = true; st.ptEscs = d[0];
+    // pico-esc-tool: one channel per signal pin (ESC k = pin k), whether an ESC is on it or not
+    log(st.pico ? `パススルー開始 (信号ピン ${d[0]} 本)` : `パススルー開始 (ESC ${d[0]} 個)`);
     await new Promise((r) => setTimeout(r, 500));
   } else {
     await st.fw.exit();
@@ -154,7 +159,7 @@ async function readAll() {
     await passthrough(true);
     if (st.pipe !== pipe) return;
     st.escs = []; st.edits = []; st.test.live = [];
-    for (let ch = 0; ch < st.motors; ch++) {
+    for (let ch = 0; ch < (st.ptEscs || st.motors); ch++) {
       const t0 = performance.now();
       try {
         const esc = await readEsc(st.fw, ch);
@@ -164,7 +169,10 @@ async function readAll() {
       } catch (e) {
         if (st.pipe !== pipe) return;
         st.escs[ch] = null;
-        log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
+        // pico-esc-tool: ESC k is pin k, so an empty pin is a channel whose InitFlash nothing answers;
+        // anything that fails after that is a real error
+        if (st.pico && /^4-way 0x37: (no reply|general error)$/.test(e.message)) log(`ESC ${ch + 1}: つながっていません`);
+        else log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
       }
     }
     renderEscs(); renderFlash();
@@ -174,18 +182,30 @@ async function readAll() {
 
 async function writeEsc(ch) {
   const esc = st.escs[ch];
-  await task(`ESC ${ch + 1} 書き込み`, async () => {
+  const ok = await task(`ESC ${ch + 1} 書き込み`, async () => {
     await passthrough(true);
-    await st.fw.initFlash(ch);
+    // Only onto the ESC that was read: the one on this channel now may have been swapped (or a
+    // different channel numbering may have put another ESC here) since then.
+    const fresh = await readEsc(st.fw, ch);
+    if (!sameEsc(fresh, esc)) {
+      throw new Error('いまつながっている ESC が、読み込んだときと違います (交換された?)。「ESC を読み込む」で読み直してから書き込んでください');
+    }
     await writeSettings(st.fw, esc, st.edits[ch]);
     st.edits[ch] = Uint8Array.from(esc.block);
     log(`ESC ${ch + 1}: 書き込み・照合 OK`, 'ok');
+    return true;
   });
   renderEscs();
+  return ok === true;   // false: refused or failed (task() has logged why), or the page was busy
 }
 
 async function writeSelected() {
-  for (const ch of selected()) if (dirty(ch)) await writeEsc(ch);
+  const skipped = [];
+  for (const ch of selected()) {
+    if (!dirty(ch)) continue;
+    if (!await writeEsc(ch)) skipped.push(ch + 1);
+  }
+  if (skipped.length) log(`書き込まなかった ESC: ${skipped.join(', ')}`, 'err');
 }
 
 const selected = () => [...document.querySelectorAll('.esc-sel:checked')].map((c) => +c.dataset.ch);
@@ -487,7 +507,7 @@ async function startTest() {
       return;
     }
     // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while an arm
-    // reads an ESC it does not know yet (a bootloader visit, up to ~4 s each, one ESC after another),
+    // reads an ESC it does not know yet (a bootloader visit, ~1.5 s each, 5.5 s for one that does not answer, one ESC after another),
     // so only a link silent for longer than that counts as lost. The firmware stops the motors on
     // its own when MSP goes quiet, and then forgets the declaration: every frame carries it again.
     let inflight = false, heard = performance.now();
@@ -675,6 +695,66 @@ async function flashSelected() {
   renderEscs(); renderFlash();
 }
 
+// ------------------------------------------------------------------------------- signal pins
+// pico-esc-tool's ESC signal pins: its `pins` command, sent as CLI lines between MSP frames like
+// `mtmode`. Answer: `pins|now|<cfg|default>|16,17`, `pins|next|...`, `pins|default|...`, then `ok` or
+// `err ...`. A saved list is used from the next boot. Never in a passthrough (every byte is 4-way there).
+async function cli(line, ms = 10000) {
+  await st.msp.busy;
+  st.pipe.drain();
+  await sendLine(line);
+  return st.pipe.until((buf) => {
+    const s = String.fromCharCode(...buf), m = /(^|\n)(ok|err[^\r\n]*)\r?\n/.exec(s);
+    if (!m) return undefined;
+    const end = m.index + m[0].length, [text, frames] = splitMsp(buf.slice(0, end));
+    buf.splice(0, end, ...frames);   // MSP frames that came meanwhile stay for their reader
+    return String.fromCharCode(...text).split(/\r?\n/).filter(Boolean);
+  }, ms);
+}
+// Bytes -> [text, MSP v1 replies ($M> / $M!) found among them, in order].
+function splitMsp(bytes) {
+  const text = [], frames = [];
+  for (let i = 0; i < bytes.length;) {
+    const n = bytes[i + 3];
+    if (bytes[i] === 0x24 && bytes[i + 1] === 0x4D && (bytes[i + 2] === 0x3E || bytes[i + 2] === 0x21)
+        && i + 6 + n <= bytes.length) {
+      frames.push(...bytes.slice(i, i + 6 + n)); i += 6 + n;
+    } else text.push(bytes[i++]);
+  }
+  return [text, frames];
+}
+const gp = (list) => (list ? list.split(',').map((p) => `GP${p}`).join(' ') : '?');
+function showPins(lines) {
+  const get = (k) => lines.find((l) => l.startsWith(`pins|${k}|`))?.split('|');
+  const now = get('now'), next = get('next'), def = get('default');
+  if (!now) return false;   // older firmware: `pins <n> <gpio>...`, no list to edit
+  st.pins = { now: now[3], next: next?.[3] ?? now[3], def: def?.[2] };
+  const src = (k) => (k === 'cfg' ? '保存した設定' : '既定');
+  $('#pins-list').value = st.pins.next.split(',').join(' ');
+  $('#pins-now').textContent = `いま: ${gp(st.pins.now)} (${src(now[2])})`
+    + (st.pins.next !== st.pins.now ? ` → 再起動後: ${gp(st.pins.next)} (${src(next?.[2])})。Pico を再起動 (USB を抜き差し) すると反映します` : '')
+    + (st.pins.def ? ` · 既定: ${gp(st.pins.def)}` : '');
+  return true;
+}
+async function loadPins() {
+  const lines = st.pico ? await cli('pins').catch(() => undefined) : undefined;
+  $('#pins').hidden = !(lines && showPins(lines));
+}
+async function savePins(toDefault) {
+  const want = $('#pins-list').value.trim();
+  if (!toDefault && !want) { log('GPIO 番号を ESC の順に並べてください (例: 16 17 18 19)', 'err'); return; }
+  await task('信号ピン', async () => {
+    await passthrough(false);
+    const lines = await cli(toDefault ? 'pins default' : `pins ${want}`);
+    if (!lines) throw new Error('応答がありません');
+    const err = lines.find((l) => l.startsWith('err'));
+    if (err) throw new Error(`保存しませんでした (${err.replace(/^err /, '')})`);
+    showPins(lines);
+    log(st.pins.next === st.pins.now ? `信号ピン: ${gp(st.pins.now)} のまま`
+      : `信号ピンを保存しました: ${gp(st.pins.next)}。Pico を再起動すると使われます`, 'ok');
+  });
+}
+
 // ------------------------------------------------------------------------------- wiring
 function tabs() {
   document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => {
@@ -691,6 +771,8 @@ function init() {
   $('#read').addEventListener('click', readAll);
   $('#write-sel').addEventListener('click', writeSelected);
   $('#exit-pt').addEventListener('click', () => task('パススルー終了', () => passthrough(false)));
+  $('#pins-save').addEventListener('click', () => savePins(false));
+  $('#pins-default').addEventListener('click', () => savePins(true));
   $('#test-toggle').addEventListener('click', () => (st.test.on ? stopTest('停止ボタン') : startTest()));
   $('#test-proto').addEventListener('change', renderTest);
   $('#test-all').addEventListener('input', (e) => {   // 0..1000 forward, from each motor's own stop

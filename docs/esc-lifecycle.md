@@ -57,7 +57,7 @@ drive rules into it ("rev1" below).
   picks up the result on a later loop.
 - core1 runs one bootloader job at a time from the queue. The BLHeli_S prime (zero-throttle burst,
   then line high) becomes timed steps instead of `delay()`.
-- LittleFS writes (config, present mask) run only while core1 is idle. A flash write pauses the
+- LittleFS writes (config, the pin list) run only while core1 is idle. A flash write pauses the
   other core, which would cut a bit-banged bootloader byte in half.
 
 ### Hot-plug
@@ -103,17 +103,17 @@ Landed in phase 1:
   (bidir zero on EMPTY/PENDING/LOST, zero in the identity's protocol on READY) and so detects a bidir
   ESC being plugged in or pulled out. `idle off` stops the hold, and with it the hot-plug detection.
 - Reads on the drive path (`spinArm`, hot-plug, the motor test) run on core1 as one asynchronous job
-  (`Op::READID`: prime, line high, the 1 s / 4 s / 4 s ladder, learn, run). core0 keeps streaming and
+  (`Op::READID`: prime, line high, the entry below, learn, run). core0 keeps streaming and
   collects the result on a later loop.
 - The explicit config ops and the 4-way passthrough stay synchronous, but every core0 wait pumps the
   other pins' frames, telemetry and deadman.
 - LOST handling with the tool/ROV switch (`escs::setPolicy`), `escs::drive()` with refusals
   (`err not-armed`, `err not-armed (state X)`, `err reverse-on-one-way (ESC i is not 3D)`), and a
   `state` CLI command.
-- The AM32 mask is gone: `/cfg/present` is one word (an older 8-byte file still loads), and the
-  passthrough always waits the AM32 time.
+- The AM32 mask is gone, and the passthrough always waits the AM32 time. (The present mask,
+  `/cfg/present`, went later too: see "Signal pins and presence" below.)
 - LittleFS writes run under `escs::FsGuard` (core1 parked in its idle branch); a refusal answers
-  `err busy (ESC read in progress, retry)`, and the present mask is retried.
+  `err busy (ESC read in progress, retry)`.
 
 - One bootloader line: a read cannot run while `scan`, `read` or `enter` holds an ESC in its
   bootloader. A pin waiting to be read wins once the session is idle: no op on it for 5 s, and never
@@ -123,8 +123,7 @@ Landed in phase 1:
   once (as 4baed53's `arm` did), unless it was written: then it answers
   `err busy (ESC <s> is being written; run it first)`. `arm` on a pin not read yet answers
   `arming (reading first, then ~3s) (state X)`; hosts poll `state` for RUNNING
-  (`host/pico_esc/drive.py` `wait_read`). An async read that finds an ESC on a pin missing from the
-  present mask adds it.
+  (`host/pico_esc/drive.py` `wait_read`).
 
 Phase 2:
 
@@ -243,6 +242,120 @@ lives now and how it meets the lifecycle states.
   - Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. If one lasts
     longer than 400 ms at zero, the pin goes LOST and is read again when it answers. This needs a
     bench check.
+
+## Signal pins and presence
+
+Which GPIOs carry ESCs, and which of them have an ESC on them now, are two separate things, and
+neither needs a rebuild or a `scan` any more.
+
+### The pin list
+
+- `ESC_SIGNAL_PINS` (`esc_config.h`) is the default. `pins 16 17 18 19` stores a list in
+  `/cfg/pins`, `pins default` removes it, and `pins` shows it (`pins|now|<cfg|default>|...`,
+  `pins|next|...`, `pins|default|...`, then `ok`). The list is read once at boot
+  (`EscTool::begin`, before the hold or the encoder starts), so a change takes effect after a reboot;
+  the answer says so (`# pins: saved; reboot to apply`). The web page has the same in its settings
+  tab, on this firmware only.
+- A list is 1..8 GPIOs in ESC-index order, each GP0..GP29, none twice, none used by this build:
+  the Pico W radio (GP23/24/25/29), the LCD bus on the panel (GP5..15), the UART console on
+  `main_uart` (GP0/1), the mode pin (GP22). Anything else answers `err bad-pins (<reason>)`, e.g.
+  `err bad-pins (GP25: Pico W radio)`. The rule is `lib/esc_lifecycle/esc_pins.h`, with a native
+  test; the default list is checked against it at compile time. A stored list that this build
+  refuses (written by another env) is ignored at boot with a `# pins:` line, and the default is used.
+- An ESC on GP16 or GP17 switches the AS5600 encoder off (its I2C0 is on those pins), as before.
+- Every per-ESC array is sized `escs::MAX` (8); `escs::COUNT` is this boot's count. `main.cpp`
+  declares eight `Thruster`s; `EscTool` uses the first `COUNT`. `cfg load` restores every stored one,
+  `cfg save` stores the first `COUNT`.
+- The legacy `esc_tool` env keeps the compile-time list.
+
+### One index per pin
+
+- ESC k is `PINS[k]` everywhere: the CLI index, MSP motor k (MOTOR, MOTOR_CONFIG, MOTOR_TELEMETRY,
+  SET_MOTOR, `mtmode` bit k, `pwmch k`), the passthrough channel k and the web page's ESC k. The MSP
+  motor count is the number of configured pins, so a configurator that reads it once at connect
+  (the AM32 configurator hides its Read button at 0) always sees them. No numbering depends on which
+  ESCs answer, so a plug-in or a pull, mid-test or not, never moves a channel onto another ESC.
+- A pin with no ESC reports state 5 (absent) in MOTOR_TELEMETRY; the page locks its slider.
+- Writes check the ESC again: the page re-reads the channel (bootloader reply and settings) before a
+  settings write and refuses one that differs from what it read (`読み込んだときと違います`); a
+  firmware flash already reads it fresh.
+
+### Presence
+
+- Nothing is stored. A pin is wired when its lifecycle state is not EMPTY: a bidir ESC is found by
+  the hold's telemetry, any ESC by a read (`scan`, a configurator read, an arm). `/cfg/present` is
+  deleted at boot. `escs` reports (`escs|<n>/<count>|<indices>`); its old arguments are ignored with
+  a note.
+- The passthrough probes per channel. MSP_SET_PASSTHROUGH answers at once with every configured pin
+  (esc-configurator times out an MSP reply after 1 s). A channel's first InitFlash waits out the
+  shared quiet window once (`ENTRY_QUIET_MS` after the lines went high), then polls its own pin with
+  BootInit: up to `ENTRY_MAX_MS` after the lines went high if its lifecycle knew an ESC there when
+  the passthrough began (`lc::Pin::ptRetry`: that ESC may be slow or stuck in its app) or it
+  answered earlier in the same passthrough, else up to `ENTRY_QUIET_MS + ENTRY_BARE_MS` (at least
+  500 ms either way). A known pin that still misses gets one more full entry (below). An EMPTY pin
+  is absent: its InitFlash fails after the probe, and every retry of it in that passthrough fails
+  at once. A retry is charged to its own channel's InitFlash only. A stock BLHeli_S that was never
+  read is EMPTY, but it is in its bootloader after the quiet window and answers the probe.
+
+### Bootloader entry timing
+
+- One entry, everywhere (`enterBootloader` for `read i` / `scan` / `enter`, the async `Op::READID`,
+  the passthrough's retry): DShot zero prime 500 ms (BLHeli-S needs valid frames first), line high,
+  `ENTRY_QUIET_MS` = 1000 ms with no traffic at all, then BootInit polled until an answer or
+  `ENTRY_MAX_MS` = 5000 ms after line high. The passthrough primes every pin at once and shares the
+  quiet window. It replaced a fixed ladder (1 s hold, then 4 s twice) and a fixed 4.5 s settle.
+- Measured on 2026-11-07 with `blpoll <i> <holdMs> <pollMs>` (line high right after the zero-throttle
+  hold stream, app running):
+  - AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
+    does not disturb it (answered at 538 ms, 6/6).
+  - Bluejay 0.21 (EFM8BB21): a single BootInit answers from 700 ms; polling from 0 or 300 ms keeps
+    it out of its bootloader (no answer within 6 s, 6/6). That is why the quiet window has no
+    traffic.
+  - Quiet 800 or 1000 ms, then poll: both answer the first BootInit (814 / 1014 ms), 12/12.
+- Expected costs: a present ESC about 1.5 s (prime + quiet + first answer) plus its read; an absent
+  pin through `read i` or an async read 5.5 s (prime + poll to 5 s), down from ~11 s. In a
+  passthrough an EMPTY pin costs at most 0.5 s. With 4 pins and ESCs on the first two, a page read
+  is about 0.5 s prime + 1 s quiet (mostly inside the configurator's own 1.2 s wait), the two ESCs'
+  reads, and 1 s for the two empty pins: about 3 s instead of the 6.7 s measured with the old 4.5 s
+  settle (needs a bench check).
+
+### Known limits
+
+- The idle hold streams to every configured pin, so an empty pin still holds a PIO SM. Bidir fits
+  only pio0's 4 SMs on a Pico W (the radio is on pio1), normal DShot goes to pio1's 3 free SMs
+  first (`newBidir` / `newNormal`). A pin past that budget reports `init-fail` (`state`, `spinMode`)
+  and the hold tries it again every second (`drvInitFail` / `drvRetryMs`); it gets an SM when one is
+  freed (a pin read as normal DShot moves to pio1, a pin goes FAILED or is in a bootloader). With
+  more than 4 pins, list the wired ones first: an ESC on a pin with no SM is not seen arriving and
+  cannot be armed until one is free. No new scheduler is planned for this.
+- The passthrough primes in turns when there are more pins than free SMs (500 ms more for pins 5..8).
+- A configurator shows an empty pin as a channel whose read failed (esc-configurator logs a read
+  failure; the web page logs `ESC n: つながっていません` and goes on to the next channel).
+- esc-configurator retries an InitFlash for about 6 s. A pin whose ESC was pulled (below) costs up
+  to ~9.5 s in a passthrough (polled to 5 s after the lines went high, then one more full entry of
+  5.5 s), which does not fit in that: that channel may fail once in esc-configurator (the web page
+  waits 20 s), and reads fine on the next read.
+- `ENTRY_MAX_MS` (5 s from line high) is measured on one AM32 build with its startup tune off. An
+  AM32 build or a tune that takes longer to reach its bootloader is missed by the first attempt; in
+  a passthrough a known pin gets the second full entry, elsewhere the read fails (FAILED, or EMPTY
+  without fresh telemetry) and `read i` tries again.
+- The quiet window must stay free of BootInit: Bluejay polled earlier than ~700 ms after line high
+  never entered its bootloader. A Bluejay/BLHeli_S build slower than the measured one would need a
+  longer `ENTRY_QUIET_MS`.
+- A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
+  ESC was here". `escs` lists it until then, and the next passthrough gives that pin the long probe
+  and one more full entry (~9.5 s) before it is called absent.
+- An empty pin is confirmed absent once a read finds nothing there (READ_EMPTY) or a passthrough
+  probe gets no answer on a pin that was EMPTY before it (`lc::Pin::absent`). The MSP motor test
+  then leaves it alone (a stock configurator sends every channel, and each empty pin would queue a
+  5.5 s read in front of the real ESCs); it reports absent (5). Any telemetry packet or a read
+  that succeeds clears the latch; `arm i` and `read i` still try the pin. So a stock BLHeli_S (no
+  telemetry) plugged into a pin confirmed absent is not armed by a configurator's motor test until a
+  read (the page's, a configurator's, `scan`) finds it.
+- An ESC left in its bootloader (for example, the Pico rebooted mid-passthrough) sends no telemetry,
+  so the boot and hot-plug detection leave its pin EMPTY until a passthrough or `read i` finds it.
+  The page's read and esc-configurator both find it; a CLI `read i` holds the session until `run i`.
+- Changing the pin list needs a reboot; there is no `reboot` command.
 
 ## rev0 (the first release)
 

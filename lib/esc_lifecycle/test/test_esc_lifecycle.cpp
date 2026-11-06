@@ -197,6 +197,44 @@ int main() {
 		f.onSessionClose(true, bluejay());
 		CHECK(f.st == State::READY, "session closed with a learn and no arm waiting: READY");
 	}
+	{   // the passthrough probe: the full entry only where an ESC was known
+		Pin e; e.onPassthroughBegin();
+		CHECK(!e.ptRetry(), "passthrough probe: an EMPTY pin that does not answer is absent (no entry ladder)");
+		e.onPassthroughEnd(false, false, Identity{});
+		CHECK(e.st == State::EMPTY, "... and stays EMPTY after the passthrough");
+		Pin r = readyPin(bluejay(), 0); r.onPassthroughBegin();
+		CHECK(r.ptRetry(), "a READY pin gets the entry ladder (its ESC may be stuck in its app)");
+		Pin p = appeared(0); p.onPassthroughBegin();
+		CHECK(p.ptRetry(), "a PENDING pin gets the entry ladder");
+		Pin l = readyPin(bluejay(), 0);
+		uint32_t t = packets(l, 10, 3, 20);
+		l.tick(t + LOST_MS, Policy::TOOL);
+		CHECK(l.st == State::LOST, "(a READY bidir pin whose telemetry stops is LOST)");
+		l.onPassthroughBegin();
+		CHECK(l.ptRetry(), "a LOST pin gets the entry ladder (identity dropped, but something was there)");
+		Pin f; f.onPassthroughBegin(); f.onPassthroughEnd(true, false, Identity{});
+		CHECK(f.st == State::EMPTY, "an EMPTY pin that answered but did not read stays EMPTY");
+	}
+	{   // the absent latch: implicit arms (a configurator's motor test) skip a confirmed-absent pin
+		Pin p;
+		CHECK(!p.implicitArmSkipped(), "a new pin is not confirmed absent (it may hold a stock BLHeli_S)");
+		p.requestArm(); p.onReadStart(10); p.onReadDone(false, Identity{});
+		CHECK(p.st == State::EMPTY && p.implicitArmSkipped(), "READ_EMPTY confirms it absent");
+		p.onStreamStart(20, true); p.onPacket(30);
+		CHECK(!p.implicitArmSkipped(), "any valid packet clears it");
+		Pin q; q.onPassthroughBegin(); q.onProbeMiss(); q.onPassthroughEnd(false, false, Identity{});
+		CHECK(q.st == State::EMPTY && q.implicitArmSkipped(), "a probe miss on a pin EMPTY before the passthrough confirms it");
+		q.onPassthroughBegin(); q.onPassthroughEnd(true, true, bluejay());
+		CHECK(q.st == State::READY && !q.absent, "a read that succeeds clears it");
+		Pin r = readyPin(bluejay(), 0); r.onPassthroughBegin(); r.onProbeMiss();
+		CHECK(!r.absent, "a probe miss on a pin that knew an ESC does not confirm absence");
+		Pin t; t.requestArm(); t.onReadStart(10); t.onReadDone(false, Identity{});
+		t.requestArm();
+		CHECK(t.st == State::PENDING && !t.implicitArmSkipped(), "an explicit arm still tries it (PENDING, read queued)");
+		Pin u = appeared(0);
+		uint32_t tt = u.pktMs + LOST_MS; u.tick(tt, Policy::TOOL);
+		CHECK(u.st == State::EMPTY && !u.implicitArmSkipped(), "GONE (telemetry stopped before a read) is not a confirmed absence");
+	}
 	{   // a bidir READY pin that never answers
 		Pin p = readyPin(bluejay(), 5000);
 		CHECK(p.tick(5000 + 7999, Policy::TOOL) == Ev::NONE, "bidir READY unanswered for 7999 ms stays READY");

@@ -3,22 +3,28 @@
 //
 // esc_config.h — user HARDWARE configuration for the RP2040 ESC tool.
 //
-// This is the ONE place to edit for your wiring. Everything here is compile-time (the DShot/PIO
-// and 1-wire bootloader bind to specific GPIOs at build time), so changing a pin means rebuilding
-// and re-flashing the Pico. Runtime-changeable things do NOT live here: the SETUP/DRIVE mode is
-// switched live with the `mode` command, and ESC settings are read/written over the tool itself.
+// This is the ONE place to edit for your wiring. Everything here is compile-time, so changing it
+// means rebuilding and re-flashing the Pico, with one exception: the ESC signal pins below are only
+// the default, and the `pins` command replaces them without a rebuild (stored, used from the next
+// boot). Other runtime-changeable things do NOT live here either: the SETUP/DRIVE mode is switched
+// live with the `mode` command, and ESC settings are read/written over the tool itself.
 #pragma once
 
 // --- ESC signal wiring ------------------------------------------------------------------------
 // One GPIO per ESC. Each line carries BOTH the 1-wire bootloader (config/flash) AND DShot
-// (drive/telemetry) for that ESC. List them in ESC-index order; add/remove entries to match how
-// many ESCs you wired. See construction/wiring/.
+// (drive/telemetry) for that ESC. List them in ESC-index order. This is the build's default list:
+// `pins 16 17 18 19` stores another one in LittleFS (/cfg/pins) and `pins default` goes back to
+// this; either takes effect after a reboot. 1..8 GPIOs, none twice, none used by this build (the
+// Pico W radio GP23/24/25/29, the LCD bus, the UART console, ESC_MODE_PIN; checked at compile time
+// here and by `pins`). See construction/wiring/ and docs/esc-lifecycle.md "Signal pins and presence".
 // How many: the 1-wire bootloader is bit-banged, so any GPIO works for config/flash, and the
 // configurator passthrough (fourway.h) shows up to 8. Driving is the limit: each wired ESC holds one
 // PIO state machine (the idle hold streams to every one of them). The bidir program (28 of a PIO's 32
 // instructions) fits only on pio0, since the Pico W radio sits on pio1, so at most 4 ESCs can run
-// bidir DShot; a normal-DShot stream goes to pio1's 3 free SMs first (esc_session.h newNormal).
-// Which of the listed ESCs are actually wired is learned at run time (`scan`, `escs`), not set here.
+// bidir DShot; a normal-DShot stream goes to pio1's 3 free SMs first (esc_session.h newNormal). A pin
+// past that budget is init-fail and retried every second, so list the wired pins first.
+// Which of the listed pins have an ESC on them is learned at run time (telemetry, reads, the
+// passthrough's probe), not set here.
 // ESC_BOARD_PANEL (env:main_panel) is the old prayer-wheel display board reused as a bench panel:
 // Pico W + SC1602 LCD + PWM1..4 headers on GP16..19. Its LCD bus takes GP5..15, so GP10/11 are not
 // free there.

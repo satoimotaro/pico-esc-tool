@@ -57,7 +57,11 @@ void setup() {
 void loop() { tool.poll(); }                   // serial + Wi-Fi + each ESC's RPM loop
 ```
 
-- **Add an ESC:** add a pin to `ESC_SIGNAL_PINS` (`esc_config.h`) and a `Thruster` here.
+- **Add an ESC or move it to another GPIO:** `pins <gpio> <gpio> ...` (ESC-index order, 1..8 pins),
+  then reboot the Pico; `pins` shows the list, `pins default` goes back to `ESC_SIGNAL_PINS`
+  (`esc_config.h`). `main.cpp` declares a `Thruster` for each of the 8 possible ESCs; ESC 2..7 run
+  RAW until you give them a profile. Which pins have an ESC on them is learned, not configured
+  ([`docs/esc-lifecycle.md`](docs/esc-lifecycle.md) "Signal pins and presence").
 - **Standalone ROV (no PC tool):** skip `EscTool` and drive the ESCs straight from `loop()` —
   `t->setRpm(mix[i]); t->poll(); escs::spinPoll();`. The `EscTool` module is only the operator surface.
 - `EscTool` = config/flash + USB-serial CLI + Wi-Fi UI; `Thruster` = one ESC (config + drive +
@@ -78,6 +82,7 @@ curve   <i> [begin <n>|add <t> <r> [s|l]|commit <pp> <up> <dn>]   # upload a mea
 pwm     <i> <1000..2000|stop>          # servo PWM (50 Hz) instead of DShot; see the web tool below
 pwmch   <ch> <1000..2000|stop>         # the same by motor-test channel, value mapped per ESC (needs mtmode)
 mtmode  <mask>                        # motor test: bit c = channel c sends 3D values (web tool)
+pins    [<gpio>... | default]         # the ESC signal pins; a change is used from the next boot
 ```
 
 Arming streams zero throttle ~3 s (BLHeli-S won't spin until armed); a **deadman** re-zeros if no
@@ -171,6 +176,10 @@ guarded, settings carried over). It talks Betaflight MSP + the BLHeli 4-way pass
 with this firmware or with any Betaflight flight controller. Static files, no build step:
 `python3 -m http.server -d web` and open `http://localhost:8000`, or the GitHub Pages copy
 (`.github/workflows/pages.yml`). Known-good settings per motor: [`docs/motor-settings.md`](docs/motor-settings.md).
+Connected to this firmware, the settings tab also shows the ESC signal pins and edits them (the
+`pins` command; the Pico uses a saved list after it restarts). ESC k is signal pin k everywhere (the
+CLI index, the configurators' ESC and motor k), whether an ESC is on it or not; an empty pin costs
+at most 0.5 s in a read (an ESC about 1.5 s to enter its bootloader), and a settings write first checks that the ESC is still the one read.
 
 The motor test re-sends its values every 100 ms and the firmware stops the motors after 2 s of MSP
 silence, after the USB port closes, or when a passthrough starts; the page also stops on Esc/Space,
@@ -232,8 +241,8 @@ python3 host/plantid.py validate --pair # the controlled bare-shaft vs propeller
 
 ## Requirements
 
-- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults GP10, GP11) with common
-  ground. All wiring in `src/apps/esc_config.h`.
+- **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults GP10, GP11; the panel
+  GP16..19; any 1..8 GPIOs with `pins`) with common ground. All wiring in `src/apps/esc_config.h`.
 - **Firmware:** [PlatformIO](https://platformio.org/) (earlephilhower Arduino-Pico core, fetched
   automatically). Envs: **`main`** (default), `esc_tool` (legacy monolithic fallback).
 - **Host:** Python 3.8+ and `pyserial` (`pip install pyserial`; `pyyaml` optional).
