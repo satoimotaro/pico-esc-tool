@@ -140,6 +140,7 @@ namespace detail {
 	static volatile uint8_t  sig[2] = {0, 0};
 	static volatile uint8_t  bootVer = 0, bootPages = 0;
 	static uint32_t prHoldMs = 0, prEdges = 0, prLows = 0, prTotal = 0;   // Op::PROBE in/out
+	static uint32_t prPollMs = 0, prAtMs = 0;   // Op::PROBE poll mode: BootInit until a reply or pollMs; when it came
 	static uint8_t  prRaw[8] = {0}; static int prN = 0;
 	static uint8_t  cfg[esc_setup::kEepromLen];
 	static uint8_t  page[esc_setup::kPageLen];
@@ -584,14 +585,16 @@ inline bool readFlash (uint8_t idx, uint16_t addr, uint8_t* out, uint16_t len) {
 // Bring-up diagnostic, no session: drive the line high for holdMs (straddles an ESC reboot into its
 // bootloader), then send BootInit and report the raw reply bytes and the line activity after a
 // second BootInit. Tells "ESC never answers" apart from "answers but we mis-decode".
-inline int probe(uint8_t idx, uint32_t holdMs, uint8_t raw[8], uint32_t& edges, uint32_t& lows, uint32_t& total) {
+inline int probe(uint8_t idx, uint32_t holdMs, uint8_t raw[8], uint32_t& edges, uint32_t& lows, uint32_t& total,
+                 uint32_t pollMs = 0, uint32_t* atMs = nullptr) {
 	using namespace detail;
 	if (idx >= COUNT) return -1;
 	jobStop(true); closeSession();
 	if (drvActive(idx) || pwmOn(idx)) drvFree(idx);
 	pin[idx].onSessionOpen(millis());
-	prHoldMs = holdMs;
+	prHoldMs = holdMs; prPollMs = pollMs;
 	runOp(Op::PROBE, PINS[idx]);
+	prPollMs = 0; if (atMs) *atMs = prAtMs;
 	pin[idx].onSessionClose(false, lc::Identity{});   // whatever it left behind is read again
 	memcpy(raw, prRaw, 8); edges = prEdges; lows = prLows; total = prTotal; return prN;
 }
@@ -1209,6 +1212,15 @@ inline void core1Poll() {
 	else if (o == Op::WRITEFLASH)  { ok = bl.writeFlash(flAddr, flBuf, flLen); }
 	else if (o == Op::READFLASH)   { ok = bl.readFlash(flAddr, flBuf, flLen); }
 	else if (o == Op::RUN)         { ok = bl.run(); }
+	else if (o == Op::PROBE && prPollMs) {   // blpoll: hold, then BootInit again and again; when did it answer
+		bl.setSignalPin(opPin); bl.begin(); uint32_t t0 = millis(); bl.holdIdleHigh(prHoldMs); bl.begin();
+		prN = 0; prAtMs = 0;
+		while (millis() - t0 < prHoldMs + prPollMs) {
+			memset(prRaw, 0, sizeof(prRaw)); int n = bl.connectRawProbe(prRaw, 15);
+			if (n >= 8 && prRaw[0] == '4' && prRaw[1] == '7' && prRaw[2] == '1') { prN = n; prAtMs = millis() - t0; break; }
+		}
+		prEdges = prLows = prTotal = 0; ok = true;
+	}
 	else if (o == Op::PROBE)       { bl.setSignalPin(opPin); bl.begin(); bl.holdIdleHigh(prHoldMs); bl.begin();
 	                                 memset(prRaw, 0, sizeof(prRaw)); prN = bl.connectRawProbe(prRaw, 40);
 	                                 bl.probeReplyActivity(200, prEdges, prLows, prTotal); ok = true; }

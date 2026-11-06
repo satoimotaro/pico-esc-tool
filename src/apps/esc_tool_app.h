@@ -1070,6 +1070,10 @@ private:
 				uint8_t raw[8]; uint32_t e,l,t; int n=escs::probe((uint8_t)i, h?(uint32_t)atoi(h):2600, raw, e, l, t);
 				console::out().printf("blprobe|n=%d|raw=",n); printHex(raw,8);
 				console::out().printf("|edges=%lu|low=%lu/%lu\n",(unsigned long)e,(unsigned long)l,(unsigned long)t); console::out().println("ok"); }
+			else if (!strcmp(cmd,"blpoll")) { if (pwmBusy()) continue; int i=argi(); char* h=strtok(nullptr," "); char* w=strtok(nullptr," ");   // blpoll <i> <holdMs> <pollMs>
+				if(i<0||i>=n_||!h||!w){ console::out().println("err bad-args"); continue; }
+				uint8_t raw[8]; uint32_t e,l,t,at=0; int n=escs::probe((uint8_t)i,(uint32_t)atoi(h),raw,e,l,t,(uint32_t)atoi(w),&at);
+				console::out().printf("blpoll|n=%d|at=%lu|raw=",n,(unsigned long)at); printHex(raw,8); console::out().println(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"readflash")) { if (pwmBusy()) continue; int i=argi(); char* ad=strtok(nullptr," "); char* ln=strtok(nullptr," ");
 				int rl=ln?atoi(ln):-1;
 				if(i<0||i>=n_||!ad||rl<1||rl>(int)sizeof(flbuf)) console::out().println("err bad-args");
