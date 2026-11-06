@@ -240,6 +240,11 @@ struct Pin {
 		if (st == State::RUNNING) st = State::READY;
 	}
 	void onPassthroughBegin() { prePt = st; st = State::READING; id = Identity{}; armWanted = openLoop = queued = false; }
+	// The passthrough probes every pin once after its settle (a short BootInit). A pin that does not
+	// answer gets the full bootloader entry (DShot prime, then the AM32 reboot waits) only if an ESC
+	// was known there when the passthrough began: that one may be stuck in its app. One that was EMPTY
+	// is absent (a stock BLHeli_S with no telemetry is in its bootloader by then, and answers).
+	bool ptRetry() const { return prePt != State::EMPTY; }
 	// ran: its bootloader was left by fwRun (learned or not); else it was never selected.
 	void onPassthroughEnd(bool ran, bool ok, const Identity& ident) {
 		if (ran && ok && ident.known) { finish(ident); return; }

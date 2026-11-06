@@ -197,6 +197,24 @@ int main() {
 		f.onSessionClose(true, bluejay());
 		CHECK(f.st == State::READY, "session closed with a learn and no arm waiting: READY");
 	}
+	{   // the passthrough probe: the full entry only where an ESC was known
+		Pin e; e.onPassthroughBegin();
+		CHECK(!e.ptRetry(), "passthrough probe: an EMPTY pin that does not answer is absent (no entry ladder)");
+		e.onPassthroughEnd(false, false, Identity{});
+		CHECK(e.st == State::EMPTY, "... and stays EMPTY after the passthrough");
+		Pin r = readyPin(bluejay(), 0); r.onPassthroughBegin();
+		CHECK(r.ptRetry(), "a READY pin gets the entry ladder (its ESC may be stuck in its app)");
+		Pin p = appeared(0); p.onPassthroughBegin();
+		CHECK(p.ptRetry(), "a PENDING pin gets the entry ladder");
+		Pin l = readyPin(bluejay(), 0);
+		uint32_t t = packets(l, 10, 3, 20);
+		l.tick(t + LOST_MS, Policy::TOOL);
+		CHECK(l.st == State::LOST, "(a READY bidir pin whose telemetry stops is LOST)");
+		l.onPassthroughBegin();
+		CHECK(l.ptRetry(), "a LOST pin gets the entry ladder (identity dropped, but something was there)");
+		Pin f; f.onPassthroughBegin(); f.onPassthroughEnd(true, false, Identity{});
+		CHECK(f.st == State::EMPTY, "an EMPTY pin that answered but did not read stays EMPTY");
+	}
 	{   // a bidir READY pin that never answers
 		Pin p = readyPin(bluejay(), 5000);
 		CHECK(p.tick(5000 + 7999, Policy::TOOL) == Ev::NONE, "bidir READY unanswered for 7999 ms stays READY");
