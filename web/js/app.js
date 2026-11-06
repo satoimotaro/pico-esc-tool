@@ -169,8 +169,9 @@ async function readAll() {
       } catch (e) {
         if (st.pipe !== pipe) return;
         st.escs[ch] = null;
-        // pico-esc-tool: ESC k is pin k, so an empty pin is just a channel nothing answers on
-        if (st.pico) log(`ESC ${ch + 1}: つながっていません`);
+        // pico-esc-tool: ESC k is pin k, so an empty pin is a channel whose InitFlash nothing answers;
+        // anything that fails after that is a real error
+        if (st.pico && /^4-way 0x37: (no reply|general error)$/.test(e.message)) log(`ESC ${ch + 1}: つながっていません`);
         else log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
       }
     }
@@ -181,7 +182,7 @@ async function readAll() {
 
 async function writeEsc(ch) {
   const esc = st.escs[ch];
-  await task(`ESC ${ch + 1} 書き込み`, async () => {
+  const ok = await task(`ESC ${ch + 1} 書き込み`, async () => {
     await passthrough(true);
     // Only onto the ESC that was read: the one on this channel now may have been swapped (or a
     // different channel numbering may have put another ESC here) since then.
@@ -192,12 +193,19 @@ async function writeEsc(ch) {
     await writeSettings(st.fw, esc, st.edits[ch]);
     st.edits[ch] = Uint8Array.from(esc.block);
     log(`ESC ${ch + 1}: 書き込み・照合 OK`, 'ok');
+    return true;
   });
   renderEscs();
+  return ok === true;   // false: refused or failed (task() has logged why), or the page was busy
 }
 
 async function writeSelected() {
-  for (const ch of selected()) if (dirty(ch)) await writeEsc(ch);
+  const skipped = [];
+  for (const ch of selected()) {
+    if (!dirty(ch)) continue;
+    if (!await writeEsc(ch)) skipped.push(ch + 1);
+  }
+  if (skipped.length) log(`書き込まなかった ESC: ${skipped.join(', ')}`, 'err');
 }
 
 const selected = () => [...document.querySelectorAll('.esc-sel:checked')].map((c) => +c.dataset.ch);
