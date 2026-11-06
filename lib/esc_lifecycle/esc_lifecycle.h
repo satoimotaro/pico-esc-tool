@@ -246,12 +246,12 @@ struct Pin {
 	}
 	void onPassthroughBegin() { prePt = st; st = State::READING; id = Identity{}; armWanted = openLoop = queued = false; }
 	// The passthrough probes every pin after its quiet window (BootInit polled). A pin where an ESC was
-	// known when the passthrough began is polled longer and, if it still misses, gets one more full
-	// bootloader entry (DShot prime, quiet, poll): that ESC may be slow or stuck in its app. One that
-	// was EMPTY is absent after a short poll (a stock BLHeli_S with no telemetry is in its bootloader
-	// by then, and answers).
+	// known when the passthrough began is polled longer (to ENTRY_MAX_MS after the lines went high):
+	// that ESC may be slow. A miss there is final for the passthrough (its prime already was the full
+	// entry). One that was EMPTY is absent after a short poll (a stock BLHeli_S with no telemetry is in
+	// its bootloader by then, and answers).
 	bool ptRetry() const { return prePt != State::EMPTY; }
-	// The probe got no answer (and no ladder found it either).
+	// The probe got no answer.
 	void onProbeMiss() { if (prePt == State::EMPTY) absent = true; }
 	// An implicit arm (the MSP motor test) leaves this pin alone: confirmed absent and still EMPTY.
 	// An explicit `arm i` / `read i` still tries it.

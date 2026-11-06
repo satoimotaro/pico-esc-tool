@@ -197,7 +197,7 @@ namespace detail {
 	static bool     fwActive = false;            // the configurator owns every pin: no hold, no jobs
 	static uint32_t fwBeginMs = 0;
 	static bool     fwSettled = false;           // the shared settle after fwBegin has been waited out
-	static bool     fwSeen[MAX] = { false };   // answered once this passthrough (worth the full entry again)
+	static bool     fwSeen[MAX] = { false };   // answered once this passthrough (worth the long poll)
 	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
 	// The lifecycle: one state per pin, and what the hold / LOST handling do with it.
 	static lc::Pin    pin[MAX];
@@ -961,9 +961,12 @@ inline UiState uiState(uint8_t i) {
 // Each channel's first InitFlash then polls its own pin with BootInit: until fwBeginMs + ENTRY_MAX_MS
 // if its lifecycle knew an ESC there (lc::Pin::ptRetry: it may be slow, or stuck in its app) or it
 // answered earlier in this passthrough, else until fwBeginMs + ENTRY_QUIET_MS + ENTRY_BARE_MS (at
-// least CONNECT_MIN_MS either way). A known pin that still misses gets one more full entry (prime,
-// quiet, poll); an EMPTY one is simply absent, so a missing ESC costs at most 0.5 s, and a retry is
-// charged to its own channel only. A miss stays failed for the passthrough: retries answer at once.
+// least CONNECT_MIN_MS either way). fwBegin's prime was the full entry for every pin, so a pin that
+// misses its poll is absent for this passthrough: no second entry. A pulled pin whose ESC was known
+// costs at most ENTRY_MAX_MS from the lines going high (inside esc-configurator's ~6 s InitFlash
+// retry window), an EMPTY one at most 0.5 s, each charged to its own channel only. Only a pin whose
+// app was run in this passthrough (DeviceReset, then selected again) gets a fresh full entry: the
+// prime no longer applies to it. A miss stays failed for the passthrough: retries answer at once.
 // Lifecycle: every configured pin is READING for the whole passthrough (no hold, no async read).
 // fwRun learns the ESC before it runs it (READY, or FAILED); fwEnd sends a pin that was never
 // selected back to EMPTY/FAILED if it started there, else to PENDING (it may have been swapped).
@@ -1019,7 +1022,8 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	if (idx >= COUNT) return false;
 	if (drvActive(idx)) drvFree(idx);
 	if (fwMiss[idx]) return false;
-	if (fwDone[idx]) { fwDone[idx] = false; pin[idx].onReadStart(millis()); }   // DeviceReset ran it; selected again
+	bool rerun = fwDone[idx];                                     // DeviceReset ran its app; selected again
+	if (rerun) { fwDone[idx] = false; pin[idx].onReadStart(millis()); }
 	session = -1; fwIdx = idx;
 	bool ok;
 	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
@@ -1028,8 +1032,9 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 		fwSettle();
 		ok = connectUntil(PINS[idx], fwBeginMs + (known ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS));
 	}
-	// it answered this passthrough, or the lifecycle knew it: one more full entry
-	if (!ok && (fwSeen[idx] || pin[idx].ptRetry())) ok = enterBootloader(PINS[idx]);
+	// its app runs since fwRun: fwBegin's prime is spent on it, so one fresh full entry (the page's
+	// flash, reset, read again). Any other miss is final for this passthrough.
+	if (!ok && rerun) ok = enterBootloader(PINS[idx]);
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
 	if (!ok) { pin[idx].onProbeMiss(); return false; }   // EMPTY before: confirmed absent
 	fwSeen[idx] = true;
