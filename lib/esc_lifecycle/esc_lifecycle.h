@@ -307,7 +307,7 @@ inline uint32_t stamp(uint32_t now) { return now ? now : 1; }
 inline uint32_t since(uint32_t now, uint32_t t) { int32_t d = (int32_t)(now - t); return d > 0 ? (uint32_t)d : 0; }
 
 // STALL WATCH (rev0 8805f12, e6ddda2). A bidir ESC that stalls drops out of its run: Bluejay beeps,
-// clears EDT and waits to be armed again (Bluejay.asm exit_run_mode), and with "require EDT to arm" it
+// clears EDT and waits to be armed again (Bluejay.asm exit_run_mode), and with EDT safety arm (FORCE_EDT_ARM) it
 // then refuses every start. It is watched only armed, under throttle, on a stream that has answered
 // (one that never answered is not watched: its telemetry may just not decode), and never for AM32,
 // which stays in its run on a stall. Three verdicts (StallKind):

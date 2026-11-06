@@ -253,7 +253,7 @@ lives now and how it meets the lifecycle states.
   back to DShot needs no reboot.
 - The idle hold covers every wired ESC (Bluejay and BLHeli_S beacon too), not only AM32.
 - A bidir arm completes only once the ESC answers with telemetry and has taken the EDT enable.
-  Bluejay with "require EDT to arm" never started after a passthrough when the motor test sent
+  Bluejay with EDT safety arm (FORCE_EDT_ARM) never started after a passthrough when the motor test sent
   throttle at once: EDT went out only in a zero-throttle gap after the arm.
 - The end of a passthrough re-reads each ESC while it is still in its bootloader, so the motor test
   that follows arms without another bootloader visit.

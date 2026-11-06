@@ -64,7 +64,7 @@ static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this lon
                                                 // (covers the ESC's boot beep after leaving the BL)
 // A bidir ESC counts as armed only once it answers and has taken the EDT enable. Bluejay sends its
 // first telemetry from wait_for_start, i.e. once it has armed, and takes DShot commands only there;
-// with "require EDT to arm" set it refuses to start without EDT, beeps and waits again
+// with EDT safety arm (FORCE_EDT_ARM) set it refuses to start without EDT, beeps and waits again
 // (Bluejay.asm wait_for_start_nonzero), and a reboot clears EDT. EDT used to go out only in a
 // zero-throttle gap after the arm, which a motor test that sends throttle at once never leaves:
 // the Bluejay then never started after a passthrough. An ESC that never answers is armed after
@@ -348,7 +348,7 @@ namespace detail {
 			// While arming that is once it has answered (above); otherwise once armed and stopped.
 			bool edtNow = drvArmed[i] ? drvTarget[i] == 0 : drvAnswer[i] != 0;
 			// Bluejay clears EDT at the end of every run (Bluejay.asm exit_run_mode_no_stall), and with
-			// "require EDT to arm" the next start is then refused: every other start beeped and was
+			// EDT safety arm (FORCE_EDT_ARM) the next start is then refused: every other start beeped and was
 			// re-armed as a stall. So EDT goes out again whenever the throttle is back at 0 after a
 			// run, and every EDT_REFRESH_MS while stopped (a command frame in place of a zero frame).
 			if (drvArmed[i] && drvTarget[i] == 0 && drvEdt[i] == 0 &&
