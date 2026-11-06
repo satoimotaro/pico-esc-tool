@@ -156,6 +156,10 @@ async function passthrough(on) {
 async function readAll() {
   await task('読み込み', async () => {
     const pipe = st.pipe;   // a disconnect mid-read: what comes back belongs to that board, drop it
+    // Every read is a fresh passthrough: within one, a channel that missed stays missed, and an ESC
+    // plugged in meanwhile never saw the prime that BLHeli-S needs before it enters its bootloader.
+    if (st.inPassthrough) await passthrough(false);
+    if (st.pipe !== pipe) return;
     await passthrough(true);
     if (st.pipe !== pipe) return;
     st.escs = []; st.edits = []; st.test.live = [];
