@@ -317,6 +317,16 @@ neither needs a rebuild or a `scan` any more.
 - A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
   ESC was here". `escs` lists it until then, and the next passthrough gives that pin the full entry
   ladder once (~11 s) before it is called absent.
+- An empty pin is confirmed absent once a read finds nothing there (READ_EMPTY) or a passthrough
+  probe gets no answer on a pin that was EMPTY before it (`lc::Pin::absent`). The MSP motor test
+  then leaves it alone (a stock configurator sends every channel, and each empty pin would queue a
+  ~10 s read ladder in front of the real ESCs); it reports absent (5). Any telemetry packet or a read
+  that succeeds clears the latch; `arm i` and `read i` still try the pin. So a stock BLHeli_S (no
+  telemetry) plugged into a pin confirmed absent is not armed by a configurator's motor test until a
+  read (the page's, a configurator's, `scan`) finds it.
+- An ESC left in its bootloader (for example, the Pico rebooted mid-passthrough) sends no telemetry,
+  so the boot and hot-plug detection leave its pin EMPTY until a passthrough or `read i` finds it.
+  The page's read and esc-configurator both find it; a CLI `read i` holds the session until `run i`.
 - Changing the pin list needs a reboot; there is no `reboot` command.
 
 ## rev0 (the first release)
