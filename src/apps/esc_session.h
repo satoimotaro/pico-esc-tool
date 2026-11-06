@@ -171,9 +171,9 @@ namespace detail {
 	static uint32_t          drvAnswer[COUNT] = { 0 };  // this arm's first telemetry (0 = none yet)
 	                                                    // a re-arm after a run-mode stop can be short
 	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
-	static bool              drvRan[COUNT] = { false };   // a non-zero target since the last EDT burst
+	static bool              drvRan[COUNT] = { false };   // ran since the ESC was last seen stopped (eRPM 0)
 	static uint32_t          drvEdtMs[COUNT] = { 0 };     // last EDT burst while stopped
-	static const uint32_t    EDT_REFRESH_MS = 1000;
+	static const uint32_t    EDT_REFRESH_MS = 1000, EDT_RAN_MS = 100;
 	static lc::Stall         stall[COUNT];                // the stall watch (streamPin) and its hold
 	static bool              drvInitFail[COUNT] = { false }; // the last driver start found no free PIO SM
 	static uint32_t          drvRetryMs[COUNT] = { 0 };   // ... the hold tries again from here
@@ -266,7 +266,7 @@ namespace detail {
 		}
 		drvInitFail[i] = false; drvKb[i] = kb;
 		drvTarget[i] = 0; drvArmed[i] = false; drvArmStart[i] = drvLast[i] = drvStartMs[i] = drvPollMs[i] = now;
-		drvArmMs[i] = 0; drvAnswer[i] = 0; drvEdt[i] = bidir ? 20 : 0; stall[i].reset();
+		drvArmMs[i] = 0; drvAnswer[i] = 0; drvEdt[i] = bidir ? 20 : 0; drvRan[i] = false; drvEdtMs[i] = now; stall[i].reset();
 		pin[i].onStreamStart(now, bidir);
 		return true;
 	}
@@ -349,10 +349,17 @@ namespace detail {
 			bool edtNow = drvArmed[i] ? drvTarget[i] == 0 : drvAnswer[i] != 0;
 			// Bluejay clears EDT at the end of every run (Bluejay.asm exit_run_mode_no_stall), and with
 			// EDT safety arm (FORCE_EDT_ARM) the next start is then refused: every other start beeped and was
-			// re-armed as a stall. So EDT goes out again whenever the throttle is back at 0 after a
-			// run, and every EDT_REFRESH_MS while stopped (a command frame in place of a zero frame).
-			if (drvArmed[i] && drvTarget[i] == 0 && drvEdt[i] == 0 &&
-			    (drvRan[i] || now - drvEdtMs[i] >= EDT_REFRESH_MS)) { drvEdt[i] = 10; drvRan[i] = false; drvEdtMs[i] = now; }
+			// re-armed as a stall. Bluejay takes the command only once it is back in wait_for_start,
+			// which is after the motor has coasted down: a burst right at the stop is dropped. So after
+			// a run EDT goes out every EDT_RAN_MS until a fresh eRPM of 0 says it has left run mode (one
+			// more burst then), and every EDT_REFRESH_MS while stopped (a command frame for a zero frame).
+			if (drvArmed[i] && drvTarget[i] == 0 && drvEdt[i] == 0) {
+				bool still = drvTele[i].rpm == 0 && (int32_t)(now - drvTele[i].rpmStampMs) < 100;
+				if ((drvRan[i] && still) || now - drvEdtMs[i] >= (drvRan[i] ? EDT_RAN_MS : EDT_REFRESH_MS)) {
+					drvEdt[i] = 10; drvEdtMs[i] = now;
+					if (still) drvRan[i] = false;
+				}
+			}
 			if (drvTarget[i]) drvRan[i] = true;
 			if (edtNow && drvEdt[i] > 0) { drvB[i]->sendRaw11Bit(13); drvEdt[i]--; return; }
 		}
