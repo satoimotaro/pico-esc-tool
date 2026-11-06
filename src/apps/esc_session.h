@@ -125,8 +125,21 @@ static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc
 enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
 
 namespace detail {
-	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500, HIGH_HOLD_MS = 1000,
-	                      AM32_HOLD_MS = 4000;
+	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500;
+	// Bootloader entry: prime (BLHeli-S needs valid frames first), line high, ENTRY_QUIET_MS with no
+	// traffic at all, then BootInit again and again until an answer or ENTRY_MAX_MS from line high.
+	// Measured 2026-11-07 with `blpoll` (line high right after the zero-throttle hold, app running):
+	//   AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
+	//     does not disturb it (answered at 538 ms, 6/6).
+	//   Bluejay 0.21 (EFM8BB21): a single BootInit answers from 700 ms; polling from 0 or 300 ms keeps
+	//     it out of its bootloader (no answer within 6 s, 6/6). Hence the quiet window.
+	//   Quiet 800 or 1000 ms, then poll: both answer the first BootInit (814 / 1014 ms), 12/12.
+	// ENTRY_MAX_MS covers a slower AM32 build and a startup tune (the old 4 s waits came from "~2 s
+	// without frames + reboot + tune"). ENTRY_BARE_MS: how long past the quiet window a pin with no
+	// known ESC is polled in a passthrough (a stock BLHeli_S has the Bluejay timing; an AM32 that sits
+	// in its bootloader answers at once). CONNECT_MIN_MS: the shortest poll (the old CONNECT).
+	static const uint32_t ENTRY_QUIET_MS = 1000, ENTRY_MAX_MS = 5000, ENTRY_BARE_MS = 500,
+	                      CONNECT_MIN_MS = 500;
 	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
 	static blheli_bl::Bootloader  bl({ .signalPin = PINS[0], .baud = 0 });    // core1 only
 
@@ -137,6 +150,7 @@ namespace detail {
 	static volatile Op       op = Op::NONE;
 	static volatile bool     opDone = false, opOk = false;
 	static volatile uint8_t  opPin = PINS[0], opIdx = 0;
+	static volatile uint32_t opUntil = 0;   // Op::CONNECT / READID: poll BootInit until this millis() (0: CONNECT_MIN_MS)
 	static volatile uint8_t  sig[2] = {0, 0};
 	static volatile uint8_t  bootVer = 0, bootPages = 0;
 	static uint32_t prHoldMs = 0, prEdges = 0, prLows = 0, prTotal = 0;   // Op::PROBE in/out
@@ -452,22 +466,22 @@ namespace detail {
 		blDepth--;
 		op = Op::NONE; return opOk;
 	}
-	static bool enterBootloader(uint8_t gpio, int tries = 3) {   // DShot-prime -> signal-loss -> connect (retry)
+	// CONNECT polling until `until` (millis(); at least CONNECT_MIN_MS from now).
+	static bool connectUntil(uint8_t gpio, uint32_t until) {
+		opUntil = until; bool ok = runOp(Op::CONNECT, gpio); opUntil = 0; return ok;
+	}
+	// One attempt: DShot prime -> line high -> ENTRY_QUIET_MS of silence -> BootInit polled until
+	// ENTRY_MAX_MS from line high (see ENTRY_QUIET_MS for the measurements).
+	static bool enterBootloader(uint8_t gpio) {
 		blDepth++; pwmSafe();
-		bool in = false;
-		for (int a = 0; a < tries && !in; a++) {
-			// AM32 only reboots into its bootloader after ~2 s without a valid frame, plus its startup
-			// tune, and its bootloader bails back to the app on garbage. So prime only on the first
-			// (BLHeli-S) try; later tries just hold the line high long enough to straddle that reboot.
-			if (a == 0) {
-				dsh = newBidir(gpio, DSHOT_KBAUD);   // the pin's own stream was freed: no extra SM
-				uint32_t t0 = millis();
-				while (millis() - t0 < PRIME_MS) { if (!dsh->initError()) dsh->sendThrottle(0); pump(); delayMicroseconds(300); }
-				delete dsh; dsh = nullptr;
-			}
-			pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH); pumpFor(a == 0 ? HIGH_HOLD_MS : AM32_HOLD_MS);
-			in = runOp(Op::CONNECT, gpio);
-		}
+		dsh = newBidir(gpio, DSHOT_KBAUD);           // the pin's own stream was freed: no extra SM
+		uint32_t t0 = millis();
+		while (millis() - t0 < PRIME_MS) { if (!dsh->initError()) dsh->sendThrottle(0); pump(); delayMicroseconds(300); }
+		delete dsh; dsh = nullptr;
+		pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH);
+		uint32_t high = millis();
+		pumpFor(ENTRY_QUIET_MS);                     // no BootInit here: it keeps Bluejay in its app
+		bool in = connectUntil(gpio, high + ENTRY_MAX_MS);
 		blDepth--;
 		return in;
 	}
@@ -942,13 +956,14 @@ inline UiState uiState(uint8_t i) {
 // fwBegin primes every configured pin with zero-throttle DShot for PRIME_MS, all at once (in turns
 // of as many as there are free PIO SMs), then holds the lines high. Both firmwares take that signal
 // loss as "go to the bootloader": BLHeli-S needs the valid frames first (a bare high line leaves it
-// waiting for signal), AM32 needs ~2 s without them plus its reboot. So by fwBeginMs + AM32_HOLD_MS
-// every ESC is in, in parallel, and the configurator's first InitFlash costs at most that wait.
-// Each channel's first InitFlash then probes its own pin with one BootInit (CONNECT, up to 500 ms on
-// a bare pin). One that does not answer gets the full entry ladder (~11 s) only if its lifecycle knew
-// an ESC there (lc::Pin::ptRetry: it may be stuck in its app) or it answered earlier in this
-// passthrough; an EMPTY one is simply absent, so a missing ESC costs 0.5 s, and a ladder is charged
-// to its own channel only. A miss stays failed for the passthrough: retries answer at once.
+// waiting for signal), AM32 needs its reboot. Every pin then has ENTRY_QUIET_MS of silence, in
+// parallel, before the first BootInit, and polls from there (see ENTRY_QUIET_MS).
+// Each channel's first InitFlash then polls its own pin with BootInit: until fwBeginMs + ENTRY_MAX_MS
+// if its lifecycle knew an ESC there (lc::Pin::ptRetry: it may be slow, or stuck in its app) or it
+// answered earlier in this passthrough, else until fwBeginMs + ENTRY_QUIET_MS + ENTRY_BARE_MS (at
+// least CONNECT_MIN_MS either way). A known pin that still misses gets one more full entry (prime,
+// quiet, poll); an EMPTY one is simply absent, so a missing ESC costs at most 0.5 s, and a retry is
+// charged to its own channel only. A miss stays failed for the passthrough: retries answer at once.
 // Lifecycle: every configured pin is READING for the whole passthrough (no hold, no async read).
 // fwRun learns the ESC before it runs it (READY, or FAILED); fwEnd sends a pin that was never
 // selected back to EMPTY/FAILED if it started there, else to PENDING (it may have been swapped).
@@ -991,14 +1006,11 @@ inline void fwBegin() {
 	fwBeginMs = millis();
 }
 namespace detail {
-	// Stay quiet until the hold has done its work: a BootInit while the ESC is still on its way into
-	// the bootloader is garbage to it, and sends it back to the app. AM32 reboots into its bootloader
-	// only ~2 s after the frames stop, plus its startup tune. Nothing says which firmware is on a pin,
-	// so every pin gets the AM32 wait, once per passthrough.
+	// The shared quiet window: no BootInit on any pin until ENTRY_QUIET_MS after the lines went high
+	// (an early one keeps Bluejay in its app), once per passthrough.
 	static void fwSettle() {
 		if (fwSettled) return;
-		uint32_t settle = AM32_HOLD_MS + 500;
-		while (millis() - fwBeginMs < settle) { pump(); delayMicroseconds(200); }
+		while (millis() - fwBeginMs < ENTRY_QUIET_MS) { pump(); delayMicroseconds(200); }
 		fwSettled = true;
 	}
 }
@@ -1011,8 +1023,12 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	session = -1; fwIdx = idx;
 	bool ok;
 	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
-	else { fwSettle(); ok = runOp(Op::CONNECT, PINS[idx]); }       // the probe: one BootInit
-	// it answered this passthrough, or the lifecycle knew it: worth the full entry
+	else {                                                         // the probe
+		bool known = fwSeen[idx] || pin[idx].ptRetry();
+		fwSettle();
+		ok = connectUntil(PINS[idx], fwBeginMs + (known ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS));
+	}
+	// it answered this passthrough, or the lifecycle knew it: one more full entry
 	if (!ok && (fwSeen[idx] || pin[idx].ptRetry())) ok = enterBootloader(PINS[idx]);
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
 	if (!ok) { pin[idx].onProbeMiss(); return false; }   // EMPTY before: confirmed absent
@@ -1086,10 +1102,12 @@ struct FsGuard {
 
 // ---- core1 worker: call once from loop1() ------------------------------------------------------
 namespace detail {
-// core1: BootInit on the current pin for up to 500 ms; on a reply, adopt it as the session.
-static bool connectHere(bool abortable) {
+// core1: BootInit on the current pin, again and again until `until` (millis(); at least CONNECT_MIN_MS
+// from now; 0 = just that); on a reply, adopt it as the session.
+static bool connectHere(bool abortable, uint32_t until = 0) {
 	uint32_t t0 = millis();
-	while (millis() - t0 < 500) {
+	if (!until || (int32_t)(until - t0) < (int32_t)CONNECT_MIN_MS) until = t0 + CONNECT_MIN_MS;
+	while ((int32_t)(until - millis()) > 0) {
 		if (abortable && jobAbort) return false;
 		uint8_t raw[8] = {0};
 		int n = bl.connectRawProbe(raw, 15);
@@ -1166,7 +1184,7 @@ inline void core1Poll() {
 	Op o = op; bool ok = false;
 	if (o == Op::CONNECT) {
 		bl.setSignalPin(opPin); bl.begin();
-		ok = connectHere(false);
+		ok = connectHere(false, opUntil);
 		if (ok) takeHello();
 	} else if (o == Op::FWSELECT) {
 		bl.setSignalPin(opPin); bl.begin();
@@ -1192,16 +1210,11 @@ inline void core1Poll() {
 		if (ok) { infoCache[opIdx] = in; identCache[opIdx] = id; }
 	} else if (o == Op::READID) {
 		// The async read of a newly found ESC (core0 has primed it and set the line high): the same
-		// ladder as enterBootloader (1 s, then 4 s twice for an AM32 reboot), learn, run its app.
-		// Job-local results only; jobAbort is honoured between steps and inside every wait.
-		static const uint32_t HOLD[3] = { HIGH_HOLD_MS, AM32_HOLD_MS, AM32_HOLD_MS };
+		// single entry as enterBootloader (quiet, then BootInit polled to ENTRY_MAX_MS from line
+		// high), learn, run its app. Job-local results only; jobAbort is honoured inside every wait.
 		bl.setSignalPin(opPin); bl.begin();
-		bool in = false;
-		for (uint8_t a = 0; a < 3 && !in && !jobAbort; a++) {
-			if (!holdHigh(HOLD[a])) break;
-			bl.begin();
-			in = connectHere(true);
-		}
+		uint32_t high = millis();
+		bool in = holdHigh(ENTRY_QUIET_MS) && (bl.begin(), connectHere(true, high + ENTRY_MAX_MS));
 		ok = in && !jobAbort && learnHere(jobInfo, jobIdent);
 		if (bl.connected()) bl.run();               // its app runs again, aborted or not
 	}

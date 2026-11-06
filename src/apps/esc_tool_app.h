@@ -1088,7 +1088,7 @@ private:
 					if(!th_[i]->initOk()) { console::out().println("err dshot-init-failed (no free PIO SM?)"); continue; }
 					if(!ok && escs::armBusySession()>=0) { console::out().printf("err busy (ESC %d is being written; run it first)\n",escs::armBusySession()); continue; }
 					if(!ok) { console::out().printf("err not-ready (state %s: scan or a configurator read reads it again)\n",escs::stateName(i)); continue; }
-					// Not read yet: the arm waits for the async read (1-11 s), then the ~3 s window; a host
+					// Not read yet: the arm waits for the async read (~1.5-5.5 s), then the ~3 s window; a host
 					// polls `state` for RUNNING (host/pico_esc/drive.py wait_read).
 					if(escs::state(i)!=lc::State::RUNNING) console::out().printf("arming (reading first, then ~3s) (state %s)\n",escs::stateName(i));
 					else { lc::Identity id=escs::identity(i);

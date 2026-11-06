@@ -507,7 +507,7 @@ async function startTest() {
       return;
     }
     // One SET_MOTOR in flight at a time. The pico-esc-tool firmware answers nothing while an arm
-    // reads an ESC it does not know yet (a bootloader visit, up to ~4 s each, one ESC after another),
+    // reads an ESC it does not know yet (a bootloader visit, ~1.5 s each, 5.5 s for one that does not answer, one ESC after another),
     // so only a link silent for longer than that counts as lost. The firmware stops the motors on
     // its own when MSP goes quiet, and then forgets the declaration: every frame carries it again.
     let inflight = false, heard = performance.now();

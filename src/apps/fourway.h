@@ -169,8 +169,8 @@ private:
 			case 217: mspReply(cmd, d, 0); break;                                            // SET_3D: ignored
 			case 245:                                                                        // SET_PASSTHROUGH -> 4-way
 				// Every configured pin is a channel. Which ones answer is known only after fwBegin and its
-				// settle, and the configurator times this answer out after 1 s; an empty pin's
-				// InitFlash fails after one 500 ms probe.
+				// quiet window, and the configurator times this answer out after 1 s; an empty pin's
+				// InitFlash fails after a 500 ms probe.
 				clearMotors();                    // EscTool stops a motor test when it sees passthrough
 				d[0] = n; mspReply(cmd, d, 1);   // answer first: fwBegin primes the ESCs for 0.5 s
 				escs::fwBegin();
@@ -224,7 +224,7 @@ private:
 				break;
 			}
 			case 0x37: {                                                                           // DeviceInitFlash
-				int8_t e = channel(p[0]);         // its first InitFlash waits the settle and probes PINS[e]
+				int8_t e = channel(p[0]);         // its first InitFlash waits the quiet window and probes PINS[e]
 				if (e < 0) { ack = ACK_I_INVALID_CHANNEL; break; }
 				uint8_t raw[8]; bool am32 = false;
 				sel_ = -1; olen = 4; memset(out, 0, 4);

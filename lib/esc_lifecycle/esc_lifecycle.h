@@ -245,10 +245,11 @@ struct Pin {
 		if (st == State::RUNNING) st = State::READY;
 	}
 	void onPassthroughBegin() { prePt = st; st = State::READING; id = Identity{}; armWanted = openLoop = queued = false; }
-	// The passthrough probes every pin once after its settle (a short BootInit). A pin that does not
-	// answer gets the full bootloader entry (DShot prime, then the AM32 reboot waits) only if an ESC
-	// was known there when the passthrough began: that one may be stuck in its app. One that was EMPTY
-	// is absent (a stock BLHeli_S with no telemetry is in its bootloader by then, and answers).
+	// The passthrough probes every pin after its quiet window (BootInit polled). A pin where an ESC was
+	// known when the passthrough began is polled longer and, if it still misses, gets one more full
+	// bootloader entry (DShot prime, quiet, poll): that ESC may be slow or stuck in its app. One that
+	// was EMPTY is absent after a short poll (a stock BLHeli_S with no telemetry is in its bootloader
+	// by then, and answers).
 	bool ptRetry() const { return prePt != State::EMPTY; }
 	// The probe got no answer (and no ladder found it either).
 	void onProbeMiss() { if (prePt == State::EMPTY) absent = true; }
