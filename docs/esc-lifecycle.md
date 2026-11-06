@@ -57,7 +57,7 @@ drive rules into it ("rev1" below).
   picks up the result on a later loop.
 - core1 runs one bootloader job at a time from the queue. The BLHeli_S prime (zero-throttle burst,
   then line high) becomes timed steps instead of `delay()`.
-- LittleFS writes (config, present mask) run only while core1 is idle. A flash write pauses the
+- LittleFS writes (config, the pin list) run only while core1 is idle. A flash write pauses the
   other core, which would cut a bit-banged bootloader byte in half.
 
 ### Hot-plug
@@ -110,10 +110,10 @@ Landed in phase 1:
 - LOST handling with the tool/ROV switch (`escs::setPolicy`), `escs::drive()` with refusals
   (`err not-armed`, `err not-armed (state X)`, `err reverse-on-one-way (ESC i is not 3D)`), and a
   `state` CLI command.
-- The AM32 mask is gone: `/cfg/present` is one word (an older 8-byte file still loads), and the
-  passthrough always waits the AM32 time.
+- The AM32 mask is gone, and the passthrough always waits the AM32 time. (The present mask,
+  `/cfg/present`, went later too: see "Signal pins and presence" below.)
 - LittleFS writes run under `escs::FsGuard` (core1 parked in its idle branch); a refusal answers
-  `err busy (ESC read in progress, retry)`, and the present mask is retried.
+  `err busy (ESC read in progress, retry)`.
 
 - One bootloader line: a read cannot run while `scan`, `read` or `enter` holds an ESC in its
   bootloader. A pin waiting to be read wins once the session is idle: no op on it for 5 s, and never
@@ -123,8 +123,7 @@ Landed in phase 1:
   once (as 4baed53's `arm` did), unless it was written: then it answers
   `err busy (ESC <s> is being written; run it first)`. `arm` on a pin not read yet answers
   `arming (reading first, then ~3s) (state X)`; hosts poll `state` for RUNNING
-  (`host/pico_esc/drive.py` `wait_read`). An async read that finds an ESC on a pin missing from the
-  present mask adds it.
+  (`host/pico_esc/drive.py` `wait_read`).
 
 Phase 2:
 
@@ -243,6 +242,72 @@ lives now and how it meets the lifecycle states.
   - Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. If one lasts
     longer than 400 ms at zero, the pin goes LOST and is read again when it answers. This needs a
     bench check.
+
+## Signal pins and presence
+
+Which GPIOs carry ESCs, and which of them have an ESC on them now, are two separate things, and
+neither needs a rebuild or a `scan` any more.
+
+### The pin list
+
+- `ESC_SIGNAL_PINS` (`esc_config.h`) is the default. `pins 16 17 18 19` stores a list in
+  `/cfg/pins`, `pins default` removes it, and `pins` shows it (`pins|now|<cfg|default>|...`,
+  `pins|next|...`, `pins|default|...`, then `ok`). The list is read once at boot
+  (`EscTool::begin`, before the hold or the encoder starts), so a change takes effect after a reboot;
+  the answer says so (`# pins: saved; reboot to apply`). The web page has the same in its settings
+  tab, on this firmware only.
+- A list is 1..8 GPIOs in ESC-index order, each GP0..GP29, none twice, none used by this build:
+  the Pico W radio (GP23/24/25/29), the LCD bus on the panel (GP5..15), the UART console on
+  `main_uart` (GP0/1), the mode pin (GP22). Anything else answers `err bad-pins (<reason>)`, e.g.
+  `err bad-pins (GP25: Pico W radio)`. The rule is `lib/esc_lifecycle/esc_pins.h`, with a native
+  test; the default list is checked against it at compile time. A stored list that this build
+  refuses (written by another env) is ignored at boot with a `# pins:` line, and the default is used.
+- An ESC on GP16 or GP17 switches the AS5600 encoder off (its I2C0 is on those pins), as before.
+- Every per-ESC array is sized `escs::MAX` (8); `escs::COUNT` is this boot's count. `main.cpp`
+  declares eight `Thruster`s; `EscTool` uses the first `COUNT`. `cfg load` restores every stored one,
+  `cfg save` stores the first `COUNT`.
+- The legacy `esc_tool` env keeps the compile-time list.
+
+### Presence
+
+- Nothing is stored. A pin is wired when its lifecycle state is not EMPTY: a bidir ESC is found by
+  the hold's telemetry, any ESC by a read (`scan`, a configurator read, an arm). `/cfg/present` is
+  deleted at boot. `escs` reports (`escs|<n>/<count>|<indices>`); its old arguments are ignored with
+  a note. The MSP motor count, MOTOR_TELEMETRY and the motor test's channels (gaps closed) follow it.
+- While a motor test runs (or a page has declared `mtmode`, or anything drives), the wired set is
+  held as it was when the test started (`escs::holdWired`): an ESC appearing on a lower pin must not
+  move a channel onto another ESC.
+- The passthrough probes. MSP_SET_PASSTHROUGH answers at once with every configured pin (esc-configurator
+  times out an MSP reply after 1 s, long before the 4.5 s settle). The first InitFlash
+  waits out the settle, then the pins are probed in order with one BootInit each (500 ms on a bare
+  pin), only as far as the channel asked for. The ones that answer are the channels, gaps closed; a
+  channel past them answers "invalid channel" at once. A pin that does not answer gets the full entry
+  ladder (prime, 1 s, then 2 x 4 s) only if its lifecycle knew an ESC there when the passthrough
+  began (`lc::Pin::ptRetry`): that ESC may be stuck in its app. An EMPTY pin is absent. A stock
+  BLHeli_S that was never read is EMPTY, but it is in its bootloader after the settle and answers.
+- So a missing ESC costs 0.5 s in a passthrough instead of ~11 s. With 4 pins and ESCs on the first
+  two, reading all four channels costs the settle, two answers, and 1 s for the two empty pins.
+
+### Known limits
+
+- The idle hold streams to every configured pin, so an empty pin still holds a PIO SM. Bidir fits
+  only pio0's 4 SMs on a Pico W (the radio is on pio1), normal DShot goes to pio1's 3 free SMs
+  first (`newBidir` / `newNormal`). A pin past that budget reports `init-fail` (`state`, `spinMode`)
+  and the hold tries it again every second (`drvInitFail` / `drvRetryMs`); it gets an SM when one is
+  freed (a pin read as normal DShot moves to pio1, a pin goes FAILED or is in a bootloader). With
+  more than 4 pins, list the wired ones first: an ESC on a pin with no SM is not seen arriving and
+  cannot be armed until one is free. No new scheduler is planned for this.
+- The passthrough primes in turns when there are more pins than free SMs (500 ms more for pins 5..8).
+- esc-configurator, offered every configured pin, logs a read failure for each channel past the
+  last ESC; the web page stops at the first one instead (`ESC n 以降: つながっていません`).
+- A probe of pins in front of the first ESC adds 0.5 s each to the first InitFlash. esc-configurator
+  retries an InitFlash for about 6 s, and the settle already takes about 3.8 s of that after its own
+  1.2 s wait, so more than about 4 empty pins in front of the first ESC can make it give up on that
+  channel (the web page waits 20 s). List the wired pins first.
+- A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
+  ESC was here". The page and the MSP count see it until then, and the next passthrough gives that
+  pin the full entry ladder once (~11 s) before it is called absent.
+- Changing the pin list needs a reboot; there is no `reboot` command.
 
 ## rev0 (the first release)
 
