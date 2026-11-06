@@ -6,7 +6,7 @@
 // firmware or a Betaflight flight controller.
 
 import { SerialPipe, SocketPipe, Msp, MSP, FEATURE_3D, FourWay, MODE } from './link.js';
-import { readEsc, writeSettings, flashCheck, flash } from './esc.js';
+import { readEsc, writeSettings, flashCheck, flash, sameEsc } from './esc.js';
 import { parseHex } from './hex.js';
 import { presetFamily } from './layouts.js';
 import * as presets from './presets.js';
@@ -138,7 +138,7 @@ async function passthrough(on) {
     await stopTest('パススルーに入るため');
     const d = await st.msp.request(MSP.SET_PASSTHROUGH, [], 3000);
     st.inPassthrough = true; st.ptEscs = d[0];
-    // pico-esc-tool offers every signal pin here and finds which answer as it reads them
+    // pico-esc-tool: one channel per signal pin (ESC k = pin k), whether an ESC is on it or not
     log(st.pico ? `パススルー開始 (信号ピン ${d[0]} 本)` : `パススルー開始 (ESC ${d[0]} 個)`);
     await new Promise((r) => setTimeout(r, 500));
   } else {
@@ -148,20 +148,8 @@ async function passthrough(on) {
     log('パススルー終了 (ESC は通常動作に戻りました)');
     await new Promise((r) => setTimeout(r, 1000));
     st.pipe.drain();
-    if (st.pico) await refreshMotors();
   }
   status();
-}
-
-// pico-esc-tool counts the ESCs that are there (its lifecycle), so the count can change with a read:
-// after a passthrough it knows every ESC that answered. 10 s: it learns each one again before it
-// answers anything.
-async function refreshMotors() {
-  const mc = await st.msp.request(MSP.MOTOR_CONFIG, [], 10000).catch(() => null);
-  if (!mc || mc.length <= 6 || mc[6] === st.motors) return;
-  st.motors = mc[6];
-  log(`モーター ${st.motors} 個`);
-  if (!st.test.on) renderTest();
 }
 
 // ------------------------------------------------------------------------------- read / write
@@ -180,13 +168,10 @@ async function readAll() {
         log(`ESC ${ch + 1}: ${esc.family.name} ${esc.version} ${esc.layoutTag} ${esc.name} (${((performance.now() - t0) / 1000).toFixed(1)} s)`);
       } catch (e) {
         if (st.pipe !== pipe) return;
-        // pico-esc-tool numbers the ESCs that answer without gaps: past the last one, none follow
-        if (st.pico && /invalid channel/.test(e.message)) {
-          log(ch ? `ESC ${ch + 1} 以降: つながっていません` : 'ESC が見つかりません', ch ? '' : 'err');
-          break;
-        }
         st.escs[ch] = null;
-        log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
+        // pico-esc-tool: ESC k is pin k, so an empty pin is just a channel nothing answers on
+        if (st.pico) log(`ESC ${ch + 1}: つながっていません`);
+        else log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
       }
     }
     renderEscs(); renderFlash();
@@ -198,7 +183,12 @@ async function writeEsc(ch) {
   const esc = st.escs[ch];
   await task(`ESC ${ch + 1} 書き込み`, async () => {
     await passthrough(true);
-    await st.fw.initFlash(ch);
+    // Only onto the ESC that was read: the one on this channel now may have been swapped (or a
+    // different channel numbering may have put another ESC here) since then.
+    const fresh = await readEsc(st.fw, ch);
+    if (!sameEsc(fresh, esc)) {
+      throw new Error('いまつながっている ESC が、読み込んだときと違います (交換された?)。「ESC を読み込む」で読み直してから書き込んでください');
+    }
     await writeSettings(st.fw, esc, st.edits[ch]);
     st.edits[ch] = Uint8Array.from(esc.block);
     log(`ESC ${ch + 1}: 書き込み・照合 OK`, 'ok');
@@ -708,9 +698,22 @@ async function cli(line, ms = 10000) {
   return st.pipe.until((buf) => {
     const s = String.fromCharCode(...buf), m = /(^|\n)(ok|err[^\r\n]*)\r?\n/.exec(s);
     if (!m) return undefined;
-    buf.splice(0, m.index + m[0].length);
-    return s.slice(0, m.index + m[0].length).split(/\r?\n/).filter(Boolean);
+    const end = m.index + m[0].length, [text, frames] = splitMsp(buf.slice(0, end));
+    buf.splice(0, end, ...frames);   // MSP frames that came meanwhile stay for their reader
+    return String.fromCharCode(...text).split(/\r?\n/).filter(Boolean);
   }, ms);
+}
+// Bytes -> [text, MSP v1 replies ($M> / $M!) found among them, in order].
+function splitMsp(bytes) {
+  const text = [], frames = [];
+  for (let i = 0; i < bytes.length;) {
+    const n = bytes[i + 3];
+    if (bytes[i] === 0x24 && bytes[i + 1] === 0x4D && (bytes[i + 2] === 0x3E || bytes[i + 2] === 0x21)
+        && i + 6 + n <= bytes.length) {
+      frames.push(...bytes.slice(i, i + 6 + n)); i += 6 + n;
+    } else text.push(bytes[i++]);
+  }
+  return [text, frames];
 }
 const gp = (list) => (list ? list.split(',').map((p) => `GP${p}`).join(' ') : '?');
 function showPins(lines) {
