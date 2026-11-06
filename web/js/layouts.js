@@ -50,7 +50,8 @@ const STARTUP_BEEP = { key: 'STARTUP_BEEP', off: 0x05, label: '起動音', type:
 const DITHER = { key: 'DITHERING', off: 0x06, label: 'Dithering', type: 'bool' };
 const BRAKING = { key: 'BRAKING_STRENGTH', off: 0x10, label: 'ブレーキの強さ', type: 'num', min: 0, max: 255 };
 const POWER_RATING = { key: 'POWER_RATING', off: 0x29, label: '電源', type: 'enum', opts: [[1, '1S'], [2, '2S 以上']] };
-const EDT_ARM = { key: 'FORCE_EDT_ARM', off: 0x2A, label: 'EDT を必須にする', type: 'bool' };
+const EDT_ARM = { key: 'FORCE_EDT_ARM', off: 0x2A, label: 'EDT を必須にする', type: 'bool',
+  help: '起動のたびに EDT 有効化 (DShot コマンド 13) を要求する。止まるたびに EDT が切れるので、送らない送信機では毎回ビープして起動しない。pico-esc-tool は自動で送る' };
 const PWM_209 = { key: 'PWM_FREQUENCY', off: 0x0A, label: 'PWM 周波数', type: 'enum',
   opts: [[24, '24 kHz'], [48, '48 kHz'], [96, '96 kHz'], [0, '可変']] };
 

@@ -8,6 +8,9 @@
 //   * Tool build (below): hand the Thrusters to an EscTool — config/flash + USB-serial CLI
 //     (host/esctool.py) + a Wi-Fi web UI. main stays tiny.
 //   * Standalone ROV: DON'T create an EscTool. Drive the Thrusters directly from your own loop, e.g.
+//       // in setup(): telemetry LOST while running keeps streaming (open loop) instead of stopping,
+//       // and the zero-throttle hold (also hot-plug detection) is on:
+//       //   escs::setPolicy(lc::Policy::ROV); escs::setHold(true);
 //       void loop() {
 //         auto cmd = readCmdVel();                       // from the Pi / RC over serial
 //         for (uint8_t i = 0; i < NTHR; i++) { THRUSTERS[i]->setRpm(cmd[i]); THRUSTERS[i]->poll(); }

@@ -14,10 +14,11 @@
 // (drive/telemetry) for that ESC. List them in ESC-index order; add/remove entries to match how
 // many ESCs you wired. See construction/wiring/.
 // How many: the 1-wire bootloader is bit-banged, so any GPIO works for config/flash, and the
-// configurator passthrough (fourway.h) shows up to 8. Driving is the limit: each armed ESC holds one
-// PIO state machine for bidir DShot, and the RP2040 has 8 (the Pico W radio takes one), so about 7
-// can spin at once. Which of the listed ESCs are actually wired is learned at run time (`scan`,
-// `escs`), not set here.
+// configurator passthrough (fourway.h) shows up to 8. Driving is the limit: each wired ESC holds one
+// PIO state machine (the idle hold streams to every one of them). The bidir program (28 of a PIO's 32
+// instructions) fits only on pio0, since the Pico W radio sits on pio1, so at most 4 ESCs can run
+// bidir DShot; a normal-DShot stream goes to pio1's 3 free SMs first (esc_session.h newNormal).
+// Which of the listed ESCs are actually wired is learned at run time (`scan`, `escs`), not set here.
 // ESC_BOARD_PANEL (env:main_panel) is the old prayer-wheel display board reused as a bench panel:
 // Pico W + SC1602 LCD + PWM1..4 headers on GP16..19. Its LCD bus takes GP5..15, so GP10/11 are not
 // free there.

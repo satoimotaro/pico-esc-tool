@@ -14,7 +14,7 @@ run_segments directly, so ESC never changes that code path (the dry-run oracle i
 from __future__ import annotations
 
 from .config import decode, encode_overrides, overrides_str
-from .drive import ARM_WAIT, PosDrive
+from .drive import ARM_WAIT, PosDrive, wait_read
 from .link import RealClock
 
 
@@ -100,7 +100,8 @@ class ESC:
             self._drive.arm()
         else:
             self._drive._log("# arming (normal)…")
-            self.link.cmd(f"arm {self.index} normal", timeout=6)
+            r = self.link.cmd(f"arm {self.index} normal", timeout=6)
+            wait_read(self.link, self.index, r, self._drive.clock)   # raises before `armed` if the read fails
             self._drive.armed = True
             self._drive.clock.sleep(ARM_WAIT)
         return self

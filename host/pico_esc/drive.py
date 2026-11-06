@@ -11,6 +11,26 @@ from __future__ import annotations
 from .types import EncReading, EncVel, Telem
 
 ARM_WAIT = 4.0             # seconds to wait after arming before driving
+READ_WAIT = 15.0           # an ESC not read yet: the firmware reads it first (up to ~11.5 s)
+
+
+def wait_read(host, idx, reply, clock, timeout=READ_WAIT):
+    """`arm` on an ESC the firmware has not read yet answers `arming (reading first, then ~3s)`
+    and reads it in the background. Poll `state` until that ESC is RUNNING (read, arm window
+    started); the caller's ARM_WAIT then covers the window. Any other reply returns at once."""
+    if not any(str(ln).startswith("arming (reading first") for ln in (reply or [])):
+        return
+    end = clock.now() + timeout
+    while clock.now() < end:
+        for ln in host.cmd("state", timeout=2):
+            f = ln.split("|")
+            if len(f) >= 3 and f[0] == "state" and f[1] == str(idx):
+                if f[2] == "RUNNING":
+                    return
+                if f[2] in ("EMPTY", "FAILED", "READY"):
+                    raise RuntimeError(f"ESC {idx} did not arm: its read ended {f[2]}")
+        clock.sleep(0.25)
+    raise TimeoutError(f"ESC {idx} was not read within {timeout:.0f} s")
 
 
 class Aborted(RuntimeError):
@@ -45,7 +65,8 @@ class PosDrive:
 
     def arm(self):
         self._log("# arming (bidir)…")
-        self.host.cmd(f"arm {self.idx} bidir", timeout=6)
+        r = self.host.cmd(f"arm {self.idx} bidir", timeout=6)
+        wait_read(self.host, self.idx, r, self.clock)   # raises before `armed` if the read fails
         self.armed = True
         self.clock.sleep(ARM_WAIT)
 

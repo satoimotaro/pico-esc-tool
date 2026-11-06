@@ -31,8 +31,9 @@ const st = {
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
   // mode: each motor's 3D meaning, frozen for the test (null = no test); mask: its `mtmode` (pico only);
-  // silent: polls in a row a motor came back SILENT; gone: forgotten mid-test; pwmOn: switched to PWM
-  test: { on: false, values: [], timer: null, sel: [], mode: null, mask: null, silent: [], gone: [], pwmOn: [] },
+  // silent: polls in a row a motor came back SILENT (or ABSENT after live); live: it reported a live
+  // state since the last start/stop, read or passthrough exit; gone: forgotten mid-test; pwmOn: on PWM
+  test: { on: false, values: [], timer: null, sel: [], mode: null, mask: null, silent: [], live: [], gone: [], pwmOn: [] },
 };
 
 // ------------------------------------------------------------------------------- log / status
@@ -110,7 +111,7 @@ function dropped() {
 // What was read belongs to that connection: another board, or other ESCs, may be there next time.
 function forget() {
   if (st.escs.some((e, ch) => e && dirty(ch))) log('書き込んでいない変更は破棄しました');
-  st.escs = []; st.edits = []; st.test.silent = [];
+  st.escs = []; st.edits = []; st.test.silent = []; st.test.live = [];
   renderEscs(); renderFlash(); renderTest();
 }
 
@@ -138,6 +139,7 @@ async function passthrough(on) {
   } else {
     await st.fw.exit();
     st.inPassthrough = false;
+    st.test.live = [];   // the firmware reads each ESC again now: a FAILED learn is not a pull
     log('パススルー終了 (ESC は通常動作に戻りました)');
     await new Promise((r) => setTimeout(r, 1000));
     st.pipe.drain();
@@ -151,7 +153,7 @@ async function readAll() {
     const pipe = st.pipe;   // a disconnect mid-read: what comes back belongs to that board, drop it
     await passthrough(true);
     if (st.pipe !== pipe) return;
-    st.escs = []; st.edits = [];
+    st.escs = []; st.edits = []; st.test.live = [];
     for (let ch = 0; ch < st.motors; ch++) {
       const t0 = performance.now();
       try {
@@ -253,6 +255,8 @@ function renderEscs() {
       h('div', { class: 'card-head' },
         h('label', {}, h('input', { type: 'checkbox', class: 'esc-sel', 'data-ch': ch, checked: true }), h('h3', {}, `ESC ${ch + 1}`)),
         h('span', { class: 'tag' }, `${esc.family.name} ${esc.version}`),
+        // stock BLHeli_S has no telemetry: the Pico cannot see it being swapped (docs/esc-lifecycle.md)
+        esc.family.id === 'blheli_s' ? h('span', { class: 'tag dim' }, '交換は検出されません: 交換したら読み直してください') : null,
         h('span', { class: 'meta' }, [esc.layoutTag, esc.mcu, esc.name].filter(Boolean).join(' · '))),
       esc.family.fields.length
         ? h('div', { class: 'fields' }, ...esc.family.fields.map((f) => fieldInput(ch, f)))
@@ -366,21 +370,27 @@ function renderTest() {
     + (pwmMode() ? ' PWM: 切り替え後 5 秒は停止パルスで待機状態に入れます。テレメトリは出ません。Bluejay は PWM を受け付けません。' : '');
 }
 
-// pico-esc-tool says per motor whether it can move now (escs::UiState in src/apps/esc_session.h; 1 is
-// reserved, never sent). While its ESC is being read or armed, stalled, or does not answer, the slider
-// is held at stop and locked, so a value never waits behind an arm and lands as a jump; the tag says
-// why. 0 = the board does not say (Betaflight, older firmware): no lock. PWM reports its arm as 2.
-const UI = { 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし',
+// pico-esc-tool says per motor whether it can move now (escs::UiState = lc::Ui in
+// lib/esc_lifecycle/esc_lifecycle.h). While its ESC is being read or armed, stalled, or does not
+// answer, the slider is held at stop and locked, so a value never waits behind an arm and lands as a
+// jump; the tag says why. 0 = the board does not say (Betaflight, older firmware): no lock. PWM
+// reports its arm as 2.
+const UI = { 1: '読み込み中…', 2: 'arm 中… (数秒)', 3: '回せます', 4: '動かすと arm (約 3 秒)', 5: '応答なし',
   6: '失速しました。arm し直しています', 7: 'テレメトリが来ません' };
-const LOCKED = new Set([2, 5, 6]);
-// 7: a bidir ESC held armed that answered once and now sends nothing. On this many answers in a row
-// that came back promptly (a board held up by a bootloader read answers late, every stamp stale) it
-// has been unplugged or lost power, and what was read from it no longer holds.
+const LOCKED = new Set([1, 2, 5, 6]);
+// 7: a bidir ESC held armed that answered once and now sends nothing; the firmware then calls it LOST
+// (5) within a fraction of a second. So 7, or 5 once the motor has been live since the last test start
+// or stop, read or passthrough exit (so a firmware-side FAILED learn right after a read does not
+// erase a good read), is
+// evidence it has gone. On this many answers in a row that came back promptly (a board held up by a
+// bootloader read answers late, every stamp stale) it has been unplugged or lost power, and what was
+// read from it no longer holds.
 const GONE_POLLS = 3;
+const LIVE = new Set([2, 3, 4, 6, 7]);
 const bidirKnown = (i) => ['bluejay', 'bluegill', 'am32'].includes(st.escs[i]?.family?.id);
 const slider = (i, type = 'range') => document.querySelector(`#sliders input[type=${type}][data-m="${i}"]`);
 function gone(i) {
-  st.test.silent[i] = 0;
+  st.test.silent[i] = 0; st.test.live[i] = false;
   log(`ESC ${i + 1}: テレメトリが途切れました (外れた / 電源が切れた?)。つなぎ直したら読み込み直してください`, 'err');
   if (dirty(i)) log(`ESC ${i + 1}: 書き込んでいない変更は破棄しました`);
   st.escs[i] = null;
@@ -396,7 +406,8 @@ function gone(i) {
 function applyUi(codes, prompt) {
   st.test.ui = codes;
   codes.forEach((c, i) => {
-    if (c !== 7) { st.test.silent[i] = 0; return; }
+    if (LIVE.has(c)) st.test.live[i] = true;
+    if (c !== 7 && !(c === 5 && st.test.live[i])) { st.test.silent[i] = 0; return; }
     if (!prompt || !bidirKnown(i)) return;
     st.test.silent[i] = (st.test.silent[i] || 0) + 1;
     if (st.test.silent[i] >= GONE_POLLS) gone(i);
@@ -452,7 +463,7 @@ async function startTest() {
       mask = mode.reduce((m, on, i) => m | (on ? 1 << i : 0), 0);
     }
     st.test.mode = mode; st.test.mask = mask;
-    st.test.silent = []; st.test.gone = []; st.test.pwmOn = [];
+    st.test.silent = []; st.test.live = []; st.test.gone = []; st.test.pwmOn = [];
     st.test.on = true;
     st.test.pwm = pwmMode();
     $('#test-proto').disabled = true;
@@ -519,7 +530,7 @@ async function stopTest(why) {
     }
   }
   st.test.mode = null; st.test.mask = null; st.test.pwm = false;
-  st.test.silent = []; st.test.gone = []; st.test.pwmOn = [];
+  st.test.silent = []; st.test.live = []; st.test.gone = []; st.test.pwmOn = [];
   st.test.stopping = false;
   $('#test-toggle').disabled = false;
   renderTest();
