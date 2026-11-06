@@ -177,8 +177,9 @@ public:
 	enum Mode { SETUP, DRIVE };
 
 	// Composed by main: an array of the Thrusters this tool operates on (main owns them, binds them, and
-	// sets their per-motor gains BEFORE calling begin()). n = how many.
-	EscTool(Thruster** thrusters, uint8_t n) : th_(thrusters), n_(n) {}
+	// sets their per-motor gains BEFORE calling begin()). n = how many; begin() uses the first
+	// escs::COUNT of them (one per signal pin of this boot).
+	EscTool(Thruster** thrusters, uint8_t n) : th_(thrusters), n_(n), nThr_(n) {}
 
 	// io = where the CLI lives (see console.h). USB CDC by default; pass an already-begun UART for a
 	// board with no USB host. USB is started either way so a laptop can still watch the boot.
@@ -202,8 +203,10 @@ public:
 		// Every LittleFS mutation runs under escs::FsGuard: a flash write pauses core1, which must not
 		// be in the middle of a bootloader byte. At boot it is idle, so these always get it.
 		{ escs::FsGuard g; if (!LittleFS.begin() && g.ok) { LittleFS.format(); LittleFS.begin(); } }   // firmware library store
-		{ static const uint8_t pins[] = ESC_SIGNAL_PINS;                  // GP16/17 wired as an ESC signal:
-		  for (uint8_t p : pins) if (p == 16 || p == 17) encOff_ = true; } // the encoder's I2C would take it
+		loadPins();                                                      // /cfg/pins, before anything uses a pin
+		if (n_ > escs::COUNT) n_ = escs::COUNT;                          // one Thruster per signal pin
+		for (uint8_t i = 0; i < escs::COUNT; i++)                        // GP16/17 wired as an ESC signal:
+			if (escs::PINS[i] == 16 || escs::PINS[i] == 17) encOff_ = true;   // the encoder's I2C would take it
 		if (!encOff_) enc_.begin();                                      // AS5600 encoder (I2C0, GP16/17)
 		{ escs::FsGuard g; if (g.ok) LittleFS.mkdir("/fw"); }
 		// Restore the saved runtime config (motor identity, gains, DOB, vbatt scale) — so `sense vcal`
@@ -211,7 +214,7 @@ public:
 		// defaults, so a stored config deliberately wins over them; an absent/corrupt one changes nothing.
 		{ escs::FsGuard g; if (g.ok) LittleFS.mkdir(settings::CFG_DIR); }
 		uint16_t storedVer = 0;
-		int restored = settings::load(th_, n_, &storedVer);
+		int restored = settings::load(th_, nThr_, &storedVer);   // every Thruster: a blob from a longer pin list fits
 		if (restored > 0)
 			console::out().printf("# cfg: restored %d ESC config(s) from %s\n", restored, settings::CFG_PATH);
 		else if (storedVer && storedVer != settings::CFG_VERSION)
@@ -223,8 +226,9 @@ public:
 		// Bind at boot, not on the first `az on`: `az status` / `az zero show` read the encoder
 		// through the same pointers, and unbound they reported the heading as "inf".
 		if (n_ >= 2) az_.bind(th_[0], th_[1], &enc_);
-		loadPresent();
-		escs::setHold(true);   // the idle hold (and hot-plug detection) for every wired ESC
+		// rev1 kept which ESCs are wired in /cfg/present; that is derived from the lifecycle now
+		if (LittleFS.exists("/cfg/present")) { escs::FsGuard g; if (g.ok) LittleFS.remove("/cfg/present"); }
+		escs::setHold(true);   // the idle hold (and hot-plug detection) for every configured pin
 		az_.zero_raw = settings::azLoadZero();
 		if (az_.zero_raw >= 0)
 			console::out().printf("# az: heading zero restored (raw %ld)\n", (long)az_.zero_raw);
@@ -262,8 +266,6 @@ public:
 #endif
 		handleSerial();
 		if (!encOff_) enc_.poll();                              // high-rate AS5600 sampling (self-gated)
-		if (escs::presentGrew()) savePresent(escs::presentMask());   // an async read found one on an unlisted pin
-		presentPersist();                                       // a deferred /cfg/present write
 		motorTestPoll();
 		az_.poll();                     // on-device azimuth loop — runs at the tracker's rate, not 50 Hz
 		if (fl_ == FL_START || fl_ == FL_RUN) flashStep();      // flashing: one page per loop (no spin)
@@ -339,9 +341,9 @@ private:
 		else if (s == vel::TempState::OK)
 			console::out().printf("# ESC %u thermal ok: ESC MCU %.0fC, full command authority\n", i, th_[i]->vc.temp());
 	}
-	uint8_t  tempSeen_[escs::COUNT] = {0};       // last ANNOUNCED TempState per ESC (0 == TempState::NONE)
-	uint32_t tempNoneSince_[escs::COUNT] = {0};  // millis() this ESC started driving with no temperature
-	bool     tempNoneSaid_[escs::COUNT] = {false};
+	uint8_t  tempSeen_[escs::MAX] = {0};       // last ANNOUNCED TempState per ESC (0 == TempState::NONE)
+	uint32_t tempNoneSince_[escs::MAX] = {0};  // millis() this ESC started driving with no temperature
+	bool     tempNoneSaid_[escs::MAX] = {false};
 	// How long a thruster may run the closed loop with NO temperature before we call it out. EDT enable
 	// is 10 DShot-13 frames sent right after the arm window, so a working ESC reports within well under a
 	// second; 5 s is generous enough that a slow first frame is not mistaken for a dead channel, and short
@@ -510,6 +512,10 @@ private:
 		// nothing and a 3D "1000" (stop, as the page drew it) into full reverse. Once a client has
 		// read it, fw_ keeps the answer for that client (FourWay::setThreeD).
 		bool idle = !mtOwned_ && !fw_.motorWanted(), reversibleWired = false;
+		// The test's channels are the wired ESCs, gaps closed (FourWay::channel): held while a test or
+		// a page's declaration is live, or anything drives, so an ESC appearing or vanishing meanwhile
+		// cannot move a channel onto another ESC.
+		escs::holdWired(!idle || fw_.declared() || driving());
 		if (idle) for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
 		fw_.setThreeD(reversibleWired, idle);
 		if (millis() - mtLoopMs_ > 500) mtArmedMs_ = millis();   // held up: queued MSP is no silence
@@ -600,30 +606,7 @@ private:
 	static constexpr const char* BUSY = "err busy (ESC read in progress, retry)";
 	bool busy_ = false;             // a preset save met a busy FsGuard
 
-	// Which ESCs are wired (escs::presentMask), kept across reboots. Wired is set by `scan` or `escs`.
-	// Older files also carry the AM32 mask as a second word; it is ignored (the passthrough always
-	// waits the AM32 time now).
-	static constexpr const char* PRESENT_PATH = "/cfg/present";
-	uint32_t presentSave_ = 0;
-	bool     presentDirty_ = false;
-	void loadPresent() {
-		File f = LittleFS.open(PRESENT_PATH, "r");
-		if (!f) return;
-		uint32_t m = 0;
-		if (f.read((uint8_t*)&m, sizeof m) == sizeof m) escs::setPresent(m);
-		f.close();
-		console::out().print("# escs: "); printPresent();
-	}
-	// RAM at once; the file once core1 is off the line (retried from poll() while an ESC read runs).
-	void savePresent(uint32_t m) { escs::setPresent(m); presentSave_ = m; presentDirty_ = true; presentPersist(); }
-	void presentPersist() {
-		if (!presentDirty_) return;
-		escs::FsGuard g;
-		if (!g.ok) return;
-		File f = LittleFS.open(PRESENT_PATH, "w");
-		if (f) { f.write((const uint8_t*)&presentSave_, sizeof presentSave_); f.close(); }
-		presentDirty_ = false;
-	}
+	// Which ESCs are wired (escs::presentMask): derived from each pin's lifecycle state, nothing stored.
 	void printPresent() {
 		console::out().printf("escs|%u/%u|", escs::presentCount(), n_);
 		bool first = true;
@@ -631,12 +614,83 @@ private:
 		console::out().println();
 	}
 
+	// THE SIGNAL PIN LIST (escs::setPins). ESC_SIGNAL_PINS is the default; `pins <gpio>...` stores a
+	// list in /cfg/pins, read once at boot, so a change takes effect after a reboot (the pins are
+	// claimed by the hold, the passthrough and the Thrusters from boot on). `pins default` removes it.
+	//   pins|now|<cfg|default>|16,17,18,19    the list this boot uses, and where it came from
+	//   pins|next|<cfg|default>|16,17         what the next boot uses (same as now unless changed)
+	//   pins|default|10,11                    ESC_SIGNAL_PINS of this build
+	static constexpr const char* PINS_PATH = "/cfg/pins";
+	uint8_t pinsNext_[escs::MAX] = {0};
+	uint8_t pinsNextN_ = 0;
+	bool    pinsNextCfg_ = false;
+	void loadPins() {
+		pinsNextN_ = escs::DEFAULT_COUNT; memcpy(pinsNext_, escs::DEFAULT_PINS, pinsNextN_); pinsNextCfg_ = false;
+		File f = LittleFS.open(PINS_PATH, "r");
+		if (!f) return;
+		char buf[64]; int k = f.read((uint8_t*)buf, sizeof buf - 1); f.close();
+		buf[k > 0 ? k : 0] = 0;
+		uint8_t p[escs::MAX], n = 0, bad = 255;
+		escpins::Err e = escpins::parse(buf, p, n, &bad);
+		if (e == escpins::Err::OK) e = escs::setPins(p, n, &bad);
+		if (e != escpins::Err::OK) {
+			console::out().printf("# pins: %s ignored (", PINS_PATH); pinsWhy(e, bad);
+			console::out().print(") - using the default "); printPinList(escs::DEFAULT_PINS, escs::DEFAULT_COUNT);
+			console::out().println();
+			return;
+		}
+		memcpy(pinsNext_, p, n); pinsNextN_ = n; pinsNextCfg_ = true;
+		console::out().print("# pins: "); printPinList(escs::PINS, escs::COUNT); console::out().printf(" (from %s)\n", PINS_PATH);
+	}
+	void printPinList(const uint8_t* p, uint8_t n) {
+		for (uint8_t i = 0; i < n; i++) console::out().printf(i ? ",%u" : "%u", p[i]);
+	}
+	void pinsWhy(escpins::Err e, uint8_t bad) {   // why a list is refused, e.g. "GP25: Pico W radio"
+		if (bad == 255 || e == escpins::Err::EMPTY || e == escpins::Err::TOO_MANY || e == escpins::Err::BUSY)
+			console::out().print(escpins::errName(e));
+		else console::out().printf("GP%u: %s", bad, e == escpins::Err::RESERVED ? escs::reservedFor(bad) : escpins::errName(e));
+	}
+	void printPins() {
+		console::out().printf("pins|now|%s|", escs::pinsCustom() ? "cfg" : "default"); printPinList(escs::PINS, escs::COUNT);
+		console::out().printf("\npins|next|%s|", pinsNextCfg_ ? "cfg" : "default"); printPinList(pinsNext_, pinsNextN_);
+		console::out().print("\npins|default|"); printPinList(escs::DEFAULT_PINS, escs::DEFAULT_COUNT);
+		console::out().println();
+		if (!escpins::same(pinsNext_, pinsNextN_, escs::PINS, escs::COUNT))
+			console::out().println("# pins: saved; reboot to apply");
+	}
+	// pins | pins <gpio> <gpio>... | pins default
+	void pinsCmd(char* args) {
+		while (args && *args == ' ') args++;
+		if (!args || !*args) { printPins(); console::out().println("ok"); return; }
+		bool def = !strncmp(args, "default", 7) && (args[7] == 0 || args[7] == ' ');
+		uint8_t p[escs::MAX], n = 0, bad = 255;
+		if (!def) {
+			escpins::Err e = escpins::parse(args, p, n, &bad);
+			if (e == escpins::Err::OK) e = escs::checkPins(p, n, &bad);
+			if (e != escpins::Err::OK) { console::out().print("err bad-pins ("); pinsWhy(e, bad); console::out().println(")"); return; }
+		}
+		escs::FsGuard g;
+		if (!g.ok) { console::out().println(BUSY); return; }
+		if (def) {
+			LittleFS.remove(PINS_PATH);
+			pinsNextN_ = escs::DEFAULT_COUNT; memcpy(pinsNext_, escs::DEFAULT_PINS, pinsNextN_); pinsNextCfg_ = false;
+		} else {
+			LittleFS.mkdir(settings::CFG_DIR);
+			File f = LittleFS.open(PINS_PATH, "w");
+			if (!f) { console::out().println("err pins-save: filesystem write failed"); return; }
+			for (uint8_t i = 0; i < n; i++) f.printf(i ? " %u" : "%u", p[i]);
+			f.print("\n"); f.close();
+			memcpy(pinsNext_, p, n); pinsNextN_ = n; pinsNextCfg_ = true;
+		}
+		printPins(); console::out().println("ok");
+	}
+
 #if ESC_LCD
 	// STATUS LCD. With an ESC armed (or arming) it shows the lowest-index one in detail:
 	//   0A T 600 R 1115       index, a=arming / A=armed, DShot value sent, rpm (--- once stale > 0.5 s)
 	//   11.2V c 11  32C       EDT volts, raw current code (the AM32 fork's code x0.05 A), ESC temp
-	// otherwise every ESC's lifecycle state (E empty, P pending, R reading = core1 in its bootloader,
-	// - ready, D driven, L lost, F failed, x not wired) and the mode.
+	// otherwise every ESC's lifecycle state (E empty = not wired, P pending, R reading = core1 in its
+	// bootloader, - ready, D driven, L lost, F failed) and the mode.
 	// The text is rebuilt at 5 Hz; Lcd1602::poll() trickles the changed characters out.
 	static constexpr uint8_t LCD_D_[8] = ESC_LCD_D;
 	Lcd1602  lcd_{ESC_LCD_RS, ESC_LCD_RW, ESC_LCD_E, LCD_D_};
@@ -670,8 +724,7 @@ private:
 			// one cell per ESC: index + lifecycle letter (a flash shows R: core1 has the pin)
 			for (uint8_t i = 0; i < n_ && k < 16; i++) {
 				lc::State st = escs::state(i);
-				k += snprintf(r0 + k, sizeof r0 - k, "%u%c ", i,
-				              !escs::isPresent(i) && st == lc::State::EMPTY ? 'x' : "EPR-DLF"[(uint8_t)st]);
+				k += snprintf(r0 + k, sizeof r0 - k, "%u%c ", i, "EPR-DLF"[(uint8_t)st]);
 			}
 #if ESC_WIFI_STA
 			// S/D = mode, then the LAN address to point the host at; * = a TCP client is attached
@@ -690,7 +743,8 @@ private:
 	// ---- members (were esc_tool.cpp file-scope globals) ----
 	FourWay         fw_;         // esc-configurator / AM32 configurator passthrough on the CLI stream
 	Thruster**      th_;         // NOT owned — main declares the Thrusters and passes them in
-	uint8_t         n_;          // how many
+	uint8_t         n_;          // how many are in use: one per signal pin (escs::COUNT)
+	uint8_t         nThr_;       // how many main declared (settings::load restores every one)
 	As5600Tracker   enc_;
 	bool            encOff_ = false;    // an ESC signal sits on GP16/17, so the encoder stays off
 	Azimuth         az_;
@@ -738,17 +792,16 @@ private:
 	// ================= Web UI handlers (SETUP mode) — ported from esc_tool.cpp =================
 	void hIndex() { server_.send_P(200, "text/html", INDEX_HTML); }
 	void hScan() {
-		String j = "["; uint32_t m = 0;
+		String j = "[";
 		for (uint8_t i = 0; i < n_; i++) {
 			escs::Info in; bool ok = th_[i]->scan(in); if (i) j += ",";
-			if (ok) m |= 1u << i;
-			if (!ok) { j += "{\"present\":false,\"pin\":"; j += Esc::pin(i); j += "}"; }
+			if (!ok) { j += "{\"present\":false,\"pin\":"; j += escs::PINS[i]; j += "}"; }
 			else { char sg[8]; snprintf(sg,sizeof(sg),"%04X",in.sig);
 				j += "{\"present\":true,\"pin\":"; j += in.pin; j += ",\"sig\":\""; j += sg;
 				j += "\",\"layout\":\""; j += jesc(in.layout); j += "\",\"name\":\""; j += jesc(in.name);
 				j += "\",\"fw\":\""; j += in.fwMain; j += "."; j += in.fwSub; j += "\"}"; }
 		}
-		j += "]"; savePresent(m); server_.send(200, "application/json", j);
+		j += "]"; server_.send(200, "application/json", j);
 	}
 	void hRead() {
 		int i = server_.arg("i").toInt(); uint8_t cfg[esc_setup::kEepromLen];
@@ -949,7 +1002,7 @@ private:
 			auto argi = []() { char* a=strtok(nullptr," "); return a?atoi(a):-1; };
 
 			if (!strcmp(cmd,"ping")) { console::out().println("id esc_tool v1"); console::out().println("ok"); }
-			else if (!strcmp(cmd,"pins")) { console::out().printf("pins %u", n_); for(uint8_t i=0;i<n_;i++)console::out().printf(" %u",Esc::pin(i)); console::out().println(); console::out().println("ok"); }
+			else if (!strcmp(cmd,"pins")) pinsCmd(strtok(nullptr, ""));   // pins [<gpio>... | default]: the signal pin list
 			else if (!strcmp(cmd,"fwlist")) { Dir dir=LittleFS.openDir(FW_DIR); int n=0;   // list on-device firmware library
 				while(dir.next()){ String fn=dir.fileName(); int sl=fn.lastIndexOf('/'); if(sl>=0)fn=fn.substring(sl+1);
 					if(fn.endsWith(".hex")){ console::out().printf("fw| %s  %u bytes\n", fn.c_str(), (unsigned)dir.fileSize()); n++; } }
@@ -963,22 +1016,19 @@ private:
 				if (a && !strcmp(a,"drive")) setMode(DRIVE); else if (a && !strcmp(a,"setup")) setMode(SETUP);
 				console::out().printf("mode %s (wifi %s)\n", mode_==SETUP?"setup":"drive", wifiUp_?"on":"off"); console::out().println("ok"); }
 			else if (!strcmp(cmd,"scan")) { if (pwmBusy()) continue; uint32_t m=0; for(uint8_t i=0;i<n_;i++){ escs::Info in;
-				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,Esc::pin(i));
+				if(!th_[i]->scan(in)) console::out().printf("esc|%u|%u|0\n",i,escs::PINS[i]);
 				else { m|=1u<<i; console::out().printf("esc|%u|%u|1|%04X|%u|%s|%s|%u.%u\n",i,in.pin,in.sig,in.bootVer,in.layout,in.name,in.fwMain,in.fwSub); } }
 				// no telemetry means the hold cannot see a plug or a pull on that pin (docs/esc-lifecycle.md)
 				for(uint8_t i=0;i<n_;i++){ lc::Identity id=escs::identity(i);
 					if((m>>i&1) && id.known && !id.bidir) console::out().printf("# esc %u: normal DShot (no telemetry): a swap is not detected; read again after changing it\n",i); }
-				savePresent(m); printPresent(); console::out().println("ok"); }
+				printPresent(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"preset")) { if (!pwmBusy()) presetCmd(); }
 			else if (!strcmp(cmd,"idle")) { char* a=strtok(nullptr," ");   // idle [on|off]: zero-throttle hold (also hot-plug detection)
 				if (a && !strcmp(a,"off")) escs::setHold(false); else if (a && !strcmp(a,"on")) escs::setHold(true);
 				console::out().printf("idle|%s|held=%lx\n", escs::holdActive()?"on":"off", (unsigned long)escs::heldMask()); console::out().println("ok"); }
-			else if (!strcmp(cmd,"escs")) { char* a=strtok(nullptr," ");   // escs [all | <i> <i> ...]: which are wired
-				if (a) { uint32_t m=0; bool bad=false;
-					if (!strcmp(a,"all")) m=~0u;
-					else for (; a; a=strtok(nullptr," ")) { int i=atoi(a); if(i<0||i>=n_) bad=true; else m|=1u<<i; }
-					if (bad) { console::out().println("err bad-index"); continue; }
-					savePresent(m); }
+			else if (!strcmp(cmd,"escs")) { char* a=strtok(nullptr," ");   // escs: which are wired (lifecycle, not set)
+				// rev1 set the wired mask here; it follows the lifecycle now, and `pins` sets the pin list
+				if (a) console::out().println("# escs: wired is learned (telemetry, scan, passthrough); `pins` sets the pin list");
 				printPresent(); console::out().println("ok"); }
 			else if (!strcmp(cmd,"state")) {   // state: per ESC its lifecycle state, what is on the wire, 3D, swap note
 				for(uint8_t i=0;i<n_;i++){ lc::State st=escs::state(i); lc::Identity id=escs::identity(i);
@@ -1266,7 +1316,7 @@ private:
 					else console::out().println("err cfg-save: filesystem write failed"); }
 				else if(!strcmp(sub,"load")) { bool anyArmed=false; for(uint8_t i=0;i<n_;i++) if(th_[i]->armed()) anyArmed=true;
 					if(anyArmed) console::out().println("err cfg-load: disarm first (replaces the FF curve)");
-					else { uint16_t sv=0; int k=settings::load(th_,n_,&sv); if(k>0) { console::out().printf("cfg|restored %d ESC(s)\n", k); console::out().println("ok"); }
+					else { uint16_t sv=0; int k=settings::load(th_,nThr_,&sv); if(k>0) { console::out().printf("cfg|restored %d ESC(s)\n", k); console::out().println("ok"); }
 						else if(sv && sv!=settings::CFG_VERSION) console::out().printf("err cfg-load: stored config is v%u, this build wants v%u — re-save\n", sv, settings::CFG_VERSION);
 						else console::out().println("err cfg-load: no valid stored config (magic/size/CRC)"); } }
 				else if(!strcmp(sub,"clear")) { escs::FsGuard g;

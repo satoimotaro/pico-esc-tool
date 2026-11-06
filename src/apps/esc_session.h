@@ -23,6 +23,7 @@
 #include "blheli_bl.h"
 #include "esc_setup.h"
 #include "esc_lifecycle.h"
+#include "esc_pins.h"
 #include <hardware/pwm.h>
 #include <hardware/clocks.h>
 #include <hardware/sync.h>
@@ -30,8 +31,45 @@
 
 namespace escs {
 
-static const uint8_t PINS[]  = ESC_SIGNAL_PINS;   // signal pin(s) per ESC — edit in esc_config.h
-static const uint8_t COUNT   = sizeof(PINS) / sizeof(PINS[0]);
+// The signal pin per ESC, in ESC-index order. ESC_SIGNAL_PINS (esc_config.h) is the default; a list
+// stored in LittleFS (/cfg/pins, the `pins` command) replaces it at boot, through setPins() below.
+// Every per-ESC array is sized MAX; COUNT is how many of them this boot uses.
+static const uint8_t MAX = escpins::MAX;
+static constexpr uint8_t DEFAULT_PINS[] = ESC_SIGNAL_PINS;
+static const uint8_t DEFAULT_COUNT = sizeof(DEFAULT_PINS) / sizeof(DEFAULT_PINS[0]);
+static uint8_t PINS[MAX] = ESC_SIGNAL_PINS;
+static uint8_t COUNT     = DEFAULT_COUNT;
+static bool    pinsFromCfg = false;                // PINS came from /cfg/pins (else the default)
+
+// GPIOs this build uses for something else, never an ESC signal pin: the Pico W radio, the LCD bus
+// (ESC_LCD), the UART console (ESC_CONSOLE_UART), the mode pin (ESC_MODE_PIN). The AS5600 encoder's
+// GP16/17 are not here: an ESC on them switches the encoder off (EscTool::begin).
+namespace detail {
+	static constexpr uint8_t LCD_PINS[] = ESC_LCD_D;
+	constexpr uint32_t lcdMask() {
+		uint32_t m = (1u << ESC_LCD_RS) | (1u << ESC_LCD_RW) | (1u << ESC_LCD_E);
+		for (uint8_t p : LCD_PINS) m |= 1u << p;
+		return m;
+	}
+}
+static constexpr uint32_t RESERVED = escpins::RADIO
+	| (ESC_LCD ? detail::lcdMask() : 0u)
+	| (ESC_CONSOLE_UART ? (1u << ESC_UART_TX) | (1u << ESC_UART_RX) : 0u)
+	| (ESC_MODE_PIN >= 0 ? 1u << (ESC_MODE_PIN & 31) : 0u);
+static_assert(escpins::check(DEFAULT_PINS, DEFAULT_COUNT, RESERVED) == escpins::Err::OK,
+              "ESC_SIGNAL_PINS: 1..8 distinct GPIOs, none used by this build (radio, LCD, UART, mode pin)");
+// What a reserved GPIO is used for (an `err` reason).
+inline const char* reservedFor(uint8_t g) {
+	if (escpins::RADIO >> g & 1) return "Pico W radio";
+	if (ESC_LCD && (detail::lcdMask() >> g & 1)) return "LCD";
+	if (ESC_CONSOLE_UART && (g == ESC_UART_TX || g == ESC_UART_RX)) return "UART console";
+	if (ESC_MODE_PIN >= 0 && g == ESC_MODE_PIN) return "mode pin";
+	return "this build";
+}
+// Is p[0..n) allowed as the pin list (escpins::check against RESERVED)? bad = the offending GPIO.
+inline escpins::Err checkPins(const uint8_t* p, uint8_t n, uint8_t* bad = nullptr) {
+	return escpins::check(p, n, RESERVED, bad);
+}
 
 struct Info {
 	bool     present = false;
@@ -118,8 +156,8 @@ namespace detail {
 	static int8_t        armBusy = -1;                 // the written session that refused the last spinArm
 	static volatile bool sessionLost = false;
 	static uint8_t       kaMiss = 0;                   // core1
-	static Info          infoCache[COUNT];             // Op::LEARN results for the session's pin
-	static lc::Identity  identCache[COUNT];
+	static Info          infoCache[MAX];             // Op::LEARN results for the session's pin
+	static lc::Identity  identCache[MAX];
 	// The async read (Op::READID) writes only these; core0 adopts them when it collects the job.
 	static Info          jobInfo;
 	static lc::Identity  jobIdent;
@@ -133,22 +171,29 @@ namespace detail {
 	// 4-way passthrough (fourway.h): an ESC once connected stays in its bootloader while another is
 	// selected, so coming back to it re-adopts its cached reply instead of a second BootInit (which
 	// AM32 does not answer).
-	static bool     fwHave[COUNT] = { false };
-	static uint8_t  fwRaw[COUNT][8];
-	static bool     fwAm32[COUNT] = { false };
+	static bool     fwHave[MAX] = { false };
+	static uint8_t  fwRaw[MAX][8];
+	static bool     fwAm32[MAX] = { false };
 	static volatile uint8_t fwIdx = 0;
 	// An ESC that never answered stays failed until the next fwBegin, so a configurator polling every
 	// reported channel pays the timeout once per session, not on every read.
-	static bool     fwMiss[COUNT] = { false };
-	static bool     fwDone[COUNT] = { false };   // fwRun already left its bootloader (DeviceReset)
+	static bool     fwMiss[MAX] = { false };
+	static bool     fwDone[MAX] = { false };   // fwRun already left its bootloader (DeviceReset)
 	static bool     fwActive = false;            // the configurator owns every pin: no hold, no jobs
 	static uint32_t fwBeginMs = 0;
-	// Which of PINS have an ESC on them, as last found by a scan (EscTool keeps it in LittleFS).
-	// Only these are offered to a configurator. Bit i = PINS[i]; all set until something is known.
-	static uint32_t present = ~0u;
+	static bool     fwSettled = false;           // the shared settle after fwBegin has been waited out
+	// The passthrough's probe (fwChannel): pins [0, fwProbed) have had their one BootInit, and fwHit
+	// says which answered. The configurator's channels are the hits in pin order, gaps closed.
+	static uint8_t  fwProbed = 0;
+	static uint32_t fwHit = 0;
+	// Which pins have an ESC on them outside a passthrough: the ones whose lifecycle state is not
+	// EMPTY (wiredLive). A motor test numbers its channels over that set, so while one runs the set is
+	// held (holdWired): an ESC appearing or vanishing must not shift a channel onto another ESC.
+	static bool     wiredHeld = false;
+	static uint32_t wiredSnap = 0;
 	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
 	// The lifecycle: one state per pin, and what the hold / LOST handling do with it.
-	static lc::Pin    pin[COUNT];
+	static lc::Pin    pin[MAX];
 	static lc::Policy policy = lc::Policy::TOOL;
 	static bool       holdOn = false;              // EscTool turns it on; the legacy esc_tool keeps it off
 	static uint8_t    evIdx[8]; static lc::Ev evEv[8]; static lc::State evSt[8];
@@ -159,45 +204,44 @@ namespace detail {
 		if (n == evTail) evTail = (evTail + 1) & 7;   // full: the oldest goes
 		evIdx[evHead] = i; evEv[evHead] = e; evSt[evHead] = pin[i].st; evHead = n;
 	}
-	static bool presentAdded = false;              // an async read found an ESC on an unlisted pin
 	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
-	static BidirDShotX1*     drvB[COUNT] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
-	static DShotX4*          drvN[COUNT] = { nullptr };   // normal DShot: idle LOW, throttle only
-	static volatile uint16_t drvTarget[COUNT] = { 0 };
-	static uint32_t          drvLast[COUNT] = { 0 };
-	static bool              drvArmed[COUNT] = { false };
-	static uint32_t          drvArmStart[COUNT] = { 0 };
-	static uint16_t          drvArmMs[COUNT] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
-	static uint32_t          drvAnswer[COUNT] = { 0 };  // this arm's first telemetry (0 = none yet)
+	static BidirDShotX1*     drvB[MAX] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
+	static DShotX4*          drvN[MAX] = { nullptr };   // normal DShot: idle LOW, throttle only
+	static volatile uint16_t drvTarget[MAX] = { 0 };
+	static uint32_t          drvLast[MAX] = { 0 };
+	static bool              drvArmed[MAX] = { false };
+	static uint32_t          drvArmStart[MAX] = { 0 };
+	static uint16_t          drvArmMs[MAX] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
+	static uint32_t          drvAnswer[MAX] = { 0 };  // this arm's first telemetry (0 = none yet)
 	                                                    // a re-arm after a run-mode stop can be short
-	static uint8_t           drvEdt[COUNT] = { 0 };       // frames of EDT-enable left to send (bidir arm)
-	static bool              drvRan[COUNT] = { false };   // ran since the ESC was last seen stopped (eRPM 0)
-	static uint32_t          drvEdtMs[COUNT] = { 0 };     // last EDT burst while stopped
+	static uint8_t           drvEdt[MAX] = { 0 };       // frames of EDT-enable left to send (bidir arm)
+	static bool              drvRan[MAX] = { false };   // ran since the ESC was last seen stopped (eRPM 0)
+	static uint32_t          drvEdtMs[MAX] = { 0 };     // last EDT burst while stopped
 	static const uint32_t    EDT_REFRESH_MS = 1000, EDT_RAN_MS = 100;
-	static lc::Stall         stall[COUNT];                // the stall watch (streamPin) and its hold
-	static bool              drvInitFail[COUNT] = { false }; // the last driver start found no free PIO SM
-	static uint32_t          drvRetryMs[COUNT] = { 0 };   // ... the hold tries again from here
-	static uint32_t          drvStartMs[COUNT] = { 0 };   // when this stream started (the prime counts it)
-	static uint32_t          drvPollMs[COUNT] = { 0 };    // when its telemetry was last polled
-	static uint16_t          drvKb[COUNT] = { 0 };        // the bitrate it was started at
-	static Telem             drvTele[COUNT];
-	static Drive             armMode[COUNT] = { Drive::AUTO };   // what the pending/last arm asked for
-	static uint16_t          armMsReq[COUNT] = { 0 };
-	static bool              armStart[COUNT] = { false };  // RUNNING after a read: start the arm stream
+	static lc::Stall         stall[MAX];                // the stall watch (streamPin) and its hold
+	static bool              drvInitFail[MAX] = { false }; // the last driver start found no free PIO SM
+	static uint32_t          drvRetryMs[MAX] = { 0 };   // ... the hold tries again from here
+	static uint32_t          drvStartMs[MAX] = { 0 };   // when this stream started (the prime counts it)
+	static uint32_t          drvPollMs[MAX] = { 0 };    // when its telemetry was last polled
+	static uint16_t          drvKb[MAX] = { 0 };        // the bitrate it was started at
+	static Telem             drvTele[MAX];
+	static Drive             armMode[MAX] = { Drive::AUTO };   // what the pending/last arm asked for
+	static uint16_t          armMsReq[MAX] = { 0 };
+	static bool              armStart[MAX] = { false };  // RUNNING after a read: start the arm stream
 	// Per-ESC overrides (0 = use the global ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default). Set via
 	// escs::setKbaud/setPoles so different ESCs/motors on the same board can differ (e.g. a 300 kbaud
 	// A_H_30 next to a 600 kbaud unit, or motors with different pole counts). Additive: untouched =>
 	// identical behavior to before, so the legacy esc_tool build is unaffected.
-	static uint16_t          drvKbaud[COUNT] = { 0 };
-	static uint8_t           drvPoles[COUNT] = { 0 };
+	static uint16_t          drvKbaud[MAX] = { 0 };
+	static uint8_t           drvPoles[MAX] = { 0 };
 	static inline uint16_t   kbaudOf(uint8_t i) { return drvKbaud[i] ? drvKbaud[i] : (uint16_t)DSHOT_KBAUD; }
 	static inline uint8_t    polesOf(uint8_t i) { return drvPoles[i] ? drvPoles[i] : (uint8_t)MOTOR_POLES; }
 	// Servo PWM (50 Hz, 1000..2000 us) instead of DShot, for firmwares that take it (AM32, stock
 	// BLHeli-S; Bluejay does not). Hardware PWM slice, not PIO. pwmUs = 0: the pin is not on PWM.
-	static volatile uint16_t pwmUs[COUNT] = { 0 }, pwmStop[COUNT] = { 0 };   // read by the deadman IRQ; pwmStop: 1500 on a 3D ESC
-	static volatile uint32_t pwmLast[COUNT] = { 0 };
-	static uint32_t          pwmStart[COUNT] = { 0 };
-	static bool              pwmZero[COUNT] = { false };   // a stop width came after the arm (lc::pwmGate)
+	static volatile uint16_t pwmUs[MAX] = { 0 }, pwmStop[MAX] = { 0 };   // read by the deadman IRQ; pwmStop: 1500 on a 3D ESC
+	static volatile uint32_t pwmLast[MAX] = { 0 };
+	static uint32_t          pwmStart[MAX] = { 0 };
+	static bool              pwmZero[MAX] = { false };   // a stop width came after the arm (lc::pwmGate)
 	static uint8_t           blDepth = 0;                  // inside a sync bootloader visit: PWM sends its stop width
 	static inline bool pwmOn(uint8_t i) { return pwmUs[i] != 0; }
 	// IRQs off: a slice's two pins share one CC register, and the deadman alarm below writes it too.
@@ -273,7 +317,7 @@ namespace detail {
 
 	static const uint32_t POLL_GAP_MS = 50;      // a pin not polled this long: core0 was away
 	static const uint8_t  SLOW_GAPS = 5;         // gaps in a row: say so (Ev::SLOW_LOOP), once per run
-	static uint8_t        gapRun[COUNT] = { 0 };
+	static uint8_t        gapRun[MAX] = { 0 };
 	// A loop held up (a blocking op that does not pump) is not an ESC gone quiet: the lifecycle's
 	// clocks move on by the gap, and the stall clocks restart. A loop slow on every pass would keep
 	// LOST, SILENT and the stall's silence rule from ever firing, so repeated gaps are reported. Only
@@ -392,10 +436,7 @@ namespace detail {
 		op = Op::NONE; jobIdx = -1; jobPhase = 0; jobAbort = false;
 		if (aborted && !ok) { pin[i].onReadAborted(); return; }
 		lc::Ev e = pin[i].onReadDone(ok, jobIdent);
-		if (ok) {
-			infoCache[i] = jobInfo; identCache[i] = jobIdent;
-			if (!(present >> i & 1)) { present |= 1u << i; presentAdded = true; }   // found on an unlisted pin
-		}
+		if (ok) { infoCache[i] = jobInfo; identCache[i] = jobIdent; }
 		evPush(i, e);
 		if (pin[i].st == lc::State::RUNNING) armStart[i] = true;
 	}
@@ -570,12 +611,15 @@ inline void release() { detail::closeSession(); }
 
 // Per-ESC drive config (call BEFORE spinArm; takes effect at the next arm). 0 restores the global
 // ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default. Lets a Thruster carry its own bitrate / pole count.
-inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < COUNT) detail::drvKbaud[idx] = kbaud; }
-inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < COUNT) detail::drvPoles[idx] = poles; }
+// Any index below MAX: main binds its Thrusters before EscTool::begin applies the pin list.
+inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < MAX) detail::drvKbaud[idx] = kbaud; }
+inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < MAX) detail::drvPoles[idx] = poles; }
 
 // ---- lifecycle (core0) -------------------------------------------------------------------------
-// The idle hold: zero throttle on every wired pin that is not driven (bidir until it is read, then
-// its own protocol). It is also the hot-plug detector, so with it off a plug-in is not seen either.
+// The idle hold: zero throttle on every configured pin that is not driven (bidir until it is read,
+// then its own protocol). It is also the hot-plug detector, so with it off a plug-in is not seen
+// either. Each held pin takes a PIO SM: past the budget (newBidir/newNormal) a pin gets init-fail
+// and is tried again every second, so with more than 4 pins list the wired ones first.
 inline void setHold(bool on) {
 	using namespace detail;
 	holdOn = on;
@@ -601,9 +645,6 @@ inline bool pollEvent(uint8_t& idx, lc::Ev& e, lc::State& st) {
 	idx = evIdx[evTail]; e = evEv[evTail]; st = evSt[evTail]; evTail = (evTail + 1) & 7;
 	return true;
 }
-// An async read found an ESC on a pin not in presentMask(): it is added (true once, so the caller
-// can persist the mask).
-inline bool presentGrew() { bool g = detail::presentAdded; detail::presentAdded = false; return g; }
 inline bool passthroughActive() { return detail::fwActive; }
 
 // ---- drive / spin (core0) ----------------------------------------------------------------------
@@ -731,7 +772,6 @@ inline bool spinArming(uint8_t idx) {
 }
 inline uint16_t spinTarget(uint8_t idx) { return idx < COUNT ? detail::drvTarget[idx] : 0; }   // DShot value being sent
 inline bool inBootloader(uint8_t idx)   { return detail::session == (int8_t)idx; }
-inline bool isPresent(uint8_t i);
 // RUNNING -> READY. The hold keeps the (armed) zero stream, so the next arm from READY is instant.
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
@@ -739,7 +779,7 @@ inline void spinStop(uint8_t idx) {
 	drvTarget[idx] = 0; drvInitFail[idx] = false; armStart[idx] = false; stall[idx].reset();
 	pin[idx].onStop();
 	if (pwmOn(idx)) pwmOff(idx);
-	if ((!holdOn || !isPresent(idx)) && (int8_t)idx != jobIdx) drvFree(idx);
+	if (!holdOn && (int8_t)idx != jobIdx) drvFree(idx);
 }
 inline void spinDisarm(uint8_t idx) { spinStop(idx); }
 inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
@@ -792,7 +832,7 @@ namespace detail {
 	// or the drive stream an arm asked for.
 	static void applyOutput(uint8_t i, uint32_t now) {
 		if (pwmOn(i) || (int8_t)i == jobIdx || (int8_t)i == session) return;
-		lc::Out o = pin[i].output(holdOn && isPresent(i));
+		lc::Out o = pin[i].output(holdOn);
 		if (o == lc::Out::NONE) { if (drvActive(i)) drvFree(i); return; }
 		if (o == lc::Out::DRIVE) { if (armStart[i]) { armStart[i] = false; startArm(i); } return; }
 		bool wantB = o == lc::Out::ZERO_BIDIR || pin[i].id.bidir;
@@ -899,41 +939,99 @@ inline UiState uiState(uint8_t i) {
 
 // ---- 4-way passthrough (fourway.h) -------------------------------------------------------------
 // fwBegin: stop driving, and hold every signal line high so each ESC drops into its bootloader
-// (what Betaflight's esc4wayInit does). fwSelect: make idx the session — the cached reply if it is
-// still in its bootloader, else a BootInit, else the full DShot-prime entry — and return its raw
-// 8-byte reply. Switching does NOT run the previous ESC; fwEnd runs every ESC that was entered.
-// fwBegin primes every wired ESC with zero-throttle DShot for PRIME_MS, all at once, then holds
-// the lines high. Both firmwares take that signal loss as "go to the bootloader": BLHeli-S needs
-// the valid frames first (a bare high line leaves it waiting for signal), AM32 needs ~2 s without
-// them plus its reboot. So by fwBeginMs + AM32_HOLD_MS every ESC is in, in parallel, and the
-// configurator's first InitFlash of each costs at most that wait. One that still won't answer gets
-// the full entry ladder once, then stays failed for the session.
-// Lifecycle: every wired pin is READING for the whole passthrough (no hold, no async read). fwRun
-// learns the ESC before it runs it (READY, or FAILED); fwEnd sends a pin that was never selected
-// back to EMPTY/FAILED if it started there, else to PENDING (it may have been swapped meanwhile).
+// (what Betaflight's esc4wayInit does). fwChannel: the configurator's channel -> a pin that answered
+// the probe. fwSelect: make idx the session — the cached reply if it is still in its bootloader, else
+// a BootInit, else the full DShot-prime entry — and return its raw 8-byte reply. Switching does NOT
+// run the previous ESC; fwEnd runs every ESC that was entered.
+// fwBegin primes every configured pin with zero-throttle DShot for PRIME_MS, all at once (in turns
+// of as many as there are free PIO SMs), then holds the lines high. Both firmwares take that signal
+// loss as "go to the bootloader": BLHeli-S needs the valid frames first (a bare high line leaves it
+// waiting for signal), AM32 needs ~2 s without them plus its reboot. So by fwBeginMs + AM32_HOLD_MS
+// every ESC is in, in parallel, and the configurator's first InitFlash costs at most that wait.
+// Which pins are offered comes from that, not from anything stored: the first channel lookup after
+// the settle probes the pins in order, one BootInit each (CONNECT, up to 500 ms on a bare pin), only
+// as far as the channel asked for. A pin that answers is a channel (gaps closed). One that does not
+// gets the full entry ladder only if its lifecycle knew an ESC there (lc::Pin::ptRetry: it may be
+// stuck in its app); an EMPTY one is simply absent, so a missing ESC costs 0.5 s, not ~11 s. The
+// MSP_SET_PASSTHROUGH answer must come within the configurator's 1 s MSP timeout, long before the
+// settle, so it offers every configured pin (count()); the channels past the last hit then answer
+// "invalid channel" at once.
+// Lifecycle: every configured pin is READING for the whole passthrough (no hold, no async read).
+// fwRun learns the ESC before it runs it (READY, or FAILED); fwEnd sends a pin that was never
+// selected back to EMPTY/FAILED if it started there, else to PENDING (it may have been swapped).
 inline void fwEnd();
 inline void fwBegin() {
 	using namespace detail;
 	if (fwActive) fwEnd();
 	jobStop(true);                               // a background read gives its pin back first
 	spinStopAll(); release();
-	fwActive = true;
-	BidirDShotX1* pr[COUNT] = { nullptr };
+	fwActive = true; fwSettled = false; fwProbed = 0; fwHit = 0;
 	for (uint8_t i = 0; i < COUNT; i++) {
 		drvFree(i);                              // the hold too: the configurator owns every pin
 		fwHave[i] = fwMiss[i] = fwDone[i] = false;
-		if (present >> i & 1) { pin[i].onPassthroughBegin(); pr[i] = newBidir(PINS[i], DSHOT_KBAUD); }
+		pin[i].onPassthroughBegin();
 	}
-	uint32_t t0 = millis();
-	while (millis() - t0 < PRIME_MS) {
-		for (uint8_t i = 0; i < COUNT; i++) if (pr[i] && !pr[i]->initError()) pr[i]->sendThrottle(0);
-		pump(); delayMicroseconds(300);
+	// bidir fits only pio0's 4 SMs on a Pico W: more pins than that are primed in a second turn. Each
+	// line goes high right after its own prime (BLHeli-S checks it as it resets into its bootloader).
+	uint32_t left = (1u << COUNT) - 1;
+	while (left) {
+		BidirDShotX1* pr[MAX] = { nullptr };
+		uint32_t turn = 0;
+		for (uint8_t i = 0; i < COUNT; i++) {
+			if (!(left >> i & 1)) continue;
+			pr[i] = newBidir(PINS[i], DSHOT_KBAUD);
+			if (pr[i]->initError()) { delete pr[i]; pr[i] = nullptr; } else turn |= 1u << i;
+		}
+		uint32_t t0 = millis();
+		while (turn && millis() - t0 < PRIME_MS) {
+			for (uint8_t i = 0; i < COUNT; i++) if (pr[i]) pr[i]->sendThrottle(0);
+			pump(); delayMicroseconds(300);
+		}
+		for (uint8_t i = 0; i < COUNT; i++) {
+			if (!(turn >> i & 1)) continue;
+			delete pr[i];
+			pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);
+		}
+		left = turn ? left & ~turn : 0;          // no SM at all: the rest go unprimed (AM32 needs none)
 	}
-	for (uint8_t i = 0; i < COUNT; i++) {
-		delete pr[i];
-		pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);
-	}
+	for (uint8_t i = 0; i < COUNT; i++) { pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
 	fwBeginMs = millis();
+}
+namespace detail {
+	// Stay quiet until the hold has done its work: a BootInit while the ESC is still on its way into
+	// the bootloader is garbage to it, and sends it back to the app. AM32 reboots into its bootloader
+	// only ~2 s after the frames stop, plus its startup tune. Nothing says which firmware is on a pin,
+	// so every pin gets the AM32 wait, once per passthrough.
+	static void fwSettle() {
+		if (fwSettled) return;
+		uint32_t settle = AM32_HOLD_MS + 500;
+		while (millis() - fwBeginMs < settle) { pump(); delayMicroseconds(200); }
+		fwSettled = true;
+	}
+	// The probe of pin i: one CONNECT; the entry ladder only where an ESC was known (see above).
+	static void fwProbe(uint8_t i) {
+		fwSettle();
+		session = -1; fwIdx = i;
+		bool ok = runOp(Op::CONNECT, PINS[i]);
+		if (!ok && pin[i].ptRetry()) ok = enterBootloader(PINS[i]);
+		fwHave[i] = ok; fwMiss[i] = !ok;
+		if (!ok) return;
+		fwHit |= 1u << i;
+		session = (int8_t)i; sessLearned = sessionWrote = false; sessLastOpMs = millis();
+		memcpy(fwRaw[i], lastRaw, 8); fwAm32[i] = lastAm32;
+	}
+}
+// The configurator's channel ch -> the pin index that answered as the ch-th, probing further pins
+// (in order) only when the hits so far do not reach ch. -1: no such ESC.
+inline int8_t fwChannel(uint8_t ch) {
+	using namespace detail;
+	if (!fwActive) return -1;
+	for (;;) {
+		uint8_t k = ch;
+		for (uint8_t i = 0; i < fwProbed; i++) if ((fwHit >> i & 1) && k-- == 0) return (int8_t)i;
+		if (fwProbed >= COUNT) return -1;
+		fwProbe(fwProbed++);
+	}
 }
 inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	using namespace detail;
@@ -944,16 +1042,9 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	session = -1; fwIdx = idx;
 	bool ok;
 	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
-	else {
-		// Stay quiet until the hold has done its work: a BootInit while the ESC is still on its way
-		// into the bootloader is garbage to it, and sends it back to the app.
-		// AM32 reboots into its bootloader only ~2 s after the frames stop, plus its startup tune.
-		// Nothing persisted says which firmware is on the pin, so every ESC gets the AM32 wait.
-		uint32_t settle = AM32_HOLD_MS + 500;
-		while (millis() - fwBeginMs < settle) { pump(); delayMicroseconds(200); }
-		ok = runOp(Op::CONNECT, PINS[idx]);
-	}
-	if (!ok) ok = enterBootloader(PINS[idx]);
+	else { fwSettle(); ok = runOp(Op::CONNECT, PINS[idx]); }
+	// it answered this passthrough, or the lifecycle knew it: worth the full entry
+	if (!ok && ((fwHit >> idx & 1) || pin[idx].ptRetry())) ok = enterBootloader(PINS[idx]);
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
 	if (!ok) return false;
 	session = (int8_t)idx; sessLearned = sessionWrote = false; sessLastOpMs = millis();
@@ -978,14 +1069,34 @@ inline void fwEnd() {
 	using namespace detail;
 	for (uint8_t i = 0; i < COUNT; i++) fwRun(i);
 	for (uint8_t i = 0; i < COUNT; i++)
-		if ((present >> i & 1) && !fwDone[i]) pin[i].onPassthroughEnd(false, false, lc::Identity{});
-	fwActive = false;
+		if (!fwDone[i]) pin[i].onPassthroughEnd(false, false, lc::Identity{});
+	fwActive = false; fwHit = 0; fwProbed = 0;
 }
 inline uint8_t count() { return COUNT; }
 
 // ---- which ESCs are wired ----------------------------------------------------------------------
-inline uint32_t presentMask() { return detail::present & ((1u << COUNT) - 1); }
-inline void     setPresent(uint32_t m) { detail::present = m; }
+// Nothing is stored: a pin is wired when its lifecycle state is not EMPTY (telemetry seen, a read,
+// a passthrough probe that answered), and during a passthrough when it answered the probe. The MSP
+// motor count, the motor test's channels and `escs` all use this. A stock BLHeli_S (no telemetry)
+// is EMPTY until it is read once (`scan`, a configurator read).
+namespace detail {
+	static inline uint32_t wiredLive() {
+		uint32_t m = 0;
+		for (uint8_t i = 0; i < COUNT; i++) if (pin[i].st != lc::State::EMPTY) m |= 1u << i;
+		return m;
+	}
+}
+// Hold the wired set as it is now (on), or follow the lifecycle again (off). EscTool holds it while a
+// motor test (or anything else) is driving, so its channel numbering cannot move under it.
+inline void holdWired(bool on) {
+	using namespace detail;
+	if (on && !wiredHeld) wiredSnap = wiredLive();
+	wiredHeld = on;
+}
+inline uint32_t presentMask() {
+	using namespace detail;
+	return fwActive ? fwHit : wiredHeld ? wiredSnap : wiredLive();
+}
 inline bool     isPresent(uint8_t i) { return i < COUNT && (presentMask() >> i & 1); }
 inline bool     identFailed(uint8_t i) { return i < COUNT && detail::pin[i].st == lc::State::FAILED; }
 // Configured reversible (3D), as read from the ESC on the pin now (false while unknown).
@@ -998,6 +1109,20 @@ inline int8_t   presentIndex(uint8_t k) {
 	for (uint8_t i = 0; i < COUNT; i++) if (isPresent(i) && k-- == 0) return (int8_t)i;
 	return -1;
 }
+
+// ---- the pin list (boot) -----------------------------------------------------------------------
+// Use p[0..n) as the signal pins instead of ESC_SIGNAL_PINS. Boot only (EscTool::begin, after
+// LittleFS and before the hold starts): nothing may be streaming, held or read yet. Refused (the
+// default stays) unless checkPins() allows it; bad = the offending GPIO.
+inline escpins::Err setPins(const uint8_t* p, uint8_t n, uint8_t* bad = nullptr) {
+	using namespace detail;
+	escpins::Err e = checkPins(p, n, bad);
+	if (e != escpins::Err::OK) return e;
+	if (spinning() || session >= 0 || jobIdx >= 0 || fwActive) return escpins::Err::BUSY;
+	memcpy(PINS, p, n); COUNT = n; pinsFromCfg = true;
+	return escpins::Err::OK;
+}
+inline bool pinsCustom() { return pinsFromCfg; }
 
 // LittleFS mutations go inside one of these: core1 parks in its idle branch (never mid-op or
 // mid-keepalive) until it goes out of scope. ok=false (an ESC read is in flight, or core1 did not

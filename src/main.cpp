@@ -18,13 +18,15 @@
 //       }
 //
 // The escs:: engine (esc_session.h) is the singleton hardware layer (2 PIO SMs + one core1 1-wire
-// worker); each Thruster is a per-ESC object delegating to it by index. Add an ESC = add a pin to
-// ESC_SIGNAL_PINS (esc_config.h) and a Thruster below.
+// worker); each Thruster is a per-ESC object delegating to it by index. There is one Thruster per
+// possible ESC (escs::MAX); which GPIOs, and how many, is the pin list: ESC_SIGNAL_PINS (esc_config.h)
+// by default, or `pins <gpio>...` at run time (stored, applied at the next boot). EscTool uses the
+// first escs::COUNT of them.
 #include "apps/thruster.h"
 #include "apps/esc_tool_app.h"
 #include "apps/profiles.h"
 
-// --- Declare the ESCs (one Thruster each). pin = ESC_SIGNAL_PINS[bind index]; the rest is per-ESC.
+// --- Declare the ESCs (one Thruster each). pin = the pin list's [bind index]; the rest is per-ESC.
 //     esc1 = 930KV, SINE config (sine_mode=2): forced-sine gives a smooth low-speed start and the
 //     firmware's virtual-eRPM telemetry lets the loop climb through sine into 6-step from rest. `rpm 0`
 //     stops cleanly via a proper NEUTRAL (thruster.h holds throttle 0 while armed; the BlueGill firmware
@@ -32,16 +34,16 @@
 //     the next non-zero target restarts with no re-arm. Apply the matching ESC config once:
 //         esctool apply 1 host/profiles/rpm_930kv_sine2.yaml
 //     (For a pure 6-step / no-sine setup use profiles::M_930KV_SINEOFF + host/profiles/rpm_930kv_sineoff.yaml.) ---
-static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // pin 10: RAW / uncalibrated
-static Thruster esc1(&profiles::M_930KV_12N14P_6STEP, /*dshotKbaud=*/300, /*motorPoles=*/14);  // pin 11: 930KV sine closed-loop
-
-#if ESC_BOARD_PANEL
-static Thruster esc2(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // PWM3: RAW / uncalibrated
-static Thruster esc3(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // PWM4: RAW / uncalibrated
-static Thruster*    THRUSTERS[] = { &esc0, &esc1, &esc2, &esc3 };
-#else
-static Thruster*    THRUSTERS[] = { &esc0, &esc1 };
-#endif
+static Thruster esc0(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);        // ESC 0 (GP10 / PWM1): RAW / uncalibrated
+static Thruster esc1(&profiles::M_930KV_12N14P_6STEP, /*dshotKbaud=*/300, /*motorPoles=*/14);  // ESC 1 (GP11 / PWM2): 930KV sine closed-loop
+// ESC 2..7: RAW / uncalibrated, used when the pin list has that many pins (the panel's PWM3/PWM4 by default)
+static Thruster esc2(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);
+static Thruster esc3(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);
+static Thruster esc4(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);
+static Thruster esc5(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);
+static Thruster esc6(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);
+static Thruster esc7(&profiles::M_LINEAR, ESC_DSHOT_KBAUD, ESC_MOTOR_POLES);
+static Thruster*    THRUSTERS[escs::MAX] = { &esc0, &esc1, &esc2, &esc3, &esc4, &esc5, &esc6, &esc7 };
 static const uint8_t NTHR = sizeof(THRUSTERS) / sizeof(THRUSTERS[0]);
 
 // --- The tool surface over those ESCs (config/flash + serial CLI + Wi-Fi). Omit for a bare ROV. ---

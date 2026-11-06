@@ -62,7 +62,7 @@ public:
 		io_.owner = this;
 	}
 
-	// Attach this object to an escs:: index (its wired pin = ESC_SIGNAL_PINS[index]) and push its
+	// Attach this object to an escs:: index (its wired pin = escs::PINS[index], the pin list) and push its
 	// per-ESC DShot config into the engine. Call once, before arming.
 	void bind(uint8_t index) {
 		index_ = index;
