@@ -177,9 +177,9 @@ with this firmware or with any Betaflight flight controller. Static files, no bu
 `python3 -m http.server -d web` and open `http://localhost:8000`, or the GitHub Pages copy
 (`.github/workflows/pages.yml`). Known-good settings per motor: [`docs/motor-settings.md`](docs/motor-settings.md).
 Connected to this firmware, the settings tab also shows the ESC signal pins and edits them (the
-`pins` command; the Pico uses a saved list after it restarts). A read offers every signal pin and
-stops at the first one with no ESC: the firmware probes the pins after the passthrough's settle,
-and an empty pin costs 0.5 s, not ~11 s.
+`pins` command; the Pico uses a saved list after it restarts). ESC k is signal pin k everywhere (the
+CLI index, the configurators' ESC and motor k), whether an ESC is on it or not; an empty pin costs
+0.5 s in a read, not ~11 s, and a settings write first checks that the ESC is still the one read.
 
 The motor test re-sends its values every 100 ms and the firmware stops the motors after 2 s of MSP
 silence, after the USB port closes, or when a passthrough starts; the page also stops on Esc/Space,

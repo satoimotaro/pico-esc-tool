@@ -268,25 +268,36 @@ neither needs a rebuild or a `scan` any more.
   `cfg save` stores the first `COUNT`.
 - The legacy `esc_tool` env keeps the compile-time list.
 
+### One index per pin
+
+- ESC k is `PINS[k]` everywhere: the CLI index, MSP motor k (MOTOR, MOTOR_CONFIG, MOTOR_TELEMETRY,
+  SET_MOTOR, `mtmode` bit k, `pwmch k`), the passthrough channel k and the web page's ESC k. The MSP
+  motor count is the number of configured pins, so a configurator that reads it once at connect
+  (the AM32 configurator hides its Read button at 0) always sees them. No numbering depends on which
+  ESCs answer, so a plug-in or a pull, mid-test or not, never moves a channel onto another ESC.
+- A pin with no ESC reports state 5 (absent) in MOTOR_TELEMETRY; the page locks its slider.
+- Writes check the ESC again: the page re-reads the channel (bootloader reply and settings) before a
+  settings write and refuses one that differs from what it read (`読み込んだときと違います`); a
+  firmware flash already reads it fresh.
+
 ### Presence
 
 - Nothing is stored. A pin is wired when its lifecycle state is not EMPTY: a bidir ESC is found by
   the hold's telemetry, any ESC by a read (`scan`, a configurator read, an arm). `/cfg/present` is
   deleted at boot. `escs` reports (`escs|<n>/<count>|<indices>`); its old arguments are ignored with
-  a note. The MSP motor count, MOTOR_TELEMETRY and the motor test's channels (gaps closed) follow it.
-- While a motor test runs (or a page has declared `mtmode`, or anything drives), the wired set is
-  held as it was when the test started (`escs::holdWired`): an ESC appearing on a lower pin must not
-  move a channel onto another ESC.
-- The passthrough probes. MSP_SET_PASSTHROUGH answers at once with every configured pin (esc-configurator
-  times out an MSP reply after 1 s, long before the 4.5 s settle). The first InitFlash
-  waits out the settle, then the pins are probed in order with one BootInit each (500 ms on a bare
-  pin), only as far as the channel asked for. The ones that answer are the channels, gaps closed; a
-  channel past them answers "invalid channel" at once. A pin that does not answer gets the full entry
-  ladder (prime, 1 s, then 2 x 4 s) only if its lifecycle knew an ESC there when the passthrough
-  began (`lc::Pin::ptRetry`): that ESC may be stuck in its app. An EMPTY pin is absent. A stock
-  BLHeli_S that was never read is EMPTY, but it is in its bootloader after the settle and answers.
+  a note.
+- The passthrough probes per channel. MSP_SET_PASSTHROUGH answers at once with every configured pin
+  (esc-configurator times out an MSP reply after 1 s, long before the 4.5 s settle). A channel's
+  first InitFlash waits out the shared settle once, then sends its own pin one BootInit (500 ms on a
+  bare pin). A pin that does not answer gets the full entry ladder (prime, 1 s, then 2 x 4 s) only
+  if its lifecycle knew an ESC there when the passthrough began (`lc::Pin::ptRetry`: that ESC may be
+  stuck in its app) or it answered earlier in the same passthrough. An EMPTY pin is absent: its
+  InitFlash fails after the probe, and every retry of it in that passthrough fails at once. A ladder
+  is charged to its own channel's InitFlash only. A stock BLHeli_S that was never read is EMPTY,
+  but it is in its bootloader after the settle and answers the probe.
 - So a missing ESC costs 0.5 s in a passthrough instead of ~11 s. With 4 pins and ESCs on the first
-  two, reading all four channels costs the settle, two answers, and 1 s for the two empty pins.
+  two, reading all four channels costs the settle, two answers, and 1 s for the two empty pins
+  (6.7 s on the bench).
 
 ### Known limits
 
@@ -298,15 +309,14 @@ neither needs a rebuild or a `scan` any more.
   more than 4 pins, list the wired ones first: an ESC on a pin with no SM is not seen arriving and
   cannot be armed until one is free. No new scheduler is planned for this.
 - The passthrough primes in turns when there are more pins than free SMs (500 ms more for pins 5..8).
-- esc-configurator, offered every configured pin, logs a read failure for each channel past the
-  last ESC; the web page stops at the first one instead (`ESC n 以降: つながっていません`).
-- A probe of pins in front of the first ESC adds 0.5 s each to the first InitFlash. esc-configurator
-  retries an InitFlash for about 6 s, and the settle already takes about 3.8 s of that after its own
-  1.2 s wait, so more than about 4 empty pins in front of the first ESC can make it give up on that
-  channel (the web page waits 20 s). List the wired pins first.
+- A configurator shows an empty pin as a channel whose read failed (esc-configurator logs a read
+  failure; the web page logs `ESC n: つながっていません` and goes on to the next channel).
+- esc-configurator retries an InitFlash for about 6 s. The ~11 s ladder of a pin whose ESC was
+  pulled (below) does not fit in that: that channel may fail once in esc-configurator (the web page
+  waits 20 s), and reads fine on the next read.
 - A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
-  ESC was here". The page and the MSP count see it until then, and the next passthrough gives that
-  pin the full entry ladder once (~11 s) before it is called absent.
+  ESC was here". `escs` lists it until then, and the next passthrough gives that pin the full entry
+  ladder once (~11 s) before it is called absent.
 - Changing the pin list needs a reboot; there is no `reboot` command.
 
 ## rev0 (the first release)
