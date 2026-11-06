@@ -31,6 +31,8 @@ inline const char* errName(Err e) {
 	uint8_t k = (uint8_t)e;
 	return k < sizeof N / sizeof N[0] ? N[k] : "?";
 }
+#undef ESCPINS_STR
+#undef ESCPINS_STR_
 
 // A list is allowed when it has 1..MAX entries, each a GPIO, none twice, none in `reserved` (bit g =
 // GP g is used for something else by this build). bad = the first offending GPIO.

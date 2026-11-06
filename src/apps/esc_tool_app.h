@@ -549,6 +549,9 @@ private:
 			if (!owned) {
 				if (!fw_.wanted(ch) || (mtLatched_ & bit)) continue;
 				if (escs::spinArmed(i) || escs::spinArming(i) || escs::pwmActive(i)) continue;   // the CLI has it
+				// a stock configurator sends every channel: an empty pin would queue a ~10 s read ladder
+				// in front of the real ESCs. It reports absent (UI 5); `arm i` / `read i` still try it.
+				if (escs::absentConfirmed(i)) continue;
 				mtOwned_ |= bit;                                           // ours from the request on
 				if (!th->arm()) {
 					mtOwned_ &= ~bit; mtLatched_ |= bit;

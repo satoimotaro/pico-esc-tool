@@ -1012,7 +1012,7 @@ inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
 	// it answered this passthrough, or the lifecycle knew it: worth the full entry
 	if (!ok && (fwSeen[idx] || pin[idx].ptRetry())) ok = enterBootloader(PINS[idx]);
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
-	if (!ok) return false;
+	if (!ok) { pin[idx].onProbeMiss(); return false; }   // EMPTY before: confirmed absent
 	fwSeen[idx] = true;
 	session = (int8_t)idx; sessLearned = sessionWrote = false; sessLastOpMs = millis();
 	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
@@ -1048,6 +1048,8 @@ inline uint8_t count() { return COUNT; }
 // A stock BLHeli_S (no telemetry) is EMPTY until it is read once (`scan`, a configurator read).
 inline bool     isPresent(uint8_t i) { return i < COUNT && detail::pin[i].st != lc::State::EMPTY; }
 inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i++) n += isPresent(i); return n; }
+// Confirmed absent (lc::Pin::implicitArmSkipped): an implicit arm (the MSP motor test) leaves it alone.
+inline bool     absentConfirmed(uint8_t i) { return i < COUNT && detail::pin[i].implicitArmSkipped(); }
 inline bool     identFailed(uint8_t i) { return i < COUNT && detail::pin[i].st == lc::State::FAILED; }
 // Configured reversible (3D), as read from the ESC on the pin now (false while unknown).
 inline bool     knownReversible(uint8_t i) { return spinReversible(i); }
