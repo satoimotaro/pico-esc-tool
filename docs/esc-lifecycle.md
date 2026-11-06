@@ -103,7 +103,7 @@ Landed in phase 1:
   (bidir zero on EMPTY/PENDING/LOST, zero in the identity's protocol on READY) and so detects a bidir
   ESC being plugged in or pulled out. `idle off` stops the hold, and with it the hot-plug detection.
 - Reads on the drive path (`spinArm`, hot-plug, the motor test) run on core1 as one asynchronous job
-  (`Op::READID`: prime, line high, the 1 s / 4 s / 4 s ladder, learn, run). core0 keeps streaming and
+  (`Op::READID`: prime, line high, the entry below, learn, run). core0 keeps streaming and
   collects the result on a later loop.
 - The explicit config ops and the 4-way passthrough stay synchronous, but every core0 wait pumps the
   other pins' frames, telemetry and deadman.
@@ -287,17 +287,37 @@ neither needs a rebuild or a `scan` any more.
   deleted at boot. `escs` reports (`escs|<n>/<count>|<indices>`); its old arguments are ignored with
   a note.
 - The passthrough probes per channel. MSP_SET_PASSTHROUGH answers at once with every configured pin
-  (esc-configurator times out an MSP reply after 1 s, long before the 4.5 s settle). A channel's
-  first InitFlash waits out the shared settle once, then sends its own pin one BootInit (500 ms on a
-  bare pin). A pin that does not answer gets the full entry ladder (prime, 1 s, then 2 x 4 s) only
-  if its lifecycle knew an ESC there when the passthrough began (`lc::Pin::ptRetry`: that ESC may be
-  stuck in its app) or it answered earlier in the same passthrough. An EMPTY pin is absent: its
-  InitFlash fails after the probe, and every retry of it in that passthrough fails at once. A ladder
-  is charged to its own channel's InitFlash only. A stock BLHeli_S that was never read is EMPTY,
-  but it is in its bootloader after the settle and answers the probe.
-- So a missing ESC costs 0.5 s in a passthrough instead of ~11 s. With 4 pins and ESCs on the first
-  two, reading all four channels costs the settle, two answers, and 1 s for the two empty pins
-  (6.7 s on the bench).
+  (esc-configurator times out an MSP reply after 1 s). A channel's first InitFlash waits out the
+  shared quiet window once (`ENTRY_QUIET_MS` after the lines went high), then polls its own pin with
+  BootInit: up to `ENTRY_MAX_MS` after the lines went high if its lifecycle knew an ESC there when
+  the passthrough began (`lc::Pin::ptRetry`: that ESC may be slow or stuck in its app) or it
+  answered earlier in the same passthrough, else up to `ENTRY_QUIET_MS + ENTRY_BARE_MS` (at least
+  500 ms either way). A known pin that still misses gets one more full entry (below). An EMPTY pin
+  is absent: its InitFlash fails after the probe, and every retry of it in that passthrough fails
+  at once. A retry is charged to its own channel's InitFlash only. A stock BLHeli_S that was never
+  read is EMPTY, but it is in its bootloader after the quiet window and answers the probe.
+
+### Bootloader entry timing
+
+- One entry, everywhere (`enterBootloader` for `read i` / `scan` / `enter`, the async `Op::READID`,
+  the passthrough's retry): DShot zero prime 500 ms (BLHeli-S needs valid frames first), line high,
+  `ENTRY_QUIET_MS` = 1000 ms with no traffic at all, then BootInit polled until an answer or
+  `ENTRY_MAX_MS` = 5000 ms after line high. The passthrough primes every pin at once and shares the
+  quiet window. It replaced a fixed ladder (1 s hold, then 4 s twice) and a fixed 4.5 s settle.
+- Measured on 2026-11-07 with `blpoll <i> <holdMs> <pollMs>` (line high right after the zero-throttle
+  hold stream, app running):
+  - AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
+    does not disturb it (answered at 538 ms, 6/6).
+  - Bluejay 0.21 (EFM8BB21): a single BootInit answers from 700 ms; polling from 0 or 300 ms keeps
+    it out of its bootloader (no answer within 6 s, 6/6). That is why the quiet window has no
+    traffic.
+  - Quiet 800 or 1000 ms, then poll: both answer the first BootInit (814 / 1014 ms), 12/12.
+- Expected costs: a present ESC about 1.5 s (prime + quiet + first answer) plus its read; an absent
+  pin through `read i` or an async read 5.5 s (prime + poll to 5 s), down from ~11 s. In a
+  passthrough an EMPTY pin costs at most 0.5 s. With 4 pins and ESCs on the first two, a page read
+  is about 0.5 s prime + 1 s quiet (mostly inside the configurator's own 1.2 s wait), the two ESCs'
+  reads, and 1 s for the two empty pins: about 3 s instead of the 6.7 s measured with the old 4.5 s
+  settle (needs a bench check).
 
 ### Known limits
 
@@ -311,16 +331,24 @@ neither needs a rebuild or a `scan` any more.
 - The passthrough primes in turns when there are more pins than free SMs (500 ms more for pins 5..8).
 - A configurator shows an empty pin as a channel whose read failed (esc-configurator logs a read
   failure; the web page logs `ESC n: つながっていません` and goes on to the next channel).
-- esc-configurator retries an InitFlash for about 6 s. The ~11 s ladder of a pin whose ESC was
-  pulled (below) does not fit in that: that channel may fail once in esc-configurator (the web page
+- esc-configurator retries an InitFlash for about 6 s. A pin whose ESC was pulled (below) costs up
+  to ~9.5 s in a passthrough (polled to 5 s after the lines went high, then one more full entry of
+  5.5 s), which does not fit in that: that channel may fail once in esc-configurator (the web page
   waits 20 s), and reads fine on the next read.
+- `ENTRY_MAX_MS` (5 s from line high) is measured on one AM32 build with its startup tune off. An
+  AM32 build or a tune that takes longer to reach its bootloader is missed by the first attempt; in
+  a passthrough a known pin gets the second full entry, elsewhere the read fails (FAILED, or EMPTY
+  without fresh telemetry) and `read i` tries again.
+- The quiet window must stay free of BootInit: Bluejay polled earlier than ~700 ms after line high
+  never entered its bootloader. A Bluejay/BLHeli_S build slower than the measured one would need a
+  longer `ENTRY_QUIET_MS`.
 - A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
-  ESC was here". `escs` lists it until then, and the next passthrough gives that pin the full entry
-  ladder once (~11 s) before it is called absent.
+  ESC was here". `escs` lists it until then, and the next passthrough gives that pin the long probe
+  and one more full entry (~9.5 s) before it is called absent.
 - An empty pin is confirmed absent once a read finds nothing there (READ_EMPTY) or a passthrough
   probe gets no answer on a pin that was EMPTY before it (`lc::Pin::absent`). The MSP motor test
   then leaves it alone (a stock configurator sends every channel, and each empty pin would queue a
-  ~10 s read ladder in front of the real ESCs); it reports absent (5). Any telemetry packet or a read
+  5.5 s read in front of the real ESCs); it reports absent (5). Any telemetry packet or a read
   that succeeds clears the latch; `arm i` and `read i` still try the pin. So a stock BLHeli_S (no
   telemetry) plugged into a pin confirmed absent is not armed by a configurator's motor test until a
   read (the page's, a configurator's, `scan`) finds it.
