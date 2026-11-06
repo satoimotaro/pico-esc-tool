@@ -27,6 +27,12 @@
       <button id="write-sel" class="needs-conn">選択した ESC の変更を書き込む</button>
       <button id="exit-pt" class="needs-conn">パススルー終了</button>
     </div>
+    <div id="pins" class="bar" hidden title="ESC の順に GPIO 番号を並べます (最大 8 本)。保存すると次の起動から使います">
+      <label>信号ピン <input id="pins-list" size="20" placeholder="例: 16 17 18 19"></label>
+      <button id="pins-save" class="needs-conn">保存</button>
+      <button id="pins-default" class="needs-conn">既定に戻す</button>
+      <span id="pins-now" class="meta"></span>
+    </div>
     <div id="escs"></div>
   </section>
 
@@ -89,6 +95,7 @@
       <li>「ESC を読み込む」で、各 ESC がブートローダーに入り設定を読みます (1 個あたり数秒)。</li>
       <li>値を変えるかプリセットを反映し、「書き込む」を押します。書いたあと読み戻して照合します。</li>
       <li>モーターテストに移るとパススルーを抜けます (ESC が再起動します)。</li>
+      <li>pico-esc-tool なら「ESC 設定」タブで ESC の信号ピン (GPIO) を変えられます。保存したあと Pico を再起動すると使われます。</li>
     </ol>
     <h2>対応</h2>
     <ul>

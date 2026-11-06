@@ -27,6 +27,8 @@ const hex2 = (v) => v.toString(16).padStart(2, '0');
 const st = {
   pipe: null, msp: null, fw: null,
   inPassthrough: false, motors: 0, threeD: false, board: '',
+  ptEscs: 0,           // ESC channels the last MSP_SET_PASSTHROUGH offered
+  pins: null,          // pico-esc-tool's signal pin list (`pins`), null = not known
   escs: [],            // results of readEsc, by channel (null = not answering)
   edits: [],           // per channel: Uint8Array being edited
   busy: false,
@@ -98,6 +100,7 @@ async function identify(pipe) {
   $('#test-proto-box').hidden = !st.pico;
   if (!st.pico) $('#test-proto').value = 'dshot';
   renderTest();
+  await loadPins();
 }
 
 function dropped() {
@@ -112,6 +115,7 @@ function dropped() {
 function forget() {
   if (st.escs.some((e, ch) => e && dirty(ch))) log('書き込んでいない変更は破棄しました');
   st.escs = []; st.edits = []; st.test.silent = []; st.test.live = [];
+  st.pins = null; st.ptEscs = 0; $('#pins').hidden = true;
   renderEscs(); renderFlash(); renderTest();
 }
 
@@ -133,8 +137,9 @@ async function passthrough(on) {
   if (on) {
     await stopTest('パススルーに入るため');
     const d = await st.msp.request(MSP.SET_PASSTHROUGH, [], 3000);
-    st.inPassthrough = true;
-    log(`パススルー開始 (ESC ${d[0]} 個)`);
+    st.inPassthrough = true; st.ptEscs = d[0];
+    // pico-esc-tool offers every signal pin here and finds which answer as it reads them
+    log(st.pico ? `パススルー開始 (信号ピン ${d[0]} 本)` : `パススルー開始 (ESC ${d[0]} 個)`);
     await new Promise((r) => setTimeout(r, 500));
   } else {
     await st.fw.exit();
@@ -143,8 +148,20 @@ async function passthrough(on) {
     log('パススルー終了 (ESC は通常動作に戻りました)');
     await new Promise((r) => setTimeout(r, 1000));
     st.pipe.drain();
+    if (st.pico) await refreshMotors();
   }
   status();
+}
+
+// pico-esc-tool counts the ESCs that are there (its lifecycle), so the count can change with a read:
+// after a passthrough it knows every ESC that answered. 10 s: it learns each one again before it
+// answers anything.
+async function refreshMotors() {
+  const mc = await st.msp.request(MSP.MOTOR_CONFIG, [], 10000).catch(() => null);
+  if (!mc || mc.length <= 6 || mc[6] === st.motors) return;
+  st.motors = mc[6];
+  log(`モーター ${st.motors} 個`);
+  if (!st.test.on) renderTest();
 }
 
 // ------------------------------------------------------------------------------- read / write
@@ -154,7 +171,7 @@ async function readAll() {
     await passthrough(true);
     if (st.pipe !== pipe) return;
     st.escs = []; st.edits = []; st.test.live = [];
-    for (let ch = 0; ch < st.motors; ch++) {
+    for (let ch = 0; ch < (st.ptEscs || st.motors); ch++) {
       const t0 = performance.now();
       try {
         const esc = await readEsc(st.fw, ch);
@@ -163,6 +180,11 @@ async function readAll() {
         log(`ESC ${ch + 1}: ${esc.family.name} ${esc.version} ${esc.layoutTag} ${esc.name} (${((performance.now() - t0) / 1000).toFixed(1)} s)`);
       } catch (e) {
         if (st.pipe !== pipe) return;
+        // pico-esc-tool numbers the ESCs that answer without gaps: past the last one, none follow
+        if (st.pico && /invalid channel/.test(e.message)) {
+          log(ch ? `ESC ${ch + 1} 以降: つながっていません` : 'ESC が見つかりません', ch ? '' : 'err');
+          break;
+        }
         st.escs[ch] = null;
         log(`ESC ${ch + 1}: 応答なし (${e.message})`, 'err');
       }
@@ -675,6 +697,53 @@ async function flashSelected() {
   renderEscs(); renderFlash();
 }
 
+// ------------------------------------------------------------------------------- signal pins
+// pico-esc-tool's ESC signal pins: its `pins` command, sent as CLI lines between MSP frames like
+// `mtmode`. Answer: `pins|now|<cfg|default>|16,17`, `pins|next|...`, `pins|default|...`, then `ok` or
+// `err ...`. A saved list is used from the next boot. Never in a passthrough (every byte is 4-way there).
+async function cli(line, ms = 10000) {
+  await st.msp.busy;
+  st.pipe.drain();
+  await sendLine(line);
+  return st.pipe.until((buf) => {
+    const s = String.fromCharCode(...buf), m = /(^|\n)(ok|err[^\r\n]*)\r?\n/.exec(s);
+    if (!m) return undefined;
+    buf.splice(0, m.index + m[0].length);
+    return s.slice(0, m.index + m[0].length).split(/\r?\n/).filter(Boolean);
+  }, ms);
+}
+const gp = (list) => (list ? list.split(',').map((p) => `GP${p}`).join(' ') : '?');
+function showPins(lines) {
+  const get = (k) => lines.find((l) => l.startsWith(`pins|${k}|`))?.split('|');
+  const now = get('now'), next = get('next'), def = get('default');
+  if (!now) return false;   // older firmware: `pins <n> <gpio>...`, no list to edit
+  st.pins = { now: now[3], next: next?.[3] ?? now[3], def: def?.[2] };
+  const src = (k) => (k === 'cfg' ? '保存した設定' : '既定');
+  $('#pins-list').value = st.pins.next.split(',').join(' ');
+  $('#pins-now').textContent = `いま: ${gp(st.pins.now)} (${src(now[2])})`
+    + (st.pins.next !== st.pins.now ? ` → 再起動後: ${gp(st.pins.next)} (${src(next?.[2])})。Pico を再起動 (USB を抜き差し) すると反映します` : '')
+    + (st.pins.def ? ` · 既定: ${gp(st.pins.def)}` : '');
+  return true;
+}
+async function loadPins() {
+  const lines = st.pico ? await cli('pins').catch(() => undefined) : undefined;
+  $('#pins').hidden = !(lines && showPins(lines));
+}
+async function savePins(toDefault) {
+  const want = $('#pins-list').value.trim();
+  if (!toDefault && !want) { log('GPIO 番号を ESC の順に並べてください (例: 16 17 18 19)', 'err'); return; }
+  await task('信号ピン', async () => {
+    await passthrough(false);
+    const lines = await cli(toDefault ? 'pins default' : `pins ${want}`);
+    if (!lines) throw new Error('応答がありません');
+    const err = lines.find((l) => l.startsWith('err'));
+    if (err) throw new Error(`保存しませんでした (${err.replace(/^err /, '')})`);
+    showPins(lines);
+    log(st.pins.next === st.pins.now ? `信号ピン: ${gp(st.pins.now)} のまま`
+      : `信号ピンを保存しました: ${gp(st.pins.next)}。Pico を再起動すると使われます`, 'ok');
+  });
+}
+
 // ------------------------------------------------------------------------------- wiring
 function tabs() {
   document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => {
@@ -691,6 +760,8 @@ function init() {
   $('#read').addEventListener('click', readAll);
   $('#write-sel').addEventListener('click', writeSelected);
   $('#exit-pt').addEventListener('click', () => task('パススルー終了', () => passthrough(false)));
+  $('#pins-save').addEventListener('click', () => savePins(false));
+  $('#pins-default').addEventListener('click', () => savePins(true));
   $('#test-toggle').addEventListener('click', () => (st.test.on ? stopTest('停止ボタン') : startTest()));
   $('#test-proto').addEventListener('change', renderTest);
   $('#test-all').addEventListener('input', (e) => {   // 0..1000 forward, from each motor's own stop
