@@ -512,10 +512,6 @@ private:
 		// nothing and a 3D "1000" (stop, as the page drew it) into full reverse. Once a client has
 		// read it, fw_ keeps the answer for that client (FourWay::setThreeD).
 		bool idle = !mtOwned_ && !fw_.motorWanted(), reversibleWired = false;
-		// The test's channels are the wired ESCs, gaps closed (FourWay::channel): held while a test or
-		// a page's declaration is live, or anything drives, so an ESC appearing or vanishing meanwhile
-		// cannot move a channel onto another ESC.
-		escs::holdWired(!idle || fw_.declared() || driving());
 		if (idle) for (uint8_t i = 0; i < n_; i++) if (escs::isPresent(i) && escs::knownReversible(i)) reversibleWired = true;
 		fw_.setThreeD(reversibleWired, idle);
 		if (millis() - mtLoopMs_ > 500) mtArmedMs_ = millis();   // held up: queued MSP is no silence
@@ -606,7 +602,7 @@ private:
 	static constexpr const char* BUSY = "err busy (ESC read in progress, retry)";
 	bool busy_ = false;             // a preset save met a busy FsGuard
 
-	// Which ESCs are wired (escs::presentMask): derived from each pin's lifecycle state, nothing stored.
+	// Which ESCs are wired (escs::isPresent): derived from each pin's lifecycle state, nothing stored.
 	void printPresent() {
 		console::out().printf("escs|%u/%u|", escs::presentCount(), n_);
 		bool first = true;
@@ -721,10 +717,11 @@ private:
 			else                     snprintf(r1, sizeof r1, "configurator");
 		} else {
 			int k = 0;
-			// one cell per ESC: index + lifecycle letter (a flash shows R: core1 has the pin)
+			// one cell per ESC: index + lifecycle letter (a flash shows R: core1 has the pin); with more
+			// than 5 ESCs the separators go, so all 8 fit the 16 columns
 			for (uint8_t i = 0; i < n_ && k < 16; i++) {
 				lc::State st = escs::state(i);
-				k += snprintf(r0 + k, sizeof r0 - k, "%u%c ", i, "EPR-DLF"[(uint8_t)st]);
+				k += snprintf(r0 + k, sizeof r0 - k, n_ > 5 ? "%u%c" : "%u%c ", i, "EPR-DLF"[(uint8_t)st]);
 			}
 #if ESC_WIFI_STA
 			// S/D = mode, then the LAN address to point the host at; * = a TCP client is attached

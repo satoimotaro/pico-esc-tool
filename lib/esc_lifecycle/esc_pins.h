@@ -12,7 +12,9 @@
 namespace escpins {
 
 // Capacity: the configurators show at most 8 motors (MSP_MOTOR, the passthrough's channel byte).
-static const uint8_t MAX = 8;
+// A macro too, so errName's text is spelled from it.
+#define ESCPINS_MAX 8
+static const uint8_t MAX = ESCPINS_MAX;
 // RP2040: GP0..GP29.
 static const uint8_t GPIO_COUNT = 30;
 // The Pico W's CYW43 radio: GP23 (power), GP24 (data / IRQ), GP25 (chip select), GP29 (clock).
@@ -20,11 +22,14 @@ static constexpr uint32_t RADIO = (1u << 23) | (1u << 24) | (1u << 25) | (1u << 
 
 // BUSY: a valid list that cannot be applied now (escs::setPins after boot).
 enum class Err : uint8_t { OK, EMPTY, TOO_MANY, BAD_NUMBER, NOT_GPIO, DUPLICATE, RESERVED, BUSY };
+#define ESCPINS_STR_(x) #x
+#define ESCPINS_STR(x) ESCPINS_STR_(x)
 inline const char* errName(Err e) {
-	static const char* const N[] = { "ok", "no pins", "more than 8 pins", "not a number", "not a GPIO (0..29)",
-	                                 "listed twice", "used by this build", "ESCs in use (boot only)" };
+	static const char* const N[] = { "ok", "no pins", "more than " ESCPINS_STR(ESCPINS_MAX) " pins", "not a number",
+	                                 "not a GPIO (0..29)", "listed twice", "used by this build", "ESCs in use (boot only)" };
+	static_assert(sizeof N / sizeof N[0] == (unsigned)Err::BUSY + 1, "one name per Err");
 	uint8_t k = (uint8_t)e;
-	return k < 8 ? N[k] : "?";
+	return k < sizeof N / sizeof N[0] ? N[k] : "?";
 }
 
 // A list is allowed when it has 1..MAX entries, each a GPIO, none twice, none in `reserved` (bit g =

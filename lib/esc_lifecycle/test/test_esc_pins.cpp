@@ -6,6 +6,7 @@
 //     g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tpins test_esc_pins.cpp && /tmp/tpins
 #include "../esc_pins.h"
 #include <cstdio>
+#include <cstring>
 
 using namespace escpins;
 
@@ -68,6 +69,7 @@ int main() {
 		CHECK(same(a, 2, a, 2) && !same(a, 2, b, 2) && !same(a, 2, a, 1), "same: order and length count");
 	}
 	CHECK(errName(Err::BUSY)[0] != '?' && errName((Err)200)[0] == '?', "every Err has a name");
+	CHECK(!strcmp(errName(Err::TOO_MANY), "more than 8 pins"), "the TOO_MANY text names MAX");
 	printf(failures ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", failures);
 	return failures ? 1 : 0;
 }
