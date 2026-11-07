@@ -98,17 +98,13 @@ struct Telem {
 
 static const uint16_t SPIN_MAX        = 2000;   // max throttle
 static const uint32_t SPIN_DEADMAN_MS = 500;    // auto-zero throttle if no command within this
-static const uint32_t SPIN_ARM_MS     = 3000;   // stream zero throttle this long to ARM the ESC
-                                                // (covers the ESC's boot beep after leaving the BL)
-// A bidir ESC counts as armed only once it answers and has taken the EDT enable. Bluejay sends its
-// first telemetry from wait_for_start, i.e. once it has armed, and takes DShot commands only there;
-// with EDT safety arm (FORCE_EDT_ARM) set it refuses to start without EDT, beeps and waits again
-// (Bluejay.asm wait_for_start_nonzero), and a reboot clears EDT. EDT used to go out only in a
-// zero-throttle gap after the arm, which a motor test that sends throttle at once never leaves:
-// the Bluejay then never started after a passthrough. An ESC that never answers is armed after
-// SPIN_ARM_TELE_MAX_MS, as before.
-static const uint32_t SPIN_ARM_TELE_HOLD_MS = 300;    // zero throttle after its first answer
-static const uint32_t SPIN_ARM_TELE_MAX_MS  = 8000;
+// Stream zero throttle this long to ARM the ESC (covers its boot beep after leaving the bootloader).
+// A bidir ESC counts as armed only once it answers and has taken the EDT enable (lc::ArmGate); EDT
+// used to go out only in a zero-throttle gap after the arm, which a motor test that sends throttle
+// at once never leaves: the Bluejay then never started after a passthrough.
+static const uint32_t SPIN_ARM_MS           = lc::ARM_MS;
+static const uint32_t SPIN_ARM_TELE_HOLD_MS = lc::ARM_ANSWER_HOLD_MS;   // zero throttle after its first answer
+static const uint32_t SPIN_ARM_TELE_MAX_MS  = lc::ANSWER_MAX_MS;        // never answered: armed anyway
 // A stalled Bluejay/BLHeli-derived bidir ESC is armed again on the same stream and held at 0 until it
 // is sent 0 (lc::Stall: the rules, STALL_ZERO_MS / STALL_SILENT_MS / STALL_MAX / STALL_REST_MS).
 static const uint16_t PWM_MIN_US      = 1000;   // servo PWM pulse range
@@ -121,7 +117,8 @@ static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc
 
 // Per-ESC DShot mode. BLHeli-S understands only *normal* DShot; *bidir* DShot (inverted, with eRPM/
 // EDT telemetry back over the wire) needs firmware that supports it (Bluejay/JESC). AUTO picks bidir
-// if the firmware name says so, else normal — so any stock BLHeli-S ESC still spins.
+// if its identity says so (lc::silabsBidir: the layout revision; AM32 always), else normal — so any
+// stock BLHeli-S ESC still spins.
 enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
 
 namespace detail {
@@ -217,15 +214,8 @@ namespace detail {
 	static DShotX4*          drvN[MAX] = { nullptr };   // normal DShot: idle LOW, throttle only
 	static volatile uint16_t drvTarget[MAX] = { 0 };
 	static uint32_t          drvLast[MAX] = { 0 };
-	static bool              drvArmed[MAX] = { false };
-	static uint32_t          drvArmStart[MAX] = { 0 };
-	static uint16_t          drvArmMs[MAX] = { 0 };   // this arm's window (0 => SPIN_ARM_MS default);
-	static uint32_t          drvAnswer[MAX] = { 0 };  // this arm's first telemetry (0 = none yet)
-	                                                    // a re-arm after a run-mode stop can be short
-	static uint8_t           drvEdt[MAX] = { 0 };       // frames of EDT-enable left to send (bidir arm)
-	static bool              drvRan[MAX] = { false };   // ran since the ESC was last seen stopped (eRPM 0)
-	static uint32_t          drvEdtMs[MAX] = { 0 };     // last EDT burst while stopped
-	static const uint32_t    EDT_REFRESH_MS = 1000, EDT_RAN_MS = 100;
+	static lc::ArmGate       armg[MAX];                 // the stream's arm window (streamPin)
+	static lc::EdtSched      edt[MAX];                  // its EDT enable (bidir)
 	static lc::Stall         stall[MAX];                // the stall watch (streamPin) and its hold
 	static bool              drvInitFail[MAX] = { false }; // the last driver start found no free PIO SM
 	static uint32_t          drvRetryMs[MAX] = { 0 };   // ... the hold tries again from here
@@ -317,8 +307,8 @@ namespace detail {
 			return false;
 		}
 		drvInitFail[i] = false; drvKb[i] = kb;
-		drvTarget[i] = 0; drvArmed[i] = false; drvArmStart[i] = drvLast[i] = drvStartMs[i] = drvPollMs[i] = now;
-		drvArmMs[i] = 0; drvAnswer[i] = 0; drvEdt[i] = bidir ? 20 : 0; drvRan[i] = false; drvEdtMs[i] = now; stall[i].reset();
+		drvTarget[i] = 0; drvLast[i] = drvStartMs[i] = drvPollMs[i] = now;
+		armg[i].begin(now); edt[i].begin(now, bidir); stall[i].reset();
 		pin[i].onStreamStart(now, bidir);
 		return true;
 	}
@@ -347,23 +337,16 @@ namespace detail {
 		uint32_t now = millis();
 		gapCheck(i, now);
 		if (pin[i].st != lc::State::RUNNING) drvTarget[i] = 0;   // only RUNNING ever sends non-zero
-		if (!drvArmed[i]) {
+		if (!armg[i].armed) {
 			drvTarget[i] = 0;
-			uint32_t t = millis() - drvArmStart[i], win = drvArmMs[i] ? drvArmMs[i] : SPIN_ARM_MS;
-			// an explicit (short) window is a re-arm of an ESC that is armed already
-			bool heard = !drvB[i] || drvArmMs[i] ||
-			             (drvAnswer[i] && millis() - drvAnswer[i] >= SPIN_ARM_TELE_HOLD_MS && drvEdt[i] == 0);
-			if (t > win && (heard || t > SPIN_ARM_TELE_MAX_MS)) {
-				drvArmed[i] = true;
-				if (drvB[i]) drvEdt[i] = 20;   // again once armed and stopped: AM32 may answer before it arms
-			}
+			if (armg[i].tick(now, drvB[i] != nullptr, edt[i].left > 0) && drvB[i]) edt[i].burst();   // AM32 may answer before it arms
 		}
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		if (drvB[i]) {
 			uint32_t v = 0;
 			BidirDshotTelemetryType ty = drvB[i]->getTelemetryPacket(&v);
 			switch (ty) {
-				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); if (!drvAnswer[i]) drvAnswer[i] = lc::stamp(millis()); break;
+				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); armg[i].onAnswer(millis()); break;
 				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
 				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
 				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; drvTele[i].tempStampMs = millis(); break;
@@ -382,38 +365,22 @@ namespace detail {
 			// BLHeli-derived (AM32 stays in its run). Its silence there is the watch's, not LOST
 			// (lc::Pin::stallWatch). ZERO / QUIET arm the same stream again (zero, answer, EDT: Bluejay
 			// cleared it) with the target held at 0; SILENT is LOST (TOOL) or the open loop (ROV).
-			bool watched = pin[i].stallWatched(drvArmed[i], drvTarget[i]);
+			bool watched = pin[i].stallWatched(armg[i].armed, drvTarget[i]);
 			lc::Ev se;
 			lc::StallAct act = pin[i].onStall(stall[i].step(now, watched, ty == BidirDshotTelemetryType::ERPM, v, pin[i].pktMs),
 			                                  policy, now, se);
 			evPush(i, se);
 			if (act == lc::StallAct::REARM) {
 				stall[i].restart(now);
-				drvArmed[i] = false; drvArmStart[i] = now; drvArmMs[i] = 0; drvAnswer[i] = 0;
-				drvEdt[i] = 20; drvTarget[i] = 0; watched = false;
+				armg[i].begin(now); edt[i].burst(); drvTarget[i] = 0; watched = false;
 			} else if (act == lc::StallAct::LOST) {   // TOOL: stop that ESC only, as LOST_STOPPED in spinPoll
 				drvTarget[i] = 0; armStart[i] = false; stall[i].reset(); watched = false;
 			}
 			pin[i].stallWatch = watched;
-			// Enable EDT (extended telemetry: V/A/temp) once armed and still stopped — the ESC ignores
-			// commands during its post-bootloader boot beep, so this must come after the arm window.
-			// While arming that is once it has answered (above); otherwise once armed and stopped.
-			bool edtNow = drvArmed[i] ? drvTarget[i] == 0 : drvAnswer[i] != 0;
-			// Bluejay clears EDT at the end of every run (Bluejay.asm exit_run_mode_no_stall), and with
-			// EDT safety arm (FORCE_EDT_ARM) the next start is then refused: every other start beeped and was
-			// re-armed as a stall. Bluejay takes the command only once it is back in wait_for_start,
-			// which is after the motor has coasted down: a burst right at the stop is dropped. So after
-			// a run EDT goes out every EDT_RAN_MS until a fresh eRPM of 0 says it has left run mode (one
-			// more burst then), and every EDT_REFRESH_MS while stopped (a command frame for a zero frame).
-			if (drvArmed[i] && drvTarget[i] == 0 && drvEdt[i] == 0) {
-				bool still = drvTele[i].rpm == 0 && (int32_t)(now - drvTele[i].rpmStampMs) < 100;
-				if ((drvRan[i] && still) || now - drvEdtMs[i] >= (drvRan[i] ? EDT_RAN_MS : EDT_REFRESH_MS)) {
-					drvEdt[i] = 10; drvEdtMs[i] = now;
-					if (still) drvRan[i] = false;
-				}
+			// EDT enable in place of this frame (lc::EdtSched: at the start, once armed, after every run)
+			if (edt[i].frame(now, armg[i].armed, armg[i].answer != 0, drvTarget[i], drvTele[i].rpm, drvTele[i].rpmStampMs)) {
+				drvB[i]->sendRaw11Bit(13); return;
 			}
-			if (drvTarget[i]) drvRan[i] = true;
-			if (edtNow && drvEdt[i] > 0) { drvB[i]->sendRaw11Bit(13); drvEdt[i]--; return; }
 		}
 		drvSend(i, drvTarget[i]);
 	}
@@ -460,7 +427,9 @@ namespace detail {
 	static bool runOp(Op o, uint8_t gpio) {         // core0: hand an op to core1, pump till done
 		jobStop(true);                               // a user op takes the line from a background read
 		blDepth++; pwmSafe();                        // nothing is fed while this waits
-		opIdx = idxOf(gpio); opPin = gpio; opOk = false; opDone = false; op = o;
+		opIdx = idxOf(gpio); opPin = gpio; opOk = false; opDone = false;
+		__sync_synchronize();                        // the op's inputs (flBuf, page, ...) before op
+		op = o;
 		while (!opDone) { pump(); delayMicroseconds(200); }
 		__sync_synchronize();                        // opDone seen: core1's results are complete
 		if (session >= 0 && opIdx == (uint8_t)session) sessLastOpMs = millis();
@@ -667,7 +636,7 @@ inline bool passthroughActive() { return detail::fwActive; }
 // spinArm() asks the pin's lifecycle for RUNNING. READY: the arming stream for SPIN_ARM_MS starts now
 // (or at once, if the hold has already armed it in that protocol). Not read yet: the arm waits for
 // the async read (spinArming() meanwhile) and starts when it lands. FAILED: refused (false). Then
-// drive() (or spinThrottle()/spinThrust()) sets the target; spinStop()/spinDisarm() release it.
+// drive() sets the target (the one drive path: by identity); spinStop()/spinDisarm() release it.
 // Mode AUTO uses the identity read from the ESC: Bluejay/JESC/AM32 -> bidir DShot (idle HIGH, eRPM +
 // EDT telemetry); otherwise normal DShot (idle LOW), which any BLHeli-S spins. Reversible (3D)
 // rotation comes from the same identity, so a command can be a signed thrust.
@@ -676,7 +645,7 @@ inline bool passthroughActive() { return detail::fwActive; }
 inline int8_t armBusySession() { return detail::armBusy; }
 inline bool spinArmed(uint8_t idx) {
 	using namespace detail;
-	return idx < COUNT && pin[idx].st == lc::State::RUNNING && drvActive(idx) && drvArmed[idx];
+	return idx < COUNT && pin[idx].st == lc::State::RUNNING && drvActive(idx) && armg[idx].armed;
 }
 namespace detail {
 	static bool startArm(uint8_t i) {           // RUNNING: the drive stream in the asked protocol
@@ -690,7 +659,7 @@ namespace detail {
 			drvTarget[i] = 0; drvLast[i] = millis(); stall[i].reset(); return true;
 		}
 		if (!drvStart(i, wantB)) { pin[i].onStop(); return false; }   // no SM: READY again, no false ARMED
-		drvArmMs[i] = armMsReq[i];   // 0 => SPIN_ARM_MS (see streamPin)
+		armg[i].ms = armMsReq[i];   // 0 => SPIN_ARM_MS; a short one re-arms an ESC that is armed already
 		return true;
 	}
 }
@@ -726,29 +695,13 @@ inline bool spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 inline lc::Refuse drive(uint8_t idx, int v) {
 	using namespace detail;
 	if (idx >= COUNT) return lc::Refuse::STATE;
-	lc::Refuse r = pin[idx].gate(drvActive(idx) && drvArmed[idx]);
+	lc::Refuse r = pin[idx].gate(drvActive(idx) && armg[idx].armed);
 	if (r != lc::Refuse::OK) return r;
 	bool use3d; int16_t s; uint16_t thr;
 	r = lc::mapDrive(pin[idx].id, v, use3d, s, thr);
 	if (r != lc::Refuse::OK) return r;
 	drvTarget[idx] = stall[idx].gate(millis(), thr); drvLast[idx] = millis();   // held at 0 after a stall
 	return lc::Refuse::OK;
-}
-inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirectional: 0..SPIN_MAX
-	using namespace detail;
-	if (!spinArmed(idx)) return;                                     // must be armed first
-	drvTarget[idx] = stall[idx].gate(millis(), throttle > SPIN_MAX ? SPIN_MAX : throttle);
-	drvLast[idx] = millis();
-}
-// Reversible (3D): -1000..+1000, 0 = stop, full scale at +-953 (lc::thrust3d clamps past that).
-// A one-way ESC takes only 0: any other value is 3D thrust it would read as about half throttle
-// (cmd 1 is wire 1095), so it is refused and the ESC is sent 0. false = refused.
-inline bool spinThrust(uint8_t idx, int16_t s) {
-	using namespace detail;
-	if (!spinArmed(idx)) return false;
-	bool ok = s == 0 || pin[idx].id.rev;
-	drvTarget[idx] = stall[idx].gate(millis(), ok ? lc::thrust3d(s) : 0); drvLast[idx] = millis();
-	return ok;
 }
 // Restarted after a stall within the last few seconds (a UI can say why it is arming again).
 inline bool spinStalled(uint8_t idx) { return idx < COUNT && detail::stall[idx].recent(millis()); }
@@ -764,7 +717,7 @@ inline bool spinSilent(uint8_t idx) {
 	using namespace detail;
 	uint32_t now = millis();
 	// not polled lately (MSP answered right after a blocking op, before spinPoll): no evidence
-	return idx < COUNT && drvB[idx] && drvArmed[idx] && drvTarget[idx] == 0 && !stall[idx].hold &&
+	return idx < COUNT && drvB[idx] && armg[idx].armed && drvTarget[idx] == 0 && !stall[idx].hold &&
 	       now - drvPollMs[idx] <= POLL_GAP_MS && pin[idx].silent(now);
 }
 inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::curIdent(idx).known && detail::curIdent(idx).rev; }
@@ -786,7 +739,7 @@ inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::drvInitFail
 inline bool spinArming(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return false;
-	return pin[idx].armWanted || (pin[idx].st == lc::State::RUNNING && drvActive(idx) && !drvArmed[idx]) ||
+	return pin[idx].armWanted || (pin[idx].st == lc::State::RUNNING && drvActive(idx) && !armg[idx].armed) ||
 	       (armStart[idx] && pin[idx].st == lc::State::RUNNING);
 }
 inline uint16_t spinTarget(uint8_t idx) { return idx < COUNT ? detail::drvTarget[idx] : 0; }   // DShot value being sent
@@ -823,7 +776,9 @@ namespace detail {
 			if (drvB[i] && now - drvStartMs[i] < PRIME_MS) return;
 			pin[i].onReadStart(now);                 // (latches whether its telemetry is fresh first)
 			drvFree(i); pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);   // core1 owns it from here
-			jobAbort = false; opIdx = i; opPin = PINS[i]; opOk = false; opDone = false; op = Op::READID;
+			jobAbort = false; opIdx = i; opPin = PINS[i]; opOk = false; opDone = false;
+			__sync_synchronize();                    // its inputs before op (core1 reads op first)
+			op = Op::READID;
 			jobPhase = 2;
 			return;
 		}
@@ -894,7 +849,7 @@ inline void spinPoll() {   // call every core0 loop: lifecycle + hold + async re
 // PWM_ARM_MS: long enough for an AM32 to notice DShot is gone (2 s), reboot, detect PWM and arm on
 // it. The stop width is 1000 us, or 1500 us on a 3D ESC, where 1000 us is full reverse: so the ESC
 // must be READY (read by scan, a configurator or the hold) and pwmBegin refuses one that is not.
-// pwmSet() then gives the pulse width, fed like spinThrottle (the same 500 ms deadman falls back
+// pwmSet() then gives the pulse width, fed like drive() (the same 500 ms deadman falls back
 // to the stop width, also from a timer IRQ while core0 is held up; it does not cut the signal). A
 // width sent during the arm is not kept, and after it nothing but the stop width passes until one
 // stop width has come (lc::pwmGate): a value never waits behind the arm and lands as a jump. During
@@ -920,7 +875,7 @@ inline bool pwmBegin(uint8_t idx) {
 	// no alarm slot for the IRQ deadman: no PWM (a held-up loop would keep the last width)
 	if (!pwmTimerOn) pwmTimerOn = add_repeating_timer_ms(50, pwmWatch, nullptr, &pwmTimer);
 	if (!pwmTimerOn) return false;
-	drvTarget[idx] = 0; drvArmed[idx] = false; drvFree(idx);
+	drvTarget[idx] = 0; armg[idx].armed = false; drvFree(idx);
 	pin[idx].onRunStart();
 	uint gp = PINS[idx], slice = pwm_gpio_to_slice_num(gp);
 	gpio_set_function(gp, GPIO_FUNC_PWM);
@@ -950,8 +905,8 @@ inline UiState uiState(uint8_t i) {
 	if (i >= COUNT) return UiState::ABSENT;
 	lc::UiIn in;
 	in.pwm = pwmActive(i); in.pwmArming = pwmArming(i);
-	in.stream = drvActive(i) && !armStart[i]; in.armed = in.stream && drvArmed[i];
-	in.stalled = spinHeld(i) || (spinStalled(i) && pin[i].st == lc::State::RUNNING && !drvArmed[i]);
+	in.stream = drvActive(i) && !armStart[i]; in.armed = in.stream && armg[i].armed;
+	in.stalled = spinHeld(i) || (spinStalled(i) && pin[i].st == lc::State::RUNNING && !armg[i].armed);
 	in.silent = spinSilent(i);
 	return lc::uiCode(pin[i], in);
 }
@@ -1168,7 +1123,7 @@ static bool learnHere(Info& out, lc::Identity& id) {
 	}
 	esc_setup::Settings s;
 	if (!esc_setup::read(bl, s)) return false;
-	id = lc::identFromSilabs(s.name, s.raw[0x0B]);
+	id = lc::identFromSilabs(s.name, s.raw[esc_setup::OFF_LAYOUT_REVISION], s.raw[0x0B]);
 	strncpy(out.layout, s.layoutTag, 16); strncpy(out.name, s.name, 16);
 	out.fwMain = s.mainRevision; out.fwSub = s.subRevision;
 	return true;

@@ -27,7 +27,7 @@ jobs:
         run: pip install platformio pyserial pytest pyyaml
 
       - name: Build all firmware environments
-        run: pio run -e main -e esc_tool
+        run: pio run -e main -e main_uart -e main_panel
 
       - name: Compile-check the host tools
         run: python -m compileall -q host
@@ -46,3 +46,5 @@ jobs:
         run: |
           cd lib/esc_lifecycle/test
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tlc test_esc_lifecycle.cpp && /tmp/tlc
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tpins test_esc_pins.cpp && /tmp/tpins
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tmt test_motor_test.cpp && /tmp/tmt

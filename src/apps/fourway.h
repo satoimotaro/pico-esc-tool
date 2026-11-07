@@ -14,6 +14,7 @@
 #include <Arduino.h>
 #include "console.h"
 #include "esc_session.h"
+#include "motor_test.h"
 
 class FourWay {
 public:
@@ -44,14 +45,7 @@ public:
 	void     declare(uint8_t mask) { declMask_ = mask; declSet_ = true; mspMs_ = millis(); }
 	bool     declared() const { return declSet_; }
 	bool     chThreeD(uint8_t ch) const { return declSet_ ? (declMask_ >> ch & 1) : threeD_; }
-	bool     wanted(uint8_t ch) const {   // a value that takes an ESC over
-		uint16_t v = motor(ch);
-		if (!v) return false;
-		if (!chThreeD(ch)) return v > 1000;
-		// 3D: the page (declared) may start in reverse; a stock client never takes an ESC over at or
-		// below its stop, so a value it did not mean as 3D cannot reach an ESC as reverse
-		return declSet_ ? v != 1500 : v > 1500;
-	}
+	bool     wanted(uint8_t ch) const { return mt::wanted(motor(ch), chThreeD(ch), declSet_); }   // takes an ESC over
 	// A configurator channel -> escs:: index: the same number (channel k is PINS[k], wired or not).
 	static int8_t channel(uint8_t ch) { return ch < MAX_CH && ch < escs::count() ? (int8_t)ch : -1; }
 

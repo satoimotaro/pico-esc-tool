@@ -133,9 +133,8 @@ Phase 2:
   at ROV launch.
 - The RPM controller falling back to open loop on LOST in ROV mode (phase 1 keeps streaming and
   reports `# esc i: lost, open loop`).
-- Signed rpm as a semantic command, and `spinThrust` on a non-3D ESC in RPM mode (phase 1 sends zero
-  for a negative command there).
-- The legacy `esc_tool.cpp` negative-throttle path.
+- Signed rpm as a semantic command (the rpm loop is refused on a one-way ESC; every drive value goes
+  through `escs::drive()`, by identity). The legacy `esc_tool` env was retired (tag `legacy-esc-tool`).
 
 Where the code refines the design:
 
@@ -236,10 +235,9 @@ lives now and how it meets the lifecycle states.
     identity; it is read again through its bootloader when it answers.
   - A bidir ESC whose telemetry never decodes stays READY (armed after 8 s anyway) and is not
     stall-watched; a pull or swap on it is not seen, like stock BLHeli_S.
-  - The rpm loop (`Thruster::setRpm`) is for reversible (3D) ESCs only: its command is 3D thrust.
-    `rpm` (CLI and HTTP) is refused on a one-way ESC (`err needs-3d`), and `escs::spinThrust`
-    sends a one-way ESC 0 for any other value, since a positive 3D command would be about half
-    throttle there. Mapping it by identity is phase 2.
+  - The rpm loop (`Thruster::setRpm`) is for reversible (3D) ESCs only: its command is signed 3D
+    thrust, sent through `escs::drive()` like every drive value. `rpm` (CLI and HTTP) is refused on
+    a one-way ESC (`err needs-3d`), and should a loop run on one anyway it is sent 0.
   - Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. If one lasts
     longer than 400 ms at zero, the pin goes LOST and is read again when it answers. This needs a
     bench check.
@@ -267,7 +265,6 @@ neither needs a rebuild or a `scan` any more.
 - Every per-ESC array is sized `escs::MAX` (8); `escs::COUNT` is this boot's count. `main.cpp`
   declares eight `Thruster`s; `EscTool` uses the first `COUNT`. `cfg load` restores every stored one,
   `cfg save` stores the first `COUNT`.
-- The legacy `esc_tool` env keeps the compile-time list.
 
 ### One index per pin
 

@@ -244,7 +244,8 @@ python3 host/plantid.py validate --pair # the controlled bare-shaft vs propeller
 - **Hardware:** RP2040 board; each ESC's signal wire on a GPIO (defaults GP10, GP11; the panel
   GP16..19; any 1..8 GPIOs with `pins`) with common ground. All wiring in `src/apps/esc_config.h`.
 - **Firmware:** [PlatformIO](https://platformio.org/) (earlephilhower Arduino-Pico core, fetched
-  automatically). Envs: **`main`** (default), `esc_tool` (legacy monolithic fallback).
+  automatically). Envs: **`main`** (default), `main_uart` (CLI on UART0), `main_panel` (the panel board).
+  The legacy `esc_tool` env is frozen at tag `legacy-esc-tool`.
 - **Host:** Python 3.8+ and `pyserial` (`pip install pyserial`; `pyyaml` optional).
 
 ## Layout

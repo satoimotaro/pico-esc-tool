@@ -365,7 +365,7 @@ public:
 		// Keep streaming 0 (don't cut the signal, don't disarm) -> the next non-zero target restarts the
 		// motor immediately from wait_for_start, with NO re-arm. Reset the integrator so restart is bump-free.
 		if (fabsf(vc.target()) <= vc.stop_below_rpm) {
-			escs::spinThrust(index_, 0);   // neutral: keep armed + signal alive; firmware stops via Rcp_Stop
+			escs::drive(index_, 0);        // neutral: keep armed + signal alive; firmware stops via Rcp_Stop
 			vc.reset();
 			// [B.6-fix] The gate has to fall with the controller. This branch RETURNS before the
 			// soft-sensor update below, so a gate latched at speed would stay valid=1 with a frozen
@@ -428,10 +428,10 @@ public:
 	// ---- io adapter: the ONLY place that knows escs:: telemetry -> vel::EscIo. Reads owner->index_. --
 	struct Io : public vel::EscIo {
 		Thruster* owner = nullptr;
-		// REVERSIBLE (3D) ESCs ONLY: cmd is 3D thrust (lc::thrust3d), and the bench profiles are
-		// calibrated that way. The CLI and HTTP refuse `rpm` on a one-way ESC; should a loop run on one
-		// anyway, spinThrust sends it 0 (a positive 3D cmd would be about half throttle there).
-		void thrust(int cmd) override { escs::spinThrust(owner->index_, (int16_t)cmd); }
+		// REVERSIBLE (3D) ESCs ONLY: cmd is signed 3D thrust (escs::drive maps it by identity), and
+		// the bench profiles are calibrated that way. The CLI and HTTP refuse `rpm` on a one-way ESC;
+		// should a loop run on one anyway, it is sent 0 (on a one-way ESC a drive value is throttle).
+		void thrust(int cmd) override { escs::drive(owner->index_, owner->reversible() ? cmd : 0); }
 		bool readTele(float& mechRpm, float& tempC) override {
 			escs::Telem t;
 			if (!escs::spinTele(owner->index_, t) || !t.valid) return false;

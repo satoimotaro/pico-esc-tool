@@ -18,8 +18,8 @@ static int failures = 0;
 	else printf("ok: %s\n", msg); } while (0)
 
 static Identity bidirOneWay() { return identFromAm32(0x35, 0); }                // AM32: bidir, not 3D
-static Identity silabs3d()    { return identFromSilabs("BLHeli_S", 3); }        // normal DShot, 3D
-static Identity bluejay()     { return identFromSilabs("Bluejay 0.21", 1); }    // bidir, one-way
+static Identity silabs3d()    { return identFromSilabs("BLHeli_S", 33, 3); }     // normal DShot, 3D
+static Identity bluejay()     { return identFromSilabs("Bluejay 0.21", 208, 1); }   // bidir, one-way
 
 // Feed n packets, one per loop sample, dt ms apart, starting at t. Returns the time after the last.
 static uint32_t packets(Pin& p, uint32_t t, int n, uint32_t dt, Ev* last = nullptr) {
@@ -154,7 +154,7 @@ int main() {
 		CHECK(p.st == State::PENDING && e == Ev::APPEARED, "LOST plus packets gives PENDING");
 	}
 	{   // a swap never carries the old identity
-		Pin p = readyPin(identFromSilabs("Bluejay", 3), 0); p.onPacket(10);
+		Pin p = readyPin(identFromSilabs("Bluejay", 208, 3), 0); p.onPacket(10);
 		p.tick(500, Policy::TOOL);
 		bool clean = p.st == State::LOST && !p.id.known;
 		packets(p, 1000, 3, 20);
@@ -301,8 +301,10 @@ int main() {
 		CHECK(a.bidir && a.rev && a.am32 && a.am32Eep == 0xF800 && b.am32Eep == 0x7C00 && !b.rev, "AM32 identity: always bidir, eep by flash code");
 		Identity u = identFromAm32(0x00, 1), v = identFromAm32(0x36, 0);
 		CHECK(!u.known && !v.known && !u.am32Eep && !v.am32Eep, "AM32 identity: an unknown flash code is unknown, no guessed block");
-		Identity j = identFromSilabs("JESC", 4), s = identFromSilabs("BLHeli_S", 1);
-		CHECK(j.bidir && j.rev && !s.bidir && !s.rev && !s.am32, "SiLabs identity: bidir by name, 3D by direction byte");
+		Identity j = identFromSilabs("JESC", 33, 4), s = identFromSilabs("BLHeli_S", 33, 1);
+		CHECK(j.bidir && j.rev && !s.bidir && !s.rev && !s.am32, "SiLabs identity: JESC by name, 3D by direction byte");
+		Identity rn = identFromSilabs("my esc", 208, 1), bg = identFromSilabs("", 226, 3), fake = identFromSilabs("Bluejay?", 33, 1);
+		CHECK(rn.bidir && bg.bidir && bg.rev && !fake.bidir, "SiLabs identity: bidir by layout revision (a renamed Bluejay too), not by a Bluejay name");
 	}
 	{   // rev0 stamp(): 0 means "none", and a stamp is never in the future
 		CHECK(stamp(0) == 1 && stamp(7) == 7 && stamp(8) == 8, "stamp(): 0 -> 1, anything else unchanged (millis()|1 was 9 for 8)");
@@ -452,6 +454,60 @@ int main() {
 		Pin l = readyPin(bluejay(), 0); l.onPacket(10); l.tick(10 + LOST_MS, Policy::TOOL);
 		CHECK(l.st == State::LOST && uiCode(l, st) == Ui::ABSENT, "LOST -> 5");
 		CHECK((uint8_t)Ui::STALLED == 6 && (uint8_t)Ui::SILENT == 7 && (uint8_t)Ui::ABSENT == 5, "the codes the page reads are fixed");
+	}
+	{   // arm gate + EDT: what streamPin does each frame, replayed at 1 ms per frame
+		// Bluejay with FORCE_EDT_ARM: answers from wait_for_start (here at 1200 ms). Every EDT frame
+		// must go out before the arm, after its answer, and the arm waits for the hold after the answer.
+		struct Run { uint32_t armedAt = 0, firstEdt = 0, edtBeforeArm = 0, edtAfterArm = 0; bool zeroWhileArming = true; };
+		auto replay = [](bool bidir, uint32_t answerAt, uint16_t window, uint32_t until) {
+			ArmGate g; EdtSched e; Run r; g.begin(0, window); e.begin(0, bidir);
+			for (uint32_t t = 1; t <= until; t++) {
+				if (bidir && answerAt && t >= answerAt) g.onAnswer(t);
+				if (!g.armed && g.tick(t, bidir, e.left > 0)) { r.armedAt = t; if (bidir) e.burst(); }
+				uint16_t target = g.armed ? 0 : 0;
+				if (bidir && e.frame(t, g.armed, g.answer != 0, target, 0, t)) {
+					if (!r.firstEdt) r.firstEdt = t;
+					(g.armed ? r.edtAfterArm : r.edtBeforeArm)++;
+				}
+			}
+			return r;
+		};
+		Run bj = replay(true, 1200, 0, 4000);
+		CHECK(bj.firstEdt == 1200 && bj.edtBeforeArm == EDT_BURST_ARM, "arm: EDT goes out once the ESC has answered, a full burst before the arm");
+		CHECK(bj.armedAt == ARM_MS + 1, "arm: answered at 1.2 s -> armed when the 3 s window ends");
+		CHECK(bj.edtAfterArm >= EDT_BURST_ARM, "arm: another EDT burst once armed and stopped");
+		Run late = replay(true, 2900, 0, 5000);
+		CHECK(late.armedAt == 2900 + ARM_ANSWER_HOLD_MS, "arm: a late answer arms ARM_ANSWER_HOLD_MS after it");
+		Run none = replay(true, 0, 0, 9000);
+		CHECK(none.armedAt == ANSWER_MAX_MS + 1 && none.firstEdt == none.armedAt, "arm: never answered -> armed after 8 s, EDT only then");
+		Run am = replay(true, 200, 0, 4000);
+		CHECK(am.armedAt == ARM_MS + 1 && am.edtBeforeArm == EDT_BURST_ARM && am.edtAfterArm >= EDT_BURST_ARM,
+		      "arm: AM32 answering early still gets the window, and EDT again once armed");
+		Run dn = replay(false, 0, 0, 4000);
+		CHECK(dn.armedAt == ARM_MS + 1 && !dn.firstEdt, "arm: normal DShot armed after the window, no EDT");
+		Run re = replay(true, 0, 300, 1000);
+		CHECK(re.armedAt == 301, "arm: a short re-arm window arms without an answer");
+
+		// after a run: EDT every EDT_RAN_MS until a fresh eRPM 0, one more burst then, then every second
+		EdtSched e; e.begin(0, true); e.left = 0;
+		uint32_t t = 0, bursts = 0, lastBurst = 0;
+		auto step = [&](uint16_t target, uint32_t rpm, uint32_t rpmMs) {
+			uint8_t before = e.left;
+			bool edt = e.frame(t, true, true, target, rpm, rpmMs);
+			if (e.left > before || (edt && before == 0)) { bursts++; lastBurst = t; }
+			return edt;
+		};
+		bool sentUnderThrottle = false;
+		for (t = 1; t <= 500; t++) sentUnderThrottle |= step(500, 3000, t);
+		CHECK(!sentUnderThrottle && e.ran, "EDT: never under throttle; a run is remembered");
+		bursts = 0;
+		for (t = 501; t <= 800; t++) step(0, 1500, t);          // coasting: eRPM not 0 yet
+		uint32_t coasting = bursts;
+		CHECK(coasting >= 2, "EDT: while it coasts down, a burst every 100 ms");
+		bursts = 0;
+		step(0, 0, t); t++;                                       // a fresh eRPM 0: one more burst, then idle
+		for (; t <= 1900; t++) step(0, 0, t - 500);               // eRPM 0, but not fresh: the 1 s refresh at 1801
+		CHECK(!e.ran && bursts == 2, "EDT: a fresh eRPM 0 gets one more burst; then one per second");
 	}
 	{   // names
 		const char* want[] = { "EMPTY", "PENDING", "READING", "READY", "RUNNING", "LOST", "FAILED" };
