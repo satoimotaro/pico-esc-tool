@@ -3,13 +3,13 @@
 """pico_esc.protocol — the FROZEN esc_tool wire protocol, as data.
 
 This is the single host-side registry of every command name and response-format literal that
-the RP2040 firmware (src/apps/esc_tool.cpp handleSerial) speaks. It is deliberately data-only:
+the RP2040 firmware (src/apps/esc_tool_app.h, its CLI) speaks. It is deliberately data-only:
 the CLIs keep building their command strings inline (byte-for-byte unchanged), and
 host/tests/test_protocol.py greps the firmware source to prove every literal below still
 exists on the device — so the two sides can never silently drift apart.
 
 DO NOT edit a literal here without making the identical change on BOTH sides (firmware +
-whichever host parser consumes it). Substrings are chosen to appear verbatim in esc_tool.cpp.
+whichever host parser consumes it). Substrings are chosen to appear verbatim in esc_tool_app.h.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ RESPONSES = (
     "data|",
     "fw| %s  %u bytes\\n",
     "fwlist %d\\n",
-    "pwm|%d|%dus\\n",
+    "pwm|%d|%uus|%s\\n",
     "enc|%d|%d|%.1f|%d|%d|%d|%d|%d\\n",
     "tele|%lu|%.2f|%lu|%lu|%lu\\n",
     "arming ~3s (mode %s, %s)\\n",

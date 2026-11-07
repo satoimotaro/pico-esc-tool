@@ -133,9 +133,8 @@ Phase 2:
   at ROV launch.
 - The RPM controller falling back to open loop on LOST in ROV mode (phase 1 keeps streaming and
   reports `# esc i: lost, open loop`).
-- Signed rpm as a semantic command, and `spinThrust` on a non-3D ESC in RPM mode (phase 1 sends zero
-  for a negative command there).
-- The legacy `esc_tool.cpp` negative-throttle path.
+- Signed rpm as a semantic command (the rpm loop is refused on a one-way ESC; every drive value goes
+  through `escs::drive()`, by identity). The legacy `esc_tool` env was retired (tag `legacy-esc-tool`).
 
 Where the code refines the design:
 
@@ -267,7 +266,6 @@ neither needs a rebuild or a `scan` any more.
 - Every per-ESC array is sized `escs::MAX` (8); `escs::COUNT` is this boot's count. `main.cpp`
   declares eight `Thruster`s; `EscTool` uses the first `COUNT`. `cfg load` restores every stored one,
   `cfg save` stores the first `COUNT`.
-- The legacy `esc_tool` env keeps the compile-time list.
 
 ### One index per pin
 

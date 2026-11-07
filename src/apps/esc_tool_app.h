@@ -22,7 +22,7 @@
 #include <LittleFS.h>
 #include "presets.h"
 #include <Wire.h>
-#include "esc.h"
+#include "esc_session.h"
 #include "as5600.h"
 #include "esc_flash.h"
 #include "thruster.h"
@@ -549,7 +549,7 @@ private:
 			if (!owned) {
 				if (!fw_.wanted(ch) || (mtLatched_ & bit)) continue;
 				if (escs::spinArmed(i) || escs::spinArming(i) || escs::pwmActive(i)) continue;   // the CLI has it
-				// a stock configurator sends every channel: an empty pin would queue a ~10 s read ladder
+				// a stock configurator sends every channel: an empty pin would queue a 5.5 s read
 				// in front of the real ESCs. It reports absent (UI 5); `arm i` / `read i` still try it.
 				if (escs::absentConfirmed(i)) continue;
 				mtOwned_ |= bit;                                           // ours from the request on
@@ -562,24 +562,13 @@ private:
 			} else if (!escs::spinArmed(i) && !escs::spinArming(i)) {   // stopped elsewhere (CLI disarm), or lost
 				mtOwned_ &= ~bit; mtLatched_ |= bit; continue;
 			}
-			// 1000..2000 (stop 1000) or 3D 1000..1500..2000 -> the CLI's raw units. Reverse only when the
-			// value is 3D AND the ESC is: any other pairing runs forward or not at all. 0 (a short or
-			// cleared frame) is stop, not "below full reverse".
-			if (!v) v = c3d ? 1500 : 1000;
-			int raw;
-			if (th->reversible()) raw = c3d ? (int(v) - 1500) * 2 : (v > 1000 ? (int(v) - 1000) : 0);
-			else                  raw = c3d ? (v > 1500 ? (int(v) - 1500) * 4 : 0) : (v > 1000 ? (int(v) - 1000) * 2 : 0);
-			th->setRaw(raw);
+			th->setRaw(mt::driveValue(v, c3d, th->reversible()));   // every pairing safe (motor_test.h)
 		}
 	}
 
 	// A motor-test value on channel ch (1000..2000, or 3D 1000..1500..2000) as a servo pulse for ESC i,
 	// by that ESC's own direction mode — the same mapping as the DShot test.
-	uint16_t pwmFromTest(uint8_t i, uint16_t v, uint8_t ch) {
-		bool c3d = fw_.chThreeD(ch);
-		if (escs::knownReversible(i)) return c3d ? v : (v > 1000 ? 1500 + (v - 1000) / 2 : 1500);
-		return c3d ? (v > 1500 ? 1000 + (v - 1500) * 2 : 1000) : v;
-	}
+	uint16_t pwmFromTest(uint8_t i, uint16_t v, uint8_t ch) { return mt::pwmValue(v, fw_.chThreeD(ch), escs::knownReversible(i)); }
 
 	// Lifecycle events from escs:: (appeared, lost, read ...) as `#` lines; dropped during a
 	// passthrough, where they would land inside the configurator's 4-way replies.

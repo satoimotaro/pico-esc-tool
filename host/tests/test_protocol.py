@@ -10,7 +10,7 @@ import pytest
 
 from pico_esc import protocol
 
-FW = os.path.join(os.path.dirname(__file__), "..", "..", "src", "apps", "esc_tool.cpp")
+FW = os.path.join(os.path.dirname(__file__), "..", "..", "src", "apps", "esc_tool_app.h")
 
 
 @pytest.fixture(scope="module")
@@ -22,17 +22,17 @@ def firmware_src():
 @pytest.mark.parametrize("cmd", protocol.COMMANDS)
 def test_command_literal_in_firmware(firmware_src, cmd):
     # commands are matched with strcmp(cmd, "..."), so the quoted token must appear verbatim
-    assert f'"{cmd}"' in firmware_src, f'command "{cmd}" missing from esc_tool.cpp'
+    assert f'"{cmd}"' in firmware_src, f'command "{cmd}" missing from esc_tool_app.h'
 
 
 @pytest.mark.parametrize("resp", protocol.RESPONSES)
 def test_response_literal_in_firmware(firmware_src, resp):
-    assert resp in firmware_src, f"response literal {resp!r} missing from esc_tool.cpp"
+    assert resp in firmware_src, f"response literal {resp!r} missing from esc_tool_app.h"
 
 
 @pytest.mark.parametrize("err", protocol.ERRORS)
 def test_error_literal_in_firmware(firmware_src, err):
-    assert err in firmware_src, f"error literal {err!r} missing from esc_tool.cpp"
+    assert err in firmware_src, f"error literal {err!r} missing from esc_tool_app.h"
 
 
 def test_response_tags_are_prefixes():

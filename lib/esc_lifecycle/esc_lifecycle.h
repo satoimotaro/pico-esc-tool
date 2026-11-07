@@ -25,7 +25,7 @@ static const uint32_t LOST_MS          = 400;
 static const uint8_t  APPEAR_PKTS      = 3;
 static const uint32_t APPEAR_WINDOW_MS = 250;
 static const uint32_t APPEAR_GAP_MS    = 15;
-// A bidir READY pin that never answers on its stream within this long (== escs::SPIN_ARM_TELE_MAX_MS)
+// A bidir READY pin that never answers on its stream within this long (ArmGate arms it then anyway)
 // is reported once (Ev::NO_ANSWER) and kept READY: it is armed after 8 s anyway, as in rev0, and its
 // telemetry may just not decode. A RUNNING pin re-armed after a stall (Stall below) that never
 // answers again within this long is LOST: it had answered before.
@@ -65,10 +65,15 @@ inline Identity identFromAm32(uint8_t flashCode, uint8_t biDir) {
 	id.known = true; id.bidir = true; id.am32 = true; id.rev = biDir == 1;
 	return id;
 }
-// SiLabs: bidir only on firmware that says so; 3D from motor_direction (1=Norm 2=Rev 3=3D 4=3D-Rev).
-inline Identity identFromSilabs(const char* name, uint8_t dirByte) {
+// SiLabs: bidir from the settings layout revision (0x1A02), as the web page and the presets read
+// it: Bluejay 200..209, BlueGill 226. The NAME at 0x60 is the user's to edit, so it only marks JESC,
+// which keeps the BLHeli_S layout. 3D from motor_direction (1=Norm 2=Rev 3=3D 4=3D-Rev).
+inline bool silabsBidir(uint8_t layoutRev, const char* name) {
+	return (layoutRev >= 200 && layoutRev <= 209) || layoutRev == 226 || (name && strstr(name, "JESC"));
+}
+inline Identity identFromSilabs(const char* name, uint8_t layoutRev, uint8_t dirByte) {
 	Identity id; id.known = true;
-	id.bidir = name && (strstr(name, "Bluejay") || strstr(name, "JESC"));
+	id.bidir = silabsBidir(layoutRev, name);
 	id.rev   = dirByte == 3 || dirByte == 4;
 	return id;
 }
@@ -119,7 +124,7 @@ struct Pin {
 	// Absent, confirmed: a read found nothing there (READ_EMPTY), or the passthrough's probe got no
 	// answer on a pin that was EMPTY before it. Any valid packet or a read that succeeds clears it.
 	// Only implicit arms (a configurator's motor test sends every channel) skip such a pin
-	// (implicitArmSkipped): each would otherwise queue a ~10 s read ladder in front of the real ESCs.
+	// (implicitArmSkipped): each would otherwise queue a 5.5 s read in front of the real ESCs.
 	bool     absent = false;
 
 	void toEmpty() { st = State::EMPTY; id = Identity{}; seen = queued = armWanted = openLoop = unconfirmed = false; burst = 0; }
@@ -328,6 +333,63 @@ inline Refuse mapDrive(const Identity& id, int v, bool& use3d, int16_t& s3d, uin
 inline uint32_t stamp(uint32_t now) { return now ? now : 1; }
 // ms from stamp t to now, 0 if t is ahead (the stamp(0) = 1 case).
 inline uint32_t since(uint32_t now, uint32_t t) { int32_t d = (int32_t)(now - t); return d > 0 ? (uint32_t)d : 0; }
+
+// ARM GATE. A drive stream counts as armed once its window (ARM_MS, or the short window of a re-arm
+// of an ESC that is armed already) has passed and the ESC has been heard: a normal-DShot stream at
+// once, a bidir one once it answered, ARM_ANSWER_HOLD_MS of zero have gone by since, and its EDT
+// enable has gone out (EdtSched). Bluejay sends its first telemetry from wait_for_start, i.e. once it
+// has armed, and takes DShot commands only there; with EDT safety arm (FORCE_EDT_ARM) it refuses to
+// start without EDT (Bluejay.asm wait_for_start_nonzero), and a reboot clears EDT. A bidir stream
+// that never answers is armed after ANSWER_MAX_MS anyway. Nothing but zero goes out until it is armed.
+static const uint32_t ARM_MS = 3000, ARM_ANSWER_HOLD_MS = 300;
+struct ArmGate {
+	bool     armed = false;
+	uint32_t start = 0, answer = 0;   // window start; first answer on this stream (stamp, 0 = none)
+	uint16_t ms = 0;                  // this window (0 = ARM_MS)
+	void begin(uint32_t now, uint16_t windowMs = 0) { armed = false; start = now; answer = 0; ms = windowMs; }
+	void onAnswer(uint32_t now) { if (!answer) answer = stamp(now); }
+	// true on the call that arms it. edtPending: EDT enable frames still to go out.
+	bool tick(uint32_t now, bool bidir, bool edtPending) {
+		if (armed) return false;
+		uint32_t t = now - start, win = ms ? ms : ARM_MS;
+		bool heard = !bidir || ms || (answer && since(now, answer) >= ARM_ANSWER_HOLD_MS && !edtPending);
+		if (t > win && (heard || t > ANSWER_MAX_MS)) armed = true;
+		return armed;
+	}
+};
+
+// EDT SCHEDULE: when a bidir stream sends the EDT enable (DShot command 13, extended telemetry:
+// V/A/temp, and what FORCE_EDT_ARM waits for) in place of a throttle frame. A burst of
+// EDT_BURST_ARM at the stream's start and again once armed (AM32 may answer before it arms), sent
+// while arming only once the ESC has answered (it ignores commands during its boot beep), and once
+// armed only at zero. Bluejay clears EDT at the end of every run (Bluejay.asm
+// exit_run_mode_no_stall) and takes the command only once it is back in wait_for_start, after the
+// motor has coasted down: a burst right at the stop is dropped. So after a run a burst goes out every
+// EDT_RAN_MS until a fresh eRPM of 0 says it has left run mode (one more burst then), and every
+// EDT_REFRESH_MS while stopped.
+static const uint32_t EDT_REFRESH_MS = 1000, EDT_RAN_MS = 100, EDT_STILL_MS = 100;
+static const uint8_t  EDT_BURST_ARM = 20, EDT_BURST = 10;
+struct EdtSched {
+	uint8_t  left = 0;        // frames of the current burst still to send
+	bool     ran = false;     // driven since the ESC was last seen stopped (eRPM 0)
+	uint32_t lastMs = 0;      // last burst while stopped
+	void begin(uint32_t now, bool bidir) { left = bidir ? EDT_BURST_ARM : 0; ran = false; lastMs = now; }
+	void burst() { left = EDT_BURST_ARM; }
+	// One frame. rpm/rpmMs: the last eRPM reading and when it came. true: send EDT, not the throttle.
+	bool frame(uint32_t now, bool armed, bool answered, uint16_t target, uint32_t rpm, uint32_t rpmMs) {
+		if (armed && target == 0 && left == 0) {
+			bool still = rpm == 0 && (int32_t)(now - rpmMs) < (int32_t)EDT_STILL_MS;
+			if ((ran && still) || now - lastMs >= (ran ? EDT_RAN_MS : EDT_REFRESH_MS)) {
+				left = EDT_BURST; lastMs = now;
+				if (still) ran = false;
+			}
+		}
+		if (target) ran = true;
+		bool may = armed ? target == 0 : answered;
+		if (may && left > 0) { left--; return true; }
+		return false;
+	}
+};
 
 // STALL WATCH (rev0 8805f12, e6ddda2). A bidir ESC that stalls drops out of its run: Bluejay beeps,
 // clears EDT and waits to be armed again (Bluejay.asm exit_run_mode), and with EDT safety arm (FORCE_EDT_ARM) it
