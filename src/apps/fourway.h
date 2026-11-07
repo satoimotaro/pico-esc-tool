@@ -79,11 +79,18 @@ private:
 	enum : uint8_t { imSIL_BLB = 1, imATM_BLB = 2, imARM_BLB = 4 };
 	enum : uint8_t { ACK_OK = 0x00, ACK_I_INVALID_CMD = 0x02, ACK_I_INVALID_CRC = 0x03,
 	                 ACK_I_INVALID_CHANNEL = 0x08, ACK_I_INVALID_PARAM = 0x09, ACK_D_GENERAL_ERROR = 0x0F };
+	// InitFlash only: the ESC is still entering its bootloader, send InitFlash again (escs::fwSelect).
+	// Betaflight's ACK_D_UNKNOWN_ERROR; esc-configurator retries on any NACK, the web page on this one.
+	static const uint8_t ACK_PENDING = 0x07;
+	// How long an InitFlash may take before it answers PENDING: under esc-configurator's 1 s reply
+	// timeout. A frame that came in with the passthrough may have waited out fwBegin's prime already.
+	static const uint32_t INIT_BUDGET_MS = 800, INIT_BUDGET_FIRST_MS = 300;
 
 	uint8_t  buf_[256 + 8];
 	uint16_t n_ = 0;
 	uint8_t  len_ = 0;                          // payload length of the MSP frame being handled
 	uint32_t lastMs_ = 0;
+	uint32_t ptMs_ = 0, rxMs_ = 0;              // fwBegin returned; the 4-way frame being read began
 	bool     fourWay_ = false;
 	int8_t   sel_ = -1;
 	uint8_t  mode_ = imSIL_BLB;
@@ -173,7 +180,7 @@ private:
 				// InitFlash fails after a 500 ms probe.
 				clearMotors();                    // EscTool stops a motor test when it sees passthrough
 				d[0] = n; mspReply(cmd, d, 1);   // answer first: fwBegin primes the ESCs for 0.5 s
-				escs::fwBegin();
+				escs::fwBegin(); ptMs_ = millis();
 				fourWay_ = true; sel_ = -1; mode_ = imSIL_BLB; n_ = 0;
 				break;
 			default:  mspReply(cmd, d, 0, true); break;
@@ -189,6 +196,7 @@ private:
 
 	void fourWayByte(uint8_t c) {
 		if (n_ == 0 && c != 0x2F) return;                         // wait for the local escape
+		if (n_ == 0) rxMs_ = millis();
 		buf_[n_++] = c;
 		if (n_ < 5) return;
 		uint16_t plen = buf_[4] ? buf_[4] : 256;
@@ -228,7 +236,9 @@ private:
 				if (e < 0) { ack = ACK_I_INVALID_CHANNEL; break; }
 				uint8_t raw[8]; bool am32 = false;
 				sel_ = -1; olen = 4; memset(out, 0, 4);
-				if (!escs::fwSelect(e, raw, am32)) { ack = ACK_D_GENERAL_ERROR; break; }
+				uint32_t budget = rxMs_ - ptMs_ < 100 ? INIT_BUDGET_FIRST_MS : INIT_BUDGET_MS;
+				escs::FwSel r = escs::fwSelect(e, raw, am32, budget);
+				if (r != escs::FwSel::OK) { ack = r == escs::FwSel::PENDING ? ACK_PENDING : ACK_D_GENERAL_ERROR; break; }
 				sel_ = e;
 				// DeviceInfo as Betaflight's BL_ConnectEx packs it: [sigLo, sigHi, 4th id char, mode]
 				out[0] = raw[5]; out[1] = raw[4]; out[2] = raw[3];

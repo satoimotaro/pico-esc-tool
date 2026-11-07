@@ -134,7 +134,10 @@ export const FW = {
 // Interface modes in DeviceInfo[3]
 export const MODE = { SIL_BLB: 1, ATM_BLB: 2, ATM_SK: 3, ARM_BLB: 4 };
 const ACK = { 0x00: 'OK', 0x02: 'invalid command', 0x03: 'bad CRC', 0x04: 'verify failed',
-  0x08: 'invalid channel', 0x09: 'invalid parameter', 0x0F: 'general error' };
+  0x07: 'pending', 0x08: 'invalid channel', 0x09: 'invalid parameter', 0x0F: 'general error' };
+// pico-esc-tool answers an InitFlash within 1 s (esc-configurator's timeout): 'pending' while the
+// ESC is still entering its bootloader, and the next InitFlash carries on.
+const ACK_PENDING = 0x07;
 
 export function crc16(bytes, crc = 0) {
   for (const b of bytes) {
@@ -173,13 +176,23 @@ export class FourWay {
       }
     }, ms);
     if (!r) throw new Error(`4-way 0x${cmd.toString(16)}: no reply`);
-    if (r.ack !== 0) throw new Error(`4-way 0x${cmd.toString(16)}: ${ACK[r.ack] || 'ack ' + r.ack}`);
+    if (r.ack !== 0) {
+      const e = new Error(`4-way 0x${cmd.toString(16)}: ${ACK[r.ack] || 'ack ' + r.ack}`);
+      e.ack = r.ack; throw e;
+    }
     return r.data;
   }
   // DeviceInfo: [sigLo, sigHi, bootVersion, mode]
   async initFlash(ch) {
-    const d = await this.command(FW.INIT_FLASH, 0, [ch], 20000);
-    return { signature: d[1] << 8 | d[0], mode: d[3], raw: d };
+    const end = performance.now() + 10000;
+    for (;;) {
+      try {
+        const d = await this.command(FW.INIT_FLASH, 0, [ch], 20000);
+        return { signature: d[1] << 8 | d[0], mode: d[3], raw: d };
+      } catch (e) {
+        if (e.ack !== ACK_PENDING || performance.now() > end) throw e;
+      }
+    }
   }
   async read(addr, n) {
     const out = [];

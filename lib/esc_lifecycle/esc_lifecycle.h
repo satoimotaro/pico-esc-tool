@@ -51,11 +51,18 @@ struct Identity {
 	bool     known = false, bidir = false, rev = false, am32 = false;
 	uint16_t am32Eep = 0;   // AM32 settings block address (0 = not AM32)
 };
+// AM32 settings block by the bootloader's flash-size code (web/js/layouts.js, host/pico_esc/am32.py):
+// 0x1F = 32 KB part (0x7C00), 0x35 = 64 KB part (0xF800). Any other code: 0, unknown. A guessed
+// block would give a made-up bi_direction, and a 3D ESC taken as one-way runs reverse.
+inline uint16_t am32EepFor(uint8_t flashCode) {
+	return flashCode == 0x1F ? 0x7C00 : flashCode == 0x35 ? 0xF800 : 0;
+}
 // AM32 (an ARM bootloader id) always speaks bidir DShot and keeps bi_direction in its own settings
-// block; the flash-size code picks the block: 0x35 = 64 KB part (0xF800), else 32 KB (0x7C00).
+// block. An unknown flash code gives known=false: nothing may be mapped.
 inline Identity identFromAm32(uint8_t flashCode, uint8_t biDir) {
-	Identity id; id.known = true; id.bidir = true; id.am32 = true; id.rev = biDir == 1;
-	id.am32Eep = flashCode == 0x35 ? 0xF800 : 0x7C00;
+	Identity id; id.am32Eep = am32EepFor(flashCode);
+	if (!id.am32Eep) return id;
+	id.known = true; id.bidir = true; id.am32 = true; id.rev = biDir == 1;
 	return id;
 }
 // SiLabs: bidir only on firmware that says so; 3D from motor_direction (1=Norm 2=Rev 3=3D 4=3D-Rev).

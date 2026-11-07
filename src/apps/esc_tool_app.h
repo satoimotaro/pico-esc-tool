@@ -840,6 +840,7 @@ private:
 	void hRpm()      { int i=server_.arg("i").toInt(); float v=server_.arg("v").toFloat();  // closed loop
 		if (i<0||i>=n_) { server_.send(200,"application/json","{\"ok\":false}"); return; }
 		if (!th_[i]->armed()) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"not-armed\"}"); return; }
+		if (!th_[i]->reversible()) { server_.send(200,"application/json","{\"ok\":false,\"err\":\"needs-3d\"}"); return; }
 		th_[i]->setRpm(v); server_.send(200,"application/json","{\"ok\":true}"); }
 	void hDisarm()   { int i=server_.arg("i").toInt(); if(i>=0&&i<n_) th_[i]->stop(); server_.send(200,"application/json","{\"ok\":true}"); }
 	void hSpinStop() { escs::spinStopAll(); server_.send(200,"application/json","{\"ok\":true}"); }
@@ -1105,6 +1106,7 @@ private:
 			else if (!strcmp(cmd,"rpm")) { int i=argi(); char* v=strtok(nullptr," ");   // NEW: closed-loop velocity target (mech RPM, signed)
 				if(i<0||i>=n_||!v) console::out().println("err bad-args");
 				else if(!th_[i]->armed()) notArmed(i);
+				else if(!th_[i]->reversible()) console::out().printf("err needs-3d (ESC %u is one-way: use throttle)\n", i);
 				else { th_[i]->setRpm(atof(v)); console::out().println("ok"); } }
 			else if (!strcmp(cmd,"gain")) { int i=argi(); char* g=strtok(nullptr," "); char* v=strtok(nullptr," ");   // gain <i> <kp|ki|kd|dtau|trim|slew> <v>
 				if(i<0||i>=n_||!g||!v) console::out().println("err bad-args");

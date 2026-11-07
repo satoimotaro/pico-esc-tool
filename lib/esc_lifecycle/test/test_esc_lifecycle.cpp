@@ -299,6 +299,8 @@ int main() {
 	{   // identity rules
 		Identity a = identFromAm32(0x35, 1), b = identFromAm32(0x1F, 0);
 		CHECK(a.bidir && a.rev && a.am32 && a.am32Eep == 0xF800 && b.am32Eep == 0x7C00 && !b.rev, "AM32 identity: always bidir, eep by flash code");
+		Identity u = identFromAm32(0x00, 1), v = identFromAm32(0x36, 0);
+		CHECK(!u.known && !v.known && !u.am32Eep && !v.am32Eep, "AM32 identity: an unknown flash code is unknown, no guessed block");
 		Identity j = identFromSilabs("JESC", 4), s = identFromSilabs("BLHeli_S", 1);
 		CHECK(j.bidir && j.rev && !s.bidir && !s.rev && !s.am32, "SiLabs identity: bidir by name, 3D by direction byte");
 	}

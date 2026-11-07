@@ -40,7 +40,7 @@ public:
 	// drive / spin
 	void spinArm(uint8_t idx, Drive mode = Drive::AUTO) { escs::spinArm(idx, mode); }
 	void spinThrottle(uint8_t idx, uint16_t throttle)   { escs::spinThrottle(idx, throttle); }
-	void spinThrust(uint8_t idx, int16_t s)             { escs::spinThrust(idx, s); }
+	bool spinThrust(uint8_t idx, int16_t s)             { return escs::spinThrust(idx, s); }
 	bool spinArmed(uint8_t idx)                   { return escs::spinArmed(idx); }
 	bool spinReversible(uint8_t idx)              { return escs::spinReversible(idx); }
 	const char* spinMode(uint8_t idx)             { return escs::spinMode(idx); }
