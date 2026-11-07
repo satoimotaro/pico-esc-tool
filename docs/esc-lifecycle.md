@@ -236,9 +236,10 @@ lives now and how it meets the lifecycle states.
     identity; it is read again through its bootloader when it answers.
   - A bidir ESC whose telemetry never decodes stays READY (armed after 8 s anyway) and is not
     stall-watched; a pull or swap on it is not seen, like stock BLHeli_S.
-  - The rpm loop (`Thruster::setRpm`) is for reversible (3D) ESCs only: its command is 3D thrust,
-    and on a one-way ESC a positive command lands in the 3D forward band (about half throttle at
-    command 1). Mapping it by identity is phase 2.
+  - The rpm loop (`Thruster::setRpm`) is for reversible (3D) ESCs only: its command is 3D thrust.
+    `rpm` (CLI and HTTP) is refused on a one-way ESC (`err needs-3d`), and `escs::spinThrust`
+    sends a one-way ESC 0 for any other value, since a positive 3D command would be about half
+    throttle there. Mapping it by identity is phase 2.
   - Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. If one lasts
     longer than 400 ms at zero, the pin goes LOST and is read again when it answers. This needs a
     bench check.
@@ -299,11 +300,18 @@ neither needs a rebuild or a `scan` any more.
   is selected again: the prime no longer applies to it, so it gets one fresh full entry (below). A
   stock BLHeli_S that was never read is EMPTY, but it is in its bootloader after the quiet window and
   answers the probe.
+- No InitFlash reply waits more than 800 ms (300 ms for one that came in with the passthrough and
+  may have waited out the prime already). esc-configurator times every 4-way reply out after 1 s,
+  sends the command again, and takes whatever frame comes next as its answer: a late reply would
+  answer the command after it. While its pin is still in the quiet window or polling toward its
+  deadline, InitFlash answers `0x07` (pending, Betaflight's `ACK_D_UNKNOWN_ERROR`), and the next
+  InitFlash for that channel carries on toward the same deadline. esc-configurator retries on any
+  NACK (250, 500, 750, 1000 ms apart, 5 tries in its read); the web page retries on `0x07` only.
 
 ### Bootloader entry timing
 
 - One entry, everywhere (`enterBootloader` for `read i` / `scan` / `enter`, the async `Op::READID`,
-  a passthrough channel selected again after DeviceReset): DShot zero prime 500 ms (BLHeli-S needs valid frames first), line high,
+  a passthrough channel selected again after DeviceReset, spread over its pending InitFlash answers): DShot zero prime 500 ms (BLHeli-S needs valid frames first), line high,
   `ENTRY_QUIET_MS` = 1000 ms with no traffic at all, then BootInit polled until an answer or
   `ENTRY_MAX_MS` = 5000 ms after line high. The passthrough primes every pin at once and shares the
   quiet window. It replaced a fixed ladder (1 s hold, then 4 s twice) and a fixed 4.5 s settle.
@@ -334,9 +342,10 @@ neither needs a rebuild or a `scan` any more.
 - The passthrough primes in turns when there are more pins than free SMs (500 ms more for pins 5..8).
 - A configurator shows an empty pin as a channel whose read failed (esc-configurator logs a read
   failure; the web page logs `ESC n: つながっていません` and goes on to the next channel).
-- esc-configurator retries an InitFlash for about 6 s. A pin whose ESC was pulled (below) costs at
-  most 5 s after the lines went high in a passthrough (polled to `ENTRY_MAX_MS`, no second entry), so
-  it fits in that window; before, one more full entry made it ~9.5 s.
+- esc-configurator's read tries an InitFlash 5 times over about 6 s. A pin whose ESC was pulled
+  (below) costs at most 5 s after the lines went high in a passthrough (polled to `ENTRY_MAX_MS`
+  across the pending answers, no second entry), so it fits in that window; before, one more full
+  entry made it ~9.5 s.
 - `ENTRY_MAX_MS` (5 s from line high) is measured on one AM32 build with its startup tune off. An
   AM32 build or a tune that takes longer to reach its bootloader is missed: in a passthrough that
   channel fails for that passthrough (the page's next read is a fresh passthrough and primes again),

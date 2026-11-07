@@ -150,7 +150,7 @@ namespace detail {
 	static volatile Op       op = Op::NONE;
 	static volatile bool     opDone = false, opOk = false;
 	static volatile uint8_t  opPin = PINS[0], opIdx = 0;
-	static volatile uint32_t opUntil = 0;   // Op::CONNECT / READID: poll BootInit until this millis() (0: CONNECT_MIN_MS)
+	static volatile uint32_t opUntil = 0;   // Op::CONNECT / READID: poll BootInit until this millis() (0: CONNECT_MIN_MS from now)
 	static volatile uint8_t  sig[2] = {0, 0};
 	static volatile uint8_t  bootVer = 0, bootPages = 0;
 	static uint32_t prHoldMs = 0, prEdges = 0, prLows = 0, prTotal = 0;   // Op::PROBE in/out
@@ -196,7 +196,8 @@ namespace detail {
 	static bool     fwDone[MAX] = { false };   // fwRun already left its bootloader (DeviceReset)
 	static bool     fwActive = false;            // the configurator owns every pin: no hold, no jobs
 	static uint32_t fwBeginMs = 0;
-	static bool     fwSettled = false;           // the shared settle after fwBegin has been waited out
+	static uint32_t fwHigh[MAX] = { 0 };       // its line went high (fwBegin, or a re-entry after DeviceReset)
+	static uint32_t fwFrom[MAX] = { 0 };       // its first BootInit of this entry (0: not yet)
 	static bool     fwSeen[MAX] = { false };   // answered once this passthrough (worth the long poll)
 	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
 	// The lifecycle: one state per pin, and what the hold / LOST handling do with it.
@@ -466,19 +467,25 @@ namespace detail {
 		blDepth--;
 		op = Op::NONE; return opOk;
 	}
-	// CONNECT polling until `until` (millis(); at least CONNECT_MIN_MS from now).
+	// CONNECT polling until `until` (millis(); 0 = CONNECT_MIN_MS from now).
 	static bool connectUntil(uint8_t gpio, uint32_t until) {
 		opUntil = until; bool ok = runOp(Op::CONNECT, gpio); opUntil = 0; return ok;
 	}
-	// One attempt: DShot prime -> line high -> ENTRY_QUIET_MS of silence -> BootInit polled until
-	// ENTRY_MAX_MS from line high (see ENTRY_QUIET_MS for the measurements).
-	static bool enterBootloader(uint8_t gpio) {
+	// DShot prime (PRIME_MS of zero throttle), then the line high: the start of every entry.
+	static void primeHigh(uint8_t gpio) {
 		blDepth++; pwmSafe();
 		dsh = newBidir(gpio, DSHOT_KBAUD);           // the pin's own stream was freed: no extra SM
 		uint32_t t0 = millis();
 		while (millis() - t0 < PRIME_MS) { if (!dsh->initError()) dsh->sendThrottle(0); pump(); delayMicroseconds(300); }
 		delete dsh; dsh = nullptr;
 		pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH);
+		blDepth--;
+	}
+	// One attempt: DShot prime -> line high -> ENTRY_QUIET_MS of silence -> BootInit polled until
+	// ENTRY_MAX_MS from line high (see ENTRY_QUIET_MS for the measurements).
+	static bool enterBootloader(uint8_t gpio) {
+		blDepth++; pwmSafe();
+		primeHigh(gpio);
 		uint32_t high = millis();
 		pumpFor(ENTRY_QUIET_MS);                     // no BootInit here: it keeps Bluejay in its app
 		bool in = connectUntil(gpio, high + ENTRY_MAX_MS);
@@ -734,11 +741,14 @@ inline void spinThrottle(uint8_t idx, uint16_t throttle) {          // unidirect
 	drvLast[idx] = millis();
 }
 // Reversible (3D): -1000..+1000, 0 = stop, full scale at +-953 (lc::thrust3d clamps past that).
-inline void spinThrust(uint8_t idx, int16_t s) {
+// A one-way ESC takes only 0: any other value is 3D thrust it would read as about half throttle
+// (cmd 1 is wire 1095), so it is refused and the ESC is sent 0. false = refused.
+inline bool spinThrust(uint8_t idx, int16_t s) {
 	using namespace detail;
-	if (!spinArmed(idx)) return;
-	if (s < 0 && !pin[idx].id.rev) return;          // reverse on a one-way ESC: refused
-	drvTarget[idx] = stall[idx].gate(millis(), lc::thrust3d(s)); drvLast[idx] = millis();
+	if (!spinArmed(idx)) return false;
+	bool ok = s == 0 || pin[idx].id.rev;
+	drvTarget[idx] = stall[idx].gate(millis(), ok ? lc::thrust3d(s) : 0); drvLast[idx] = millis();
+	return ok;
 }
 // Restarted after a stall within the last few seconds (a UI can say why it is arming again).
 inline bool spinStalled(uint8_t idx) { return idx < COUNT && detail::stall[idx].recent(millis()); }
@@ -958,15 +968,19 @@ inline UiState uiState(uint8_t i) {
 // loss as "go to the bootloader": BLHeli-S needs the valid frames first (a bare high line leaves it
 // waiting for signal), AM32 needs its reboot. Every pin then has ENTRY_QUIET_MS of silence, in
 // parallel, before the first BootInit, and polls from there (see ENTRY_QUIET_MS).
-// Each channel's first InitFlash then polls its own pin with BootInit: until fwBeginMs + ENTRY_MAX_MS
-// if its lifecycle knew an ESC there (lc::Pin::ptRetry: it may be slow, or stuck in its app) or it
-// answered earlier in this passthrough, else until fwBeginMs + ENTRY_QUIET_MS + ENTRY_BARE_MS (at
-// least CONNECT_MIN_MS either way). fwBegin's prime was the full entry for every pin, so a pin that
-// misses its poll is absent for this passthrough: no second entry. A pulled pin whose ESC was known
-// costs at most ENTRY_MAX_MS from the lines going high (inside esc-configurator's ~6 s InitFlash
-// retry window), an EMPTY one at most 0.5 s, each charged to its own channel only. Only a pin whose
-// app was run in this passthrough (DeviceReset, then selected again) gets a fresh full entry: the
-// prime no longer applies to it. A miss stays failed for the passthrough: retries answer at once.
+// Each channel's InitFlash then polls its own pin with BootInit: until fwHigh + ENTRY_MAX_MS if its
+// lifecycle knew an ESC there (lc::Pin::ptRetry: it may be slow, or stuck in its app) or it answered
+// earlier in this passthrough, else until fwHigh + ENTRY_QUIET_MS + ENTRY_BARE_MS (at least
+// CONNECT_MIN_MS from its first BootInit either way). fwBegin's prime was the full entry for every
+// pin, so a pin that misses its poll is absent for this passthrough: no second entry. A pulled pin
+// whose ESC was known costs at most ENTRY_MAX_MS from the lines going high, an EMPTY one at most
+// 0.5 s past the quiet window, each charged to its own channel only. Only a pin whose app was run in
+// this passthrough (DeviceReset, then selected again) gets a fresh prime: fwBegin's no longer
+// applies to it. A miss stays failed for the passthrough: retries answer at once.
+// No reply waits past budgetMs: esc-configurator times a 4-way reply out after 1 s and sends the
+// command again, and it takes whatever frame comes next as the answer, so a late reply would answer
+// the command after it. Not done within the budget: PENDING (the 4-way NACKs it), and the next
+// InitFlash for that channel carries on toward the same deadline.
 // Lifecycle: every configured pin is READING for the whole passthrough (no hold, no async read).
 // fwRun learns the ESC before it runs it (READY, or FAILED); fwEnd sends a pin that was never
 // selected back to EMPTY/FAILED if it started there, else to PENDING (it may have been swapped).
@@ -976,10 +990,10 @@ inline void fwBegin() {
 	if (fwActive) fwEnd();
 	jobStop(true);                               // a background read gives its pin back first
 	spinStopAll(); release();
-	fwActive = true; fwSettled = false;
+	fwActive = true;
 	for (uint8_t i = 0; i < COUNT; i++) {
 		drvFree(i);                              // the hold too: the configurator owns every pin
-		fwHave[i] = fwMiss[i] = fwDone[i] = fwSeen[i] = false;
+		fwHave[i] = fwMiss[i] = fwDone[i] = fwSeen[i] = false; fwFrom[i] = 0;
 		pin[i].onPassthroughBegin();
 	}
 	// bidir fits only pio0's 4 SMs on a Pico W: more pins than that are primed in a second turn. Each
@@ -1007,41 +1021,42 @@ inline void fwBegin() {
 	}
 	for (uint8_t i = 0; i < COUNT; i++) { pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
 	fwBeginMs = millis();
+	for (uint8_t i = 0; i < COUNT; i++) fwHigh[i] = fwBeginMs;
 }
-namespace detail {
-	// The shared quiet window: no BootInit on any pin until ENTRY_QUIET_MS after the lines went high
-	// (an early one keeps Bluejay in its app), once per passthrough.
-	static void fwSettle() {
-		if (fwSettled) return;
-		while (millis() - fwBeginMs < ENTRY_QUIET_MS) { pump(); delayMicroseconds(200); }
-		fwSettled = true;
-	}
-}
-inline bool fwSelect(uint8_t idx, uint8_t raw[8], bool& am32) {
+enum class FwSel : uint8_t { OK, MISS, PENDING };
+inline FwSel fwSelect(uint8_t idx, uint8_t raw[8], bool& am32, uint32_t budgetMs) {
 	using namespace detail;
-	if (idx >= COUNT) return false;
+	if (idx >= COUNT) return FwSel::MISS;
 	if (drvActive(idx)) drvFree(idx);
-	if (fwMiss[idx]) return false;
-	bool rerun = fwDone[idx];                                     // DeviceReset ran its app; selected again
-	if (rerun) { fwDone[idx] = false; pin[idx].onReadStart(millis()); }
+	if (fwMiss[idx]) return FwSel::MISS;
+	uint32_t stop = millis() + budgetMs;
+	if (fwDone[idx]) {                  // DeviceReset ran its app (the page's flash, reset, read again)
+		fwDone[idx] = false; pin[idx].onReadStart(millis());
+		primeHigh(PINS[idx]); fwHigh[idx] = millis(); fwFrom[idx] = 0;
+	}
 	session = -1; fwIdx = idx;
 	bool ok;
 	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
 	else {                                                         // the probe
+		// no BootInit until ENTRY_QUIET_MS after its line went high: an early one keeps Bluejay in its app
+		uint32_t quiet = fwHigh[idx] + ENTRY_QUIET_MS;
+		while ((int32_t)(millis() - quiet) < 0 && (int32_t)(millis() - stop) < 0) { pump(); delayMicroseconds(200); }
+		if ((int32_t)(millis() - quiet) < 0) return FwSel::PENDING;
+		if (!fwFrom[idx]) fwFrom[idx] = millis();
 		bool known = fwSeen[idx] || pin[idx].ptRetry();
-		fwSettle();
-		ok = connectUntil(PINS[idx], fwBeginMs + (known ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS));
+		uint32_t end = fwHigh[idx] + (known ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS);
+		if ((int32_t)(end - fwFrom[idx]) < (int32_t)CONNECT_MIN_MS) end = fwFrom[idx] + CONNECT_MIN_MS;
+		bool last = (int32_t)(end - stop) <= 0;
+		ok = connectUntil(PINS[idx], last ? end : stop);
+		if (!ok && !last) return FwSel::PENDING;
 	}
-	// its app runs since fwRun: fwBegin's prime is spent on it, so one fresh full entry (the page's
-	// flash, reset, read again). Any other miss is final for this passthrough.
-	if (!ok && rerun) ok = enterBootloader(PINS[idx]);
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
-	if (!ok) { pin[idx].onProbeMiss(); return false; }   // EMPTY before: confirmed absent
+	if (!ok) { pin[idx].onProbeMiss(); return FwSel::MISS; }   // EMPTY before: confirmed absent
 	fwSeen[idx] = true;
 	session = (int8_t)idx; sessLearned = sessionWrote = false; sessLastOpMs = millis();
 	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
 	memcpy(raw, lastRaw, 8); am32 = lastAm32;
-	return true;
+	return FwSel::OK;
 }
 inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); forget its session
 	using namespace detail;
@@ -1107,11 +1122,11 @@ struct FsGuard {
 
 // ---- core1 worker: call once from loop1() ------------------------------------------------------
 namespace detail {
-// core1: BootInit on the current pin, again and again until `until` (millis(); at least CONNECT_MIN_MS
-// from now; 0 = just that); on a reply, adopt it as the session.
+// core1: BootInit on the current pin, again and again until `until` (millis(); 0 = CONNECT_MIN_MS
+// from now; already past = none); on a reply, adopt it as the session.
 static bool connectHere(bool abortable, uint32_t until = 0) {
 	uint32_t t0 = millis();
-	if (!until || (int32_t)(until - t0) < (int32_t)CONNECT_MIN_MS) until = t0 + CONNECT_MIN_MS;
+	if (!until) until = t0 + CONNECT_MIN_MS;
 	while ((int32_t)(until - millis()) > 0) {
 		if (abortable && jobAbort) return false;
 		uint8_t raw[8] = {0};
@@ -1143,6 +1158,7 @@ static bool learnHere(Info& out, lc::Identity& id) {
 	out.bootVer = d.bootVersion; out.bootPages = d.bootPages;
 	if (armId(d.bootInfo)) {
 		lc::Identity a = lc::identFromAm32(d.bootInfo[4], 0);
+		if (!a.known) return false;                                           // unknown flash code: no guessed block
 		uint8_t dir = 0, nm[15];
 		if (!bl.readFlash(a.am32Eep + 18, &dir, 1)) return false;           // bi_direction (host/pico_esc/am32.py)
 		id = lc::identFromAm32(d.bootInfo[4], dir);

@@ -430,7 +430,8 @@ static void handleSerial() {
 		else if (!strcmp(cmd,"thrust")) { int i=argi(); char* v=strtok(nullptr," ");   // signed -1000..1000 (reversible/3D)
 			if(i<0||i>=Esc::COUNT||!v) Serial.println("err bad-args");
 			else if(!esc.spinArmed((uint8_t)i)) Serial.println("err not-armed");
-			else { esc.spinThrust((uint8_t)i,(int16_t)atoi(v)); Serial.println("ok"); } }
+			else if(!esc.spinThrust((uint8_t)i,(int16_t)atoi(v))) Serial.println("err needs-3d (one-way ESC: 0 only)");
+			else Serial.println("ok"); }
 		else if (!strcmp(cmd,"disarm")||!strcmp(cmd,"spinstop")) { int i=argi(); if(i<0) esc.spinStopAll(); else if(i<Esc::COUNT) esc.spinStop((uint8_t)i); Serial.println("ok"); }
 		else if (!strcmp(cmd,"pwm")) { int i=argi(); char* v=strtok(nullptr," ");   // servo-PWM test (50Hz, hw PWM, not DShot); pwm <i> <us|stop>
 			if(i<0||i>=Esc::COUNT||!v) Serial.println("err bad-args");
