@@ -245,39 +245,55 @@ int main() {
 		// goes on the never-used pin 19)
 		sim::plug(19, { sim::Fw::BLHELI_S, false, false, false, false });
 		runFor(1000);
-		bool armed = armAndWait(3, 15000);
-		note("BLHeli_S whose bootloader entry ignores the bidir prime: `arm` %s (state %s, %u bootloader entries)",
-		     armed ? "reads and arms it" : "finds nothing there", escs::stateName(3), sim::esc(19).blEntries);
-		CHECK(!sim::esc(19).running, "BLHeli_S (bidir prime does not count): it does not run");
-		escs::spinStop(3); sim::unplug(19); runFor(2000);
+		CHECK(armAndWait(3, 15000) && !escs::identity(3).bidir,
+		      "BLHeli_S that ignores bidir frames: `arm` reads and arms it (a pin with no bidir ESC known is primed with normal DShot)");
+		driveFor(3, 400, 1000);
+		CHECK(sim::esc(19).rpm > 500, "BLHeli_S that ignores bidir frames: it runs");
+		driveFor(3, 0, 300); escs::spinStop(3); sim::unplug(19); runFor(2000);
 	}
-	{   // known limits, reported rather than checked
-		// (a) a swap inside the first answer after a read: the old identity is kept
+	{   // known limits (reported rather than checked), and the startup-tune cases
+		// (a) a swap inside the first answer after a read: pulled 0.1 s after it, the other one in
+		// 1 s later. Its answer comes past ANSWER_DUE_MS, so the pin is read again.
 		sim::unplug(18); runFor(2000);
 		sim::plug(18, { sim::Fw::BLUEJAY, false, false });
 		waitState(2, lc::State::READY, 12000);
 		sim::unplug(18); runFor(100);
+		runFor(1000);
+		sim::plug(18, { sim::Fw::BLUEJAY, true, false });
+		runFor(6000);
+		CHECK(escs::state(2) == lc::State::READY && escs::identity(2).rev,
+		      "swap before the first answer after a read: the late answer has it read again (3D now)");
+		// the same within the first answer itself (faster than a hand can) is not seen
+		sim::unplug(18); runFor(2000);
+		sim::plug(18, { sim::Fw::BLUEJAY, false, false });
+		waitState(2, lc::State::READY, 12000);
+		sim::unplug(18); runFor(50);
 		sim::plug(18, { sim::Fw::BLUEJAY, true, false });
 		runFor(4000);
-		note("swap within 0.1 s of a read (before its first answer): identity %s, the ESC is 3D",
-		     escs::identity(2).rev ? "3D (caught)" : "one-way (missed: forward would run it in reverse)");
-		sim::unplug(18); runFor(2000);
-		sim::plug(18, { sim::Fw::BLUEJAY, false, true });
-		waitState(2, lc::State::READY, 12000);
-		// (b) DeviceReset then InitFlash on a Bluejay that plays its startup tune
-		sim::unplug(18); runFor(2000);
+		note("swap within 0.05 s of a read: identity %s", escs::identity(2).rev ? "3D (caught)" : "one-way (missed: its answer is in time)");
+		runFor(3000); sim::unplug(18); runFor(2000);
+		// (b) a Bluejay with its startup melody: deaf for 8 s after every read
 		sim::plug(18, { sim::Fw::BLUEJAY, false, true, true });
-		waitState(2, lc::State::READY, 15000);
-		runFor(3000);   // its tune is over
+		runFor(30000);  // its melody at power-up, the read, its melody again
+		CHECK(escs::state(2) == lc::State::READY && escs::identity(2).tune && escs::answerDelay(2) > 8000,
+		      "startup melody on: READY, its melody known, it answered after it (no read every 9 s)");
 		mspPassthrough();
 		Reply sel = cmd4(0x37, 0, { 2 }, 5);
 		cmd4(0x35, 0, { 2 });
 		int tries = 0; Reply again = cmd4(0x37, 0, { 2 }, 10, &tries);
-		note("startup tune on: selected %s; after DeviceReset %s (%d tries)", sel.got && !sel.ack ? "yes" : "no",
-		     again.got && !again.ack ? "selected again" : "not found again", tries);
+		CHECK(sel.got && !sel.ack && again.got && !again.ack,
+		      "startup tune on: selected again after DeviceReset (its prime waits for the answer after the tune)");
+		send4(0x34, 0, { 0 }); runFor(3000);
+		// (c) the page's second read: InterfaceExit runs the ESC (tune), and the next passthrough
+		// comes at once
+		mspPassthrough(); cmd4(0x37, 0, { 2 }, 5); send4(0x34, 0, { 0 }); runFor(100);
+		mspPassthrough();
+		Reply re = cmd4(0x37, 0, { 2 }, 12, &tries);   // the page asks again for 20 s (esc-configurator gives up after ~6.5 s)
+		CHECK(re.got && !re.ack, "startup tune on: a passthrough right after one ends selects it (the page's second read)");
 		send4(0x34, 0, { 0 }); runFor(3000);
 	}
 
+	CHECK(lateReplies == 0, "no 4-way reply in any passthrough took more than 1 s");
 	for (auto& n : notes) printf("note: %s\n", n.c_str());
 	printf("throttle frames checked: %u\n", throttleFrames);
 	CHECK(violations == 0, violations ? firstViolation : "invariant held on every frame");

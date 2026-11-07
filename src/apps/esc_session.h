@@ -122,22 +122,12 @@ static const uint16_t MOTOR_POLES     = ESC_MOTOR_POLES;   // eRPM->RPM (see esc
 enum class Drive : uint8_t { AUTO, NORMAL, BIDIR };
 
 namespace detail {
-	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD, PRIME_MS = 500;
-	// Bootloader entry: prime (BLHeli-S needs valid frames first), line high, ENTRY_QUIET_MS with no
-	// traffic at all, then BootInit again and again until an answer or ENTRY_MAX_MS from line high.
-	// Measured 2026-11-07 with `blpoll` (line high right after the zero-throttle hold, app running):
-	//   AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
-	//     does not disturb it (answered at 538 ms, 6/6).
-	//   Bluejay 0.21 (EFM8BB21): a single BootInit answers from 700 ms; polling from 0 or 300 ms keeps
-	//     it out of its bootloader (no answer within 6 s, 6/6). Hence the quiet window.
-	//   Quiet 800 or 1000 ms, then poll: both answer the first BootInit (814 / 1014 ms), 12/12.
-	// ENTRY_MAX_MS covers a slower AM32 build and a startup tune (the old 4 s waits came from "~2 s
-	// without frames + reboot + tune"). ENTRY_BARE_MS: how long past the quiet window a pin with no
-	// known ESC is polled in a passthrough (a stock BLHeli_S has the Bluejay timing; an AM32 that sits
-	// in its bootloader answers at once). CONNECT_MIN_MS: the shortest poll (the old CONNECT).
-	static const uint32_t ENTRY_QUIET_MS = 1000, ENTRY_MAX_MS = 5000, ENTRY_BARE_MS = 500,
-	                      CONNECT_MIN_MS = 500;
-	static BidirDShotX1*          dsh = nullptr;                              // core0 only (PIO)
+	static const uint32_t DSHOT_KBAUD = ESC_DSHOT_KBAUD;
+	// Bootloader entry: prime, line high, quiet, BootInit polled (lc::Entry: the rules and the bench
+	// measurements behind them).
+	static const uint32_t PRIME_MS = lc::ENTRY_PRIME_MS, ENTRY_QUIET_MS = lc::ENTRY_QUIET_MS,
+	                      ENTRY_MAX_MS = lc::ENTRY_MAX_MS, ENTRY_BARE_MS = lc::ENTRY_BARE_MS,
+	                      CONNECT_MIN_MS = lc::ENTRY_POLL_MIN_MS;
 	static blheli_bl::Bootloader  bl({ .signalPin = PINS[0], .baud = 0 });    // core1 only
 
 	enum class Op : uint8_t { NONE, CONNECT, READCFG, READPAGE, WRITEPAGE, ERASE, WRITEFLASH, READFLASH, RUN, PROBE,
@@ -193,9 +183,15 @@ namespace detail {
 	static bool     fwDone[MAX] = { false };   // fwRun already left its bootloader (DeviceReset)
 	static bool     fwActive = false;            // the configurator owns every pin: no hold, no jobs
 	static uint32_t fwBeginMs = 0;
-	static uint32_t fwHigh[MAX] = { 0 };       // its line went high (fwBegin, or a re-entry after DeviceReset)
-	static uint32_t fwFrom[MAX] = { 0 };       // its first BootInit of this entry (0: not yet)
-	static bool     fwSeen[MAX] = { false };   // answered once this passthrough (worth the long poll)
+	// A bootloader entry's prime stream: bidir when a bidir ESC is known there (its answer ends the
+	// prime), else normal DShot, which every firmware takes (a stock BLHeli_S may not count inverted
+	// frames as the signal it needs before the line goes high).
+	struct Prime {
+		BidirDShotX1* b = nullptr; DShotX4* n = nullptr;
+		void end() { delete b; b = nullptr; delete n; n = nullptr; }
+	};
+	static lc::Entry fwEntry[MAX];             // each channel's bootloader entry (fwBegin, fwSelect)
+	static Prime     fwPrime[MAX];             // ... its prime stream, kept across InitFlash calls
 	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
 	// The lifecycle: one state per pin, and what the hold / LOST handling do with it.
 	static lc::Pin    pin[MAX];
@@ -339,7 +335,7 @@ namespace detail {
 		if (pin[i].st != lc::State::RUNNING) drvTarget[i] = 0;   // only RUNNING ever sends non-zero
 		if (!armg[i].armed) {
 			drvTarget[i] = 0;
-			if (armg[i].tick(now, drvB[i] != nullptr, edt[i].left > 0) && drvB[i]) edt[i].burst();   // AM32 may answer before it arms
+			if (armg[i].tick(now, drvB[i] != nullptr, edt[i].left > 0, pin[i].id.tune) && drvB[i]) edt[i].burst();   // AM32 may answer before it arms
 		}
 		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
 		if (drvB[i]) {
@@ -440,26 +436,56 @@ namespace detail {
 	static bool connectUntil(uint8_t gpio, uint32_t until) {
 		opUntil = until; bool ok = runOp(Op::CONNECT, gpio); opUntil = 0; return ok;
 	}
-	// DShot prime (PRIME_MS of zero throttle), then the line high: the start of every entry.
-	static void primeHigh(uint8_t gpio) {
+	// Run entry `en` on pin i (lc::Entry) until the ESC is in its bootloader (IN), the entry misses
+	// (MISS), or `stop` (millis) comes first (LATER: call again, it carries on). pd is its prime
+	// stream, kept from one call to the next; the pin's own stream must be freed already.
+	enum class EntryRes : uint8_t { IN, MISS, LATER };
+	static EntryRes runEntry(uint8_t i, lc::Entry& en, Prime& pd, uint32_t stop) {
+		uint8_t gpio = PINS[i];
+		EntryRes r = EntryRes::LATER;
 		blDepth++; pwmSafe();
-		dsh = newBidir(gpio, DSHOT_KBAUD);           // the pin's own stream was freed: no extra SM
-		uint32_t t0 = millis();
-		while (millis() - t0 < PRIME_MS) { if (!dsh->initError()) dsh->sendThrottle(0); pump(); delayMicroseconds(300); }
-		delete dsh; dsh = nullptr;
-		pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH);
+		for (;;) {
+			uint32_t now = millis();
+			lc::Entry::Do d = en.step(now);
+			if (d == lc::Entry::Do::PRIME) {
+				if ((int32_t)(now - stop) >= 0) break;
+				// no SM: it goes on unprimed (AM32 needs none)
+				if (en.waitAnswer && !pd.b) pd.b = newBidir(gpio, DSHOT_KBAUD);
+				if (!en.waitAnswer && !pd.n) pd.n = newNormal(gpio, DSHOT_KBAUD);
+				if (pd.b && !pd.b->initError()) {
+					pd.b->sendThrottle(0);
+					uint32_t v; BidirDshotTelemetryType ty = pd.b->getTelemetryPacket(&v);
+					if (ty != BidirDshotTelemetryType::CHECKSUM_ERROR && ty != BidirDshotTelemetryType::NO_PACKET) en.onAnswer();
+				}
+				if (pd.n && !pd.n->initError()) { uint16_t z[4] = { 0, 0, 0, 0 }; pd.n->sendThrottles(z); }
+				pump(); delayMicroseconds(300);
+				continue;
+			}
+			pd.end();
+			pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH);
+			if (d == lc::Entry::Do::QUIET) {           // no BootInit here: it keeps Bluejay in its app
+				uint32_t until = (int32_t)(en.quietEnd() - stop) < 0 ? en.quietEnd() : stop;
+				while ((int32_t)(millis() - until) < 0) { pump(); delayMicroseconds(200); }
+				if ((int32_t)(millis() - en.quietEnd()) < 0) break;
+				continue;
+			}
+			if (d == lc::Entry::Do::MISS) { r = EntryRes::MISS; break; }
+			uint32_t end = en.pollEnd();
+			bool last = (int32_t)(end - stop) <= 0;
+			if (connectUntil(gpio, last ? end : stop)) r = EntryRes::IN;
+			else if (last) r = EntryRes::MISS;
+			break;
+		}
 		blDepth--;
+		return r;
 	}
-	// One attempt: DShot prime -> line high -> ENTRY_QUIET_MS of silence -> BootInit polled until
-	// ENTRY_MAX_MS from line high (see ENTRY_QUIET_MS for the measurements).
+	// One full entry, waited for (`read i`, `scan`, `enter`): a bidir ESC known on the pin is primed
+	// until it answers (lc::Entry).
 	static bool enterBootloader(uint8_t gpio) {
-		blDepth++; pwmSafe();
-		primeHigh(gpio);
-		uint32_t high = millis();
-		pumpFor(ENTRY_QUIET_MS);                     // no BootInit here: it keeps Bluejay in its app
-		bool in = connectUntil(gpio, high + ENTRY_MAX_MS);
-		blDepth--;
-		return in;
+		uint8_t i = idxOf(gpio);
+		lc::Entry en; Prime pd;
+		en.begin(millis(), pin[i].id.known ? pin[i].id.bidir : pin[i].seen, ENTRY_MAX_MS, pin[i].id.tune);
+		return runEntry(i, en, pd, millis() + 60000) == EntryRes::IN;
 	}
 	static bool learnSession(uint8_t i) {          // identity + Info of the session's ESC, read now
 		sessLearned = runOp(Op::LEARN, PINS[i]);
@@ -622,6 +648,8 @@ inline lc::State state(uint8_t i) { return i < COUNT ? detail::pin[i].st : lc::S
 // What a motor-test UI can do with pin i now: uiState() below (after the PWM API it reads).
 inline const char* stateName(uint8_t i) { return lc::stateName(state(i)); }
 inline lc::Identity identity(uint8_t i) { return i < COUNT ? detail::curIdent(i) : lc::Identity{}; }
+// ms from its stream's start to its first answer, the last time it answered a fresh stream (0: never).
+inline uint32_t answerDelay(uint8_t i) { return i < COUNT ? detail::pin[i].answerDelay : 0; }
 inline bool openLoop(uint8_t i) { return i < COUNT && detail::pin[i].openLoop; }   // ROV: telemetry gone
 // The next lifecycle event (appeared, lost, read ...), oldest first. false when there is none.
 inline bool pollEvent(uint8_t& idx, lc::Ev& e, lc::State& st) {
@@ -771,9 +799,9 @@ namespace detail {
 			uint8_t i = (uint8_t)jobIdx;
 			if (jobPhase == 2) { if (opDone) jobCollect(); return; }
 			if (pin[i].st != lc::State::PENDING || !canRunJob()) { jobIdx = -1; jobPhase = 0; return; }   // stays PENDING
-			// The prime: BLHeli-S needs valid frames before the line goes high. A pin whose bidir zero
+			// The prime: BLHeli-S needs valid frames before the line goes high. A pin whose zero stream
 			// has run PRIME_MS already is primed; no SM for it -> go on unprimed (AM32 needs none).
-			if (drvB[i] && now - drvStartMs[i] < PRIME_MS) return;
+			if (drvActive(i) && now - drvStartMs[i] < PRIME_MS) return;
 			pin[i].onReadStart(now);                 // (latches whether its telemetry is fresh first)
 			drvFree(i); pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);   // core1 owns it from here
 			jobAbort = false; opIdx = i; opPin = PINS[i]; opOk = false; opDone = false;
@@ -798,7 +826,10 @@ namespace detail {
 			if (pin[i].st != lc::State::PENDING) continue;
 			jobRr = (uint8_t)(i + 1); jobIdx = (int8_t)i; jobPhase = 1;
 			if (pwmOn(i)) pwmOff(i);
-			if (!drvB[i]) drvStart(i, true);
+			// a pin that has answered keeps its bidir stream; one that never did (an `arm` / read of a
+			// pin with nothing heard) is primed with normal DShot, which every firmware takes (Prime)
+			bool bidir = pin[i].seen;
+			if (!drvActive(i) || (drvB[i] != nullptr) != bidir) drvStart(i, bidir);
 			return;
 		}
 	}
@@ -919,7 +950,9 @@ inline UiState uiState(uint8_t i) {
 // The configurator's channel k is PINS[k], like every other index (MSP motor k, CLI index k): no
 // numbering depends on which ESCs answer, so nothing can shift a channel onto another ESC.
 // fwBegin primes every configured pin with zero-throttle DShot for PRIME_MS, all at once (in turns
-// of as many as there are free PIO SMs), then holds the lines high. Both firmwares take that signal
+// of as many as there are free PIO SMs), then holds the lines high. A pin with a known bidir ESC that
+// did not answer that prime (booting, playing its melody) is primed again by its own InitFlash until
+// it answers (lc::Entry). Both firmwares take that signal
 // loss as "go to the bootloader": BLHeli-S needs the valid frames first (a bare high line leaves it
 // waiting for signal), AM32 needs its reboot. Every pin then has ENTRY_QUIET_MS of silence, in
 // parallel, before the first BootInit, and polls from there (see ENTRY_QUIET_MS).
@@ -946,37 +979,60 @@ inline void fwBegin() {
 	jobStop(true);                               // a background read gives its pin back first
 	spinStopAll(); release();
 	fwActive = true;
+	bool waits[MAX] = { false }, heard[MAX] = { false }, tune[MAX] = { false };
+	uint32_t primeStart[MAX] = { 0 };
 	for (uint8_t i = 0; i < COUNT; i++) {
 		drvFree(i);                              // the hold too: the configurator owns every pin
-		fwHave[i] = fwMiss[i] = fwDone[i] = fwSeen[i] = false; fwFrom[i] = 0;
+		fwHave[i] = fwMiss[i] = fwDone[i] = false;
+		fwPrime[i].end();
+		// a bidir ESC is known here: the prime must hear it (it may be booting, deaf, in its tune)
+		waits[i] = pin[i].st != lc::State::EMPTY && (pin[i].id.known ? pin[i].id.bidir : pin[i].seen);
+		tune[i] = pin[i].id.known && pin[i].id.tune;
 		pin[i].onPassthroughBegin();
 	}
-	// bidir fits only pio0's 4 SMs on a Pico W: more pins than that are primed in a second turn. Each
-	// line goes high right after its own prime (BLHeli-S checks it as it resets into its bootloader).
+	// A pin with a bidir ESC known is primed with bidir DShot (its answer says it heard the prime),
+	// every other one with normal DShot (Prime). Bidir fits only pio0's 4 SMs on a Pico W and normal
+	// DShot pio1's 3: pins past that are primed in a second turn. Each line goes high right after its
+	// own prime (BLHeli-S checks it as it resets into its bootloader).
 	uint32_t left = (1u << COUNT) - 1;
 	while (left) {
-		BidirDShotX1* pr[MAX] = { nullptr };
+		Prime pr[MAX];
 		uint32_t turn = 0;
 		for (uint8_t i = 0; i < COUNT; i++) {
 			if (!(left >> i & 1)) continue;
-			pr[i] = newBidir(PINS[i], DSHOT_KBAUD);
-			if (pr[i]->initError()) { delete pr[i]; pr[i] = nullptr; } else turn |= 1u << i;
+			bool ok;
+			if (waits[i]) { pr[i].b = newBidir(PINS[i], DSHOT_KBAUD); ok = !pr[i].b->initError(); }
+			else          { pr[i].n = newNormal(PINS[i], DSHOT_KBAUD); ok = !pr[i].n->initError(); }
+			if (!ok) pr[i].end(); else turn |= 1u << i;
 		}
 		uint32_t t0 = millis();
+		for (uint8_t i = 0; i < COUNT; i++) if (turn >> i & 1) primeStart[i] = t0;
 		while (turn && millis() - t0 < PRIME_MS) {
-			for (uint8_t i = 0; i < COUNT; i++) if (pr[i]) pr[i]->sendThrottle(0);
+			for (uint8_t i = 0; i < COUNT; i++) {
+				if (pr[i].n) { uint16_t z[4] = { 0, 0, 0, 0 }; pr[i].n->sendThrottles(z); }
+				if (!pr[i].b) continue;
+				pr[i].b->sendThrottle(0);
+				uint32_t v; BidirDshotTelemetryType ty = pr[i].b->getTelemetryPacket(&v);
+				if (ty != BidirDshotTelemetryType::CHECKSUM_ERROR && ty != BidirDshotTelemetryType::NO_PACKET) heard[i] = true;
+			}
 			pump(); delayMicroseconds(300);
 		}
 		for (uint8_t i = 0; i < COUNT; i++) {
 			if (!(turn >> i & 1)) continue;
-			delete pr[i];
+			pr[i].end();
 			pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);
 		}
 		left = turn ? left & ~turn : 0;          // no SM at all: the rest go unprimed (AM32 needs none)
 	}
 	for (uint8_t i = 0; i < COUNT; i++) { pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH); }
 	fwBeginMs = millis();
-	for (uint8_t i = 0; i < COUNT; i++) fwHigh[i] = fwBeginMs;
+	// A pin whose known bidir ESC did not answer the prime (it was booting, e.g. run at the end of the
+	// last passthrough and playing its tune) is primed again by its InitFlash until it answers.
+	for (uint8_t i = 0; i < COUNT; i++) {
+		uint32_t poll = pin[i].ptRetry() ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS;
+		if (waits[i] && !heard[i]) fwEntry[i].begin(primeStart[i], true, poll, tune[i]);
+		else fwEntry[i].primed(fwBeginMs, poll);
+	}
 }
 enum class FwSel : uint8_t { OK, MISS, PENDING };
 inline FwSel fwSelect(uint8_t idx, uint8_t raw[8], bool& am32, uint32_t budgetMs) {
@@ -986,28 +1042,21 @@ inline FwSel fwSelect(uint8_t idx, uint8_t raw[8], bool& am32, uint32_t budgetMs
 	if (fwMiss[idx]) return FwSel::MISS;
 	uint32_t stop = millis() + budgetMs;
 	if (fwDone[idx]) {                  // DeviceReset ran its app (the page's flash, reset, read again)
+		bool bidir = !pin[idx].id.known || pin[idx].id.bidir;   // it plays its tune now: wait for it
+		bool tune = pin[idx].id.known && pin[idx].id.tune;
 		fwDone[idx] = false; pin[idx].onReadStart(millis());
-		primeHigh(PINS[idx]); fwHigh[idx] = millis(); fwFrom[idx] = 0;
+		fwEntry[idx].begin(millis(), bidir, ENTRY_MAX_MS, tune);
 	}
 	session = -1; fwIdx = idx;
 	bool ok;
 	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
-	else {                                                         // the probe
-		// no BootInit until ENTRY_QUIET_MS after its line went high: an early one keeps Bluejay in its app
-		uint32_t quiet = fwHigh[idx] + ENTRY_QUIET_MS;
-		while ((int32_t)(millis() - quiet) < 0 && (int32_t)(millis() - stop) < 0) { pump(); delayMicroseconds(200); }
-		if ((int32_t)(millis() - quiet) < 0) return FwSel::PENDING;
-		if (!fwFrom[idx]) fwFrom[idx] = millis();
-		bool known = fwSeen[idx] || pin[idx].ptRetry();
-		uint32_t end = fwHigh[idx] + (known ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS);
-		if ((int32_t)(end - fwFrom[idx]) < (int32_t)CONNECT_MIN_MS) end = fwFrom[idx] + CONNECT_MIN_MS;
-		bool last = (int32_t)(end - stop) <= 0;
-		ok = connectUntil(PINS[idx], last ? end : stop);
-		if (!ok && !last) return FwSel::PENDING;
+	else {                                                         // its entry, carried on from the last call
+		EntryRes r = runEntry(idx, fwEntry[idx], fwPrime[idx], stop);
+		if (r == EntryRes::LATER) return FwSel::PENDING;
+		ok = r == EntryRes::IN;
 	}
 	fwHave[idx] = ok; fwMiss[idx] = !ok;
 	if (!ok) { pin[idx].onProbeMiss(); return FwSel::MISS; }   // EMPTY before: confirmed absent
-	fwSeen[idx] = true;
 	session = (int8_t)idx; sessLearned = sessionWrote = false; sessLastOpMs = millis();
 	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
 	memcpy(raw, lastRaw, 8); am32 = lastAm32;
@@ -1028,6 +1077,7 @@ inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); fo
 }
 inline void fwEnd() {
 	using namespace detail;
+	for (uint8_t i = 0; i < COUNT; i++) fwPrime[i].end();
 	for (uint8_t i = 0; i < COUNT; i++) fwRun(i);
 	for (uint8_t i = 0; i < COUNT; i++)
 		if (!fwDone[i]) pin[i].onPassthroughEnd(false, false, lc::Identity{});
@@ -1117,6 +1167,9 @@ static bool learnHere(Info& out, lc::Identity& id) {
 		uint8_t dir = 0, nm[15];
 		if (!bl.readFlash(a.am32Eep + 18, &dir, 1)) return false;           // bi_direction (host/pico_esc/am32.py)
 		id = lc::identFromAm32(d.bootInfo[4], dir);
+		// tune[] at 48: a melody unless tune[0] is 0xFF (its three short beeps) or the first note is 0
+		uint8_t t[6];
+		id.tune = bl.readFlash(a.am32Eep + 48, t, 6) && t[0] != 0xFF && (t[4] || t[5]);
 		if (bl.readFlash(a.am32Eep - 32, nm, 15)) { memcpy(out.name, nm, 15); out.name[15] = 0; }   // FILE_NAME
 		strncpy(out.layout, "AM32", 16);
 		return true;
@@ -1124,6 +1177,8 @@ static bool learnHere(Info& out, lc::Identity& id) {
 	esc_setup::Settings s;
 	if (!esc_setup::read(bl, s)) return false;
 	id = lc::identFromSilabs(s.name, s.raw[esc_setup::OFF_LAYOUT_REVISION], s.raw[0x0B]);
+	// Bluejay / BlueGill play the startup melody at 0x70 unless its first byte is 0xFF
+	id.tune = lc::silabsBidir(s.raw[esc_setup::OFF_LAYOUT_REVISION], nullptr) && s.raw[0x70] != 0xFF;
 	strncpy(out.layout, s.layoutTag, 16); strncpy(out.name, s.name, 16);
 	out.fwMain = s.mainRevision; out.fwSub = s.subRevision;
 	return true;

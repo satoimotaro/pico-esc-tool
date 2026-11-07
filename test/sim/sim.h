@@ -61,7 +61,9 @@ struct Esc {
 	uint8_t  teleType = 0xFF; uint32_t teleVal = 0;
 };
 
-static const uint32_t BOOT_MS = 150, BOOT_TUNE_MS = 1500, ARM_ZERO_MS = 300, BL_QUIET_MS = 700,
+// BOOT_MS + ARM_ZERO_MS ~ the bench Bluejay's first answer 0.75 s after a read (tune off); with its
+// melody on it answered at 8.3 s.
+static const uint32_t BOOT_MS = 450, BOOT_TUNE_MS = 8000, ARM_ZERO_MS = 300, BL_QUIET_MS = 700,
                       AM32_BOOT_MS = 150, AM32_BL_MS = 540, POLES = 14;
 
 // The test drives these.

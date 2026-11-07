@@ -184,7 +184,7 @@ export class FourWay {
   }
   // DeviceInfo: [sigLo, sigHi, bootVersion, mode]
   async initFlash(ch) {
-    const end = performance.now() + 10000;
+    const end = performance.now() + 20000;   // an ESC playing its startup melody is deaf for seconds
     for (;;) {
       try {
         const d = await this.command(FW.INIT_FLASH, 0, [ch], 20000);
