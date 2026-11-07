@@ -48,3 +48,6 @@ jobs:
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tlc test_esc_lifecycle.cpp && /tmp/tlc
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tpins test_esc_pins.cpp && /tmp/tpins
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -o /tmp/tmt test_motor_test.cpp && /tmp/tmt
+
+      - name: Run the escs simulation (firmware on the host, ESC models)
+        run: make -C test/sim OUT=/tmp/escs_sim
