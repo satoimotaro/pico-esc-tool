@@ -307,11 +307,25 @@ neither needs a rebuild or a `scan` any more.
 
 ### Bootloader entry timing
 
-- One entry, everywhere (`enterBootloader` for `read i` / `scan` / `enter`, the async `Op::READID`,
-  a passthrough channel selected again after DeviceReset, spread over its pending InitFlash answers): DShot zero prime 500 ms (BLHeli-S needs valid frames first), line high,
-  `ENTRY_QUIET_MS` = 1000 ms with no traffic at all, then BootInit polled until an answer or
-  `ENTRY_MAX_MS` = 5000 ms after line high. The passthrough primes every pin at once and shares the
-  quiet window. It replaced a fixed ladder (1 s hold, then 4 s twice) and a fixed 4.5 s settle.
+- One entry timeline, `lc::Entry`, for `read i` / `scan` / `enter` and every passthrough channel
+  (spread over its pending InitFlash answers). The async `Op::READID` uses the same timing.
+  - Prime: DShot zero for 500 ms (BLHeli-S needs valid frames first).
+  - Line high, then `ENTRY_QUIET_MS` = 1000 ms with no traffic at all.
+  - BootInit polled until an answer or `ENTRY_MAX_MS` = 5000 ms after line high.
+  - The passthrough primes every pin at once and shares the quiet window. It replaced a fixed
+    ladder (1 s hold, then 4 s twice) and a fixed 4.5 s settle.
+- **The prime waits for an answer.** A pin where a bidir ESC is known is primed with bidir DShot
+  until that ESC answers, up to `ENTRY_PRIME_MAX_MS` = 3 s, or `ENTRY_PRIME_TUNE_MS` = 15 s when its
+  settings have a startup melody (`Identity::tune`). An ESC that was just run out of its bootloader is
+  deaf while it boots and plays its melody, and a prime that ended inside the melody left it waiting
+  in its app.
+  - The passthrough checks which pins answered its 500 ms prime. A pin with a known bidir ESC that
+    stayed silent is primed again by its own InitFlash (pending answers) until it answers.
+  - Every other pin is primed with normal DShot, which every firmware takes. A stock BLHeli_S may not
+    count inverted frames as the signal it needs. This is not measured: there is no stock BLHeli_S on
+    the bench, and the simulation (`test/sim`) runs both cases.
+  - Bench (2026-11-07), Bluejay 0.21 with its melody on: two page reads back to back now both find
+    it (10 s each), and so does a DeviceReset followed by InitFlash. Before, both missed it.
 - Measured on 2026-11-07 with `blpoll <i> <holdMs> <pollMs>` (line high right after the zero-throttle
   hold stream, app running):
   - AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
@@ -328,6 +342,21 @@ neither needs a rebuild or a `scan` any more.
   settle (needs a bench check).
 
 ### Known limits
+
+- **A startup melody makes an ESC deaf for seconds after every read.** The bench Bluejay's melody
+  answers 8.3 s after a read, against 0.75 s with it off (`state` shows `ans=` and `tune=`).
+  - The page waits up to 20 s for it.
+  - esc-configurator gives up on an InitFlash after about 6.5 s (5 tries). Read it there once the
+    melody has ended.
+  - Before the fix, the 8 s NO_ANSWER rule took such an ESC as unconfirmed and read it again, which
+    played the melody again: a read every 9 s, for good. `ANSWER_MAX_TUNE_MS` = 15 s now applies to
+    a melody ESC, for NO_ANSWER and for arming anyway.
+- **A swap before the ESC's first answer after a read.** Nothing on the wire tells a booting ESC from
+  an empty connector, so the first answer is checked against the boot time.
+  - A first answer more than `ANSWER_DUE_MS` = 1.5 s after the stream started (bench: Bluejay 0.75 s,
+    AM32 0.03 s) has the pin read again, once (`Ev::LATE_ANSWER`).
+  - A swap faster than the old ESC's own first answer is still not seen. With a melody on, the check
+    is off: its 8 s melody covers any swap, and a read again would only play it again.
 
 - The idle hold streams to every configured pin, so an empty pin still holds a PIO SM. Bidir fits
   only pio0's 4 SMs on a Pico W (the radio is on pio1), normal DShot goes to pio1's 3 free SMs

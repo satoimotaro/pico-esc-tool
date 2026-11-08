@@ -1020,11 +1020,12 @@ private:
 				// rev1 set the wired mask here; it follows the lifecycle now, and `pins` sets the pin list
 				if (a) console::out().println("# escs: wired is learned (telemetry, scan, passthrough); `pins` sets the pin list");
 				printPresent(); console::out().println("ok"); }
-			else if (!strcmp(cmd,"state")) {   // state: per ESC its lifecycle state, what is on the wire, 3D, swap note
+			else if (!strcmp(cmd,"state")) {   // state: per ESC its lifecycle state, what is on the wire, 3D, swap note, first answer (ms after its stream began), tune
 				for(uint8_t i=0;i<n_;i++){ lc::State st=escs::state(i); lc::Identity id=escs::identity(i);
 					bool rd = st==lc::State::READY || st==lc::State::RUNNING;
-					console::out().printf("state|%u|%s|%s|3d=%c|%s\n", i, lc::stateName(st), escs::streamProto(i),
-						!id.known ? '?' : id.rev ? 'y' : 'n', rd && id.known && !id.bidir ? "swap-not-detected" : "-"); }
+					console::out().printf("state|%u|%s|%s|3d=%c|%s|ans=%lu|tune=%c\n", i, lc::stateName(st), escs::streamProto(i),
+						!id.known ? '?' : id.rev ? 'y' : 'n', rd && id.known && !id.bidir ? "swap-not-detected" : "-",
+						(unsigned long)escs::answerDelay(i), !id.known ? '?' : id.tune ? 'y' : 'n'); }
 				console::out().println("ok"); }
 			else if (!strcmp(cmd,"read")) { if (pwmBusy()) continue; int i=argi(); uint8_t cfg[esc_setup::kEepromLen];
 				if(i<0||i>=n_) console::out().println("err bad-index");

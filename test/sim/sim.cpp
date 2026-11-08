@@ -104,6 +104,7 @@ void driverGone(uint8_t p) {   // its RX FIFO goes with it
 static void fillMem(Esc& e) {
 	memset(e.mem, 0xFF, sizeof e.mem); memset(e.name, 0, sizeof e.name);
 	if (e.spec.fw == Fw::AM32) {
+		memset(e.mem + 48, 0xFF, 1);                          // tune[0] = 0xFF: three short beeps
 		const uint8_t head[] = { 0x01, 0x04, 0x0d, 0x02, 0x15, 0xa0, 0x01, 0x00, 0x0a, 0x64, 0x00, 0x64, 0x00, 0x00 };
 		memcpy(e.mem, head, sizeof head);
 		e.mem[18] = e.spec.rev ? 1 : 0;                       // bi_direction
@@ -117,14 +118,19 @@ static void fillMem(Esc& e) {
 	strcpy((char*)e.mem + 0x40, "#S_H_50#");
 	strcpy((char*)e.mem + 0x50, "#BLHELI$EFM8B21#");
 	strcpy((char*)e.mem + 0x60, bj ? "Bluejay (.0)" : "");
+	if (bj && e.spec.tune) { e.mem[0x70] = 0x02; e.mem[0x71] = 0x30; }   // a startup melody
 }
 static uint32_t bootMs(const Spec& s) { return s.tune ? BOOT_TUNE_MS : s.fw == Fw::AM32 ? AM32_BOOT_MS : BOOT_MS; }
 void plug(uint8_t p, const Spec& s) {
+	if (getenv("SIM_TRACE")) printf("  %8.3f s  [sim] plug GP%u (fw %d, 3D %d, tune %d)\n", T / 1e6, p, (int)s.fw, s.rev, s.tune);
 	Esc& e = escs_[p & 31]; e = Esc{}; e.present = true; e.spec = s; fillMem(e);
 	if (held(p)) { e.mode = Mode::BL; e.blEntries++; }       // powered with the line high: its bootloader
 	else { e.mode = Mode::BOOT; e.bootEndUs = T + bootMs(s) * 1000ull; }
 }
-void unplug(uint8_t p) { escs_[p & 31] = Esc{}; }
+void unplug(uint8_t p) {
+	if (getenv("SIM_TRACE")) printf("  %8.3f s  [sim] unplug GP%u\n", T / 1e6, p);
+	escs_[p & 31] = Esc{};
+}
 static void appStart(Esc& e) {
 	e.mode = Mode::BOOT; e.armed = e.edt = e.running = e.stuck = e.hadFrames = false; e.rpm = 0;
 	e.bootEndUs = T + bootMs(e.spec) * 1000ull;

@@ -509,6 +509,47 @@ int main() {
 		for (; t <= 1900; t++) step(0, 0, t - 500);               // eRPM 0, but not fresh: the 1 s refresh at 1801
 		CHECK(!e.ran && bursts == 2, "EDT: a fresh eRPM 0 gets one more burst; then one per second");
 	}
+	{   // bootloader entry timeline (lc::Entry)
+		using D = Entry::Do;
+		Entry a; a.primed(1000, ENTRY_MAX_MS);   // the passthrough primed it, line high at 1000
+		CHECK(a.step(1999) == D::QUIET && a.step(2000) == D::POLL && a.step(5999) == D::POLL && a.step(6000) == D::MISS,
+		      "entry: primed -> quiet 1 s -> poll to 5 s after the line went high -> miss");
+		Entry late; late.primed(0, ENTRY_QUIET_MS + ENTRY_BARE_MS);
+		CHECK(late.step(9000) == D::POLL && late.step(9499) == D::POLL && late.step(9500) == D::MISS,
+		      "entry: a first poll past its deadline still polls ENTRY_POLL_MIN_MS");
+		Entry n; n.begin(0, false, ENTRY_MAX_MS);
+		CHECK(n.step(499) == D::PRIME && n.step(500) == D::QUIET && n.highMs == 500, "entry: nothing to wait for -> prime 500 ms, then the line high");
+		Entry w; w.begin(0, true, ENTRY_MAX_MS);
+		bool primeTill = w.step(1799) == D::PRIME; w.onAnswer();
+		CHECK(primeTill && w.step(1800) == D::QUIET && w.quietEnd() == 2800 && w.pollMs == ENTRY_MAX_MS,
+		      "entry: a known bidir ESC is primed until it answers (booting, deaf), then quiet");
+		Entry g; g.begin(0, true, ENTRY_MAX_MS);
+		CHECK(g.step(ENTRY_PRIME_MAX_MS - 1) == D::PRIME && g.step(ENTRY_PRIME_MAX_MS) == D::QUIET &&
+		      g.pollMs == ENTRY_QUIET_MS + ENTRY_BARE_MS, "entry: no answer within 3 s -> on, with the short poll (likely not there)");
+		Entry t; t.begin(0, true, ENTRY_MAX_MS, true);
+		CHECK(t.step(8300) == D::PRIME && t.step(ENTRY_PRIME_TUNE_MS) == D::QUIET, "entry: a startup melody gets ENTRY_PRIME_TUNE_MS to answer");
+	}
+	{   // the first answer after a read: in time, late (a swap), late again, and with a melody
+		Pin p; p.finish(bluejay()); p.onStreamStart(0, true);
+		p.onPacket(750);
+		CHECK(p.st == State::READY && p.answerDelay == 750 && !p.fresh, "first answer 0.75 s after the read: kept (the bench Bluejay)");
+		Pin q; q.finish(bluejay()); q.onStreamStart(0, true);
+		Ev e = q.onPacket(ANSWER_DUE_MS + 500);
+		CHECK(e == Ev::LATE_ANSWER && q.st == State::PENDING && q.lateOnce, "first answer past ANSWER_DUE_MS: read again (swapped?)");
+		q.onReadStart(3000); q.onReadDone(true, bluejay()); q.onStreamStart(3100, true);
+		e = q.onPacket(3100 + ANSWER_DUE_MS + 500);
+		CHECK(e == Ev::NONE && q.st == State::READY, "late again after that read: its own slow boot, kept (no loop)");
+		Identity bt = bluejay(); bt.tune = true;
+		Pin m; m.finish(bt); m.onStreamStart(0, true);
+		CHECK(m.tick(ANSWER_MAX_MS, Policy::TOOL) == Ev::NONE && !m.unconfirmed, "melody: no NO_ANSWER at 8 s");
+		e = m.onPacket(8300);
+		CHECK(e == Ev::NONE && m.st == State::READY, "melody: its answer at 8.3 s is in time (no read every 9 s)");
+		Pin m2; m2.finish(bt); m2.onStreamStart(0, true);
+		CHECK(m2.tick(ANSWER_MAX_TUNE_MS, Policy::TOOL) == Ev::NO_ANSWER, "melody: NO_ANSWER after ANSWER_MAX_TUNE_MS");
+		ArmGate g; g.begin(0);
+		bool early = g.tick(ANSWER_MAX_MS + 1, true, false, true);
+		CHECK(!early && g.tick(ANSWER_MAX_TUNE_MS + 1, true, false, true), "arm: a melody ESC that never answered waits ANSWER_MAX_TUNE_MS");
+	}
 	{   // names
 		const char* want[] = { "EMPTY", "PENDING", "READING", "READY", "RUNNING", "LOST", "FAILED" };
 		bool all = true;

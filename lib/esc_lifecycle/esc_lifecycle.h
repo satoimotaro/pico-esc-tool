@@ -29,7 +29,19 @@ static const uint32_t APPEAR_GAP_MS    = 15;
 // is reported once (Ev::NO_ANSWER) and kept READY: it is armed after 8 s anyway, as in rev0, and its
 // telemetry may just not decode. A RUNNING pin re-armed after a stall (Stall below) that never
 // answers again within this long is LOST: it had answered before.
-static const uint32_t ANSWER_MAX_MS    = 8000;
+// ANSWER_MAX_TUNE_MS for an ESC with a startup melody (Identity::tune): it is deaf while it plays
+// (8.3 s on the bench; at 8 s the pin was taken as unconfirmed and read again, which played it
+// again: a read every 9 s, for good).
+static const uint32_t ANSWER_MAX_MS    = 8000, ANSWER_MAX_TUNE_MS = 15000;
+// After a read the ESC runs its app: it boots (deaf), arms and then answers. Its first answer on the
+// stream that follows is due within ANSWER_DUE_MS; a later one may be another ESC, swapped in while
+// this one booted and before it could answer (nothing on the wire tells the two apart). That answer
+// sends the pin to PENDING, once: a second late answer after the read that follows is taken as this
+// ESC's own slow boot. Past ANSWER_MAX_MS the NO_ANSWER rules below apply instead. Measured (the
+// `state` ans= column): Bluejay 0.21 0.75 s, AM32 2.21 0.03 s.
+// Not with a startup melody (Identity::tune): it plays for seconds (8.3 s on the bench), long
+// enough for any swap, and a read again would only play it again.
+static const uint32_t ANSWER_DUE_MS = 1500;
 // An answered bidir stream at zero with no packet for this long is reported SILENT (Ui::SILENT): the
 // web page's hint that LOST (LOST_MS) is coming, or, under Policy::ROV, the open loop.
 static const uint32_t SILENT_MS        = 200;
@@ -49,6 +61,7 @@ enum class Policy : uint8_t { TOOL, ROV };
 // What the ESC on the pin is, as read through its bootloader. known=false: nothing may be mapped.
 struct Identity {
 	bool     known = false, bidir = false, rev = false, am32 = false;
+	bool     tune = false;  // plays a startup melody: it boots for seconds, deaf (Bluejay 0x70, AM32 tune[])
 	uint16_t am32Eep = 0;   // AM32 settings block address (0 = not AM32)
 };
 // AM32 settings block by the bootloader's flash-size code (web/js/layouts.js, host/pico_esc/am32.py):
@@ -79,14 +92,15 @@ inline Identity identFromSilabs(const char* name, uint8_t layoutRev, uint8_t dir
 }
 
 enum class Ev : uint8_t { NONE, APPEARED, GONE, LOST_IDLE, LOST_STOPPED, LOST_OPENLOOP, RETURNED,
-                          READ_OK, READ_FAILED, READ_EMPTY, INIT_FAIL, NO_ANSWER, SLOW_LOOP };
+                          READ_OK, READ_FAILED, READ_EMPTY, INIT_FAIL, NO_ANSWER, SLOW_LOOP, LATE_ANSWER };
 inline const char* evName(Ev e) {
 	static const char* const N[] = { "none", "appeared", "gone", "lost", "lost, stopped", "lost, open loop",
 	                                 "telemetry back", "read", "read failed", "nothing there", "init-fail (no free PIO SM)",
 	                                 "no telemetry within 8 s (kept, armed anyway; a pull is not seen)",
-	                                 "core0 loop slow: LOST / stall checks paused" };
+	                                 "core0 loop slow: LOST / stall checks paused",
+	                                 "first answer after its read came late (swapped?): read again" };
 	uint8_t k = (uint8_t)e;
-	return k < 13 ? N[k] : "?";
+	return k < 14 ? N[k] : "?";
 }
 
 // Why a drive command was not applied. A refusal never touches the target or feeds the deadman.
@@ -118,6 +132,10 @@ struct Pin {
 	// been swapped before its first answer, so that answer sends the pin to PENDING (read again)
 	// instead of trusting the identity.
 	bool     unconfirmed = false;
+	// The identity was just read: its first answer must come in time (ANSWER_DUE_MS). lateOnce: a late
+	// one already sent it to be read again. answerDelay: the last first answer, ms after its stream began.
+	bool     fresh = false, lateOnce = false;
+	uint32_t answerDelay = 0;
 	uint32_t streamMs = 0, pktMs = 0, burstMs = 0, cntMs = 0;
 	uint8_t  burst = 0;
 	State    prePt = State::EMPTY; // state when the passthrough began
@@ -127,10 +145,10 @@ struct Pin {
 	// (implicitArmSkipped): each would otherwise queue a 5.5 s read in front of the real ESCs.
 	bool     absent = false;
 
-	void toEmpty() { st = State::EMPTY; id = Identity{}; seen = queued = armWanted = openLoop = unconfirmed = false; burst = 0; }
+	void toEmpty() { st = State::EMPTY; id = Identity{}; seen = queued = armWanted = openLoop = unconfirmed = fresh = lateOnce = false; burst = 0; }
 	// LOST forgets `seen` too: what answered is gone, so a read that then fails finds nothing (EMPTY,
 	// detection on) rather than FAILED (silent until the user reads it again).
-	void toLost()  { st = State::LOST; id = Identity{}; seen = armWanted = openLoop = unconfirmed = false; burst = 0; }
+	void toLost()  { st = State::LOST; id = Identity{}; seen = armWanted = openLoop = unconfirmed = fresh = lateOnce = false; burst = 0; }
 	void toPending(bool byRequest) {
 		st = State::PENDING; id = Identity{}; queued = byRequest; burst = 0; unconfirmed = false;
 		if (!byRequest) armWanted = false;   // found by telemetry: nobody asked to drive it
@@ -139,7 +157,7 @@ struct Pin {
 	// waited for the read is honoured exactly once and never outlives it.
 	void finish(const Identity& ident) {
 		id = ident; st = armWanted ? State::RUNNING : State::READY;
-		armWanted = openLoop = unconfirmed = absent = false;
+		armWanted = openLoop = unconfirmed = absent = false; fresh = true;
 	}
 	// Telemetry that is fresh when a read starts is what makes its failure FAILED (something answers
 	// but will not read: no automatic retry loop). Old telemetry from before a session or passthrough
@@ -181,7 +199,19 @@ struct Pin {
 	// word per read, so these are loop samples, not frames: the debounce counts one per APPEAR_GAP_MS.
 	Ev onPacket(uint32_t now) {
 		if (st == State::FAILED || st == State::READING) return Ev::NONE;   // FAILED sends nothing anyway
+		bool first = streaming && !answered;
 		seen = answered = true; absent = false; pktMs = now;
+		if (first) {
+			answerDelay = now - streamMs;
+			if (fresh && !unconfirmed && (st == State::READY || st == State::RUNNING)) {
+				fresh = false;
+				// past answerMax() it is NO_ANSWER's (READY: unconfirmed; RUNNING: kept, its telemetry
+				// may just not decode)
+				bool late = !id.tune && answerDelay > ANSWER_DUE_MS && answerDelay < answerMax();
+				if (late && !lateOnce) { lateOnce = true; toPending(false); return Ev::LATE_ANSWER; }
+				if (!late) lateOnce = false;
+			}
+		}
 		if (burst == 0 || now - cntMs >= APPEAR_GAP_MS) {
 			if (burst == 0 || now - burstMs > APPEAR_WINDOW_MS) { burstMs = now; burst = 0; }
 			if (burst < 255) burst++;
@@ -193,6 +223,7 @@ struct Pin {
 		if (st == State::RUNNING && openLoop) { openLoop = false; return Ev::RETURNED; }
 		return Ev::NONE;
 	}
+	uint32_t answerMax() const { return id.tune ? ANSWER_MAX_TUNE_MS : ANSWER_MAX_MS; }
 	// core0 did not poll this pin for gapMs (a long blocking command): its silence then is no evidence.
 	void rebase(uint32_t gapMs) { pktMs += gapMs; streamMs += gapMs; burstMs += gapMs; cntMs += gapMs; }
 	Ev tick(uint32_t now, Policy policy) {
@@ -202,14 +233,14 @@ struct Pin {
 			break;
 		case State::READY:
 			if (streaming && streamBidir && answered && now - pktMs >= LOST_MS) { toLost(); return Ev::LOST_IDLE; }
-			if (streaming && streamBidir && !answered && !noAnswerSaid && now - streamMs >= ANSWER_MAX_MS) {
+			if (streaming && streamBidir && !answered && !noAnswerSaid && now - streamMs >= answerMax()) {
 				noAnswerSaid = unconfirmed = true; return Ev::NO_ANSWER;   // kept READY (see ANSWER_MAX_MS)
 			}
 			break;
 		case State::RUNNING:   // unanswered RUNNING keeps 4baed53's "armed after 8 s anyway", except after a stall
 			if (streaming && streamBidir &&
 			    ((answered && !stallWatch && now - pktMs >= LOST_MS) ||
-			     (rearmed && !answered && now - streamMs >= ANSWER_MAX_MS))) {
+			     (rearmed && !answered && now - streamMs >= answerMax()))) {
 				if (policy == Policy::ROV) { if (!openLoop) { openLoop = true; return Ev::LOST_OPENLOOP; } }
 				else { toLost(); return Ev::LOST_STOPPED; }
 			}
@@ -334,13 +365,68 @@ inline uint32_t stamp(uint32_t now) { return now ? now : 1; }
 // ms from stamp t to now, 0 if t is ahead (the stamp(0) = 1 case).
 inline uint32_t since(uint32_t now, uint32_t t) { int32_t d = (int32_t)(now - t); return d > 0 ? (uint32_t)d : 0; }
 
+// BOOTLOADER ENTRY: one timeline for every way into an ESC's bootloader (escs:: enterBootloader,
+// the passthrough's channels). PRIME: zero-throttle DShot, ENTRY_PRIME_MS at least (BLHeli-S needs
+// valid frames before the line goes high; a bare high line leaves it waiting for signal). A bidir
+// ESC known on the pin is primed until it has answered, up to ENTRY_PRIME_MAX_MS: one that was just
+// run out of its bootloader is deaf while it boots and plays its startup tune, and a prime that ends
+// inside the tune leaves it waiting in its app. QUIET: the line high, ENTRY_QUIET_MS with no traffic
+// at all (a BootInit earlier than ~700 ms keeps Bluejay in its app). POLL: BootInit again and again
+// until an answer or pollMs after the line went high (at least ENTRY_POLL_MIN_MS). Measured
+// 2026-11-07 (`blpoll`, line high right after the zero-throttle hold, app running):
+//   AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
+//     does not disturb it (answered at 538 ms, 6/6).
+//   Bluejay 0.21 (EFM8BB21): a single BootInit answers from 700 ms; polling from 0 or 300 ms keeps
+//     it out of its bootloader (no answer within 6 s, 6/6). Hence the quiet window.
+//   Quiet 800 or 1000 ms, then poll: both answer the first BootInit (814 / 1014 ms), 12/12.
+// ENTRY_MAX_MS covers a slower AM32 build and a startup tune. ENTRY_BARE_MS: the poll past the quiet
+// window for a pin with no ESC known (a stock BLHeli_S has the Bluejay timing; an AM32 that sits in
+// its bootloader answers at once), and for one whose wait for an answer ran out (likely not there).
+// ENTRY_PRIME_MAX_MS / ENTRY_PRIME_TUNE_MS: how long a known bidir ESC is primed for its answer,
+// without and with a startup melody (the bench's Bluejay 0.21 with its melody on answers 8.3 s after
+// it was run; with it off 0.75 s, the AM32 0.03 s).
+static const uint32_t ENTRY_PRIME_MS = 500, ENTRY_PRIME_MAX_MS = 3000, ENTRY_PRIME_TUNE_MS = 15000, ENTRY_QUIET_MS = 1000,
+                      ENTRY_MAX_MS = 5000, ENTRY_BARE_MS = 500, ENTRY_POLL_MIN_MS = 500;
+struct Entry {
+	enum class Do : uint8_t { PRIME, QUIET, POLL, MISS };
+	bool     high = false, waitAnswer = false, answered = false;
+	uint32_t start = 0, highMs = 0, from = 0, pollMs = ENTRY_MAX_MS, primeMax = ENTRY_PRIME_MAX_MS;
+	// A fresh entry, primed from now. pollMs: ENTRY_MAX_MS for a known ESC, else the bare poll. tune:
+	// the ESC plays a startup melody (Identity::tune): its answer may take ENTRY_PRIME_TUNE_MS.
+	void begin(uint32_t now, bool waitForAnswer, uint32_t poll, bool tune = false) {
+		*this = Entry{}; start = now; waitAnswer = waitForAnswer; pollMs = poll;
+		primeMax = tune ? ENTRY_PRIME_TUNE_MS : ENTRY_PRIME_MAX_MS;
+	}
+	// Primed already (the passthrough primes every pin at once), the line high since highAt.
+	void primed(uint32_t highAt, uint32_t poll) { *this = Entry{}; high = true; highMs = highAt; pollMs = poll; }
+	void onAnswer() { answered = true; }
+	// What to do now. PRIME -> QUIET is the moment the line goes high (the caller does it at once).
+	Do step(uint32_t now) {
+		if (!high) {
+			uint32_t t = since(now, start);
+			if (t < ENTRY_PRIME_MS || (waitAnswer && !answered && t < primeMax)) return Do::PRIME;
+			high = true; highMs = now;
+			if (waitAnswer && !answered) pollMs = ENTRY_QUIET_MS + ENTRY_BARE_MS;
+		}
+		if (since(now, highMs) < ENTRY_QUIET_MS) return Do::QUIET;
+		if (!from) from = now;
+		return (int32_t)(now - pollEnd()) < 0 ? Do::POLL : Do::MISS;
+	}
+	uint32_t quietEnd() const { return highMs + ENTRY_QUIET_MS; }
+	uint32_t pollEnd() const {
+		uint32_t e = highMs + pollMs;
+		return (int32_t)(e - from) < (int32_t)ENTRY_POLL_MIN_MS ? from + ENTRY_POLL_MIN_MS : e;
+	}
+};
+
 // ARM GATE. A drive stream counts as armed once its window (ARM_MS, or the short window of a re-arm
 // of an ESC that is armed already) has passed and the ESC has been heard: a normal-DShot stream at
 // once, a bidir one once it answered, ARM_ANSWER_HOLD_MS of zero have gone by since, and its EDT
 // enable has gone out (EdtSched). Bluejay sends its first telemetry from wait_for_start, i.e. once it
 // has armed, and takes DShot commands only there; with EDT safety arm (FORCE_EDT_ARM) it refuses to
 // start without EDT (Bluejay.asm wait_for_start_nonzero), and a reboot clears EDT. A bidir stream
-// that never answers is armed after ANSWER_MAX_MS anyway. Nothing but zero goes out until it is armed.
+// that never answers is armed after ANSWER_MAX_MS anyway (ANSWER_MAX_TUNE_MS with a startup melody).
+// Nothing but zero goes out until it is armed.
 static const uint32_t ARM_MS = 3000, ARM_ANSWER_HOLD_MS = 300;
 struct ArmGate {
 	bool     armed = false;
@@ -348,12 +434,13 @@ struct ArmGate {
 	uint16_t ms = 0;                  // this window (0 = ARM_MS)
 	void begin(uint32_t now, uint16_t windowMs = 0) { armed = false; start = now; answer = 0; ms = windowMs; }
 	void onAnswer(uint32_t now) { if (!answer) answer = stamp(now); }
-	// true on the call that arms it. edtPending: EDT enable frames still to go out.
-	bool tick(uint32_t now, bool bidir, bool edtPending) {
+	// true on the call that arms it. edtPending: EDT enable frames still to go out. tune: it plays a
+	// startup melody (Identity::tune), so an unanswered stream waits ANSWER_MAX_TUNE_MS.
+	bool tick(uint32_t now, bool bidir, bool edtPending, bool tune = false) {
 		if (armed) return false;
 		uint32_t t = now - start, win = ms ? ms : ARM_MS;
 		bool heard = !bidir || ms || (answer && since(now, answer) >= ARM_ANSWER_HOLD_MS && !edtPending);
-		if (t > win && (heard || t > ANSWER_MAX_MS)) armed = true;
+		if (t > win && (heard || t > (tune ? ANSWER_MAX_TUNE_MS : ANSWER_MAX_MS))) armed = true;
 		return armed;
 	}
 };
