@@ -40,13 +40,13 @@ static void frameHook(uint8_t gp, bool bidir, bool command, uint16_t wire) {
 	if (i < 0) return violate("throttle on a pin that is not an ESC pin", gp, wire);
 	using namespace escs::detail;
 	sim::Esc& e = sim::esc(gp);
-	if (pin[i].st != lc::State::RUNNING) return violate("throttle on a pin that is not RUNNING", gp, wire);
-	if (!pin[i].id.known) return violate("throttle with no identity", gp, wire);
+	if (ch[i].pin.st != lc::State::RUNNING) return violate("throttle on a pin that is not RUNNING", gp, wire);
+	if (!ch[i].pin.id.known) return violate("throttle with no identity", gp, wire);
 	if (!e.present) return;   // pulled: the next frames find out (LOST); the identity was right
 	bool escBidir = e.spec.fw != sim::Fw::BLHELI_S;
-	if (pin[i].id.rev != e.spec.rev) return violate("throttle on an identity whose 3D is not the ESC's", gp, wire);
-	if (pin[i].id.bidir != escBidir || bidir != escBidir) return violate("throttle in a protocol that is not the ESC's", gp, wire);
-	if (millis() - drvLast[i] > escs::SPIN_DEADMAN_MS + 5) return violate("throttle past the deadman", gp, wire);
+	if (ch[i].pin.id.rev != e.spec.rev) return violate("throttle on an identity whose 3D is not the ESC's", gp, wire);
+	if (ch[i].pin.id.bidir != escBidir || bidir != escBidir) return violate("throttle in a protocol that is not the ESC's", gp, wire);
+	if (millis() - ch[i].drv.last > escs::SPIN_DEADMAN_MS + 5) return violate("throttle past the deadman", gp, wire);
 	// exactly the value asked for, as this ESC (3D or not, whatever the pin believes) reads the wire
 	int v = lastDrive[i];
 	uint16_t want = e.spec.rev ? (v ? lc::thrust3d((int16_t)(v > 1000 ? 1000 : v < -1000 ? -1000 : v)) + 47 : 0)

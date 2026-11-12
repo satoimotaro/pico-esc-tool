@@ -91,7 +91,7 @@ request to a non-3D ESC is refused and reported, not clamped to zero silently.
 - Re-validation flags after config writes, flashes and passthrough: those all end in READING.
 - Writes never use cached identity: the bootloader session that writes reads signature and layout
   first and compares (already so in the web flasher's `flashCheck`; to be checked for the CLI and
-  for the cached `fwHave` reply).
+  for the cached `fw.have` reply).
 
 ## Phase 1 and phase 2
 

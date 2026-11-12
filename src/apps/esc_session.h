@@ -158,8 +158,6 @@ namespace detail {
 	static int8_t        armBusy = -1;                 // the written session that refused the last spinArm
 	static volatile bool sessionLost = false;
 	static uint8_t       kaMiss = 0;                   // core1
-	static Info          infoCache[MAX];             // Op::LEARN results for the session's pin
-	static lc::Identity  identCache[MAX];
 	// The async read (Op::READID) writes only these; core0 adopts them when it collects the job.
 	static Info          jobInfo;
 	static lc::Identity  jobIdent;
@@ -170,17 +168,7 @@ namespace detail {
 	// LittleFS writes pause the other core (flash erase), which would cut a bit-banged bootloader
 	// byte in half: core1 parks in its idle branch first (FsGuard).
 	static volatile bool parkReq = false, parked = false, core1Up = false;
-	// 4-way passthrough (fourway.h): an ESC once connected stays in its bootloader while another is
-	// selected, so coming back to it re-adopts its cached reply instead of a second BootInit (which
-	// AM32 does not answer).
-	static bool     fwHave[MAX] = { false };
-	static uint8_t  fwRaw[MAX][8];
-	static bool     fwAm32[MAX] = { false };
 	static volatile uint8_t fwIdx = 0;
-	// An ESC that never answered stays failed until the next fwBegin, so a configurator polling every
-	// reported channel pays the timeout once per session, not on every read.
-	static bool     fwMiss[MAX] = { false };
-	static bool     fwDone[MAX] = { false };   // fwRun already left its bootloader (DeviceReset)
 	static bool     fwActive = false;            // the configurator owns every pin: no hold, no jobs
 	static uint32_t fwBeginMs = 0;
 	// A bootloader entry's prime stream: bidir when a bidir ESC is known there (its answer ends the
@@ -190,54 +178,80 @@ namespace detail {
 		BidirDShotX1* b = nullptr; DShotX4* n = nullptr;
 		void end() { delete b; b = nullptr; delete n; n = nullptr; }
 	};
-	static lc::Entry fwEntry[MAX];             // each channel's bootloader entry (fwBegin, fwSelect)
-	static Prime     fwPrime[MAX];             // ... its prime stream, kept across InitFlash calls
 	static inline bool armId(const uint8_t raw[8]) { return raw[5] == 0x06 && raw[4] > 0 && raw[4] < 0x90; }
-	// The lifecycle: one state per pin, and what the hold / LOST handling do with it.
-	static lc::Pin    pin[MAX];
+
+	// Everything one ESC pin carries, ch[i] for pin index i.
+	struct Chan {
+		lc::Pin      pin;                    // its lifecycle: one state, and what the hold / LOST handling do with it
+		Info         info;                   // Op::LEARN results for the session on this pin
+		lc::Identity ident;
+		// drive/spin: one DShot driver (core0). Only one of b/n is non-null.
+		struct Drv {
+			BidirDShotX1*     b = nullptr;       // bidir DShot: idle HIGH, eRPM/EDT telemetry
+			DShotX4*          n = nullptr;       // normal DShot: idle LOW, throttle only
+			volatile uint16_t target = 0;
+			uint32_t          last = 0;          // when the target was last fed (deadman)
+			lc::ArmGate       arm;               // the stream's arm window (streamPin)
+			lc::EdtSched      edt;               // its EDT enable (bidir)
+			lc::Stall         stall;             // the stall watch (streamPin) and its hold
+			bool              initFail = false;  // the last driver start found no free PIO SM
+			uint32_t          retryMs = 0;       // ... the hold tries again from here
+			uint32_t          startMs = 0;       // when this stream started (the prime counts it)
+			uint32_t          pollMs = 0;        // when its telemetry was last polled
+			uint16_t          kb = 0;            // the bitrate it was started at
+			uint8_t           gapRun = 0;        // poll gaps in a row (gapCheck)
+			Telem             tele;
+			// A fresh stream on the driver just made (b or n): zero, the arm window and EDT from now.
+			void begin(uint32_t now, uint16_t kbps, bool bidir) {
+				initFail = false; kb = kbps;
+				target = 0; last = startMs = pollMs = now;
+				arm.begin(now); edt.begin(now, bidir); stall.reset();
+			}
+		} drv;
+		struct ArmReq {                          // what the pending/last arm asked for
+			Drive    mode = Drive::AUTO;
+			uint16_t ms = 0;
+			bool     start = false;              // RUNNING after a read: start the arm stream
+		} armReq;
+		// Overrides (0 = the global ESC_DSHOT_KBAUD / ESC_MOTOR_POLES), set via escs::setKbaud/setPoles so
+		// ESCs/motors on one board can differ (a 300 kbaud A_H_30 next to a 600 kbaud unit, other poles).
+		uint16_t kbaud = 0;
+		uint8_t  poles = 0;
+		// Servo PWM (50 Hz, 1000..2000 us) instead of DShot, for firmwares that take it (AM32, stock
+		// BLHeli-S; Bluejay does not). Hardware PWM slice, not PIO. us = 0: the pin is not on PWM.
+		struct Pwm {
+			volatile uint16_t us = 0, stop = 0;  // read by the deadman IRQ; stop: 1500 on a 3D ESC
+			volatile uint32_t last = 0;
+			uint32_t          start = 0;
+			bool              zero = false;      // a stop width came after the arm (lc::pwmGate)
+		} pwm;
+		// 4-way passthrough (fourway.h): an ESC once connected stays in its bootloader while another is
+		// selected, so coming back to it re-adopts its cached reply instead of a second BootInit (which
+		// AM32 does not answer). One that never answered stays failed until the next fwBegin, so a
+		// configurator polling every reported channel pays the timeout once per session.
+		struct Fw {
+			bool      have = false, am32 = false, miss = false;
+			bool      done = false;              // fwRun already left its bootloader (DeviceReset)
+			uint8_t   raw[8] = {0};
+			lc::Entry entry;                     // its bootloader entry (fwBegin, fwSelect)
+			Prime     prime;                     // ... its prime stream, kept across InitFlash calls
+		} fw;
+	};
+	static Chan ch[MAX];
 	static lc::Policy policy = lc::Policy::TOOL;
-	static bool       holdOn = false;              // EscTool turns it on; the legacy esc_tool keeps it off
+	static bool       holdOn = false;              // EscTool turns it on
 	static uint8_t    evIdx[8]; static lc::Ev evEv[8]; static lc::State evSt[8];
 	static uint8_t    evHead = 0, evTail = 0;
 	static inline void evPush(uint8_t i, lc::Ev e) {   // with the state it left, not the state at print time
 		if (e == lc::Ev::NONE) return;
 		uint8_t n = (evHead + 1) & 7;
 		if (n == evTail) evTail = (evTail + 1) & 7;   // full: the oldest goes
-		evIdx[evHead] = i; evEv[evHead] = e; evSt[evHead] = pin[i].st; evHead = n;
+		evIdx[evHead] = i; evEv[evHead] = e; evSt[evHead] = ch[i].pin.st; evHead = n;
 	}
-	// drive/spin: one DShot driver per pin (core0). Only one of drvB/drvN is non-null per pin.
-	static BidirDShotX1*     drvB[MAX] = { nullptr };   // bidir DShot: idle HIGH, eRPM/EDT telemetry
-	static DShotX4*          drvN[MAX] = { nullptr };   // normal DShot: idle LOW, throttle only
-	static volatile uint16_t drvTarget[MAX] = { 0 };
-	static uint32_t          drvLast[MAX] = { 0 };
-	static lc::ArmGate       armg[MAX];                 // the stream's arm window (streamPin)
-	static lc::EdtSched      edt[MAX];                  // its EDT enable (bidir)
-	static lc::Stall         stall[MAX];                // the stall watch (streamPin) and its hold
-	static bool              drvInitFail[MAX] = { false }; // the last driver start found no free PIO SM
-	static uint32_t          drvRetryMs[MAX] = { 0 };   // ... the hold tries again from here
-	static uint32_t          drvStartMs[MAX] = { 0 };   // when this stream started (the prime counts it)
-	static uint32_t          drvPollMs[MAX] = { 0 };    // when its telemetry was last polled
-	static uint16_t          drvKb[MAX] = { 0 };        // the bitrate it was started at
-	static Telem             drvTele[MAX];
-	static Drive             armMode[MAX] = { Drive::AUTO };   // what the pending/last arm asked for
-	static uint16_t          armMsReq[MAX] = { 0 };
-	static bool              armStart[MAX] = { false };  // RUNNING after a read: start the arm stream
-	// Per-ESC overrides (0 = use the global ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default). Set via
-	// escs::setKbaud/setPoles so different ESCs/motors on the same board can differ (e.g. a 300 kbaud
-	// A_H_30 next to a 600 kbaud unit, or motors with different pole counts). Additive: untouched =>
-	// identical behavior to before, so the legacy esc_tool build is unaffected.
-	static uint16_t          drvKbaud[MAX] = { 0 };
-	static uint8_t           drvPoles[MAX] = { 0 };
-	static inline uint16_t   kbaudOf(uint8_t i) { return drvKbaud[i] ? drvKbaud[i] : (uint16_t)DSHOT_KBAUD; }
-	static inline uint8_t    polesOf(uint8_t i) { return drvPoles[i] ? drvPoles[i] : (uint8_t)MOTOR_POLES; }
-	// Servo PWM (50 Hz, 1000..2000 us) instead of DShot, for firmwares that take it (AM32, stock
-	// BLHeli-S; Bluejay does not). Hardware PWM slice, not PIO. pwmUs = 0: the pin is not on PWM.
-	static volatile uint16_t pwmUs[MAX] = { 0 }, pwmStop[MAX] = { 0 };   // read by the deadman IRQ; pwmStop: 1500 on a 3D ESC
-	static volatile uint32_t pwmLast[MAX] = { 0 };
-	static uint32_t          pwmStart[MAX] = { 0 };
-	static bool              pwmZero[MAX] = { false };   // a stop width came after the arm (lc::pwmGate)
+	static inline uint16_t   kbaudOf(uint8_t i) { return ch[i].kbaud ? ch[i].kbaud : (uint16_t)DSHOT_KBAUD; }
+	static inline uint8_t    polesOf(uint8_t i) { return ch[i].poles ? ch[i].poles : (uint8_t)MOTOR_POLES; }
 	static uint8_t           blDepth = 0;                  // inside a sync bootloader visit: PWM sends its stop width
-	static inline bool pwmOn(uint8_t i) { return pwmUs[i] != 0; }
+	static inline bool pwmOn(uint8_t i) { return ch[i].pwm.us != 0; }
 	// IRQs off: a slice's two pins share one CC register, and the deadman alarm below writes it too.
 	static inline void pwmLevel(uint8_t i, uint16_t us) {
 		uint32_t s = save_and_disable_interrupts(); pwm_set_gpio_level(PINS[i], us); restore_interrupts(s);
@@ -247,31 +261,31 @@ namespace detail {
 	static repeating_timer_t pwmTimer; static bool pwmTimerOn = false;
 	static bool pwmWatch(repeating_timer_t*) {
 		for (uint8_t i = 0; i < COUNT; i++)
-			if (pwmOn(i) && millis() - pwmLast[i] > SPIN_DEADMAN_MS) pwm_set_gpio_level(PINS[i], pwmStop[i]);
+			if (pwmOn(i) && millis() - ch[i].pwm.last > SPIN_DEADMAN_MS) pwm_set_gpio_level(PINS[i], ch[i].pwm.stop);
 		return true;
 	}
-	static inline void pwmSafe() { for (uint8_t i = 0; i < COUNT; i++) if (pwmOn(i)) pwmLevel(i, pwmStop[i]); }
+	static inline void pwmSafe() { for (uint8_t i = 0; i < COUNT; i++) if (pwmOn(i)) pwmLevel(i, ch[i].pwm.stop); }
 	static inline void pwmOff(uint8_t i) {
 		if (!pwmOn(i)) return;
-		pwmLevel(i, 0); pwmUs[i] = 0;
+		pwmLevel(i, 0); ch[i].pwm.us = 0;
 		gpio_set_function(PINS[i], GPIO_FUNC_SIO); pinMode(PINS[i], INPUT);
 	}
 
 	static inline uint8_t idxOf(uint8_t p) { for (uint8_t i = 0; i < COUNT; i++) if (PINS[i] == p) return i; return 0; }
 	// The identity that applies to pin i now: the session's own LEARN while it is held, else the pin's.
 	static inline const lc::Identity& curIdent(uint8_t i) {
-		return (session == (int8_t)i && sessLearned) ? identCache[i] : pin[i].id;
+		return (session == (int8_t)i && sessLearned) ? ch[i].ident : ch[i].pin.id;
 	}
-	static inline bool drvActive(uint8_t i) { return drvB[i] || drvN[i]; }
+	static inline bool drvActive(uint8_t i) { return ch[i].drv.b || ch[i].drv.n; }
 	static inline void drvSend(uint8_t i, uint16_t t) {
-		if (drvB[i]) drvB[i]->sendThrottle(t);
-		else if (drvN[i]) { uint16_t a[4] = { t, 0, 0, 0 }; drvN[i]->sendThrottles(a); }
+		if (ch[i].drv.b) ch[i].drv.b->sendThrottle(t);
+		else if (ch[i].drv.n) { uint16_t a[4] = { t, 0, 0, 0 }; ch[i].drv.n->sendThrottles(a); }
 	}
 	static inline void drvFree(uint8_t i) {
 		pwmOff(i);                                   // whoever takes the pin next owns it alone
-		if (drvB[i]) { drvB[i]->sendThrottle(0); delete drvB[i]; drvB[i] = nullptr; }
-		if (drvN[i]) { uint16_t a[4] = { 0, 0, 0, 0 }; drvN[i]->sendThrottles(a); delete drvN[i]; drvN[i] = nullptr; }
-		pin[i].onStreamEnd();
+		if (ch[i].drv.b) { ch[i].drv.b->sendThrottle(0); delete ch[i].drv.b; ch[i].drv.b = nullptr; }
+		if (ch[i].drv.n) { uint16_t a[4] = { 0, 0, 0, 0 }; ch[i].drv.n->sendThrottles(a); delete ch[i].drv.n; ch[i].drv.n = nullptr; }
+		ch[i].pin.onStreamEnd();
 	}
 	// PIO SM budget. The Pico W's CYW43 radio claims, at boot (before any stream here), the
 	// highest-numbered PIO with room (pio1: 1 SM + 6 instructions), and the bidir program (28 of 32
@@ -295,36 +309,33 @@ namespace detail {
 		drvFree(i);
 		uint16_t kb = kbaudOf(i);
 		uint32_t now = millis();
-		if (bidir) { drvB[i] = newBidir(PINS[i], kb); if (drvB[i]->initError()) { delete drvB[i]; drvB[i] = nullptr; } }
-		else       { drvN[i] = newNormal(PINS[i], kb); if (drvN[i]->initError()) { delete drvN[i]; drvN[i] = nullptr; } }
+		if (bidir) { ch[i].drv.b = newBidir(PINS[i], kb); if (ch[i].drv.b->initError()) { delete ch[i].drv.b; ch[i].drv.b = nullptr; } }
+		else       { ch[i].drv.n = newNormal(PINS[i], kb); if (ch[i].drv.n->initError()) { delete ch[i].drv.n; ch[i].drv.n = nullptr; } }
 		if (!drvActive(i)) {
-			if (!drvInitFail[i]) evPush(i, lc::Ev::INIT_FAIL);
-			drvInitFail[i] = true; drvRetryMs[i] = now + 1000;
+			if (!ch[i].drv.initFail) evPush(i, lc::Ev::INIT_FAIL);
+			ch[i].drv.initFail = true; ch[i].drv.retryMs = now + 1000;
 			return false;
 		}
-		drvInitFail[i] = false; drvKb[i] = kb;
-		drvTarget[i] = 0; drvLast[i] = drvStartMs[i] = drvPollMs[i] = now;
-		armg[i].begin(now); edt[i].begin(now, bidir); stall[i].reset();
-		pin[i].onStreamStart(now, bidir);
+		ch[i].drv.begin(now, kb, bidir);
+		ch[i].pin.onStreamStart(now, bidir);
 		return true;
 	}
 
 	static const uint32_t POLL_GAP_MS = 50;      // a pin not polled this long: core0 was away
 	static const uint8_t  SLOW_GAPS = 5;         // gaps in a row: say so (Ev::SLOW_LOOP), once per run
-	static uint8_t        gapRun[MAX] = { 0 };
 	// A loop held up (a blocking op that does not pump) is not an ESC gone quiet: the lifecycle's
 	// clocks move on by the gap, and the stall clocks restart. A loop slow on every pass would keep
 	// LOST, SILENT and the stall's silence rule from ever firing, so repeated gaps are reported. Only
 	// spinPoll's own check counts them (count): the streamPin/pump checks right after it see no gap
 	// and must not reset the run.
 	static void gapCheck(uint8_t i, uint32_t now, bool count = false) {
-		bool gap = drvActive(i) && now - drvPollMs[i] > POLL_GAP_MS;
-		if (gap) { pin[i].rebase(now - drvPollMs[i]); stall[i].onGap(); }
+		bool gap = drvActive(i) && now - ch[i].drv.pollMs > POLL_GAP_MS;
+		if (gap) { ch[i].pin.rebase(now - ch[i].drv.pollMs); ch[i].drv.stall.onGap(); }
 		if (count && drvActive(i)) {
-			if (!gap) gapRun[i] = 0;
-			else if (gapRun[i] < 255 && ++gapRun[i] == SLOW_GAPS) evPush(i, lc::Ev::SLOW_LOOP);
+			if (!gap) ch[i].drv.gapRun = 0;
+			else if (ch[i].drv.gapRun < 255 && ++ch[i].drv.gapRun == SLOW_GAPS) evPush(i, lc::Ev::SLOW_LOOP);
 		}
-		drvPollMs[i] = now;
+		ch[i].drv.pollMs = now;
 	}
 	// One loop's worth of pin i's stream: arm window, deadman, telemetry, stall watch, EDT, one frame.
 	// Shared by spinPoll() and pump(), so a synchronous wait streams exactly what the loop would.
@@ -332,61 +343,61 @@ namespace detail {
 		if (!drvActive(i)) return;
 		uint32_t now = millis();
 		gapCheck(i, now);
-		if (pin[i].st != lc::State::RUNNING) drvTarget[i] = 0;   // only RUNNING ever sends non-zero
-		if (!armg[i].armed) {
-			drvTarget[i] = 0;
-			if (armg[i].tick(now, drvB[i] != nullptr, edt[i].left > 0, pin[i].id.tune) && drvB[i]) edt[i].burst();   // AM32 may answer before it arms
+		if (ch[i].pin.st != lc::State::RUNNING) ch[i].drv.target = 0;   // only RUNNING ever sends non-zero
+		if (!ch[i].drv.arm.armed) {
+			ch[i].drv.target = 0;
+			if (ch[i].drv.arm.tick(now, ch[i].drv.b != nullptr, ch[i].drv.edt.left > 0, ch[i].pin.id.tune) && ch[i].drv.b) ch[i].drv.edt.burst();   // AM32 may answer before it arms
 		}
-		else if (millis() - drvLast[i] > SPIN_DEADMAN_MS) drvTarget[i] = 0;   // deadman (armed only)
-		if (drvB[i]) {
+		else if (millis() - ch[i].drv.last > SPIN_DEADMAN_MS) ch[i].drv.target = 0;   // deadman (armed only)
+		if (ch[i].drv.b) {
 			uint32_t v = 0;
-			BidirDshotTelemetryType ty = drvB[i]->getTelemetryPacket(&v);
+			BidirDshotTelemetryType ty = ch[i].drv.b->getTelemetryPacket(&v);
 			switch (ty) {
-				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); drvTele[i].rpm = (pp > 1) ? v / (pp / 2) : v; } drvTele[i].valid = true; drvTele[i].rpmStampMs = millis(); armg[i].onAnswer(millis()); break;
-				case BidirDshotTelemetryType::VOLTAGE:     drvTele[i].voltage = (float)v / 4.0f; break;
-				case BidirDshotTelemetryType::CURRENT:     drvTele[i].current = v; break;
-				case BidirDshotTelemetryType::TEMPERATURE: drvTele[i].tempC = v; drvTele[i].tempStampMs = millis(); break;
-				case BidirDshotTelemetryType::STRESS:      drvTele[i].stress = v & ESC_STATUS_MAX_STRESS_MASK; break;
-				case BidirDshotTelemetryType::STATUS:      drvTele[i].status = v; break;
+				case BidirDshotTelemetryType::ERPM:        { uint8_t pp = polesOf(i); ch[i].drv.tele.rpm = (pp > 1) ? v / (pp / 2) : v; } ch[i].drv.tele.valid = true; ch[i].drv.tele.rpmStampMs = millis(); ch[i].drv.arm.onAnswer(millis()); break;
+				case BidirDshotTelemetryType::VOLTAGE:     ch[i].drv.tele.voltage = (float)v / 4.0f; break;
+				case BidirDshotTelemetryType::CURRENT:     ch[i].drv.tele.current = v; break;
+				case BidirDshotTelemetryType::TEMPERATURE: ch[i].drv.tele.tempC = v; ch[i].drv.tele.tempStampMs = millis(); break;
+				case BidirDshotTelemetryType::STRESS:      ch[i].drv.tele.stress = v & ESC_STATUS_MAX_STRESS_MASK; break;
+				case BidirDshotTelemetryType::STATUS:      ch[i].drv.tele.status = v; break;
 				default: break;
 			}
 			// Any valid packet is a sign of life (EDT keeps coming in forced sine, where eRPM does not).
 			if (ty != BidirDshotTelemetryType::CHECKSUM_ERROR && ty != BidirDshotTelemetryType::NO_PACKET) {
-				drvTele[i].pktStampMs = now;
-				evPush(i, pin[i].onPacket(now));
+				ch[i].drv.tele.pktStampMs = now;
+				evPush(i, ch[i].pin.onPacket(now));
 				// an unconfirmed identity's first answer sends the pin to PENDING: nothing more this frame
-				if (pin[i].st != lc::State::RUNNING) { drvTarget[i] = 0; armStart[i] = false; }
+				if (ch[i].pin.st != lc::State::RUNNING) { ch[i].drv.target = 0; ch[i].armReq.start = false; }
 			}
 			// Stall watch (lc::Stall): armed, under throttle, on a stream that has answered, Bluejay/
 			// BLHeli-derived (AM32 stays in its run). Its silence there is the watch's, not LOST
 			// (lc::Pin::stallWatch). ZERO / QUIET arm the same stream again (zero, answer, EDT: Bluejay
 			// cleared it) with the target held at 0; SILENT is LOST (TOOL) or the open loop (ROV).
-			bool watched = pin[i].stallWatched(armg[i].armed, drvTarget[i]);
+			bool watched = ch[i].pin.stallWatched(ch[i].drv.arm.armed, ch[i].drv.target);
 			lc::Ev se;
-			lc::StallAct act = pin[i].onStall(stall[i].step(now, watched, ty == BidirDshotTelemetryType::ERPM, v, pin[i].pktMs),
+			lc::StallAct act = ch[i].pin.onStall(ch[i].drv.stall.step(now, watched, ty == BidirDshotTelemetryType::ERPM, v, ch[i].pin.pktMs),
 			                                  policy, now, se);
 			evPush(i, se);
 			if (act == lc::StallAct::REARM) {
-				stall[i].restart(now);
-				armg[i].begin(now); edt[i].burst(); drvTarget[i] = 0; watched = false;
+				ch[i].drv.stall.restart(now);
+				ch[i].drv.arm.begin(now); ch[i].drv.edt.burst(); ch[i].drv.target = 0; watched = false;
 			} else if (act == lc::StallAct::LOST) {   // TOOL: stop that ESC only, as LOST_STOPPED in spinPoll
-				drvTarget[i] = 0; armStart[i] = false; stall[i].reset(); watched = false;
+				ch[i].drv.target = 0; ch[i].armReq.start = false; ch[i].drv.stall.reset(); watched = false;
 			}
-			pin[i].stallWatch = watched;
+			ch[i].pin.stallWatch = watched;
 			// EDT enable in place of this frame (lc::EdtSched: at the start, once armed, after every run)
-			if (edt[i].frame(now, armg[i].armed, armg[i].answer != 0, drvTarget[i], drvTele[i].rpm, drvTele[i].rpmStampMs)) {
-				drvB[i]->sendRaw11Bit(13); return;
+			if (ch[i].drv.edt.frame(now, ch[i].drv.arm.armed, ch[i].drv.arm.answer != 0, ch[i].drv.target, ch[i].drv.tele.rpm, ch[i].drv.tele.rpmStampMs)) {
+				ch[i].drv.b->sendRaw11Bit(13); return;
 			}
 		}
-		drvSend(i, drvTarget[i]);
+		drvSend(i, ch[i].drv.target);
 	}
 	static void pwmPoll() {
 		for (uint8_t i = 0; i < COUNT; i++) {
 			if (!pwmOn(i)) continue;
 			uint32_t now = millis();
-			bool arming = now - pwmStart[i] < PWM_ARM_MS, dead = now - pwmLast[i] > SPIN_DEADMAN_MS;
+			bool arming = now - ch[i].pwm.start < PWM_ARM_MS, dead = now - ch[i].pwm.last > SPIN_DEADMAN_MS;
 			// nothing is fed during a sync bootloader visit (core0 waits on core1): the stop width
-			pwmLevel(i, arming || dead || blDepth ? pwmStop[i] : pwmUs[i]);
+			pwmLevel(i, arming || dead || blDepth ? ch[i].pwm.stop : ch[i].pwm.us);
 		}
 	}
 	// What every core0 wait runs instead of delay(): the other pins' frames, telemetry, deadman, stall
@@ -405,11 +416,11 @@ namespace detail {
 		__sync_synchronize();                        // opDone seen: core1's results are complete
 		uint8_t i = (uint8_t)jobIdx; bool ok = opOk, aborted = jobAbort;
 		op = Op::NONE; jobIdx = -1; jobPhase = 0; jobAbort = false;
-		if (aborted && !ok) { pin[i].onReadAborted(); return; }
-		lc::Ev e = pin[i].onReadDone(ok, jobIdent);
-		if (ok) { infoCache[i] = jobInfo; identCache[i] = jobIdent; }
+		if (aborted && !ok) { ch[i].pin.onReadAborted(); return; }
+		lc::Ev e = ch[i].pin.onReadDone(ok, jobIdent);
+		if (ok) { ch[i].info = jobInfo; ch[i].ident = jobIdent; }
 		evPush(i, e);
-		if (pin[i].st == lc::State::RUNNING) armStart[i] = true;
+		if (ch[i].pin.st == lc::State::RUNNING) ch[i].armReq.start = true;
 	}
 	// core0: end the async job now: a prime is just dropped (the pin stays PENDING), a core1 read is
 	// aborted (abort) or waited for, the other pins streaming meanwhile.
@@ -484,7 +495,7 @@ namespace detail {
 	static bool enterBootloader(uint8_t gpio) {
 		uint8_t i = idxOf(gpio);
 		lc::Entry en; Prime pd;
-		en.begin(millis(), pin[i].id.known ? pin[i].id.bidir : pin[i].seen, ENTRY_MAX_MS, pin[i].id.tune);
+		en.begin(millis(), ch[i].pin.id.known ? ch[i].pin.id.bidir : ch[i].pin.seen, ENTRY_MAX_MS, ch[i].pin.id.tune);
 		return runEntry(i, en, pd, millis() + 60000) == EntryRes::IN;
 	}
 	static bool learnSession(uint8_t i) {          // identity + Info of the session's ESC, read now
@@ -503,8 +514,8 @@ namespace detail {
 		if (!ok && !sessionLost) ok = learnSession(i);
 		runOp(Op::RUN, PINS[i]);
 		session = -1; sessLearned = sessionWrote = false;
-		pin[i].onSessionClose(ok, identCache[i]);
-		if (pin[i].st == lc::State::RUNNING) armStart[i] = true;   // an arm waited for this read
+		ch[i].pin.onSessionClose(ok, ch[i].ident);
+		if (ch[i].pin.st == lc::State::RUNNING) ch[i].armReq.start = true;   // an arm waited for this read
 	}
 	static bool ensureConnected(uint8_t i) {        // reuse the session; enter only if needed
 		jobStop(true);                               // core1 may be reading this very pin: take it back first
@@ -518,10 +529,10 @@ namespace detail {
 		}
 		if (session >= 0) closeSession();
 		if (drvActive(i) || pwmOn(i)) drvFree(i);                                 // free pin from drive
-		armStart[i] = false;
-		if (!fwActive) pin[i].onSessionOpen(millis());
+		ch[i].armReq.start = false;
+		if (!fwActive) ch[i].pin.onSessionOpen(millis());
 		if (enterBootloader(PINS[i])) { session = (int8_t)i; sessLearned = sessionWrote = false; sessLastOpMs = millis(); return true; }
-		if (!fwActive) pin[i].onReadDone(false, lc::Identity{});
+		if (!fwActive) ch[i].pin.onReadDone(false, lc::Identity{});
 		return false;
 	}
 	static bool park() {                            // core0: FsGuard
@@ -545,7 +556,7 @@ inline bool connect(uint8_t idx, Info& out) {
 	out = Info{}; if (idx >= COUNT) return false; out.pin = PINS[idx];
 	if (!ensureConnected(idx)) return false;
 	// Always read it now: dev| and the flasher's compatibility check see the live ESC, never a cache.
-	if (learnSession(idx)) { out = infoCache[idx]; return true; }
+	if (learnSession(idx)) { out = ch[idx].info; return true; }
 	out.present = true; out.sig = (uint16_t)((sig[0] << 8) | sig[1]);   // answered, settings unread
 	out.bootVer = bootVer; out.bootPages = bootPages;
 	return true;
@@ -607,11 +618,11 @@ inline int probe(uint8_t idx, uint32_t holdMs, uint8_t raw[8], uint32_t& edges, 
 	if (idx >= COUNT) return -1;
 	jobStop(true); closeSession();
 	if (drvActive(idx) || pwmOn(idx)) drvFree(idx);
-	pin[idx].onSessionOpen(millis());
+	ch[idx].pin.onSessionOpen(millis());
 	prHoldMs = holdMs; prPollMs = pollMs;
 	runOp(Op::PROBE, PINS[idx]);
 	prPollMs = 0; if (atMs) *atMs = prAtMs;
-	pin[idx].onSessionClose(false, lc::Identity{});   // whatever it left behind is read again
+	ch[idx].pin.onSessionClose(false, lc::Identity{});   // whatever it left behind is read again
 	memcpy(raw, prRaw, 8); edges = prEdges; lows = prLows; total = prTotal; return prN;
 }
 
@@ -623,8 +634,8 @@ inline void release() { detail::closeSession(); }
 // Per-ESC drive config (call BEFORE spinArm; takes effect at the next arm). 0 restores the global
 // ESC_DSHOT_KBAUD / ESC_MOTOR_POLES default. Lets a Thruster carry its own bitrate / pole count.
 // Any index below MAX: main binds its Thrusters before EscTool::begin applies the pin list.
-inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < MAX) detail::drvKbaud[idx] = kbaud; }
-inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < MAX) detail::drvPoles[idx] = poles; }
+inline void setKbaud(uint8_t idx, uint16_t kbaud) { if (idx < MAX) detail::ch[idx].kbaud = kbaud; }
+inline void setPoles(uint8_t idx, uint8_t poles)  { if (idx < MAX) detail::ch[idx].poles = poles; }
 
 // ---- lifecycle (core0) -------------------------------------------------------------------------
 // The idle hold: zero throttle on every configured pin that is not driven (bidir until it is read,
@@ -635,22 +646,22 @@ inline void setHold(bool on) {
 	using namespace detail;
 	holdOn = on;
 	if (!on) for (uint8_t i = 0; i < COUNT; i++)   // at once, not on the next poll: `idle off` reads held=0
-		if (drvActive(i) && pin[i].st != lc::State::RUNNING && (int8_t)i != jobIdx) drvFree(i);
+		if (drvActive(i) && ch[i].pin.st != lc::State::RUNNING && (int8_t)i != jobIdx) drvFree(i);
 }
 inline bool holdActive() { return detail::holdOn; }
 inline uint32_t heldMask() {   // pins carrying a zero stream the hold owns
 	uint32_t m = 0;
-	for (uint8_t i = 0; i < COUNT; i++) if (detail::drvActive(i) && detail::pin[i].st != lc::State::RUNNING) m |= 1u << i;
+	for (uint8_t i = 0; i < COUNT; i++) if (detail::drvActive(i) && detail::ch[i].pin.st != lc::State::RUNNING) m |= 1u << i;
 	return m;
 }
 inline void setPolicy(lc::Policy p) { detail::policy = p; }
-inline lc::State state(uint8_t i) { return i < COUNT ? detail::pin[i].st : lc::State::EMPTY; }
+inline lc::State state(uint8_t i) { return i < COUNT ? detail::ch[i].pin.st : lc::State::EMPTY; }
 // What a motor-test UI can do with pin i now: uiState() below (after the PWM API it reads).
 inline const char* stateName(uint8_t i) { return lc::stateName(state(i)); }
 inline lc::Identity identity(uint8_t i) { return i < COUNT ? detail::curIdent(i) : lc::Identity{}; }
 // ms from its stream's start to its first answer, the last time it answered a fresh stream (0: never).
-inline uint32_t answerDelay(uint8_t i) { return i < COUNT ? detail::pin[i].answerDelay : 0; }
-inline bool openLoop(uint8_t i) { return i < COUNT && detail::pin[i].openLoop; }   // ROV: telemetry gone
+inline uint32_t answerDelay(uint8_t i) { return i < COUNT ? detail::ch[i].pin.answerDelay : 0; }
+inline bool openLoop(uint8_t i) { return i < COUNT && detail::ch[i].pin.openLoop; }   // ROV: telemetry gone
 // The next lifecycle event (appeared, lost, read ...), oldest first. false when there is none.
 inline bool pollEvent(uint8_t& idx, lc::Ev& e, lc::State& st) {
 	using namespace detail;
@@ -673,21 +684,21 @@ inline bool passthroughActive() { return detail::fwActive; }
 inline int8_t armBusySession() { return detail::armBusy; }
 inline bool spinArmed(uint8_t idx) {
 	using namespace detail;
-	return idx < COUNT && pin[idx].st == lc::State::RUNNING && drvActive(idx) && armg[idx].armed;
+	return idx < COUNT && ch[idx].pin.st == lc::State::RUNNING && drvActive(idx) && ch[idx].drv.arm.armed;
 }
 namespace detail {
 	static bool startArm(uint8_t i) {           // RUNNING: the drive stream in the asked protocol
-		Drive m = armMode[i];
-		if (m == Drive::AUTO) m = pin[i].id.bidir ? Drive::BIDIR : Drive::NORMAL;
+		Drive m = ch[i].armReq.mode;
+		if (m == Drive::AUTO) m = ch[i].pin.id.bidir ? Drive::BIDIR : Drive::NORMAL;
 		bool wantB = m == Drive::BIDIR;
 		// The hold's stream in that protocol is kept, armed or still arming: a new driver cuts the line,
 		// and a Bluejay that loses its signal starts over from its boot (it did, on every first slider
 		// move of a motor test that came within the hold's arm window).
-		if (drvActive(i) && (drvB[i] != nullptr) == wantB && drvKb[i] == kbaudOf(i) && !armMsReq[i]) {
-			drvTarget[i] = 0; drvLast[i] = millis(); stall[i].reset(); return true;
+		if (drvActive(i) && (ch[i].drv.b != nullptr) == wantB && ch[i].drv.kb == kbaudOf(i) && !ch[i].armReq.ms) {
+			ch[i].drv.target = 0; ch[i].drv.last = millis(); ch[i].drv.stall.reset(); return true;
 		}
-		if (!drvStart(i, wantB)) { pin[i].onStop(); return false; }   // no SM: READY again, no false ARMED
-		armg[i].ms = armMsReq[i];   // 0 => SPIN_ARM_MS; a short one re-arms an ESC that is armed already
+		if (!drvStart(i, wantB)) { ch[i].pin.onStop(); return false; }   // no SM: READY again, no false ARMED
+		ch[i].drv.arm.ms = ch[i].armReq.ms;   // 0 => SPIN_ARM_MS; a short one re-arms an ESC that is armed already
 		return true;
 	}
 }
@@ -696,17 +707,17 @@ inline bool spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 	if (idx >= COUNT) return false;
 	// Held in a sync session (enter/read): it is learned there (one LEARN, no second bootloader visit)
 	// and run. A session on another pin is left alone.
-	armBusy = -1; drvInitFail[idx] = false;
+	armBusy = -1; ch[idx].drv.initFail = false;
 	if (fwActive) return false;                  // the configurator owns every pin
 	if (session == (int8_t)idx) closeSession();
 	// An arm that must wait for a read would have to run the other held ESC, but one being written
 	// (a writeflash/erase image half done) must not be run under the host: refused (armBusySession()).
-	lc::State st = pin[idx].st;
+	lc::State st = ch[idx].pin.st;
 	if (session >= 0 && sessionWrote && st != lc::State::READY && st != lc::State::RUNNING && st != lc::State::FAILED) {
 		armBusy = session; return false;
 	}
-	armMode[idx] = mode; armMsReq[idx] = armMs; drvInitFail[idx] = false;
-	switch (pin[idx].requestArm()) {
+	ch[idx].armReq.mode = mode; ch[idx].armReq.ms = armMs; ch[idx].drv.initFail = false;
+	switch (ch[idx].pin.requestArm()) {
 		case lc::Arm::REFUSED:    return false;
 		case lc::Arm::AFTER_READ:
 			// The read runs only with no session held (core1 has one bootloader line): run the other
@@ -723,20 +734,20 @@ inline bool spinArm(uint8_t idx, Drive mode = Drive::AUTO, uint16_t armMs = 0) {
 inline lc::Refuse drive(uint8_t idx, int v) {
 	using namespace detail;
 	if (idx >= COUNT) return lc::Refuse::STATE;
-	lc::Refuse r = pin[idx].gate(drvActive(idx) && armg[idx].armed);
+	lc::Refuse r = ch[idx].pin.gate(drvActive(idx) && ch[idx].drv.arm.armed);
 	if (r != lc::Refuse::OK) return r;
 	bool use3d; int16_t s; uint16_t thr;
-	r = lc::mapDrive(pin[idx].id, v, use3d, s, thr);
+	r = lc::mapDrive(ch[idx].pin.id, v, use3d, s, thr);
 	if (r != lc::Refuse::OK) return r;
-	drvTarget[idx] = stall[idx].gate(millis(), thr); drvLast[idx] = millis();   // held at 0 after a stall
+	ch[idx].drv.target = ch[idx].drv.stall.gate(millis(), thr); ch[idx].drv.last = millis();   // held at 0 after a stall
 	return lc::Refuse::OK;
 }
 // Restarted after a stall within the last few seconds (a UI can say why it is arming again).
-inline bool spinStalled(uint8_t idx) { return idx < COUNT && detail::stall[idx].recent(millis()); }
+inline bool spinStalled(uint8_t idx) { return idx < COUNT && detail::ch[idx].drv.stall.recent(millis()); }
 // Held at 0 after a stall until it is sent 0 (lc::Stall).
 inline bool spinHeld(uint8_t idx) {
 	using namespace detail;
-	return idx < COUNT && pin[idx].st == lc::State::RUNNING && drvActive(idx) && stall[idx].hold;
+	return idx < COUNT && ch[idx].pin.st == lc::State::RUNNING && drvActive(idx) && ch[idx].drv.stall.hold;
 }
 // An answered bidir stream at zero throttle, not held, that has gone quiet (lc::Pin::silent): only at
 // zero, because under throttle a silent ESC is the stall watch's (a failed start beeps without
@@ -745,39 +756,39 @@ inline bool spinSilent(uint8_t idx) {
 	using namespace detail;
 	uint32_t now = millis();
 	// not polled lately (MSP answered right after a blocking op, before spinPoll): no evidence
-	return idx < COUNT && drvB[idx] && armg[idx].armed && drvTarget[idx] == 0 && !stall[idx].hold &&
-	       now - drvPollMs[idx] <= POLL_GAP_MS && pin[idx].silent(now);
+	return idx < COUNT && ch[idx].drv.b && ch[idx].drv.arm.armed && ch[idx].drv.target == 0 && !ch[idx].drv.stall.hold &&
+	       now - ch[idx].drv.pollMs <= POLL_GAP_MS && ch[idx].pin.silent(now);
 }
 inline bool spinReversible(uint8_t idx) { return idx < COUNT && detail::curIdent(idx).known && detail::curIdent(idx).rev; }
 inline const char* spinMode(uint8_t idx) {   // the protocol while driven, else the state (lowercase)
 	using namespace detail;
 	if (idx >= COUNT) return "none";
-	if (drvInitFail[idx]) return "init-fail";
+	if (ch[idx].drv.initFail) return "init-fail";
 	if (pwmOn(idx)) return "pwm";
-	if (pin[idx].st == lc::State::RUNNING && drvActive(idx)) return drvB[idx] ? "bidir" : "normal";
-	return lc::stateName(pin[idx].st, true);
+	if (ch[idx].pin.st == lc::State::RUNNING && drvActive(idx)) return ch[idx].drv.b ? "bidir" : "normal";
+	return lc::stateName(ch[idx].pin.st, true);
 }
 inline const char* streamProto(uint8_t idx) {   // what is on the wire now, whatever the state
 	using namespace detail;
 	if (idx >= COUNT) return "none";
-	if (drvInitFail[idx]) return "init-fail";
-	return pwmOn(idx) ? "pwm" : drvB[idx] ? "bidir" : drvN[idx] ? "normal" : "none";
+	if (ch[idx].drv.initFail) return "init-fail";
+	return pwmOn(idx) ? "pwm" : ch[idx].drv.b ? "bidir" : ch[idx].drv.n ? "normal" : "none";
 }
-inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::drvInitFail[idx]; }
+inline bool spinInitOk(uint8_t idx) { return idx < COUNT && !detail::ch[idx].drv.initFail; }
 inline bool spinArming(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return false;
-	return pin[idx].armWanted || (pin[idx].st == lc::State::RUNNING && drvActive(idx) && !armg[idx].armed) ||
-	       (armStart[idx] && pin[idx].st == lc::State::RUNNING);
+	return ch[idx].pin.armWanted || (ch[idx].pin.st == lc::State::RUNNING && drvActive(idx) && !ch[idx].drv.arm.armed) ||
+	       (ch[idx].armReq.start && ch[idx].pin.st == lc::State::RUNNING);
 }
-inline uint16_t spinTarget(uint8_t idx) { return idx < COUNT ? detail::drvTarget[idx] : 0; }   // DShot value being sent
+inline uint16_t spinTarget(uint8_t idx) { return idx < COUNT ? detail::ch[idx].drv.target : 0; }   // DShot value being sent
 inline bool inBootloader(uint8_t idx)   { return detail::session == (int8_t)idx; }
 // RUNNING -> READY. The hold keeps the (armed) zero stream, so the next arm from READY is instant.
 inline void spinStop(uint8_t idx) {
 	using namespace detail;
 	if (idx >= COUNT) return;
-	drvTarget[idx] = 0; drvInitFail[idx] = false; armStart[idx] = false; stall[idx].reset();
-	pin[idx].onStop();
+	ch[idx].drv.target = 0; ch[idx].drv.initFail = false; ch[idx].armReq.start = false; ch[idx].drv.stall.reset();
+	ch[idx].pin.onStop();
 	if (pwmOn(idx)) pwmOff(idx);
 	if (!holdOn && (int8_t)idx != jobIdx) drvFree(idx);
 }
@@ -785,8 +796,8 @@ inline void spinDisarm(uint8_t idx) { spinStop(idx); }
 inline void spinStopAll() { for (uint8_t i = 0; i < COUNT; i++) spinStop(i); }
 inline bool spinning()    { for (uint8_t i = 0; i < COUNT; i++) if (detail::drvActive(i)) return true; return false; }
 inline bool spinTele(uint8_t idx, Telem& out) {
-	if (idx >= COUNT || !detail::drvB[idx]) return false;   // telemetry only on bidir DShot
-	out = detail::drvTele[idx]; return true;
+	if (idx >= COUNT || !detail::ch[idx].drv.b) return false;   // telemetry only on bidir DShot
+	out = detail::ch[idx].drv.tele; return true;
 }
 
 namespace detail {
@@ -798,11 +809,11 @@ namespace detail {
 		if (jobIdx >= 0) {
 			uint8_t i = (uint8_t)jobIdx;
 			if (jobPhase == 2) { if (opDone) jobCollect(); return; }
-			if (pin[i].st != lc::State::PENDING || !canRunJob()) { jobIdx = -1; jobPhase = 0; return; }   // stays PENDING
+			if (ch[i].pin.st != lc::State::PENDING || !canRunJob()) { jobIdx = -1; jobPhase = 0; return; }   // stays PENDING
 			// The prime: BLHeli-S needs valid frames before the line goes high. A pin whose zero stream
 			// has run PRIME_MS already is primed; no SM for it -> go on unprimed (AM32 needs none).
-			if (drvActive(i) && now - drvStartMs[i] < PRIME_MS) return;
-			pin[i].onReadStart(now);                 // (latches whether its telemetry is fresh first)
+			if (drvActive(i) && now - ch[i].drv.startMs < PRIME_MS) return;
+			ch[i].pin.onReadStart(now);                 // (latches whether its telemetry is fresh first)
 			drvFree(i); pinMode(PINS[i], OUTPUT); digitalWrite(PINS[i], HIGH);   // core1 owns it from here
 			jobAbort = false; opIdx = i; opPin = PINS[i]; opOk = false; opDone = false;
 			__sync_synchronize();                    // its inputs before op (core1 reads op first)
@@ -811,7 +822,7 @@ namespace detail {
 			return;
 		}
 		bool waiting = false;
-		for (uint8_t k = 0; k < COUNT; k++) waiting = waiting || pin[k].st == lc::State::PENDING;
+		for (uint8_t k = 0; k < COUNT; k++) waiting = waiting || ch[k].pin.st == lc::State::PENDING;
 		if (!waiting) return;
 		// A held session (scan/read/enter leave the last ESC in its bootloader) would hold every read
 		// back until a `run`: an ESC that is waiting to be read wins once the session is idle — no op
@@ -823,13 +834,13 @@ namespace detail {
 		if (!canRunJob()) return;
 		for (uint8_t k = 0; k < COUNT; k++) {
 			uint8_t i = (uint8_t)((jobRr + k) % COUNT);
-			if (pin[i].st != lc::State::PENDING) continue;
+			if (ch[i].pin.st != lc::State::PENDING) continue;
 			jobRr = (uint8_t)(i + 1); jobIdx = (int8_t)i; jobPhase = 1;
 			if (pwmOn(i)) pwmOff(i);
 			// a pin that has answered keeps its bidir stream; one that never did (an `arm` / read of a
 			// pin with nothing heard) is primed with normal DShot, which every firmware takes (Prime)
-			bool bidir = pin[i].seen;
-			if (!drvActive(i) || (drvB[i] != nullptr) != bidir) drvStart(i, bidir);
+			bool bidir = ch[i].pin.seen;
+			if (!drvActive(i) || (ch[i].drv.b != nullptr) != bidir) drvStart(i, bidir);
 			return;
 		}
 	}
@@ -837,12 +848,12 @@ namespace detail {
 	// or the drive stream an arm asked for.
 	static void applyOutput(uint8_t i, uint32_t now) {
 		if (pwmOn(i) || (int8_t)i == jobIdx || (int8_t)i == session) return;
-		lc::Out o = pin[i].output(holdOn);
+		lc::Out o = ch[i].pin.output(holdOn);
 		if (o == lc::Out::NONE) { if (drvActive(i)) drvFree(i); return; }
-		if (o == lc::Out::DRIVE) { if (armStart[i]) { armStart[i] = false; startArm(i); } return; }
-		bool wantB = o == lc::Out::ZERO_BIDIR || pin[i].id.bidir;
-		if (drvActive(i) && (drvB[i] != nullptr) == wantB && drvKb[i] == kbaudOf(i)) return;
-		if (drvInitFail[i] && (int32_t)(now - drvRetryMs[i]) < 0) return;   // no SM: retry in a second
+		if (o == lc::Out::DRIVE) { if (ch[i].armReq.start) { ch[i].armReq.start = false; startArm(i); } return; }
+		bool wantB = o == lc::Out::ZERO_BIDIR || ch[i].pin.id.bidir;
+		if (drvActive(i) && (ch[i].drv.b != nullptr) == wantB && ch[i].drv.kb == kbaudOf(i)) return;
+		if (ch[i].drv.initFail && (int32_t)(now - ch[i].drv.retryMs) < 0) return;   // no SM: retry in a second
 		drvStart(i, wantB);
 	}
 }
@@ -852,9 +863,9 @@ inline void spinPoll() {   // call every core0 loop: lifecycle + hold + async re
 	uint32_t now = millis();
 	for (uint8_t i = 0; i < COUNT; i++) {
 		gapCheck(i, now, true);
-		stall[i].poll(now);
-		lc::Ev e = pin[i].tick(now, policy);
-		if (e == lc::Ev::LOST_STOPPED) { drvTarget[i] = 0; armStart[i] = false; }   // TOOL: stop that ESC only
+		ch[i].drv.stall.poll(now);
+		lc::Ev e = ch[i].pin.tick(now, policy);
+		if (e == lc::Ev::LOST_STOPPED) { ch[i].drv.target = 0; ch[i].armReq.start = false; }   // TOOL: stop that ESC only
 		evPush(i, e);
 	}
 	if (!fwActive) {
@@ -867,8 +878,8 @@ inline void spinPoll() {   // call every core0 loop: lifecycle + hold + async re
 	// (no longer driving()). Here, not in pwmPoll: pump() runs inside sync ops and frees no driver.
 	for (uint8_t i = 0; i < COUNT; i++) {
 		if (!pwmOn(i)) continue;
-		if (now - pwmStart[i] > PWM_ARM_MS + PWM_RELEASE_MS && millis() - pwmLast[i] > PWM_RELEASE_MS) {
-			pwmOff(i); pin[i].onStop();
+		if (now - ch[i].pwm.start > PWM_ARM_MS + PWM_RELEASE_MS && millis() - ch[i].pwm.last > PWM_RELEASE_MS) {
+			pwmOff(i); ch[i].pin.onStop();
 		}
 	}
 	pwmPoll();
@@ -889,12 +900,12 @@ inline void spinPoll() {   // call every core0 loop: lifecycle + hold + async re
 inline bool pwmActive(uint8_t idx) { return idx < COUNT && detail::pwmOn(idx); }
 // Arming, or waiting for its first stop width after the arm.
 inline bool pwmArming(uint8_t idx) {
-	return pwmActive(idx) && (millis() - detail::pwmStart[idx] < PWM_ARM_MS || !detail::pwmZero[idx]);
+	return pwmActive(idx) && (millis() - detail::ch[idx].pwm.start < PWM_ARM_MS || !detail::ch[idx].pwm.zero);
 }
 // Fed a width above its stop within the deadman: a blocking bootloader visit must wait.
 inline bool pwmDriving(uint8_t idx) {
 	using namespace detail;
-	return pwmActive(idx) && pwmUs[idx] != pwmStop[idx] && millis() - pwmLast[idx] <= SPIN_DEADMAN_MS;
+	return pwmActive(idx) && ch[idx].pwm.us != ch[idx].pwm.stop && millis() - ch[idx].pwm.last <= SPIN_DEADMAN_MS;
 }
 inline bool pwmBegin(uint8_t idx) {
 	using namespace detail;
@@ -902,31 +913,31 @@ inline bool pwmBegin(uint8_t idx) {
 	if (pwmOn(idx)) return true;
 	if (fwActive) return false;
 	if (session == (int8_t)idx) closeSession();   // held in its bootloader: learn it, run its app
-	if (pin[idx].st != lc::State::READY && pin[idx].st != lc::State::RUNNING) return false;
+	if (ch[idx].pin.st != lc::State::READY && ch[idx].pin.st != lc::State::RUNNING) return false;
 	// no alarm slot for the IRQ deadman: no PWM (a held-up loop would keep the last width)
 	if (!pwmTimerOn) pwmTimerOn = add_repeating_timer_ms(50, pwmWatch, nullptr, &pwmTimer);
 	if (!pwmTimerOn) return false;
-	drvTarget[idx] = 0; armg[idx].armed = false; drvFree(idx);
-	pin[idx].onRunStart();
+	ch[idx].drv.target = 0; ch[idx].drv.arm.armed = false; drvFree(idx);
+	ch[idx].pin.onRunStart();
 	uint gp = PINS[idx], slice = pwm_gpio_to_slice_num(gp);
 	gpio_set_function(gp, GPIO_FUNC_PWM);
 	pwm_set_clkdiv(slice, clock_get_hz(clk_sys) / 1e6f);       // 1 tick = 1 us
 	pwm_set_wrap(slice, 20000 - 1);                             // 50 Hz; a slice's two pins share it
-	pwmStop[idx] = pin[idx].id.rev ? PWM_MID_US : PWM_STOP_US;
-	pwmLevel(idx, pwmStop[idx]);
+	ch[idx].pwm.stop = ch[idx].pin.id.rev ? PWM_MID_US : PWM_STOP_US;
+	pwmLevel(idx, ch[idx].pwm.stop);
 	pwm_set_enabled(slice, true);
-	pwmStart[idx] = pwmLast[idx] = millis(); pwmZero[idx] = false;
-	pwmUs[idx] = pwmStop[idx];                   // last: pwmOn() is what the IRQ checks
+	ch[idx].pwm.start = ch[idx].pwm.last = millis(); ch[idx].pwm.zero = false;
+	ch[idx].pwm.us = ch[idx].pwm.stop;                   // last: pwmOn() is what the IRQ checks
 	return true;
 }
 inline void pwmSet(uint8_t idx, uint16_t us) {
 	using namespace detail;
 	if (!pwmActive(idx)) return;
 	us = us < PWM_MIN_US ? PWM_MIN_US : (us > PWM_MAX_US ? PWM_MAX_US : us);
-	pwmUs[idx] = lc::pwmGate(millis() - pwmStart[idx], PWM_ARM_MS, pwmZero[idx], us, pwmStop[idx]);
-	pwmLast[idx] = millis();
+	ch[idx].pwm.us = lc::pwmGate(millis() - ch[idx].pwm.start, PWM_ARM_MS, ch[idx].pwm.zero, us, ch[idx].pwm.stop);
+	ch[idx].pwm.last = millis();
 }
-inline uint16_t pwmTarget(uint8_t idx) { return pwmActive(idx) ? detail::pwmUs[idx] : 0; }
+inline uint16_t pwmTarget(uint8_t idx) { return pwmActive(idx) ? detail::ch[idx].pwm.us : 0; }
 
 // What the web tool's motor test can do with ESC i now (lc::Ui, from its lifecycle state). Sent in
 // MOTOR_TELEMETRY's mAh field with a 0x5A marker (fourway.h); mirrored once in web/js/app.js (UI).
@@ -936,10 +947,10 @@ inline UiState uiState(uint8_t i) {
 	if (i >= COUNT) return UiState::ABSENT;
 	lc::UiIn in;
 	in.pwm = pwmActive(i); in.pwmArming = pwmArming(i);
-	in.stream = drvActive(i) && !armStart[i]; in.armed = in.stream && armg[i].armed;
-	in.stalled = spinHeld(i) || (spinStalled(i) && pin[i].st == lc::State::RUNNING && !armg[i].armed);
+	in.stream = drvActive(i) && !ch[i].armReq.start; in.armed = in.stream && ch[i].drv.arm.armed;
+	in.stalled = spinHeld(i) || (spinStalled(i) && ch[i].pin.st == lc::State::RUNNING && !ch[i].drv.arm.armed);
 	in.silent = spinSilent(i);
-	return lc::uiCode(pin[i], in);
+	return lc::uiCode(ch[i].pin, in);
 }
 
 // ---- 4-way passthrough (fourway.h) -------------------------------------------------------------
@@ -983,12 +994,12 @@ inline void fwBegin() {
 	uint32_t primeStart[MAX] = { 0 };
 	for (uint8_t i = 0; i < COUNT; i++) {
 		drvFree(i);                              // the hold too: the configurator owns every pin
-		fwHave[i] = fwMiss[i] = fwDone[i] = false;
-		fwPrime[i].end();
+		ch[i].fw.have = ch[i].fw.miss = ch[i].fw.done = false;
+		ch[i].fw.prime.end();
 		// a bidir ESC is known here: the prime must hear it (it may be booting, deaf, in its tune)
-		waits[i] = pin[i].st != lc::State::EMPTY && (pin[i].id.known ? pin[i].id.bidir : pin[i].seen);
-		tune[i] = pin[i].id.known && pin[i].id.tune;
-		pin[i].onPassthroughBegin();
+		waits[i] = ch[i].pin.st != lc::State::EMPTY && (ch[i].pin.id.known ? ch[i].pin.id.bidir : ch[i].pin.seen);
+		tune[i] = ch[i].pin.id.known && ch[i].pin.id.tune;
+		ch[i].pin.onPassthroughBegin();
 	}
 	// A pin with a bidir ESC known is primed with bidir DShot (its answer says it heard the prime),
 	// every other one with normal DShot (Prime). Bidir fits only pio0's 4 SMs on a Pico W and normal
@@ -1029,9 +1040,9 @@ inline void fwBegin() {
 	// A pin whose known bidir ESC did not answer the prime (it was booting, e.g. run at the end of the
 	// last passthrough and playing its tune) is primed again by its InitFlash until it answers.
 	for (uint8_t i = 0; i < COUNT; i++) {
-		uint32_t poll = pin[i].ptRetry() ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS;
-		if (waits[i] && !heard[i]) fwEntry[i].begin(primeStart[i], true, poll, tune[i]);
-		else fwEntry[i].primed(fwBeginMs, poll);
+		uint32_t poll = ch[i].pin.ptRetry() ? ENTRY_MAX_MS : ENTRY_QUIET_MS + ENTRY_BARE_MS;
+		if (waits[i] && !heard[i]) ch[i].fw.entry.begin(primeStart[i], true, poll, tune[i]);
+		else ch[i].fw.entry.primed(fwBeginMs, poll);
 	}
 }
 enum class FwSel : uint8_t { OK, MISS, PENDING };
@@ -1039,48 +1050,48 @@ inline FwSel fwSelect(uint8_t idx, uint8_t raw[8], bool& am32, uint32_t budgetMs
 	using namespace detail;
 	if (idx >= COUNT) return FwSel::MISS;
 	if (drvActive(idx)) drvFree(idx);
-	if (fwMiss[idx]) return FwSel::MISS;
+	if (ch[idx].fw.miss) return FwSel::MISS;
 	uint32_t stop = millis() + budgetMs;
-	if (fwDone[idx]) {                  // DeviceReset ran its app (the page's flash, reset, read again)
-		bool bidir = !pin[idx].id.known || pin[idx].id.bidir;   // it plays its tune now: wait for it
-		bool tune = pin[idx].id.known && pin[idx].id.tune;
-		fwDone[idx] = false; pin[idx].onReadStart(millis());
-		fwEntry[idx].begin(millis(), bidir, ENTRY_MAX_MS, tune);
+	if (ch[idx].fw.done) {                  // DeviceReset ran its app (the page's flash, reset, read again)
+		bool bidir = !ch[idx].pin.id.known || ch[idx].pin.id.bidir;   // it plays its tune now: wait for it
+		bool tune = ch[idx].pin.id.known && ch[idx].pin.id.tune;
+		ch[idx].fw.done = false; ch[idx].pin.onReadStart(millis());
+		ch[idx].fw.entry.begin(millis(), bidir, ENTRY_MAX_MS, tune);
 	}
 	session = -1; fwIdx = idx;
 	bool ok;
-	if (fwHave[idx]) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
+	if (ch[idx].fw.have) ok = runOp(Op::FWSELECT, PINS[idx]);      // re-select: compare or adopt the cached reply
 	else {                                                         // its entry, carried on from the last call
-		EntryRes r = runEntry(idx, fwEntry[idx], fwPrime[idx], stop);
+		EntryRes r = runEntry(idx, ch[idx].fw.entry, ch[idx].fw.prime, stop);
 		if (r == EntryRes::LATER) return FwSel::PENDING;
 		ok = r == EntryRes::IN;
 	}
-	fwHave[idx] = ok; fwMiss[idx] = !ok;
-	if (!ok) { pin[idx].onProbeMiss(); return FwSel::MISS; }   // EMPTY before: confirmed absent
+	ch[idx].fw.have = ok; ch[idx].fw.miss = !ok;
+	if (!ok) { ch[idx].pin.onProbeMiss(); return FwSel::MISS; }   // EMPTY before: confirmed absent
 	session = (int8_t)idx; sessLearned = sessionWrote = false; sessLastOpMs = millis();
-	memcpy(fwRaw[idx], lastRaw, 8); fwAm32[idx] = lastAm32;
+	memcpy(ch[idx].fw.raw, lastRaw, 8); ch[idx].fw.am32 = lastAm32;
 	memcpy(raw, lastRaw, 8); am32 = lastAm32;
 	return FwSel::OK;
 }
 inline void fwRun(uint8_t idx) {   // leave idx's bootloader (start its app); forget its session
 	using namespace detail;
-	if (idx >= COUNT || !fwHave[idx]) return;
+	if (idx >= COUNT || !ch[idx].fw.have) return;
 	fwIdx = idx;
 	// Learn it again while it is still in its bootloader: whatever the configurator wrote or flashed
 	// is in by now, and the motor test that usually follows then arms without a second bootloader
 	// visit (that one stalled the board for ~5 s, and the web test gave up on it).
 	bool learned = runOp(Op::FWSELECT, PINS[idx]) && runOp(Op::LEARN, PINS[idx]);
 	runOp(Op::FWRUN, PINS[idx]);
-	fwHave[idx] = false; if (session == (int8_t)idx) session = -1;
-	pin[idx].onPassthroughEnd(true, learned, identCache[idx]); fwDone[idx] = true;
-	if (pin[idx].st == lc::State::RUNNING) armStart[idx] = true;   // spinPoll starts it after fwEnd
+	ch[idx].fw.have = false; if (session == (int8_t)idx) session = -1;
+	ch[idx].pin.onPassthroughEnd(true, learned, ch[idx].ident); ch[idx].fw.done = true;
+	if (ch[idx].pin.st == lc::State::RUNNING) ch[idx].armReq.start = true;   // spinPoll starts it after fwEnd
 }
 inline void fwEnd() {
 	using namespace detail;
-	for (uint8_t i = 0; i < COUNT; i++) fwPrime[i].end();
+	for (uint8_t i = 0; i < COUNT; i++) ch[i].fw.prime.end();
 	for (uint8_t i = 0; i < COUNT; i++) fwRun(i);
 	for (uint8_t i = 0; i < COUNT; i++)
-		if (!fwDone[i]) pin[i].onPassthroughEnd(false, false, lc::Identity{});
+		if (!ch[i].fw.done) ch[i].pin.onPassthroughEnd(false, false, lc::Identity{});
 	fwActive = false;
 }
 inline uint8_t count() { return COUNT; }
@@ -1090,11 +1101,11 @@ inline uint8_t count() { return COUNT; }
 // passthrough probe that answered). Only `escs` and the 3D answer use it: every index (CLI, MSP
 // motor, passthrough channel) is the pin index, wired or not, and an unwired pin reports ABSENT.
 // A stock BLHeli_S (no telemetry) is EMPTY until it is read once (`scan`, a configurator read).
-inline bool     isPresent(uint8_t i) { return i < COUNT && detail::pin[i].st != lc::State::EMPTY; }
+inline bool     isPresent(uint8_t i) { return i < COUNT && detail::ch[i].pin.st != lc::State::EMPTY; }
 inline uint8_t  presentCount() { uint8_t n = 0; for (uint8_t i = 0; i < COUNT; i++) n += isPresent(i); return n; }
 // Confirmed absent (lc::Pin::implicitArmSkipped): an implicit arm (the MSP motor test) leaves it alone.
-inline bool     absentConfirmed(uint8_t i) { return i < COUNT && detail::pin[i].implicitArmSkipped(); }
-inline bool     identFailed(uint8_t i) { return i < COUNT && detail::pin[i].st == lc::State::FAILED; }
+inline bool     absentConfirmed(uint8_t i) { return i < COUNT && detail::ch[i].pin.implicitArmSkipped(); }
+inline bool     identFailed(uint8_t i) { return i < COUNT && detail::ch[i].pin.st == lc::State::FAILED; }
 // Configured reversible (3D), as read from the ESC on the pin now (false while unknown).
 inline bool     knownReversible(uint8_t i) { return spinReversible(i); }
 // The AM32 settings block of ESC i, from its identity (0 = not AM32 / not read).
@@ -1219,26 +1230,26 @@ inline void core1Poll() {
 		if (ok) takeHello();
 	} else if (o == Op::FWSELECT) {
 		bl.setSignalPin(opPin); bl.begin();
-		if (fwHave[fwIdx]) {
+		if (ch[fwIdx].fw.have) {
 			// A SiLabs bootloader answers BootInit again: the fresh reply is adopted (and fwSelect stores
-			// it as fwRaw), so an ESC swapped behind the configurator's back is reported as what it is
+			// it as fw.raw), so an ESC swapped behind the configurator's back is reported as what it is
 			// now, and fwRun learns that one. AM32 answers only the first BootInit, and a silent SiLabs
 			// falls back the same way: re-adopt the cached reply if it still takes a keepalive.
-			if (!fwAm32[fwIdx]) {
+			if (!ch[fwIdx].fw.am32) {
 				uint8_t raw[8] = {0};
 				int n = bl.connectRawProbe(raw, 15);
 				ok = n >= 8 && raw[0] == '4' && raw[1] == '7' && raw[2] == '1' && bl.adoptReply(raw);
 			}
-			if (!ok) ok = bl.adoptReply(fwRaw[fwIdx], fwAm32[fwIdx]) && bl.keepAlive();
+			if (!ok) ok = bl.adoptReply(ch[fwIdx].fw.raw, ch[fwIdx].fw.am32) && bl.keepAlive();
 		} else ok = connectHere(false);
 		if (ok) takeHello();
 	} else if (o == Op::FWRUN) {
 		bl.setSignalPin(opPin); bl.begin();
-		ok = bl.adoptReply(fwRaw[fwIdx], fwAm32[fwIdx]) && bl.run();
+		ok = bl.adoptReply(ch[fwIdx].fw.raw, ch[fwIdx].fw.am32) && bl.run();
 	} else if (o == Op::LEARN) {
 		Info in; lc::Identity id;
 		ok = learnHere(in, id);
-		if (ok) { infoCache[opIdx] = in; identCache[opIdx] = id; }
+		if (ok) { ch[opIdx].info = in; ch[opIdx].ident = id; }
 	} else if (o == Op::READID) {
 		// The async read of a newly found ESC (core0 has primed it and set the line high): the same
 		// single entry as enterBootloader (quiet, then BootInit polled to ENTRY_MAX_MS from line
