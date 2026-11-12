@@ -1,9 +1,16 @@
-# ESC lifecycle: identify, drive, hot-plug (design; phase 1 built)
+# ESC lifecycle: identify, drive, hot-plug
 
-Status: phase 1 is implemented (`lib/esc_lifecycle`, `src/apps/esc_session.h`); phase 2 is still
-design. See "Phase 1 and phase 2" below for the split and for where the code refines this design.
-Hot-plug timing and the LOST threshold have not had a hardware bench pass yet. rev1 carries rev0's
-drive rules into it ("rev1" below).
+How the firmware knows what is on each ESC signal pin, when it may drive it, and how it notices a
+plug-in, a pull or a swap. The code is `lib/esc_lifecycle/esc_lifecycle.h` (the pure rules, with
+native tests), `src/apps/esc_session.h` (`escs::`, which runs them on the pins) and
+`src/apps/fourway.h` (the 4-way passthrough). `test/sim` runs `escs::` on the host against ESC models.
+
+Contents:
+1. Requirements.
+2. Current behaviour.
+3. Known limits.
+4. Not built yet.
+5. History: rev0, phase 1, rev1.
 
 ## Requirements
 
@@ -17,235 +24,155 @@ drive rules into it ("rev1" below).
   an id) or from declared config instead of the bootloader.
 - R5 Obvious to drive: start the motor test, it spins.
 
-## What is wrong today
-
-- `escs::spinArm` reads the ESC through its bootloader whenever its cached info is unknown, and
-  core0 waits for core1 the whole time (`runOp`). Every DShot stream on the board stops for that
-  long: ~1.3–3.4 s for a present ESC, ~11.5 s for an absent one.
-- The cache (`infoKnown/infoBidir/infoRev`) is RAM only, is not tied to the ESC that is on the pin
-  now, and a failed read still arms in normal DShot with the stale direction.
-- The rev0 idle hold re-arms an ESC 5 s after it is stopped; for an ESC whose read failed that is a
-  fresh bootloader visit, so one dead ESC could stall everything every 16 s.
-
-## Design
+## Current behaviour
 
 ### One state per pin
 
-| state | meaning | may send |
-|---|---|---|
-| EMPTY | nothing seen | zero throttle (bidir), to detect a plug-in |
-| PENDING | something appeared, not read yet | zero throttle |
-| READING | core1 is in its bootloader | nothing (core1 owns the pin) |
-| READY | identity known | zero throttle |
-| RUNNING | being driven | any throttle, mapped by identity |
-| LOST | its telemetry stopped | zero throttle; identity dropped |
-| FAILED | the read failed | nothing; no automatic retry |
+Every pin has one `lc::Pin` (`escs::detail::ch[i].pin`). `spinPoll()` feeds it telemetry and time
+and puts on the pin what its state allows (`lc::Pin::output`, with the idle hold on).
 
-- Only READY and RUNNING accept a non-zero command (R3). Commands that arrive in any other state are
-  refused with the state's name, never queued and never waited on.
-- The pin has exactly one owner at a time: core0 while DShot or PWM runs, core1 while in the
-  bootloader. Ownership changes only on a state change.
-- LOST drops the identity and goes to PENDING when telemetry returns. A swap always passes through
-  LOST, so a new ESC is never driven with the old one's identity (R2, R3).
-- FAILED is left only by a user action (`scan`, a read from the configurator). It sends nothing, so
-  it cannot see telemetry appear either: a read that fails without any telemetry seen on the pin goes
-  to EMPTY instead (refinement 4 below).
+| state | meaning | on the wire (hold on) | motor-test code |
+|---|---|---|---|
+| EMPTY | nothing seen | bidir zero, to detect a plug-in | 5 |
+| PENDING | something appeared, not read yet | bidir zero | 1 (2 if an arm waits) |
+| READING | in its bootloader (core1 owns the pin) | nothing | 1 (2 if an arm waits) |
+| READY | identity known | zero in the identity's protocol | 3 armed, 2 arming, 4 no stream, 7 silent |
+| RUNNING | being driven | the drive stream, mapped by identity | 3, 2 arming, 6 stalled, 7 silent / open loop |
+| LOST | its telemetry stopped; identity dropped | bidir zero | 5 |
+| FAILED | the read failed | nothing; no automatic retry | 5 |
 
-### Asynchronous reads
+Transitions (`lc::Pin`, events in `lc::Ev`):
 
-- core0 never blocks on the bootloader. It queues a read, keeps streaming to every other pin, and
-  picks up the result on a later loop.
-- core1 runs one bootloader job at a time from the queue. The BLHeli_S prime (zero-throttle burst,
-  then line high) becomes timed steps instead of `delay()`.
-- LittleFS writes (config, the pin list) run only while core1 is idle. A flash write pauses the
-  other core, which would cut a bit-banged bootloader byte in half.
+- EMPTY or LOST → PENDING (APPEARED): 3 valid packets within 250 ms, each counted at least 15 ms
+  after the previous one (`APPEAR_PKTS`, `APPEAR_WINDOW_MS`, `APPEAR_GAP_MS`). The driver keeps only
+  the newest telemetry word and core0 polls every ~200 us, so the spacing is what makes 3 samples
+  real evidence.
+- PENDING → EMPTY (GONE): found by telemetry (not asked for), then silent for `LOST_MS` while it
+  waits for its read.
+- PENDING → READING → READY: the async read (below). An `arm` that waited for it goes on to RUNNING.
+- A read that fails → FAILED if telemetry was fresh (under `LOST_MS` old) when it started, else EMPTY
+  (READ_EMPTY: e.g. `arm` on a bare pin, `scan` after a pull, a read after a session or a
+  passthrough). FAILED sends nothing, so this keeps a read-fail, reboot, telemetry, re-read loop out.
+  FAILED is left only by a user action (`scan`, `read i`, a configurator read).
+- READY → RUNNING: `arm`. A READY pin whose zero stream is already armed in the asked protocol goes
+  RUNNING with no new arm window, so `arm` and the motor test stay fast. RUNNING → READY: `disarm`,
+  stop, a PWM pin left unfed.
+- READY or RUNNING → LOST: no valid packet for `LOST_MS` = 400 ms once the pin has answered on its
+  current stream (the reboot gap after a read is expected). Under throttle on a stall-watched stream
+  the silence is the stall watch's instead (below). LOST → PENDING when telemetry returns, so a swap
+  always passes through LOST and a new ESC is never driven with the old one's identity (R2, R3).
+- No answer within `ANSWER_MAX_MS` = 8 s on a READY bidir stream (15 s, `ANSWER_MAX_TUNE_MS`, with a
+  startup melody): reported once (NO_ANSWER, `# esc i: no telemetry within 8 s ...`) and kept READY,
+  armed anyway. Its identity is then unconfirmed: if it ever answers, the pin goes PENDING and is read
+  again before it is driven.
+- The first answer after a read more than `ANSWER_DUE_MS` = 1.5 s after the stream started (and
+  before `ANSWER_MAX_MS`) sends the pin to PENDING, once (LATE_ANSWER): it may be another ESC, swapped
+  in while the read one booted. Not with a startup melody. Measured (`state` shows `ans=`): Bluejay
+  0.21 0.75 s, AM32 2.21 0.03 s.
 
-### Hot-plug
+Hidden sub-states on top of the seven (fields of `lc::Pin`):
 
-- Empty and READY pins get bidir zero throttle. Bluejay and AM32 answer as soon as they are powered,
-  which moves the pin to PENDING and queues a read. Zero throttle is safe for an unread ESC.
-- Telemetry absent for 300–500 ms (not a few bad frames) is LOST.
-- Non-bidir ESCs (stock BLHeli_S) cannot be seen arriving or leaving. Decision: do not re-read them
-  on every start. The UI marks them "swap not detected: read again after changing it" and they are
-  read by `scan` or by the configurator's read. Bidir ESCs are handled automatically.
+- `queued`: PENDING by request (user, arm, an aborted read, a write); never times out to EMPTY.
+- `armWanted`: an `arm` came before the identity; RUNNING once the read is OK.
+- `unconfirmed`, `fresh` / `lateOnce`: the NO_ANSWER and LATE_ANSWER rules above.
+- `absent`: confirmed absent (a read found nothing, or a passthrough probe missed a pin that was
+  EMPTY before it). Only implicit arms (a configurator's motor test sends every channel) skip such a
+  pin; `arm i` and `read i` still try it. Any packet or a successful read clears it.
+- `prePt`: the state when a passthrough began (how long its probe polls, what it returns to).
+- `openLoop`: ROV, RUNNING with its telemetry gone.
 
-### Identity sources and policies
+### Reads
+
+- Reads on the drive path (hot-plug, `arm` of an unread pin, the motor test) run on core1 as one
+  asynchronous job, `Op::READID`: prime, line high, the entry below, learn, run its app. core0 keeps
+  streaming to every other pin and collects the result on a later loop. One job at a time, round
+  robin over PENDING pins.
+- The explicit config ops (`scan`, `read`, `enter`, `editpage`, `erase`, `writeflash`, `readflash`,
+  `preset`, web flash, `blprobe`) and the 4-way passthrough are synchronous, but every core0 wait
+  pumps the other pins' frames, telemetry, deadman and PWM.
+- One bootloader line. A read cannot run while `scan`, `read` or `enter` holds an ESC in its
+  bootloader. A pin waiting to be read wins once the session is idle: no op on it for 5 s
+  (`SESSION_IDLE_MS`), and never a session that has been written (an `erase`/`writeflash` sequence
+  must not see its ESC run mid-image; `run` ends it). The held session is then learned and run.
+  `arm` of a pin that must be read first runs a foreign held session at once, unless it was written:
+  then `err busy (ESC <s> is being written; run it first)`. `arm` on a pin not read yet answers
+  `arming (reading first, then ~3s) (state X)`; hosts poll `state` for RUNNING
+  (`host/pico_esc/drive.py` `wait_read`).
+- Writes never trust a cached reply. A write makes closing the session read the identity again
+  before RUN. Two failed keepalives in a row mark the session lost, and the next op enters again with
+  a fresh CONNECT. A 4-way re-select of a non-AM32 ESC sends a fresh BootInit and adopts a different
+  reply as a new ESC; AM32 answers only the first BootInit, so it re-adopts the cached reply if a
+  keepalive answers (a swap there is caught by the re-read after the passthrough). The page re-reads
+  the channel before a settings write and refuses one that differs (`読み込んだときと違います`); a
+  firmware flash reads it fresh anyway (`flashCheck`).
+- Identity from the bootloader (`learnHere`): AM32 by its flash code (`lc::am32EepFor`; an unknown
+  code is not read), 3D from `bi_direction`, the melody from `tune[]`. SiLabs: bidir from the layout
+  revision at 0x1A02 (Bluejay 200..209, BlueGill 226, `lc::silabsBidir`) or a name with "JESC", 3D
+  from the direction byte, the melody from 0x70.
+- LittleFS writes (config, the pin list) run under `escs::FsGuard`: core1 parks in its idle branch
+  first, because a flash write pauses the other core and would cut a bit-banged bootloader byte in
+  half. A refusal answers `err busy (ESC read in progress, retry)`.
+
+### Policies
 
 | | identity from | telemetry LOST while running |
 |---|---|---|
-| configurator (tool) | bootloader read (R1) | stop that ESC only, report |
-| ROV | telemetry id or declared config; `scan` at launch | keep streaming, drop to open loop, report |
+| configurator (tool) | bootloader read (R1) | stop that ESC only, report (`lost, stopped`) |
+| ROV | bootloader read today (see "Not built yet") | keep streaming, report (`# esc i: lost, open loop`) |
 
-Only these two columns differ; the state machine and the async reads are shared (R4). On the ROV a
-mismatch between declared and read identity keeps that thruster in FAILED.
+`escs::setPolicy`. Only these two columns differ; the state machine and the reads are shared (R4).
 
-### Commands are semantic
+### Driving
 
-Callers ask for signed thrust (or rpm); the pin's identity maps it to DShot or PWM values. A reverse
-request to a non-3D ESC is refused and reported, not clamped to zero silently.
+- One drive path: `escs::drive(i, v)`. A semantic value, signed thrust -1000..1000 on a 3D ESC,
+  throttle 0..2000 on a one-way one, mapped to DShot by the identity (`lc::mapDrive`). Refused, with
+  the target untouched and the deadman not fed, unless RUNNING and armed: `err not-armed`,
+  `err not-armed (state X)`, and `err reverse-on-one-way (ESC i is not 3D)` (a reverse request to a
+  one-way ESC is refused, not clamped). The rpm loop (`Thruster`) goes through it too, and `rpm` is
+  refused on a one-way ESC (`err needs-3d`).
+- Protocol: bidir DShot (eRPM/EDT telemetry) when the identity says so (Bluejay, BlueGill, JESC,
+  AM32), else normal DShot, which every BLHeli_S takes.
+- Arm (`lc::ArmGate`): zero for `ARM_MS` = 3 s. A bidir ESC counts as armed only once it answers and
+  has taken the EDT enable, plus `ARM_ANSWER_HOLD_MS` of zero after its first answer; one that never
+  answers is armed after `ANSWER_MAX_MS` anyway. EDT (`lc::EdtSched`) is sent at the stream start,
+  once armed, and after every run until a fresh eRPM 0, then once a second: Bluejay with
+  FORCE_EDT_ARM refuses a start without it and clears it at the end of every run.
+- Deadman: a target not fed for 500 ms (`SPIN_DEADMAN_MS`) goes to 0.
+- Stall watch (`lc::Stall`, Bluejay/BLHeli-derived bidir only, not AM32): an armed RUNNING stream
+  under throttle that has answered (`lc::Pin::stallWatched`). Its verdicts:
+  - ZERO: eRPM 0 for 1.5 s. The clock starts only on an eRPM reading of 0, so forced sine (EDT
+    flowing, no eRPM) is never a stall while a valid EDT packet comes at least every 500 ms
+    (`STALL_SILENT_MS`).
+  - QUIET: not turned yet and no valid packet for 0.5 s (a failed start beeps without telemetry).
+  - SILENT: the same silence after it has turned. Tool policy: LOST, identity dropped. ROV: the open
+    loop.
 
-### What disappears
-
-- The persisted AM32 mask (`armMask`): the idle hold covers every READY pin, and the passthrough
-  always waits the AM32 time (2–3 s more per session).
-- Re-validation flags after config writes, flashes and passthrough: those all end in READING.
-- Writes never use cached identity: the bootloader session that writes reads signature and layout
-  first and compares (already so in the web flasher's `flashCheck`; to be checked for the CLI and
-  for the cached `fwHave` reply).
-
-## Phase 1 and phase 2
-
-Landed in phase 1:
-
-- `lib/esc_lifecycle/esc_lifecycle.h`: the state machine (`lc::Pin`), the identity rules, the 3D map
-  and the semantic drive mapping, with a native g++ test.
-- `escs::` keeps one `lc::Pin` per pin. `spinPoll()` feeds it telemetry and time, runs the idle hold
-  (bidir zero on EMPTY/PENDING/LOST, zero in the identity's protocol on READY) and so detects a bidir
-  ESC being plugged in or pulled out. `idle off` stops the hold, and with it the hot-plug detection.
-- Reads on the drive path (`spinArm`, hot-plug, the motor test) run on core1 as one asynchronous job
-  (`Op::READID`: prime, line high, the entry below, learn, run). core0 keeps streaming and
-  collects the result on a later loop.
-- The explicit config ops and the 4-way passthrough stay synchronous, but every core0 wait pumps the
-  other pins' frames, telemetry and deadman.
-- LOST handling with the tool/ROV switch (`escs::setPolicy`), `escs::drive()` with refusals
-  (`err not-armed`, `err not-armed (state X)`, `err reverse-on-one-way (ESC i is not 3D)`), and a
-  `state` CLI command.
-- The AM32 mask is gone, and the passthrough always waits the AM32 time. (The present mask,
-  `/cfg/present`, went later too: see "Signal pins and presence" below.)
-- LittleFS writes run under `escs::FsGuard` (core1 parked in its idle branch); a refusal answers
-  `err busy (ESC read in progress, retry)`.
-
-- One bootloader line: a read cannot run while `scan`, `read` or `enter` holds an ESC in its
-  bootloader. A pin waiting to be read wins once the session is idle: no op on it for 5 s, and never
-  a session that has been written (an `erase`/`writeflash` sequence must not see its ESC run
-  mid-image; `run` ends it). The held session is then learned and run, and the next config op on
-  that ESC enters it again. `arm` of a pin that must be read first runs a foreign held session at
-  once (as 4baed53's `arm` did), unless it was written: then it answers
-  `err busy (ESC <s> is being written; run it first)`. `arm` on a pin not read yet answers
-  `arming (reading first, then ~3s) (state X)`; hosts poll `state` for RUNNING
-  (`host/pico_esc/drive.py` `wait_read`).
-
-Phase 2:
-
-- The explicit config commands (`scan`, `read`, `enter`, `editpage`, `erase`, `writeflash`,
-  `readflash`, `preset`, web flash, `blprobe`) go asynchronous with deferred replies.
-- ROV identity from a telemetry id or declared config (a mismatch keeps the pin FAILED), and `scan`
-  at ROV launch.
-- The RPM controller falling back to open loop on LOST in ROV mode (phase 1 keeps streaming and
-  reports `# esc i: lost, open loop`).
-- Signed rpm as a semantic command (the rpm loop is refused on a one-way ESC; every drive value goes
-  through `escs::drive()`, by identity). The legacy `esc_tool` env was retired (tag `legacy-esc-tool`).
-
-Where the code refines the design:
-
-1. READY accepts `arm`, not a bare non-zero command: non-zero needs RUNNING and an armed stream.
-   After `disarm` or a firmware abort, host scripts rely on `err not-armed`, and rev0's idle hold
-   re-enabled throttle by itself. A READY pin whose zero stream is already armed in the asked
-   protocol goes RUNNING with no new arm window, so `arm` and the motor test stay fast.
-2. A read that fails without fresh telemetry at its start goes to EMPTY, not FAILED (for example
-   `arm` on a bare pin, or `scan` after an ESC was pulled). FAILED sends nothing, which avoids a read-fail, reboot, telemetry, re-read loop.
-3. Hot-plug debounce: EMPTY or LOST becomes PENDING after 3 valid packets within 250 ms, each counted
-   at least 15 ms after the previous one (so they span 30 ms or more). LOST is no
-   valid packet for 400 ms once the pin has answered on its current stream (the reboot gap after a
-   read is expected). A bidir READY pin that never answers within 8 s stays READY and is reported
-   once (`# esc i: no telemetry within 8 s ...`); a pull is then not seen on it. Its identity is then
-   unconfirmed: if it ever answers, the pin goes to PENDING and is read again before it is driven
-   (an ESC swapped before its first answer is never driven with the old identity). RUNNING keeps the
-   "armed after 8 s anyway" rule for an ESC that never answers. The driver keeps only the newest
-   telemetry word per read, and core0 polls every ~200 us: the 15 ms spacing is what makes 3 samples
-   real evidence. A failed read is FAILED only if telemetry was fresh (under 400 ms old) when the read
-   started; a read after a session, a passthrough or a LOST finds stale telemetry and goes to EMPTY.
-4. Writes never trust a cached reply. A 4-way re-select of a non-AM32 ESC sends a fresh BootInit and
-   adopts a different reply as a new ESC; AM32 answers only the first BootInit, so it still re-adopts
-   the cached reply if a keepalive answers (a swap there is caught by the re-read after the
-   passthrough). Two failed keepalives in a row mark the CLI session lost, and the next op enters
-   again with a fresh CONNECT. A write makes closing the session read the identity again before RUN.
-
-## rev1: rev0's drive rules on the lifecycle
-
-rev1 is phase 1 rebased onto rev0. Every rev0 rule below still holds; this is where each one
-lives now and how it meets the lifecycle states.
-
-- Motor-test state (MSP_MOTOR_TELEMETRY mAh field, 0x5A marker) is one enum, `lc::Ui`
-  (`escs::UiState`), mapped from the pin's state by `lc::uiCode`:
-  - 1: PENDING or READING.
-  - 2: an arm waiting for its read, a DShot arm window, the hold's stream still arming, or a PWM
-    arm or PWM waiting for its first stop width.
-  - 3: armed (READY on an armed hold stream, or RUNNING).
-  - 4: READY with no stream.
-  - 5: EMPTY, LOST or FAILED.
-  - 6: RUNNING and stalled: re-arming, or held at 0.
-  - 7: an answered bidir stream at zero, not held, that has been silent for 200 ms
-    (`lc::SILENT_MS`), or the ROV open loop.
-
-  The page locks 1, 2, 5 and 6. Under the tool policy a pulled ESC goes LOST 400 ms after its
-  last packet, so 7 shows for one poll at most. The page's gone rule (3 prompt polls in a row,
-  read Bluejay/BlueGill/AM32 only) therefore also counts 5 once that motor has reported a live
-  code since the last test start or stop, read or passthrough exit (a firmware-side FAILED learn
-  right after a read does not erase the page's read).
-- Stall watch (`lc::Stall`, run in `escs::detail::streamPin`): the same thresholds and the same
-  hold until a zero command, STALL_MAX, and no stall judgement for AM32. It watches an armed
-  RUNNING bidir stream under throttle that has answered (`lc::Pin::stallWatched`); one that never
-  answered is not judged. Under throttle its silence belongs to the stall watch, not to LOST
-  (`lc::Pin::stallWatch`), because a failed start beeps without telemetry. Its verdicts:
-  - ZERO: eRPM read 0 for 1.5 s. The clock starts only on an eRPM reading of 0, so forced sine (EDT
-    flowing, no eRPM) is never a stall, as long as a valid EDT packet comes at least every 500 ms
-    (STALL_SILENT_MS); sparser EDT is judged as silence.
-  - QUIET: not turned yet and no valid packet of any kind for 0.5 s (the failed start).
-  - SILENT: the same total silence after it has turned. Under the tool policy that is LOST with the
-    identity dropped (`lc::Pin::onStall`), so an ESC swapped in meanwhile is read before it is
-    driven. Under the ROV policy it is the open loop (keep streaming, `# esc i: lost, open loop`),
-    as LOST while running is there.
-
-  ZERO and QUIET re-arm the same stream (zero, answer, EDT; `lc::Pin::onRearm`) with the identity
-  kept and the target held at 0, under either policy. A re-arm that gets no answer within 8 s is
-  LOST. At zero the 400 ms LOST rule applies as before.
-- The loop-gap guard is `gapCheck`: a pin not polled for 50 ms moves its lifecycle clocks on by
-  the gap, and its stall clocks restart. Five gaps in a row are reported once
-  (`# esc i: core0 loop slow ...`), because a loop slow on every pass keeps LOST, SILENT and the
-  stall silence rule from firing. SILENT is not reported for a pin not polled in the last 50 ms.
-  A loop slower than 50 ms on every pass therefore disables LOST detection (and SILENT and the
-  stall silence rule) altogether; SLOW_LOOP is the only report of it. `lc::stamp` replaces
-  `millis()|1`.
-- PWM: `lc::pwmGate` drops widths sent during the arm and needs one stop width first. The IRQ
-  deadman stays. Every sync bootloader visit (`runOp`, `enterBootloader`) sends the stop width
-  while it waits, because pump() keeps PWM going. `pwmBusy` refuses CLI bootloader commands. A pin
-  unfed for 3 s after its arm goes back to READY, and the hold takes it. `pwmBegin` refuses when no
-  alarm slot is free for the IRQ deadman.
-- Unchanged from rev0:
-  - the FEATURE_3D latch, the `mtmode` declaration and its acknowledgement, and the session end on
-    DTR fall or MSP silence (fourway.h, `motorTestPoll`);
-  - SET_MOTOR 0 as stop;
-  - the undeclared 3D rule;
-  - the page's mode snapshot, 全体, stop streaming, the stopping flag, the readAll pipe guard,
-    forget on disconnect, and the lossless TUNE/MELODY fields.
-- Known limits added by rev1:
-  - A swap under throttle that keeps telemetry flowing in eRPM 0 readings (ZERO) or that never
-    turned (QUIET) is re-armed with the old identity. An ESC plugged in within the following 8 s
-    answers the re-arm as the old one, though held at 0 until a zero command. If the old identity
-    was 3D and the new ESC is one-way, a forward command is then about 50 % throttle there, and
-    "reverse" runs forward too. A pull after the motor has turned (SILENT) drops the identity
-    (tool policy).
-  - A jam while the motor is running may show up as total silence (SILENT) rather than as eRPM 0
-    readings (ZERO), depending on what Bluejay sends as it drops out of its run. Under the tool
-    policy that ESC then goes LOST and is read again through its bootloader instead of being
-    re-armed. This needs a bench check.
-  - AM32 is not stall-watched, so under throttle it is under the plain 400 ms LOST rule: a
-    telemetry decode dropout longer than that stops it in the web tool (tool policy) and drops its
-    identity; it is read again through its bootloader when it answers.
-  - A bidir ESC whose telemetry never decodes stays READY (armed after 8 s anyway) and is not
-    stall-watched; a pull or swap on it is not seen, like stock BLHeli_S.
-  - The rpm loop (`Thruster::setRpm`) is for reversible (3D) ESCs only: its command is signed 3D
-    thrust, sent through `escs::drive()` like every drive value. `rpm` (CLI and HTTP) is refused on
-    a one-way ESC (`err needs-3d`), and should a loop run on one anyway it is sent 0.
-  - Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. If one lasts
-    longer than 400 ms at zero, the pin goes LOST and is read again when it answers. This needs a
-    bench check.
+  ZERO and QUIET re-arm the same stream (zero, answer, EDT) with the identity kept and the target
+  held at 0 until a 0 is sent, so a jam is never restarted on its own. A re-arm with no answer within
+  8 s is LOST. After 3 restarts without a run in between (`STALL_MAX`), only a 0 held for 1 s frees
+  it.
+- Loop-gap guard (`gapCheck`): a pin not polled for 50 ms moves its lifecycle clocks on by the gap,
+  and its stall clocks restart. Five gaps in a row are reported once (`# esc i: core0 loop slow ...`).
+- PWM (50 Hz servo pulses) for firmwares that take it (AM32, stock BLHeli_S; not Bluejay): only on a
+  READY or RUNNING pin, stop width 1000 us, or 1500 us on a 3D ESC. A width sent during the 5 s arm is
+  not kept, and after it only the stop width passes until one stop width has come (`lc::pwmGate`).
+  The 500 ms deadman also runs from a timer IRQ, every sync bootloader visit sends the stop width, CLI
+  bootloader commands are refused while a pin is fed above its stop, and a pin unfed for 3 s after
+  its arm goes back to READY and the hold.
+- Motor test (MSP): the state goes in MOTOR_TELEMETRY's mAh field with 0x5A in the high byte
+  (`lc::Ui`, `lc::uiCode`; codes in the state table). The page locks 1, 2, 5 and 6, and forgets its
+  read of a motor (Bluejay, BlueGill or AM32 only) after 3 prompt polls in a row of 7, or of 5 once that motor reported a live code since the
+  last test start or stop, read or passthrough exit. The 3D/one-way meaning of a value is fixed per
+  test on both sides: the page declares it (`mtmode <mask>`, answered `mtmode|xx`) ahead of every
+  frame, and without an answer treats every motor as FEATURE_3D says. The firmware latches its
+  FEATURE_3D answer when a client reads it, until USB DTR falls or it is read again with no test
+  running. An undeclared channel takes an ESC over only above the reported stop. The mapping is
+  `lib/esc_lifecycle/motor_test.h`. A test session ends on DTR fall or after 2 s without MSP.
 
 ## Signal pins and presence
 
 Which GPIOs carry ESCs, and which of them have an ESC on them now, are two separate things, and
-neither needs a rebuild or a `scan` any more.
+neither needs a rebuild or a `scan`.
 
 ### The pin list
 
@@ -261,8 +188,8 @@ neither needs a rebuild or a `scan` any more.
   `err bad-pins (GP25: Pico W radio)`. The rule is `lib/esc_lifecycle/esc_pins.h`, with a native
   test; the default list is checked against it at compile time. A stored list that this build
   refuses (written by another env) is ignored at boot with a `# pins:` line, and the default is used.
-- An ESC on GP16 or GP17 switches the AS5600 encoder off (its I2C0 is on those pins), as before.
-- Every per-ESC array is sized `escs::MAX` (8); `escs::COUNT` is this boot's count. `main.cpp`
+- An ESC on GP16 or GP17 switches the AS5600 encoder off (its I2C0 is on those pins).
+- `escs::detail::ch[]` is sized `escs::MAX` (8); `escs::COUNT` is this boot's count. `main.cpp`
   declares eight `Thruster`s; `EscTool` uses the first `COUNT`. `cfg load` restores every stored one,
   `cfg save` stores the first `COUNT`.
 
@@ -274,58 +201,57 @@ neither needs a rebuild or a `scan` any more.
   (the AM32 configurator hides its Read button at 0) always sees them. No numbering depends on which
   ESCs answer, so a plug-in or a pull, mid-test or not, never moves a channel onto another ESC.
 - A pin with no ESC reports state 5 (absent) in MOTOR_TELEMETRY; the page locks its slider.
-- Writes check the ESC again: the page re-reads the channel (bootloader reply and settings) before a
-  settings write and refuses one that differs from what it read (`読み込んだときと違います`); a
-  firmware flash already reads it fresh.
 
 ### Presence
 
 - Nothing is stored. A pin is wired when its lifecycle state is not EMPTY: a bidir ESC is found by
-  the hold's telemetry, any ESC by a read (`scan`, a configurator read, an arm). `/cfg/present` is
-  deleted at boot. `escs` reports (`escs|<n>/<count>|<indices>`); its old arguments are ignored with
-  a note.
-- The passthrough probes per channel. MSP_SET_PASSTHROUGH answers at once with every configured pin
-  (esc-configurator times out an MSP reply after 1 s). A channel's first InitFlash waits out the
-  shared quiet window once (`ENTRY_QUIET_MS` after the lines went high), then polls its own pin with
-  BootInit: up to `ENTRY_MAX_MS` after the lines went high if its lifecycle knew an ESC there when
-  the passthrough began (`lc::Pin::ptRetry`: that ESC may be slow or stuck in its app) or it
+  the hold's telemetry, any ESC by a read (`scan`, a configurator read, an arm). `escs` reports
+  (`escs|<n>/<count>|<indices>`); its old arguments are ignored with a note. The old present mask
+  `/cfg/present` is deleted at boot.
+- Each held pin takes a PIO SM. Bidir fits only pio0's 4 SMs on a Pico W (the radio is on pio1);
+  normal DShot goes to pio1's 3 free SMs first (`newBidir` / `newNormal`). A pin past that budget
+  reports `init-fail` and the hold tries it again every second.
+
+### Passthrough
+
+- MSP_SET_PASSTHROUGH answers at once with every configured pin (esc-configurator times out an MSP
+  reply after 1 s). Every pin is READING for the whole passthrough: no hold, no async read.
+- `fwBegin` primes every pin at once (in turns, when there are more pins than free SMs), holds the
+  lines high and shares the quiet window. A pin with a known bidir ESC is primed with bidir DShot,
+  and if that ESC did not answer (booting, playing its melody) its own InitFlash primes it again until
+  it answers. Every other pin is primed with normal DShot.
+- Each channel's InitFlash then polls its own pin with BootInit: up to `ENTRY_MAX_MS` after the lines
+  went high if its lifecycle knew an ESC there when the passthrough began (`lc::Pin::ptRetry`) or it
   answered earlier in the same passthrough, else up to `ENTRY_QUIET_MS + ENTRY_BARE_MS` (at least
-  500 ms either way). The passthrough's prime was the full entry for every pin, so a pin that misses
-  its poll, known or not, is absent for that passthrough: its InitFlash fails, and every retry of it
-  in that passthrough fails at once. A retry is charged to its own channel's InitFlash only. The one
-  exception is a channel whose ESC was run in this passthrough (DeviceReset, e.g. after a flash) and
-  is selected again: the prime no longer applies to it, so it gets one fresh full entry (below). A
-  stock BLHeli_S that was never read is EMPTY, but it is in its bootloader after the quiet window and
-  answers the probe.
-- No InitFlash reply waits more than 800 ms (300 ms for one that came in with the passthrough and
-  may have waited out the prime already). esc-configurator times every 4-way reply out after 1 s,
-  sends the command again, and takes whatever frame comes next as its answer: a late reply would
-  answer the command after it. While its pin is still in the quiet window or polling toward its
-  deadline, InitFlash answers `0x07` (pending, Betaflight's `ACK_D_UNKNOWN_ERROR`), and the next
-  InitFlash for that channel carries on toward the same deadline. esc-configurator retries on any
-  NACK (250, 500, 750, 1000 ms apart, 5 tries in its read); the web page retries on `0x07` only.
+  500 ms either way). A miss is final for that passthrough; retries fail at once. A channel whose ESC
+  was run in this passthrough (DeviceReset, e.g. after a flash) and is selected again gets one fresh
+  full entry. A stock BLHeli_S that was never read is EMPTY, but it is in its bootloader after the
+  quiet window and answers the probe.
+- No InitFlash reply waits more than 800 ms (300 ms for one that came in with the passthrough;
+  `INIT_BUDGET_MS`, `INIT_BUDGET_FIRST_MS` in `fourway.h`). esc-configurator times every 4-way reply
+  out after 1 s, sends the command again, and takes whatever frame comes next as its answer, so a
+  late reply would answer the command after it. While its pin is still priming, quiet or polling,
+  InitFlash answers `0x07` (pending, Betaflight's `ACK_D_UNKNOWN_ERROR`), and the next InitFlash for
+  that channel carries on toward the same deadline. esc-configurator retries on any NACK (250, 500,
+  750, 1000 ms apart, 5 tries in its read, about 6.5 s); the web page retries on `0x07` only, for up
+  to 20 s.
+- `fwRun` (DeviceReset, or the end) learns the ESC again while it is still in its bootloader, so the
+  motor test that follows arms without another bootloader visit. `fwEnd` sends a pin that was never
+  selected back to EMPTY/FAILED if it started there, else to PENDING (it may have been swapped).
 
 ### Bootloader entry timing
 
 - One entry timeline, `lc::Entry`, for `read i` / `scan` / `enter` and every passthrough channel
   (spread over its pending InitFlash answers). The async `Op::READID` uses the same timing.
-  - Prime: DShot zero for 500 ms (BLHeli-S needs valid frames first).
+  - Prime: DShot zero for `ENTRY_PRIME_MS` = 500 ms (BLHeli_S needs valid frames first).
   - Line high, then `ENTRY_QUIET_MS` = 1000 ms with no traffic at all.
   - BootInit polled until an answer or `ENTRY_MAX_MS` = 5000 ms after line high.
-  - The passthrough primes every pin at once and shares the quiet window. It replaced a fixed
-    ladder (1 s hold, then 4 s twice) and a fixed 4.5 s settle.
-- **The prime waits for an answer.** A pin where a bidir ESC is known is primed with bidir DShot
-  until that ESC answers, up to `ENTRY_PRIME_MAX_MS` = 3 s, or `ENTRY_PRIME_TUNE_MS` = 15 s when its
-  settings have a startup melody (`Identity::tune`). An ESC that was just run out of its bootloader is
-  deaf while it boots and plays its melody, and a prime that ended inside the melody left it waiting
-  in its app.
-  - The passthrough checks which pins answered its 500 ms prime. A pin with a known bidir ESC that
-    stayed silent is primed again by its own InitFlash (pending answers) until it answers.
-  - Every other pin is primed with normal DShot, which every firmware takes. A stock BLHeli_S may not
-    count inverted frames as the signal it needs. This is not measured: there is no stock BLHeli_S on
-    the bench, and the simulation (`test/sim`) runs both cases.
-  - Bench (2026-11-07), Bluejay 0.21 with its melody on: two page reads back to back now both find
-    it (10 s each), and so does a DeviceReset followed by InitFlash. Before, both missed it.
+- The prime waits for an answer. A pin where a bidir ESC is known is primed with bidir DShot until
+  that ESC answers, up to `ENTRY_PRIME_MAX_MS` = 3 s, or `ENTRY_PRIME_TUNE_MS` = 15 s when its settings
+  have a startup melody (`Identity::tune`). An ESC that was just run out of its bootloader is deaf
+  while it boots and plays its melody, and a prime that ended inside the melody left it waiting in its
+  app. Bench (2026-11-07), Bluejay 0.21 with its melody on: two page reads back to back both find it
+  (10 s each), and so does a DeviceReset followed by InitFlash.
 - Measured on 2026-11-07 with `blpoll <i> <holdMs> <pollMs>` (line high right after the zero-throttle
   hold stream, app running):
   - AM32 2.21 (ARIA, startup tune off): a single BootInit answers from 700 ms; polling from 0 ms
@@ -334,119 +260,157 @@ neither needs a rebuild or a `scan` any more.
     it out of its bootloader (no answer within 6 s, 6/6). That is why the quiet window has no
     traffic.
   - Quiet 800 or 1000 ms, then poll: both answer the first BootInit (814 / 1014 ms), 12/12.
-- Expected costs: a present ESC about 1.5 s (prime + quiet + first answer) plus its read; an absent
-  pin through `read i` or an async read 5.5 s (prime + poll to 5 s), down from ~11 s. In a
-  passthrough an EMPTY pin costs at most 0.5 s. With 4 pins and ESCs on the first two, a page read
-  is about 0.5 s prime + 1 s quiet (mostly inside the configurator's own 1.2 s wait), the two ESCs'
-  reads, and 1 s for the two empty pins: about 3 s instead of the 6.7 s measured with the old 4.5 s
-  settle (needs a bench check).
+- Costs: a present ESC about 1.5 s (prime + quiet + first answer) plus its read; an absent pin
+  through `read i` or an async read 5.5 s. In a passthrough an EMPTY pin costs at most 0.5 s. A page
+  read with two ESCs on four pins takes about 3.2 s on the bench.
 
-### Known limits
+### Timing constants
 
-- **A startup melody makes an ESC deaf for seconds after every read.** The bench Bluejay's melody
-  answers 8.3 s after a read, against 0.75 s with it off (`state` shows `ans=` and `tune=`).
-  - The page waits up to 20 s for it.
-  - esc-configurator gives up on an InitFlash after about 6.5 s (5 tries). Read it there once the
-    melody has ended.
-  - Before the fix, the 8 s NO_ANSWER rule took such an ESC as unconfirmed and read it again, which
-    played the melody again: a read every 9 s, for good. `ANSWER_MAX_TUNE_MS` = 15 s now applies to
-    a melody ESC, for NO_ANSWER and for arming anyway.
-- **A swap before the ESC's first answer after a read.** Nothing on the wire tells a booting ESC from
-  an empty connector, so the first answer is checked against the boot time.
-  - A first answer more than `ANSWER_DUE_MS` = 1.5 s after the stream started (bench: Bluejay 0.75 s,
-    AM32 0.03 s) has the pin read again, once (`Ev::LATE_ANSWER`).
-  - A swap faster than the old ESC's own first answer is still not seen. With a melody on, the check
-    is off: its 8 s melody covers any swap, and a read again would only play it again.
+| constant | value | file | what |
+|---|---|---|---|
+| `LOST_MS` | 400 ms | esc_lifecycle.h | silence that is LOST (and PENDING → EMPTY) |
+| `APPEAR_PKTS` / `_WINDOW_MS` / `_GAP_MS` | 3 / 250 / 15 ms | esc_lifecycle.h | the plug-in debounce |
+| `ANSWER_MAX_MS` / `_TUNE_MS` | 8 / 15 s | esc_lifecycle.h | NO_ANSWER; armed anyway |
+| `ANSWER_DUE_MS` | 1.5 s | esc_lifecycle.h | a later first answer after a read is LATE_ANSWER |
+| `SILENT_MS` | 200 ms | esc_lifecycle.h | code 7 |
+| `ENTRY_*` | see above | esc_lifecycle.h | the bootloader entry |
+| `ARM_MS` / `ARM_ANSWER_HOLD_MS` | 3 s / 300 ms | esc_lifecycle.h | the arm window |
+| `EDT_*` | 1 s refresh, bursts of 20 / 10 | esc_lifecycle.h | the EDT enable |
+| `STALL_ZERO_MS` / `_SILENT_MS` / `_MAX` / `_REST_MS` | 1.5 s / 0.5 s / 3 / 1 s | esc_lifecycle.h | the stall watch |
+| `SPIN_DEADMAN_MS` | 500 ms | esc_session.h | the deadman (DShot and PWM) |
+| `PWM_ARM_MS` / `PWM_RELEASE_MS` | 5 s / 3 s | esc_session.h | PWM arm, release |
+| `POLL_GAP_MS` / `SLOW_GAPS` | 50 ms / 5 | esc_session.h | the loop-gap guard |
+| `SESSION_IDLE_MS` | 5 s | esc_session.h | an idle held session yields to a read |
+| `INIT_BUDGET_MS` / `_FIRST_MS` | 800 / 300 ms | fourway.h | the longest InitFlash reply |
 
-- The idle hold streams to every configured pin, so an empty pin still holds a PIO SM. Bidir fits
-  only pio0's 4 SMs on a Pico W (the radio is on pio1), normal DShot goes to pio1's 3 free SMs
-  first (`newBidir` / `newNormal`). A pin past that budget reports `init-fail` (`state`, `spinMode`)
-  and the hold tries it again every second (`drvInitFail` / `drvRetryMs`); it gets an SM when one is
-  freed (a pin read as normal DShot moves to pio1, a pin goes FAILED or is in a bootloader). With
-  more than 4 pins, list the wired ones first: an ESC on a pin with no SM is not seen arriving and
-  cannot be armed until one is free. No new scheduler is planned for this.
-- The passthrough primes in turns when there are more pins than free SMs (500 ms more for pins 5..8).
-- A configurator shows an empty pin as a channel whose read failed (esc-configurator logs a read
-  failure; the web page logs `ESC n: つながっていません` and goes on to the next channel).
-- esc-configurator's read tries an InitFlash 5 times over about 6 s. A pin whose ESC was pulled
-  (below) costs at most 5 s after the lines went high in a passthrough (polled to `ENTRY_MAX_MS`
-  across the pending answers, no second entry), so it fits in that window; before, one more full
-  entry made it ~9.5 s.
+## Known limits
+
+Swaps and identity:
+
+- Non-bidir ESCs (stock BLHeli_S) cannot be seen arriving or leaving. They are not re-read on every
+  start; they are read by `scan` or a configurator read. The rule for the user: after changing the
+  wiring (moving an ESC to another pin, or plugging one in during a motor test), press
+  「ESC を読み込む」 again (or `read i` / `scan`). A motor that went away mid-test stays locked for the
+  rest of that test, and the settings card stays cleared until the next read.
+- A swap faster than the old ESC's own first answer after a read (Bluejay 0.75 s) is not seen. With
+  a melody on, the LATE_ANSWER check is off: its melody covers any swap, and a read again would only
+  play it again.
+- A swap under throttle that keeps telemetry flowing in eRPM 0 readings (ZERO) or that never turned
+  (QUIET) is re-armed with the old identity. An ESC plugged in within the following 8 s answers the
+  re-arm as the old one, though held at 0 until a zero command. If the old identity was 3D and the
+  new ESC is one-way, a forward command is then about 50 % throttle there, and "reverse" runs forward
+  too. A pull after the motor has turned (SILENT) drops the identity (tool policy).
+- A bidir ESC whose telemetry never decodes stays READY (armed after 8 s anyway) and is not
+  stall-watched; a pull or swap on it is not seen, like stock BLHeli_S.
+- A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
+  ESC was here". `escs` lists it until then, and the next passthrough gives that pin the long probe.
+- A stock BLHeli_S (no telemetry) plugged into a pin confirmed absent is not armed by a configurator's
+  motor test until a read (the page's, a configurator's, `scan`) finds it.
+- An ESC left in its bootloader (the Pico rebooted mid-passthrough, or an ESC moved during one, whose
+  new pin held the line high while it powered up) sends no telemetry, so its pin stays EMPTY until a
+  passthrough or `read i` finds it. A CLI `read i` holds the session until `run i`.
+
+Timing:
+
+- A startup melody makes an ESC deaf for seconds after every read: the bench Bluejay answers 8.3 s
+  after a read with it on, 0.75 s with it off (`state` shows `ans=` and `tune=`). The page waits up
+  to 20 s; esc-configurator gives up on an InitFlash after about 6.5 s, so read it there once the
+  melody has ended.
 - `ENTRY_MAX_MS` (5 s from line high) is measured on one AM32 build with its startup tune off. An
-  AM32 build or a tune that takes longer to reach its bootloader is missed: in a passthrough that
-  channel fails for that passthrough (the page's next read is a fresh passthrough and primes again),
-  elsewhere the read fails (FAILED, or EMPTY without fresh telemetry) and `read i` tries again.
+  AM32 build that takes longer to reach its bootloader is missed: in a passthrough that channel fails
+  for that passthrough, elsewhere the read fails and `read i` tries again.
 - The quiet window must stay free of BootInit: Bluejay polled earlier than ~700 ms after line high
   never entered its bootloader. A Bluejay/BLHeli_S build slower than the measured one would need a
   longer `ENTRY_QUIET_MS`.
-- A pulled ESC stays wired until its pin goes EMPTY (a read that finds nothing): LOST is still "an
-  ESC was here". `escs` lists it until then, and the next passthrough gives that pin the long probe
-  (to 5 s after the lines went high) before it is called absent.
-- An empty pin is confirmed absent once a read finds nothing there (READ_EMPTY) or a passthrough
-  probe gets no answer on a pin that was EMPTY before it (`lc::Pin::absent`). The MSP motor test
-  then leaves it alone (a stock configurator sends every channel, and each empty pin would queue a
-  5.5 s read in front of the real ESCs); it reports absent (5). Any telemetry packet or a read
-  that succeeds clears the latch; `arm i` and `read i` still try the pin. So a stock BLHeli_S (no
-  telemetry) plugged into a pin confirmed absent is not armed by a configurator's motor test until a
-  read (the page's, a configurator's, `scan`) finds it.
-- An ESC left in its bootloader (for example, the Pico rebooted mid-passthrough) sends no telemetry,
-  so the boot and hot-plug detection leave its pin EMPTY until a passthrough or `read i` finds it.
-  The page's read and esc-configurator both find it; a CLI `read i` holds the session until `run i`.
-  Moving an ESC during a passthrough does this too: its new pin held the line high while it powered
-  up, so it sits in its bootloader there (seen on hardware: a Bluejay moved from GP16 to an empty
-  GP19 stayed EMPTY until `read 3`).
-- The rule for the user: after changing the wiring (moving an ESC to another pin, or plugging one in
-  during a motor test), press 「ESC を読み込む」 again (or `read i` / `scan`). An ESC moved while in
-  its bootloader is found only by a read. A motor that went away mid-test stays locked for the rest
-  of that test, and the settings card stays cleared until the next read.
+- A pin with no bidir ESC known is primed with normal DShot. Whether a stock BLHeli_S also counts
+  inverted frames is not measured (no stock BLHeli_S on the bench); `test/sim` runs both cases.
+- A loop slower than 50 ms on every pass disables LOST detection (and SILENT and the stall silence
+  rule) altogether; SLOW_LOOP is the only report of it.
+- Bluejay's beacon (minutes at zero throttle) and its stall beeps send no telemetry. One longer than
+  400 ms at zero makes the pin LOST, and it is read again when it answers. Needs a bench check.
+- A jam while the motor is running may show up as total silence (SILENT) rather than as eRPM 0
+  (ZERO), depending on what Bluejay sends as it drops out of its run. Under the tool policy that ESC
+  then goes LOST and is read again instead of being re-armed. Needs a bench check.
+- AM32 is not stall-watched, so under throttle it is under the plain 400 ms LOST rule: a telemetry
+  decode dropout longer than that stops it in the web tool and drops its identity.
+
+Resources and the UI:
+
+- The idle hold streams to every configured pin, so an empty pin still holds a PIO SM. With more than
+  4 pins, list the wired ones first: an ESC on a pin with no SM is not seen arriving and cannot be
+  armed until one is freed (a pin read as normal DShot moves to pio1, a pin goes FAILED or is in a
+  bootloader). The passthrough primes in turns (500 ms more for pins 5..8).
+- A configurator shows an empty pin as a channel whose read failed (esc-configurator logs a read
+  failure; the web page logs `ESC n: つながっていません` and goes on).
 - Changing the pin list needs a reboot; there is no `reboot` command.
+- Under the tool policy code 7 shows for one poll at most (LOST follows 200 ms later).
 
-## rev0 (the first release)
+Motor test:
 
-- Idle hold: start holding only when nothing else is being driven, and never retry an ESC whose
-  read failed until `scan` or a configurator read.
-- PWM output (50 Hz servo pulses) for firmwares that take it (AM32, stock BLHeli_S; not Bluejay,
-  which accepts DShot only): its own deadman, the idle hold leaves PWM pins alone, and switching
-  back to DShot needs no reboot.
-- The idle hold covers every wired ESC (Bluejay and BLHeli_S beacon too), not only AM32.
-- A bidir arm completes only once the ESC answers with telemetry and has taken the EDT enable.
-  Bluejay with EDT safety arm (FORCE_EDT_ARM) never started after a passthrough when the motor test sent
-  throttle at once: EDT went out only in a zero-throttle gap after the arm.
-- The end of a passthrough re-reads each ESC while it is still in its bootloader, so the motor test
-  that follows arms without another bootloader visit.
-- The 3D/one-way meaning of a motor-test value is fixed per session on both sides. The page takes
-  each motor's meaning once when the test starts and keeps it until the test has stopped, even if an
-  ESC is forgotten or re-read meanwhile; it declares it (`mtmode <mask>`, answered `mtmode|xx`) and
-  repeats the declaration ahead of every frame. Without an answer it treats every motor as FEATURE_3D
-  says. The firmware latches its FEATURE_3D answer when a client reads it, until USB DTR falls or it
-  is read again with no test running. A declaration ends with the test, when DTR falls, and after
-  2 s without MSP (a loop held up by a bootloader read does not count). An undeclared channel takes
-  an ESC over only above the reported stop.
-- Known limits, in the release notes:
-  - A bootloader read on the drive path still stalls every stream (rev1: async, see above).
-  - Swaps are not detected. A bidir ESC that answered and then goes silent for 1 s while armed is
-    reported (code 7); after 3 prompt polls in a row the page forgets its read and locks its slider.
-  - A failed read leaves the ESC unknown (no stale direction is used), and it is not retried
-    automatically.
-  - Stall re-arm (Bluejay/BLHeli-derived bidir only, not AM32): eRPM 0 under throttle for 1.5 s, or
-    no telemetry for 0.5 s once it has turned, re-arms the ESC (EDT included). A throttle below the
-    start point therefore re-arms after 1.5 s. The target is then held at 0 until a 0 is sent, so a
-    jam is never restarted on its own. After 3 restarts without a run in between, only a 0 held for
-    1 s frees it.
-  - A session ends on DTR fall (USB). Transports without DTR (the `main_uart` build, a WebSocket
-    bridge) only end it on MSP silence: a client that reconnects within 2 s inherits the old test.
-  - The firmware's `mtmode` declaration and the FEATURE_3D latch are RAM only; the page sends the
-    declaration again on each frame.
-  - MOTOR_TELEMETRY's mAh field carries the motor-test state (escs::UiState: 2 arming, 3 armed,
-    4 idle, 5 absent, 6 stalled, 7 silent; 1 reserved in rev0, "being read" from rev1) with 0x5A in
-    the high byte. Betaflight
-    Configurator shows it as about 23 Ah. The page reads it only from a board that says PICO.
-  - PWM: a width sent during the 5 s arm is not kept. After the arm, only the stop width passes
-    until one stop width has come (reported as arming, code 2, so the page keeps its slider locked).
-    The 500 ms deadman also runs from a timer IRQ, so it holds while core0 is blocked. Every PWM
-    pin goes to its stop width during any bootloader visit, and CLI bootloader commands are refused
-    while a PWM pin is fed above its stop. A pin unfed for 3 s after its arm leaves PWM, and the idle
-    hold takes it back. There is no hardware watchdog: a core0 hang with interrupts off keeps the
-    last width.
-  - `thrust` and the 3D motor-test range reach full scale at ±953. Past that the value is clamped,
-    because the next 47 units would fall into the other direction's band.
+- A session ends on DTR fall (USB). Transports without DTR (the `main_uart` build, a WebSocket
+  bridge) only end it on MSP silence: a client that reconnects within 2 s inherits the old test.
+- The `mtmode` declaration and the FEATURE_3D latch are RAM only; the page sends the declaration
+  again on each frame.
+- The mAh field reads as about 23 Ah in Betaflight Configurator. The page reads it only from a board
+  that says PICO.
+- There is no hardware watchdog: a core0 hang with interrupts off keeps the last PWM width.
+- `thrust` and the 3D motor-test range reach full scale at ±953. Past that the value is clamped,
+  because the next 47 units would fall into the other direction's band.
+
+## Not built yet
+
+- The explicit config commands asynchronous with deferred replies.
+- ROV identity from a telemetry id or declared config (a mismatch keeps the pin FAILED), and `scan`
+  at ROV launch.
+- The RPM controller falling back to open loop on LOST in ROV mode (today the stream keeps going and
+  `# esc i: lost, open loop` is reported).
+
+## History
+
+### rev0 (the first release, PR #12)
+
+- An idle hold that started only when nothing else was driven, and never retried an ESC whose read
+  failed until `scan` or a configurator read. It covered every wired ESC (Bluejay and BLHeli_S
+  beacon too), not only AM32.
+- PWM output, with its own deadman; switching back to DShot needs no reboot.
+- A bidir arm completes only once the ESC answers with telemetry and has taken the EDT enable:
+  Bluejay with FORCE_EDT_ARM never started after a passthrough when the motor test sent throttle at
+  once (EDT went out only in a zero-throttle gap after the arm).
+- The end of a passthrough re-reads each ESC while it is still in its bootloader.
+- The per-test 3D meaning (`mtmode`, the FEATURE_3D latch) and the stall re-arm.
+- Its limits, fixed since: a bootloader read on the drive path stalled every stream; swaps were not
+  detected (a bidir ESC silent for 1 s while armed was reported as code 7, and the page forgot it
+  after 3 polls); a failed read left the ESC unknown and was not retried.
+
+### Phase 1 (PR #13) and what it replaced
+
+Before it:
+
+- `escs::spinArm` read the ESC through its bootloader whenever its cached info was unknown, and core0
+  waited for core1 the whole time: every DShot stream on the board stopped for ~1.3–3.4 s for a
+  present ESC, ~11.5 s for an absent one.
+- The cache (`infoKnown/infoBidir/infoRev`) was RAM only, not tied to the ESC on the pin now, and a
+  failed read still armed in normal DShot with the stale direction.
+- The idle hold re-armed an ESC 5 s after it was stopped; for an ESC whose read failed that was a
+  fresh bootloader visit, so one dead ESC could stall everything every 16 s.
+
+Phase 1 brought the state machine, the async read, hot-plug, the tool/ROV switch, semantic drive
+with refusals, the `state` command and `FsGuard`. The persisted AM32 mask (`armMask`) went, and later
+the present mask (`/cfg/present`, deleted at boot). Where the code refined the design: READY takes
+`arm`, not a bare non-zero command; a read that fails without fresh telemetry goes to EMPTY; the
+plug-in debounce; writes never trust a cached reply.
+
+### rev1 and after
+
+- rev1 (PR #13) carried rev0's drive rules onto the lifecycle: `lc::Ui` for the motor-test codes,
+  `lc::Stall`, the loop-gap guard, `lc::pwmGate`.
+- PR #14: the pin list at run time, one index per pin, presence without a scan, the quiet + poll
+  entry (it replaced a fixed ladder of a 1 s hold, then 4 s twice, and a 4.5 s settle).
+- PR #15, #16: a fresh passthrough per read, InitFlash replies within 1 s (`0x07` pending), a one-way
+  ESC refusing 3D thrust, no guessed AM32 block.
+- PR #17: one drive path; `lc::ArmGate`, `lc::EdtSched`, `motor_test.h`; the legacy `esc_tool` env
+  retired (tag `legacy-esc-tool`).
+- PR #18: `test/sim`.
+- PR #19: one entry timeline (`lc::Entry`), the melody limits, LATE_ANSWER, the normal-DShot prime.
+  Before it, the 8 s NO_ANSWER rule took a melody ESC as unconfirmed and read it again, which played
+  the melody again: a read every 9 s, for good.
