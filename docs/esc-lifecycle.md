@@ -103,7 +103,8 @@ Hidden sub-states on top of the seven (fields of `lc::Pin`):
   a fresh CONNECT. A 4-way re-select of a non-AM32 ESC sends a fresh BootInit and adopts a different
   reply as a new ESC; AM32 answers only the first BootInit, so it re-adopts the cached reply if a
   keepalive answers (a swap there is caught by the re-read after the passthrough). The page re-reads
-  the channel before a settings write and refuses one that differs (`読み込んだときと違います`).
+  the channel before a settings write and refuses one that differs (`読み込んだときと違います`); a
+  firmware flash reads it fresh anyway (`flashCheck`).
 - Identity from the bootloader (`learnHere`): AM32 by its flash code (`lc::am32EepFor`; an unknown
   code is not read), 3D from `bi_direction`, the melody from `tune[]`. SiLabs: bidir from the layout
   revision at 0x1A02 (Bluejay 200..209, BlueGill 226, `lc::silabsBidir`) or a name with "JESC", 3D
@@ -205,7 +206,8 @@ neither needs a rebuild or a `scan`.
 
 - Nothing is stored. A pin is wired when its lifecycle state is not EMPTY: a bidir ESC is found by
   the hold's telemetry, any ESC by a read (`scan`, a configurator read, an arm). `escs` reports
-  (`escs|<n>/<count>|<indices>`).
+  (`escs|<n>/<count>|<indices>`); its old arguments are ignored with a note. The old present mask
+  `/cfg/present` is deleted at boot.
 - Each held pin takes a PIO SM. Bidir fits only pio0's 4 SMs on a Pico W (the radio is on pio1);
   normal DShot goes to pio1's 3 free SMs first (`newBidir` / `newNormal`). A pin past that budget
   reports `init-fail` and the hold tries it again every second.
